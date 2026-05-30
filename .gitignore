@@ -1,6 +1,5 @@
 build/
 bin/
-lib/
 test/
 __MACOSX/
 __pycache__/

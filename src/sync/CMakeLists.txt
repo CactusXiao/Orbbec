@@ -54,7 +54,8 @@ elseif(UNIX)
     set(CMAKE_SKIP_BUILD_RPATH FALSE)
     set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib/OrbbecSDK_v2.7.2/lib")
+    set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_LIST_DIR}/../../lib/OrbbecSDK_v2.7.2/lib")
 endif()
 
 install(FILES

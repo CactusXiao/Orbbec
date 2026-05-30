@@ -1,7 +1,5 @@
 mkdir -p build
-cd build
-export CMAKE_RUNTIME_OUTPUT_DIRECTORY=../output
-cmake .. 
-make
-mv orbbec ../bin/orbbec
-cd ..
+cmake -S . -B build
+cmake --build build -j
+mkdir -p bin
+cp build/orbbec bin/orbbec
