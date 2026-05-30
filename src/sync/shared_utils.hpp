@@ -71,6 +71,10 @@ struct SaveOptions {
     int         pngCompression = 1;
     bool        rgbH265        = false;
     std::string h265Ext        = "mp4";
+    std::string h265EncoderMode = "software";
+    std::string h265Codec      = "";
+    std::string h265HwDevice   = "/dev/dri/renderD128";
+    std::string h265LogLevel   = "info";
     std::string h265Preset     = "medium";
     int         h265Crf        = 23;
     int         h265Threads    = 0;

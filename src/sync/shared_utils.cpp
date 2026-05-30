@@ -322,6 +322,18 @@ AppConfig loadConfig(const fs::path &configPath) {
             if(auto v = getString(saveObj, "h265Ext")) {
                 cfg.save.h265Ext = *v;
             }
+            if(auto v = getString(saveObj, "h265EncoderMode")) {
+                cfg.save.h265EncoderMode = trimString(*v);
+            }
+            if(auto v = getString(saveObj, "h265Codec")) {
+                cfg.save.h265Codec = trimString(*v);
+            }
+            if(auto v = getString(saveObj, "h265HwDevice")) {
+                cfg.save.h265HwDevice = trimString(*v);
+            }
+            if(auto v = getString(saveObj, "h265LogLevel")) {
+                cfg.save.h265LogLevel = trimString(*v);
+            }
             if(auto v = getString(saveObj, "h265Preset")) {
                 cfg.save.h265Preset = *v;
             }

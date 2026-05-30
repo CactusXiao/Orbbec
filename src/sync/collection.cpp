@@ -967,6 +967,13 @@ static std::string shellQuote(const std::string &s) {
     return out;
 }
 
+static std::string toLowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
 static std::string h265ExtNormalized(std::string ext) {
     if(ext.empty()) {
         ext = "mp4";
@@ -979,6 +986,40 @@ static std::string h265ExtNormalized(std::string ext) {
 
 static std::string h265OutputFileName(const SaveOptions &options) {
     return "rgb" + h265ExtNormalized(options.h265Ext);
+}
+
+static std::string resolvedH265Codec(const SaveOptions &options) {
+    const std::string codec = trimString(options.h265Codec);
+    if(!codec.empty()) {
+        return codec;
+    }
+    const std::string mode = toLowerAscii(trimString(options.h265EncoderMode));
+    if(mode == "hardware" || mode == "hw") {
+        return "hevc_nvenc";
+    }
+    return "libx265";
+}
+
+static bool h265CodecIsSoftware(const std::string &codec) {
+    const std::string c = toLowerAscii(codec);
+    return c == "libx265" || c == "x265";
+}
+
+static bool h265CodecIsVaapi(const std::string &codec) {
+    return toLowerAscii(codec).find("vaapi") != std::string::npos;
+}
+
+static bool h265CodecIsQsv(const std::string &codec) {
+    return toLowerAscii(codec).find("qsv") != std::string::npos;
+}
+
+static bool h265CodecIsNvenc(const std::string &codec) {
+    const std::string c = toLowerAscii(codec);
+    return c.find("nvenc") != std::string::npos;
+}
+
+static bool h265CodecIsHardware(const std::string &codec) {
+    return !h265CodecIsSoftware(codec);
 }
 
 static bool copyColorFrameToBgr(const std::shared_ptr<ob::Frame> &frame, cv::Mat &outBgr) {
@@ -3243,16 +3284,49 @@ private:
 
     private:
         std::string buildCommand() const {
+            const std::string codec = resolvedH265Codec(options_);
+            const std::string logLevel = trimString(options_.h265LogLevel).empty() ? "info" : trimString(options_.h265LogLevel);
             std::ostringstream cmd;
-            cmd << "ffmpeg -hide_banner -loglevel error -y"
+            cmd << "ffmpeg -hide_banner -loglevel " << shellQuote(logLevel) << " -stats -y"
                 << " -f rawvideo -pix_fmt bgr24"
                 << " -s " << width_ << "x" << height_
                 << " -r " << fps_
-                << " -i - -an"
-                << " -c:v libx265"
-                << " -preset " << shellQuote(options_.h265Preset.empty() ? "medium" : options_.h265Preset)
-                << " -crf " << std::max(0, std::min(51, options_.h265Crf));
-            if(threads_ > 0) {
+                << " -i - -an";
+
+            if(h265CodecIsVaapi(codec)) {
+                const std::string dev = trimString(options_.h265HwDevice).empty() ? "/dev/dri/renderD128" : trimString(options_.h265HwDevice);
+                cmd << " -vaapi_device " << shellQuote(dev)
+                    << " -vf format=nv12,hwupload";
+            }
+            else if(h265CodecIsQsv(codec)) {
+                cmd << " -vf format=nv12";
+            }
+
+            cmd << " -c:v " << shellQuote(codec);
+
+            const std::string preset = trimString(options_.h265Preset);
+            if(!preset.empty() && (h265CodecIsSoftware(codec) || h265CodecIsNvenc(codec) || h265CodecIsQsv(codec))) {
+                cmd << " -preset " << shellQuote(preset);
+            }
+
+            const int quality = std::max(0, std::min(51, options_.h265Crf));
+            if(h265CodecIsSoftware(codec)) {
+                cmd << " -crf " << quality;
+            }
+            else if(h265CodecIsNvenc(codec)) {
+                cmd << " -cq " << quality << " -pix_fmt yuv420p";
+            }
+            else if(h265CodecIsVaapi(codec)) {
+                cmd << " -qp " << quality;
+            }
+            else if(h265CodecIsQsv(codec)) {
+                cmd << " -global_quality " << quality;
+            }
+            else {
+                cmd << " -q:v " << quality;
+            }
+
+            if(threads_ > 0 && h265CodecIsSoftware(codec)) {
                 cmd << " -threads " << threads_;
             }
             if(endsWith(outputPath_.string(), ".mp4") || endsWith(outputPath_.string(), ".mov")) {
@@ -3260,6 +3334,42 @@ private:
             }
             cmd << " " << shellQuote(outputPath_.string());
             return cmd.str();
+        }
+
+        void logStart(const std::string &command) const {
+            const std::string codec = resolvedH265Codec(options_);
+            std::cerr << "[collection][h265] start encoder"
+                      << " output=" << outputPath_
+                      << " mode=" << (h265CodecIsHardware(codec) ? "hardware" : "software")
+                      << " codec=" << codec
+                      << " size=" << width_ << "x" << height_
+                      << " fps=" << fps_
+                      << " threads=" << threads_
+                      << " preset=" << (trimString(options_.h265Preset).empty() ? "(none)" : trimString(options_.h265Preset))
+                      << " quality=" << std::max(0, std::min(51, options_.h265Crf));
+            if(h265CodecIsVaapi(codec) || h265CodecIsQsv(codec)) {
+                std::cerr << " hwDevice=" << (trimString(options_.h265HwDevice).empty() ? "/dev/dri/renderD128" : trimString(options_.h265HwDevice));
+            }
+            std::cerr << " ffmpegLogLevel=" << (trimString(options_.h265LogLevel).empty() ? "info" : trimString(options_.h265LogLevel))
+                      << std::endl;
+            std::cerr << "[collection][h265] ffmpeg command: " << command << std::endl;
+        }
+
+        void logExitFailure(int status) const {
+            const std::string codec = resolvedH265Codec(options_);
+            std::cerr << "[collection][h265] ffmpeg encoder failed"
+                      << " output=" << outputPath_
+                      << " status=" << status
+                      << " mode=" << (h265CodecIsHardware(codec) ? "hardware" : "software")
+                      << " codec=" << codec << std::endl;
+            if(h265CodecIsHardware(codec)) {
+                std::cerr << "[collection][h265] hardware encoder debug: run `ffmpeg -hide_banner -encoders | grep -Ei 'hevc|h265|265'`, "
+                          << "`ffmpeg -hide_banner -h encoder=" << codec << "`, and check GPU device/driver permissions";
+                if(h265CodecIsVaapi(codec) || h265CodecIsQsv(codec)) {
+                    std::cerr << " plus `ls -l " << (trimString(options_.h265HwDevice).empty() ? "/dev/dri/renderD128" : trimString(options_.h265HwDevice)) << "`";
+                }
+                std::cerr << std::endl;
+            }
         }
 
         void loop() {
@@ -3270,9 +3380,11 @@ private:
                 return;
             }
 
-            FILE *pipe = popen(buildCommand().c_str(), "w");
+            const std::string command = buildCommand();
+            logStart(command);
+            FILE *pipe = popen(command.c_str(), "w");
             if(!pipe) {
-                std::cerr << "[collection] failed to start ffmpeg h265 encoder: " << outputPath_ << std::endl;
+                std::cerr << "[collection][h265] failed to start ffmpeg process: " << outputPath_ << std::endl;
                 {
                     std::lock_guard<std::mutex> lock(mtx_);
                     stop_ = true;
@@ -3318,8 +3430,10 @@ private:
 
             const int status = pclose(pipe);
             if(status != 0) {
-                std::cerr << "[collection] ffmpeg h265 encoder exited with status " << status
-                          << ": " << outputPath_ << std::endl;
+                logExitFailure(status);
+            }
+            else {
+                std::cerr << "[collection][h265] encoder finished output=" << outputPath_ << std::endl;
             }
         }
 
