@@ -40,7 +40,7 @@
         "colorExt": "jpg",
         "jpegQuality": 90,
         "pngCompression": 1,
-        "h265Ext": "mp4",
+        "h265Ext": "h265",
         "_h265_comment": "h265EncoderMode: software/hardware. h265Codec can be libx265, hevc_nvenc, nvenc_hevc, hevc_vaapi, hevc_qsv, or hevc_v4l2m2m. On this Ubuntu machine, hevc_nvenc is the recommended hardware encoder if NVIDIA driver is available.",
         "h265EncoderMode": "software",
         "h265Codec": "",

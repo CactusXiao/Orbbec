@@ -988,6 +988,11 @@ static std::string h265OutputFileName(const SaveOptions &options) {
     return "rgb" + h265ExtNormalized(options.h265Ext);
 }
 
+static bool h265OutputIsRawStream(const fs::path &path) {
+    const std::string p = toLowerAscii(path.string());
+    return endsWith(p, ".h265") || endsWith(p, ".hevc");
+}
+
 static std::string resolvedH265Codec(const SaveOptions &options) {
     const std::string codec = trimString(options.h265Codec);
     if(!codec.empty()) {
@@ -3227,6 +3232,12 @@ private:
         std::function<void()> fn;
     };
 
+    struct H265FrameItem {
+        cv::Mat frame;
+        std::string frameIndex;
+        uint64_t tsUs = 0;
+    };
+
     class H265Encoder {
     public:
         H265Encoder(fs::path outputPath, int width, int height, int fps, int threads, SaveOptions options, size_t queueMax)
@@ -3249,7 +3260,7 @@ private:
             worker_ = std::thread([this]() { loop(); });
         }
 
-        void enqueue(cv::Mat frame) {
+        void enqueue(std::string frameIndex, uint64_t tsUs, cv::Mat frame) {
             if(frame.empty() || frame.cols != width_ || frame.rows != height_ || frame.type() != CV_8UC3) {
                 return;
             }
@@ -3261,7 +3272,7 @@ private:
                 if(stop_) {
                     return;
                 }
-                queue_.push_back(std::move(frame));
+                queue_.push_back(H265FrameItem{ std::move(frame), std::move(frameIndex), tsUs });
                 queued_.fetch_add(1);
             }
             cv_.notify_one();
@@ -3329,7 +3340,10 @@ private:
             if(threads_ > 0 && h265CodecIsSoftware(codec)) {
                 cmd << " -threads " << threads_;
             }
-            if(endsWith(outputPath_.string(), ".mp4") || endsWith(outputPath_.string(), ".mov")) {
+            if(h265OutputIsRawStream(outputPath_)) {
+                cmd << " -f hevc";
+            }
+            else if(endsWith(outputPath_.string(), ".mp4") || endsWith(outputPath_.string(), ".mov")) {
                 cmd << " -tag:v hvc1";
             }
             cmd << " " << shellQuote(outputPath_.string());
@@ -3380,6 +3394,15 @@ private:
                 return;
             }
 
+            const fs::path timestampPath = outputPath_.string() + ".timestamps.csv";
+            std::ofstream timestampOfs(timestampPath, std::ios::out | std::ios::trunc);
+            if(timestampOfs.is_open()) {
+                timestampOfs << "video_frame_index,frame_index,rgb_timestamp_us\n";
+            }
+            else {
+                std::cerr << "[collection][h265] warning: failed to open timestamp sidecar: " << timestampPath << std::endl;
+            }
+
             const std::string command = buildCommand();
             logStart(command);
             FILE *pipe = popen(command.c_str(), "w");
@@ -3396,7 +3419,7 @@ private:
             }
 
             while(true) {
-                cv::Mat frame;
+                H265FrameItem item;
                 {
                     std::unique_lock<std::mutex> lock(mtx_);
                     cv_.wait(lock, [&]() {
@@ -3408,13 +3431,14 @@ private:
                     if(queue_.empty()) {
                         continue;
                     }
-                    frame = std::move(queue_.front());
+                    item = std::move(queue_.front());
                     queue_.pop_front();
                     queued_.fetch_sub(1);
                     inFlight_.fetch_add(1);
                     cv_.notify_all();
                 }
 
+                const cv::Mat &frame = item.frame;
                 if(frame.isContinuous()) {
                     const size_t bytes = static_cast<size_t>(frame.total()) * frame.elemSize();
                     (void)fwrite(frame.data, 1, bytes, pipe);
@@ -3425,7 +3449,18 @@ private:
                         (void)fwrite(frame.ptr(r), 1, rowBytes, pipe);
                     }
                 }
+                if(timestampOfs.is_open()) {
+                    timestampOfs << encodedFrameCount_ << "," << item.frameIndex << "," << item.tsUs << "\n";
+                }
+                encodedFrameCount_++;
                 inFlight_.fetch_sub(1);
+            }
+
+            if(timestampOfs.is_open()) {
+                timestampOfs.flush();
+                timestampOfs.close();
+                std::cerr << "[collection][h265] timestamp sidecar written path=" << timestampPath
+                          << " frames=" << encodedFrameCount_ << std::endl;
             }
 
             const int status = pclose(pipe);
@@ -3446,11 +3481,12 @@ private:
         size_t queueMax_ = 1024;
         mutable std::mutex mtx_;
         std::condition_variable cv_;
-        std::deque<cv::Mat> queue_;
+        std::deque<H265FrameItem> queue_;
         std::thread worker_;
         bool stop_ = false;
         std::atomic<size_t> queued_{ 0 };
         std::atomic<int> inFlight_{ 0 };
+        size_t encodedFrameCount_ = 0;
     };
 
     struct SessionState {
@@ -4121,7 +4157,7 @@ private:
         h265EncodingActive_.store(false);
     }
 
-    void enqueueH265Frame(const std::string &sn, cv::Mat frame) {
+    void enqueueH265Frame(const std::string &sn, const std::string &frameIndex, uint64_t tsUs, cv::Mat frame) {
         H265Encoder *encoder = nullptr;
         {
             std::lock_guard<std::mutex> lock(h265Mtx_);
@@ -4131,7 +4167,7 @@ private:
             }
         }
         if(encoder) {
-            encoder->enqueue(std::move(frame));
+            encoder->enqueue(frameIndex, tsUs, std::move(frame));
         }
     }
 
@@ -4506,7 +4542,7 @@ private:
                 if(t == CollectDataType::RGB) {
                     if(cfg_.save.rgbH265) {
                         cv::Mat frame = packet.frame;
-                        enqueueH265Frame(sn, std::move(frame));
+                        enqueueH265Frame(sn, frameIndex, packet.tsUs, std::move(frame));
                         continue;
                     }
                     const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + colorExtNormalized(cfg_.save.colorExt));
