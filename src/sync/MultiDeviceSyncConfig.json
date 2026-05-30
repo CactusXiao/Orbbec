@@ -1,0 +1,42 @@
+{
+    "version": "1.0.0",
+    "configTime": "2023/01/01",
+    "devices": [
+        {
+            "sn": "CPCBC53000MZ",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_PRIMARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            }
+        },
+        {
+            "sn": "CPC7B53000BV",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            }
+        },
+        {
+            "sn": "CPCBC5300065",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            }
+        }
+    ]
+}

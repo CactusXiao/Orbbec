@@ -1,0 +1,35 @@
+target_type: "apriltag"  # chessboard | apriltag
+
+board_cols: 9
+board_rows: 6
+square_size_m: 0.0255
+apriltag_family: "tag36h11"
+apriltag_min_tags: 1
+apriltag_min_inliers: 4
+apriltag_default_size_m: 0.096
+
+fixed_camera_ids:
+  - "00"
+  - "01"
+  - "02"
+  - "03"
+  - "04"
+  - "05"
+target_camera_id: "08"
+
+frame_policy: "intersection"  # intersection | target_primary
+
+use_mm_to_m_auto_scale: true
+fixed_extrinsics_are_twc: true
+
+pnp_reproj_error_px: 2.0
+pnp_iterations: 200
+min_inliers: 12
+min_fixed_observations: 2
+
+fusion_ransac_trans_thresh_m: 0.08
+fusion_ransac_rot_thresh_deg: 8.0
+
+output_subdir: "outputs"
+calibration_filename: "camera_params.json"
+extrinsics_filename: "extrinsics.json"

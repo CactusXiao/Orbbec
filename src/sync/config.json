@@ -1,0 +1,199 @@
+{
+    "_comment": "avaliable mode: viewer,interaction,collection,calibration",
+    "mode": "interaction",
+    "viewer_fps": 30,
+    "init_extrinsic_path": "extrinsic.json",
+    "max_depth": 6.0,
+    "different_color": false,
+    "filters": {
+        "_filter_comment": "preset: Default/Hand/High Accuracy/High Density/Medium Density/Custom",
+        "preset": "Default",
+        "point_cloud_decimation_factor": 2,
+        "decimation_filter_scale": 0,
+        "noise_removal_filter_max_size": 0,
+        "noise_removal_filter_min_diff": 0,
+        "spatial_filter_alpha": 0,
+        "spatial_filter_disp_diff": 0,
+        "spatial_filter_magnitude": 0,
+        "spatial_filter_radius": 0,
+        "temporal_filter_diff_scale": 0,
+        "temporal_filter_weight": 0,
+        "hole_filling_filter_mode": 0,
+        "desk_crop": true
+    },
+    "calibration": {
+        "chessboard": {
+            "rows": 8,
+            "cols": 11,
+            "squareSize": 0.03
+        }
+    },
+    "outputDir": "./collection_000",
+    "durationSec": 5,
+    "maxFrames": 1000,
+    "collectFps": 30,
+    "enableSync": true,
+    "queueCapacity": 1024,
+    "writerThreads": 0,
+    "save": {
+        "rgbEncoding": "image",
+        "colorExt": "jpg",
+        "jpegQuality": 90,
+        "pngCompression": 1,
+        "h265Ext": "mp4",
+        "h265Preset": "medium",
+        "h265Crf": 23,
+        "h265Threads": 0,
+        "h265ThreadsByCamera": {
+            "00": 4,
+            "01": 4,
+            "02": 4
+        }
+    },
+    "fisheye": {
+        "_comment": "Fish-eye cameras bind to a physical device by uniqueId. If the configured node cannot stream, startup will probe sibling video-index nodes on the same camera. camera1 -> left hand, camera2 -> right hand.",
+        "enabled": true,
+        "targetFps": 60,
+        "maxBufferedSets": 4096,
+        "cameras": [
+            {
+                "cameraId": "left_hand",
+                "handRole": "left",
+                "uniqueId": "v4l:/dev/v4l/by-id/usb-DCX-260417-KTY_usb_camera1_01.00.00-video-index0",
+                "width": 1280,
+                "height": 720,
+                "fps": 60,
+                "preferMjpeg": true
+            },
+            {
+                "cameraId": "right_hand",
+                "handRole": "right",
+                "uniqueId": "v4l:/dev/v4l/by-id/usb-DCX-260417-KTY_usb_camera2_01.00.00-video-index0",
+                "width": 1280,
+                "height": 720,
+                "fps": 60,
+                "preferMjpeg": true
+            }
+        ]
+    },
+    
+    "devices": [
+        {
+            "sn": "CPCBC53000MZ",
+            "index": "00",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_PRIMARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPC7B53000BV",
+            "index": "01",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1280,
+                    "height": 720,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPCBC5300065",
+            "index": "02",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1280,
+                    "height": 720,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 640,
+                    "height": 400,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        }
+    ]
+}

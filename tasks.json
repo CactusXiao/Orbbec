@@ -1,0 +1,191 @@
+{
+  "hand_shape_calibration": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：手掌向下把手放到采集区域中心，静止3s，然后手掌翻转静止3s，用于计算手部形状。",
+    "task_description_en": "show your hand up for 3s and down for 3s",
+    "scene": "none"
+  },
+  "glass_tableware_separation_and_arrangement": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将叠放或相邻摆放的玻璃大盘、玻璃小盘和碗逐件分离，完成简单视检后平码到指定位置。\n道具：玻璃基大盘子、玻璃基小盘子、碗\n参考动作：接近、托举、捏边、分离、在手旋转、视检、对位、平放、释放\n动作指导：先用一手稳定下层餐具，另一手从边缘或底部切入提起上层餐具；拿起后做一次自然翻面或转向检查，再放到指定区域；最后对摆放位置做一次轻微微调，保证餐具之间不重叠。\n注意事项：不要整叠端走；每件餐具都应体现一次拿起后的姿态调整；放置时避免快速砸放或滑出桌边。",
+    "task_description_en": "Separate the glass large plate, glass small plate, and bowl one by one, briefly inspect them, and place them flat in designated positions.",
+    "scene": "kitchen"
+  },
+  "wipe_glass_plate_with_sponge": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：使用海绵对玻璃大盘的盘面和盘沿进行擦洗，并在结束前完成简短检查。\n道具：海绵、玻璃基大盘子\n参考动作：抓握、按压、擦拭、环绕移动、旋转盘面、边缘重定位、放回\n动作指导：先拿起海绵调整握姿，再用另一手扶住盘边；沿盘面做连续环形或往复擦拭，期间转动盘子一次，让手从不同方向接触表面；结束前短暂停顿，检查擦洗是否覆盖到盘沿和中心区域。\n注意事项：不要只擦一两下；尽量让盘面、盘边和手指重定位都出现；擦拭路径应连续，不要一直停在一个局部。",
+    "task_description_en": "Use a sponge to wipe the surface and rim of the glass large plate, then briefly inspect the result before finishing.",
+    "scene": "kitchen"
+  },
+  "dry_bowl_and_place_in_dish_rack": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：使用洗碗巾将碗内外擦干后，将碗按正确方向放入碗碟架。\n道具：洗碗巾、碗、碗碟架\n参考动作：展开布料、包覆、擦拭、旋转碗体、托举、对位、插放、释放\n动作指导：先展开布料，一手持碗，一手持布，从碗内到碗外依次擦拭；擦完后调整碗口方向，再将碗缓慢放入碗碟架；放入后可轻推或轻转一次，确认碗已稳固卡住。\n注意事项：不要省略擦干直接上架；布和碗之间应有持续接触过程；上架时避免整只手挡住碗口与架子的接触位置。",
+    "task_description_en": "Dry the bowl inside and outside with a dish cloth, then place it into the dish rack in the correct orientation.",
+    "scene": "kitchen"
+  },
+  "glass_tableware_clean_and_rack": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将一组玻璃餐具从分离检查、擦洗、擦干到上架依次完成，形成完整的清洁归位流程。\n道具：玻璃基大盘子、玻璃基小盘子、碗、海绵、洗澡巾（作为洗碗巾使用）、碗碟架\n参考动作：分离、托举、旋转、视检、擦拭、翻面、包覆擦干、对位上架、释放\n阶段：\n阶段 1：分离三件玻璃餐具并完成初步检查\n阶段 2：使用海绵擦洗其中的盘子或碗\n阶段 3：用洗碗巾擦干后放入碗碟架\n动作指导：先将叠放餐具分离，过程中加入翻面和边缘检查；接着选择盘子或碗进行连续擦洗，擦洗后再换布擦干；最后依次把餐具放入架中，放入时保留短暂停顿和方向微调。\n注意事项：三个阶段要清楚，不要直接“拿起-上架”一笔带过；海绵和布分别承担不同作用，避免混用；最后上架时尽量让不同餐具进入合理位置。",
+    "task_description_en": "Complete a full workflow for a set of glass tableware, including separation, inspection, wiping, drying, and rack placement.",
+    "scene": "kitchen"
+  },
+  "sort_and_nest_colored_plastic_tableware": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：从混放的彩色塑料杯、碗、碟中挑出同色物体，并完成分组和套放。\n道具：不同颜色的塑料碗、杯子、碟子\n参考动作：捏取、识别、分类、转向、套放、叠放、调整、释放\n动作指导：从混放状态开始，先拿起一件餐具确认颜色，再寻找对应颜色的同类或异类餐具完成套放；建议至少完成 3 次独立抓取和 2 次套放；结束时做一次整体目视检查和位置修正。\n注意事项：不要一把全扫到一起；应体现“拿起-判断-套放”的分类逻辑；套放时不要用力过猛，以免卡住或弹开。",
+    "task_description_en": "Pick same-colored plastic cups, bowls, and plates from a mixed pile, then group and nest them together.",
+    "scene": "kitchen"
+  },
+  "sort_colored_plastic_tableware_sets": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将混放的彩色塑料杯、碗、碟和刀叉勺按颜色整理成套，并归置到指定区域。\n道具：不同颜色的塑料碗、杯子、碟子、刀叉、勺子\n参考动作：捏取、分类判断、套放、叠放、抓取小件、翻转、平行摆放、终态整理\n阶段：\n阶段 1：从混放区挑出同色的杯、碗、碟\n阶段 2：补齐同色的刀、叉、勺\n阶段 3：把同色整套餐具收拢到指定区域\n动作指导：先完成大件餐具的分色，再处理小件刀叉勺；抓取小件时尽量展示捏取、翻转和对向放置；最后将整套餐具摆成一组，并做 1-2 次细微修整。\n注意事项：不要只按形状收纳而忽略颜色逻辑；小件餐具不要一次抓一把；成套摆放结束后应有明显终态。",
+    "task_description_en": "Sort mixed colorful plastic cups, bowls, plates, and cutlery into color-matched sets and place them in a designated area.",
+    "scene": "kitchen"
+  },
+  "organize_and_wipe_tableware": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：对散放的餐具进行简单擦拭和整理，并按类别整齐归置到指定位置。\n道具：塑料碗、杯子、碟子、刀叉、勺子、洗澡巾（作为洗碗巾使用）、碗碟架或指定收纳区\n参考动作：抓取、擦拭、翻转、分类、套放、叠放、对位、释放\n阶段：\n阶段 1：收拢散放餐具并完成简单分类\n阶段 2：选择其中部分餐具完成擦拭\n阶段 3：将擦拭后的餐具整齐放入收纳位置\n动作指导：先收拢大件，再处理小件刀叉勺；擦拭阶段可选取 1-2 件餐具，从接触面到边缘完成简单擦拭；归置时先粗放后精调，让最终摆放更规整。\n注意事项：任务名称强调“整理+擦拭”，两类动作都必须出现；不要只擦不整理，也不要只整理不擦；终态应体现类别分开、位置清晰。",
+    "task_description_en": "Briefly wipe scattered tableware, organize it by category, and place it neatly in designated positions.",
+    "scene": "kitchen"
+  },
+  "prepare_dough_on_cutting_board": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：在砧板上对面团进行揉压、搓条和分段整理，并将处理后的面团放入盘或碗中。\n道具：砧板、面团、碗或小盘\n参考动作：按压、揉捏、搓滚、捏断或分段、聚拢、转运、放置\n阶段：\n阶段 1：将面团放到砧板中央并完成揉压整形\n阶段 2：把面团搓成长条并分成若干段\n阶段 3：将处理后的面团转移到碗或盘中\n动作指导：先在砧板上完成按压和揉捏，让面团形状更均匀；再用双手或单手掌根把面团搓成长条，并通过捏断或掐分完成分段；最后逐块转移到盘或碗中，放下前做一次对位。\n注意事项：任务重点是“砧板+面”的处理过程，不是单纯端走面团；揉、搓、分段三个动作应尽量都出现；面团转移时避免一把全抓进容器。",
+    "task_description_en": "Knead, roll, and portion dough on the chopping board, then transfer the processed dough into a plate or bowl.",
+    "scene": "kitchen"
+  },
+  "use_chopsticks_for_dough": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：使用筷子将面团小块逐个夹起并放入碗中，完成基本夹持与转运动作。\n道具：筷子、面团、碗\n参考动作：持筷调整、夹持、抬升、转运、悬停、对位、释放、再抓取\n动作指导：开始前先调整筷子在指间的位置，确保持筷姿势稳定；夹取时尽量从不同角度接近面团小块，至少完成 2-3 次独立夹取；放入碗中前在碗口上方短暂停顿，再松开筷子完成释放。\n注意事项：不要改成扒、拨或推入碗中；若第一次未夹稳，可自然重试；夹取对象大小要适中，保证能在时长内稳定完成。",
+    "task_description_en": "Use chopsticks to pick up small dough pieces one by one and place them into a bowl.",
+    "scene": "kitchen"
+  },
+  "clean_cutting_board": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：对砧板的主要表面和边缘进行清洗擦拭，并将其恢复到干净、可使用的状态。\n道具：砧板、海绵、洗澡巾（作为洗碗巾使用）\n参考动作：抓边、翻面、按压、擦拭、沿边移动、重抓、放回\n动作指导：先用海绵擦拭砧板表面和边缘，再用布做一次收尾擦干；过程中可将砧板翻面或旋转一次，以展示不同方向的接触；结束后把砧板重新摆正放回操作区。\n注意事项：不要只擦一面就结束；边缘和角部应有至少一次明确接触；拿起和放下砧板时避免动作过猛。",
+    "task_description_en": "Wipe the main surface and edges of the chopping board and restore it to a clean, usable state.",
+    "scene": "kitchen"
+  },
+  "deal_uino_cards": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将一叠 UINO 牌按顺序逐张发到多个指定位置，形成清晰的发牌过程。\n道具：UINO牌或扑克牌\n参考动作：拇指分牌、捏取、滑移、转运、释放、平码、叠齐\n动作指导：先把牌叠整理整齐，再用拇指逐张推出，配合食指和中指捏起后发到指定位置；发牌时保持固定顺序，例如从左到右；每张放下后短暂停顿一下，保证发牌动作清晰。\n注意事项：不要整叠挪来挪去代替逐张发牌；发牌路径应有规律；放牌时避免牌面翻折或甩飞。",
+    "task_description_en": "Deal a stack of UINO cards one by one to multiple designated positions in a clear dealing sequence.",
+    "scene": "workspace"
+  },
+  "shuffle_uino_cards": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：对一叠 UINO 牌进行整理、分叠和混洗，形成自然的洗牌过程。\n道具：UINO牌或扑克牌\n参考动作：收拢、压齐、分叠、滑动、交错合并、拍齐、重抓\n动作指导：先将牌叠四边压齐，再分成两叠；通过推送、交错或桌面混洗的方式让两叠牌重新合并；最后将牌重新拍齐并整理成一叠。\n注意事项：不要只是把牌从一边挪到另一边；洗牌中应出现“分开-混合-合并”三段；若牌张散乱，可自然收拢，但不要中断任务。",
+    "task_description_en": "Square up, split, and shuffle a stack of UINO cards in a natural card-shuffling sequence.",
+    "scene": "workspace"
+  },
+  "sort_items_into_storage_boxes": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将桌面小件分到蓝色和白色收纳盒中，并在结束时把两个收纳盒摞放整齐。\n道具：蓝色无盖收纳盒、白色无盖收纳盒、扑克牌或卡纸小片\n参考动作：捏取、分类判断、放入、压齐、搬运、摞放、对位\n动作指导：先把蓝白两个盒子摆开，再将牌卡或纸片按规则分别放入两个盒中；分拣完成后将盒口方向调整一致，再把一个盒子平稳摞到另一个盒子上方；摞放后做一次边缘对齐。\n注意事项：不要一把抓很多张一次投入；分类规则要一致；摞放时避免歪斜或边缘悬空。",
+    "task_description_en": "Sort small desktop items into the blue and white storage boxes, then stack the two boxes neatly at the end.",
+    "scene": "workspace"
+  },
+  "fold_cardboard_into_box": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将预折纸板沿折线折起并组成立体纸箱雏形。\n道具：可折叠成纸箱的预折纸板\n参考动作：展开、按折线压折、捏边、立边、插扣或对位、压实\n动作指导：先将纸板完全铺开，找到主要折线后依次压折；随后立起两侧边和底部结构，必要时用双手分别稳定相对两边；最后沿边角和箱口轻压，保证纸箱雏形立稳。\n注意事项：虽然是短任务，也应体现完整折叠过程；不要直接暴力掰起成立体；若边角未到位，应做自然微调。",
+    "task_description_en": "Fold a pre-creased cardboard sheet along its crease lines and form it into a basic paper box shape.",
+    "scene": "workspace"
+  },
+  "pack_box_and_tie_it": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将小物件装入纸箱后，用纸带或细绳完成一次打结固定。\n道具：小纸箱或预折纸箱、扑克牌或小卡片等装入物、纸带或细绳\n参考动作：打开箱体、扶持、装入、压整、交叉、绕圈、穿出、拉紧、整理结头\n阶段：\n阶段 1：打开或撑起小纸箱并稳定箱体\n阶段 2：把小物件分批装入纸箱\n阶段 3：使用纸带或细绳完成打结固定\n动作指导：先让纸箱保持开口稳定，再分 2-3 次把物品装入；装入后可轻压整理，让内部更平整；最后用纸带或细绳完成交叉、绕圈、穿出和拉紧，形成清晰的打结过程。\n注意事项：任务名称中“装东西+打结”两部分都必须出现；不要一次性把全部物品倒进去；打结动作要完整，至少应出现交叉和拉紧两个关键步骤。",
+    "task_description_en": "Put small items into a paper box and secure it with a knot using a paper strip or string.",
+    "scene": "workspace"
+  },
+  "mark_correct_and_cut_card_paper": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：在卡纸上完成标记、擦除修正和裁片三个连续步骤，得到可收纳的卡纸片。\n道具：卡纸、铅笔、橡皮擦、剪刀\n参考动作：按纸、书写、抬笔检查、擦除、重描、转纸、剪切、分离裁片、收拢\n阶段：\n阶段 1：在卡纸上画出目标线条或边界\n阶段 2：擦除一处标记并重新修正\n阶段 3：沿线裁下目标卡片\n动作指导：先画线并保留一个需要修正的位置，擦除后再重描；进入裁切阶段时，重新调整纸张方向，让剪刀入刀点更清楚；裁完后把成品和剩余材料分开摆放。\n注意事项：三个阶段要有清晰过渡；不要画完就直接剪，必须保留修正动作；非持剪刀手不要进入刀路前方。",
+    "task_description_en": "Perform marking, erasing correction, and cutting in sequence on card paper to produce usable paper pieces.",
+    "scene": "workspace"
+  },
+  "sweep_paper_scraps_to_dustpan_and_trash": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将桌面碎纸扫入簸箕，并把收集到的碎纸送入垃圾桶。\n道具：桌面清扫刷、簸箕、碎纸或纸屑、垃圾桶\n参考动作：摆放簸箕、推扫、聚拢、调整簸箕位置、提起、倾倒、复位\n动作指导：先将簸箕放到纸屑一侧，再用清扫刷把碎纸分几次扫入簸箕；扫动过程中可调整簸箕位置一次，确保纸屑真正进入；最后提起簸箕并将纸屑倒入垃圾桶。\n注意事项：不要用手直接拢纸屑；不要只象征性扫一下；送入垃圾桶的过程也应完整出现。",
+    "task_description_en": "Sweep paper scraps into the dustpan and carry them to the trash bin for disposal.",
+    "scene": "workspace"
+  },
+  "water_potted_plant_with_watering_can": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：使用喷壶对盆栽根部区域进行定点浇水，并在结束后复位花盆和工具。\n道具：塑料盆栽、喷壶\n参考动作：抓握壶柄、调整壶嘴方向、抬起、倾斜、回正、转盆、放回\n动作指导：先拿起喷壶调整壶嘴方向，再靠近花盆边缘做定点浇水；过程中可轻微转动花盆或改变壶嘴角度，让不同区域都被覆盖；结束后把喷壶放回并目视检查花盆位置。\n注意事项：不要全程悬空乱晃；浇水动作应体现“靠近-倾斜-回正”；注意不要让壶嘴长时间完全挡住接触区域。",
+    "task_description_en": "Use the watering can to apply water to the root area of the potted plant, then return both the plant and the tool to place.",
+    "scene": "workspace"
+  },
+  "sort_and_inspect_screws": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：从混合的十字螺丝和六角螺丝中完成分拣、简单视检，并将不同螺丝分别放入蓝白小盒。\n道具：十字螺丝、六角螺丝、蓝色小盒、白色小盒\n参考动作：指尖捏取、翻面视检、分类判断、跨区域搬运、定点释放、盒内整理\n动作指导：从混合螺丝堆中逐个捏起螺丝，先做一次短暂翻面或转向检查，再根据类型放入对应颜色的小盒；建议优先处理桌面上分散的螺丝，让抓取方向更丰富；盒内放入后可轻微整理位置，避免全部堆在同一点。\n注意事项：螺丝总数按 10 个准备，十字和六角各占一半；不要一把抓起多个螺丝一起丢入盒中；视检动作应真实出现，而不是仅凭位置直接分拣。",
+    "task_description_en": "Sort mixed Phillips screws and hex screws, briefly inspect them, and place each type into the blue and white storage boxes separately.",
+    "scene": "industrial"
+  },
+  "remove_screws_with_electric_screwdriver": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：使用电动螺丝刀将底座上的四个螺丝依次拆卸下来，并整齐放到指定区域。\n道具：电动螺丝刀、螺丝、带螺丝槽点的底座、暂存盒或桌面指定区\n参考动作：握持工具、对准螺丝头、轴向施压、触发启动、提起取出、捏取转移、放置\n动作指导：先调整电动螺丝刀与螺丝头的角度，再逐颗拆卸；每颗螺丝松脱后，可用指尖捏起或让其自然落出后再拾取放到指定区；拆卸顺序尽量固定，例如按左上到右下，便于形成稳定流程。\n注意事项：不要斜着硬拧，避免打滑；拆卸后不要让螺丝滚散；工具头部与手不要长时间完全遮挡螺丝接触点。",
+    "task_description_en": "Use the electric screwdriver to remove four screws from the base one by one and place them neatly in a designated area.",
+    "scene": "industrial"
+  },
+  "store_tools_and_close_toolbox": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将电动螺丝刀和螺丝刀头收纳到小盒中，再把小盒放入工具箱并完成卡扣闭合。\n道具：电动螺丝刀、螺头、小盒、工具箱\n参考动作：抓握、放入、调整朝向、推入、提盖或开盒、闭合、按压卡扣\n动作指导：先将电动螺丝刀和螺头按合理方向放入小盒，必要时做一次朝向微调；随后打开工具箱，把小盒放入指定位置；最后合上工具箱盖并完成卡扣闭合，可在卡扣处短暂停顿确认锁定。\n注意事项：不要把工具随手丢进盒中；小盒进入工具箱前应有明确的开盖和对位动作；卡扣闭合要完整出现，不能只虚掩箱盖。",
+    "task_description_en": "Store the electric screwdriver and driver bits in the small case, place the case into the toolbox, and close the toolbox latch.",
+    "scene": "industrial"
+  },
+  "coil_and_tie_usb_cable": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将桌面上的长 USB 线缆整理成整齐线圈，并使用尼龙扎带完成捆扎固定。\n道具：长 USB 线缆、尼龙扎带扣\n参考动作：理线、拉直、环绕成圈、扶持线圈、穿入扎带、拉紧、整理尾端\n动作指导：先拉直线缆并理顺缠绕，再将线缆环绕成大小相近的线圈；一手维持线圈形状，另一手把扎带穿过并拉紧；完成后可再整理一次线圈边缘，让整体更规整。\n注意事项：不要直接把乱线强行捆住；环绕成圈和扎带固定都必须出现；注意让线缆不要长时间遮挡手部关键动作。",
+    "task_description_en": "Organize a long USB cable into a neat coil and secure it with a nylon tie.",
+    "scene": "industrial"
+  },
+  "connect_usb_hub_and_power_on": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将 USB 拓展坞连接电源线和插线板，再插上两条 USB 线，最后打开插线板和拓展坞电源开关。\n道具：USB拓展坞、电源线、电源插头、插线板、两条USB线\n参考动作：抓握线头、对准接口、插接、电源插入、理线、按压开关、复检\n阶段：\n阶段 1：将拓展坞连接到电源线，并把电源插头插入插线板\n阶段 2：在拓展坞上插入两条 USB 线\n阶段 3：打开插线板开关和拓展坞电源开关，并整理线缆\n动作指导：先完成主供电链路连接，再处理两条 USB 数据线；每次插接前都先做接口方向判断和短暂停顿对位；最后依次按下插线板和拓展坞开关，并顺手整理线缆走向，减少遮挡。\n注意事项：注意不要让线缆长时间挡住手部关键动作；不同接口插接应一根一根完成，不要同时抓多根线操作；两个开关动作都应完整出现。",
+    "task_description_en": "Connect the USB hub to its power cable and power strip, plug in two USB cables, and then switch on both the power strip and the USB hub.",
+    "scene": "industrial"
+  },
+  "assemble_and_extend_phone_tripod": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将收纳成棍状的三脚相机支架与手机夹具组装在一起，并把三脚架展开拉伸到工作状态。\n道具：三脚相机支架、手机夹具\n参考动作：抓握、对位、旋接或插接、展开支脚、拉伸、稳定、调整角度\n动作指导：先将手机夹具与三脚架顶部连接，过程中体现对位和旋紧或插紧动作；随后依次打开三只支脚，并把每只脚拉伸出来；最后调整支架站姿，让三脚均匀着地或均匀展开。\n注意事项：不要直接把三脚架甩开；夹具安装和三脚展开是两个清晰阶段；每只脚都应真正展开和拉伸，而不是只象征性拨动。",
+    "task_description_en": "Attach the phone holder to the folded tripod stick, then open and extend the tripod legs into a working configuration.",
+    "scene": "industrial"
+  },
+  "replace_light_bulb": {
+    "horizon": "short",
+    "repeat_times": 1,
+    "task_description_cn": "任务：将灯座上的旧灯泡旋下，并安装上新的灯泡。\n道具：坏灯泡、新灯泡、灯泡底座\n参考动作：包覆抓握、旋拧、取下、换手、对准螺纹、旋入、终点确认\n动作指导：先用一手稳定底座，另一手包覆旧灯泡完成逆时针旋下；取下后放到一旁，再拿起新灯泡对准螺纹起始位置，顺时针旋入到底；安装完成后可轻轻再旋半步确认到位。\n注意事项：旧灯泡和新灯泡要分区放置，避免混淆；拆装过程中不要大幅摇晃底座；旋入新灯泡时不要跳过起始对牙过程。",
+    "task_description_en": "Unscrew the old bulb from the lamp socket and install a new bulb in its place.",
+    "scene": "industrial"
+  },
+  "wrap_rope_and_rewind_onto_cardboard": {
+    "horizon": "long",
+    "repeat_times": 1,
+    "task_description_cn": "任务：先在绕绳工作台上完成三圈绕绳，再把绕好的绳从工作台转移并重新缠绕到纸板道具上。\n道具：绕绳工作台、绳线、纸板收绞道具\n参考动作：抓绳、引线、绕柱、跨点引导、拉紧、提起脱离、缠绕纸板、压线整理\n阶段：\n阶段 1：在绕绳工作台上按路径完成三圈绕绳\n阶段 2：将已绕好的绳从工作台取下并整理线头\n阶段 3：把绳重新缠绕收绞到纸板上\n动作指导：第一阶段按既定路径完成三圈环绕，过程中保留引线、拉紧和转向动作；第二阶段把绳从工作台上取下时注意保持整体形态；第三阶段用纸板作为收绞芯，逐圈缠绕并压整边缘。\n注意事项：不要跳过工作台绕绳直接缠纸板；三圈绕绳要清晰可见；缠到纸板上时应尽量让线圈规整，避免松散打结。",
+    "task_description_en": "First wrap the rope around the rope-routing workstation for three turns, then transfer the wrapped rope and rewind it onto the cardboard holder.",
+    "scene": "industrial"
+  }
+}

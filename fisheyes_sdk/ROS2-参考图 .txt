@@ -1,0 +1,91 @@
+USB Camera Demo（C++ / ROS2 Humble）
+本仓库包含一个基于 OpenCV 的 USB 相机演示程序，以及在 ROS2 Humble 下发布相机图像的示例节点。
+
+纯本地 C++ Demo：usb_cam_demo/cpp/main.cpp
+
+使用 OpenCV 通过 V4L2 采集图像，支持分辨率 / 帧率配置、曝光/亮度/对比度调节。
+按键功能：
+s：抓图保存 PNG 到 build/ 目录（例如 capture_0.png）。
+r：开始/停止录像到 AVI。
+q / ESC：退出程序。
+ROS2 Humble 节点：usb_cam_demo/cpp/ros_usb_cam_node.cpp
+
+使用 rclcpp + cv_bridge + sensor_msgs 发布图像。
+采集线程使用 OpenCV 从 USB 相机读取图像，主线程将图像转换为 ROS2 消息并发布。
+支持发布原始 sensor_msgs::msg::Image 或压缩 sensor_msgs::msg::CompressedImage（可选 JPEG 压缩），帧率和话题名等参数可通过配置文件设置。
+相机硬件链接
+本 Demo 使用的 USB 相机型号链接如下（淘宝）：
+
+DECXIN USB Camera
+目录结构
+usb_cam_demo/cpp/：C++ 源码和 CMake 构建脚本
+main.cpp：本地 OpenCV 演示程序（不依赖 ROS2）
+ros_usb_cam_node.cpp：ROS2 Humble 图像发布节点
+CMakeLists.txt：C++ demo 与 ROS2 节点的构建配置
+config.yaml：相机与 ROS2 节点的统一配置文件
+usb_cam_demo/python/：Python 相关示例（如虚拟环境等，若存在）
+UVC.md：与 UVC 协议和相机相关的说明
+环境依赖
+Ubuntu（已在 22.04 + Linux 6.8 内核环境测试）
+OpenCV（系统安装版本，例如 libopencv-dev）
+ROS2 Humble（rclcpp、sensor_msgs、cv_bridge 等）
+安装依赖示例（仅供参考，具体以自己环境为准）：
+
+sudo apt update
+sudo apt install libopencv-dev
+
+source /opt/ros/humble/setup.bash
+sudo apt install ros-humble-cv-bridge ros-humble-image-transport
+构建与运行（C++ 本地 Demo）
+cd usb_cam_demo/cpp
+mkdir -p build
+cd build
+cmake ..
+make -j4
+
+./usb_cam_demo
+相机与图像参数可在 usb_cam_demo/cpp/config.yaml 的 camera 部分修改，例如：
+
+camera:
+  device_index: 0
+  width: 1280
+  height: 720
+  fps: 60
+  exp_sw: 128
+  bright_hw: 128
+  contr_hw: 32
+构建与运行（ROS2 Humble 节点）
+cd usb_cam_demo/cpp
+mkdir -p build
+cd build
+
+source /opt/ros/humble/setup.bash
+cmake ..
+make -j4
+
+./usb_cam_ros
+ROS2 相关参数在 config.yaml 的 ros 部分配置，例如：
+
+ros:
+  topic_name: "/usb_cam/image_raw"
+  frame_id: "usb_cam"
+  queue_size: 10
+  frame_queue_size: 5
+  wait_timeout_ms: 50
+
+  # 发布目标帧率（Hz），例如 30；<=0 表示不限制
+  publish_fps: 30
+
+  # 是否发布压缩图像(CompressedImage)，1 表示启用
+  use_compressed: 1
+
+  # JPEG 压缩质量（0~100）
+  compressed_quality: 70
+常用 ROS2 命令：
+
+查看话题：
+ros2 topic list
+查看图像消息频率：
+ros2 topic hz /usb_cam/image_raw
+在 RViz2 中查看图像（订阅相同话题，选择合适的 QoS 与传输方式）。
+注意：本地 Demo（usb_cam_demo）与 ROS2 节点（usb_cam_ros）不能同时运行，否则会抢占同一个 /dev/videoX 摄像头设备。
