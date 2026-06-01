@@ -24,6 +24,10 @@ add_executable(orbbec
     src/sync/utils/utils_opencv.cpp
 )
 
+add_executable(orbbec_probe
+    src/probe_orbbec.cpp
+)
+
 find_package(OrbbecSDK REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters registration segmentation sample_consensus)
@@ -46,6 +50,10 @@ target_link_libraries(orbbec PRIVATE
     Threads::Threads
 )
 
+target_link_libraries(orbbec_probe PRIVATE
+    ob::OrbbecSDK
+)
+
 if(APPLE)
     set(CMAKE_MACOSX_RPATH ON)
     set(CMAKE_INSTALL_RPATH "@loader_path/../lib/OrbbecSDK_v2.7.2/lib")
@@ -57,6 +65,7 @@ elseif(UNIX)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
     set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib/OrbbecSDK_v2.7.2/lib")
     set_target_properties(orbbec PROPERTIES BUILD_RPATH "${OrbbecSDK_ROOT}/lib")
+    set_target_properties(orbbec_probe PROPERTIES BUILD_RPATH "${OrbbecSDK_ROOT}/lib")
 endif()
 
 install(FILES
