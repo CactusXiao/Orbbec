@@ -519,6 +519,37 @@ private:
         return coeffs;
     }
 
+    static int preferredProfileFormatScore(OBSensorType sensorType, OBFormat format) {
+        if(sensorType == OB_SENSOR_COLOR) {
+            if(format == OB_FORMAT_RGB) {
+                return 0;
+            }
+            if(format == OB_FORMAT_BGR) {
+                return 1;
+            }
+            if(format == OB_FORMAT_MJPG) {
+                return 2;
+            }
+            if(format == OB_FORMAT_YUYV || format == OB_FORMAT_YUY2 || format == OB_FORMAT_UYVY) {
+                return 3;
+            }
+            return 10;
+        }
+        if(sensorType == OB_SENSOR_DEPTH) {
+            if(format == OB_FORMAT_Y16 || format == OB_FORMAT_Z16) {
+                return 0;
+            }
+            if(format == OB_FORMAT_Y14) {
+                return 1;
+            }
+            if(format == OB_FORMAT_RLE) {
+                return 2;
+            }
+            return 10;
+        }
+        return 10;
+    }
+
     static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::shared_ptr<ob::Pipeline> &pipe,
                                                                     OBSensorType sensorType,
                                                                     int width,
@@ -534,41 +565,61 @@ private:
         if(!list || list->getCount() == 0) {
             return nullptr;
         }
-        std::shared_ptr<ob::VideoStreamProfile> best;
-        int bestScore = std::numeric_limits<int>::max();
-        for(uint32_t i = 0; i < list->getCount(); i++) {
-            auto p = list->getProfile(i);
-            auto vp = p->as<ob::VideoStreamProfile>();
-            if(!vp) {
-                continue;
-            }
-            const int pw = static_cast<int>(vp->getWidth());
-            const int ph = static_cast<int>(vp->getHeight());
-            const int pf = static_cast<int>(vp->getFps());
-            if(width > 0 && pw != width) {
-                continue;
-            }
-            if(height > 0 && ph != height) {
-                continue;
-            }
-            if(fps > 0 && pf == fps) {
-                return vp;
-            }
-            int score = 0;
-            if(fps > 0) {
-                score += std::abs(pf - fps);
-                if(pf < fps) {
-                    score += 2;
+        auto findBest = [&](int targetW, int targetH, int targetFps) {
+            std::shared_ptr<ob::VideoStreamProfile> best;
+            int bestScore = std::numeric_limits<int>::max();
+            for(uint32_t i = 0; i < list->getCount(); i++) {
+                auto p = list->getProfile(i);
+                auto vp = p->as<ob::VideoStreamProfile>();
+                if(!vp) {
+                    continue;
+                }
+                const int pw = static_cast<int>(vp->getWidth());
+                const int ph = static_cast<int>(vp->getHeight());
+                const int pf = static_cast<int>(vp->getFps());
+                if(targetW > 0 && pw != targetW) {
+                    continue;
+                }
+                if(targetH > 0 && ph != targetH) {
+                    continue;
+                }
+                int score = preferredProfileFormatScore(sensorType, vp->getFormat());
+                if(targetFps > 0) {
+                    score += std::abs(pf - targetFps) * 10;
+                    if(pf < targetFps) {
+                        score += 2;
+                    }
+                }
+                if(score < bestScore) {
+                    bestScore = score;
+                    best = vp;
                 }
             }
-            if(score < bestScore) {
-                bestScore = score;
-                best = vp;
-            }
-        }
-        if(best) {
+            return best;
+        };
+
+        if(auto best = findBest(width, height, fps)) {
             return best;
         }
+
+        if(width > 0 || height > 0) {
+            std::vector<std::pair<int, int>> fallbacks;
+            if(sensorType == OB_SENSOR_DEPTH) {
+                fallbacks = { { 640, 400 }, { 1280, 800 }, { 320, 200 } };
+            }
+            else if(sensorType == OB_SENSOR_COLOR) {
+                fallbacks = { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
+            }
+            for(const auto &fallback: fallbacks) {
+                if(fallback.first == width && fallback.second == height) {
+                    continue;
+                }
+                if(auto best = findBest(fallback.first, fallback.second, fps)) {
+                    return best;
+                }
+            }
+        }
+
         try {
             return list->getProfile(OB_PROFILE_DEFAULT)->as<ob::VideoStreamProfile>();
         }
@@ -583,7 +634,7 @@ private:
         activePair_.p2 = std::make_shared<ob::Pipeline>(b.dev);
         const int targetFps = std::max(1, cfg_.viewerFps > 0 ? cfg_.viewerFps : 30);
         const int targetW = 1280;
-        const int targetH = 800;
+        const int targetH = 720;
         auto c1 = pickVideoProfile(activePair_.p1, OB_SENSOR_COLOR, targetW, targetH, targetFps);
         auto c2 = pickVideoProfile(activePair_.p2, OB_SENSOR_COLOR, targetW, targetH, targetFps);
         if(!c1 || !c2) {

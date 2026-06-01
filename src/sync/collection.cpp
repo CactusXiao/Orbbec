@@ -703,8 +703,8 @@ struct CollectionConfigUi {
     bool enableCloud     = false;
     bool enableColorCloud = false;
     bool enableImu       = false;
-    std::string width    = "848";
-    std::string height   = "480";
+    std::string width    = "1280";
+    std::string height   = "720";
     std::string fps      = "30";
     std::string exposureMs = "0.1";
     std::string brightness;
@@ -731,8 +731,8 @@ struct CollectionConfigUi {
         return enableMultiview || enableFisheyes;
     }
 
-    int widthInt() const { return std::max(1, parseIntOr(width, 848)); }
-    int heightInt() const { return std::max(1, parseIntOr(height, 480)); }
+    int widthInt() const { return std::max(1, parseIntOr(width, 1280)); }
+    int heightInt() const { return std::max(1, parseIntOr(height, 720)); }
     int fpsInt() const { return std::max(1, parseIntOr(fps, 30)); }
     float exposureMsFloat() const { return static_cast<float>(parseDoubleBound(exposureMs, 0.1, 0.05, 100.0)); }
     int brightnessInt() const { return parseIntOr(brightness, -1); }
@@ -841,6 +841,49 @@ static size_t saveWorkerCount() {
     return static_cast<size_t>(std::max(12u, std::min(24u, hc + 4)));
 }
 
+static int preferredProfileFormatScore(OBSensorType sensorType, OBFormat format) {
+    if(sensorType == OB_SENSOR_COLOR) {
+        if(format == OB_FORMAT_RGB) {
+            return 0;
+        }
+        if(format == OB_FORMAT_BGR) {
+            return 1;
+        }
+        if(format == OB_FORMAT_MJPG) {
+            return 2;
+        }
+        if(format == OB_FORMAT_YUYV || format == OB_FORMAT_YUY2 || format == OB_FORMAT_UYVY) {
+            return 3;
+        }
+        return 10;
+    }
+    if(sensorType == OB_SENSOR_DEPTH) {
+        if(format == OB_FORMAT_Y16 || format == OB_FORMAT_Z16) {
+            return 0;
+        }
+        if(format == OB_FORMAT_Y14) {
+            return 1;
+        }
+        if(format == OB_FORMAT_RLE) {
+            return 2;
+        }
+        return 10;
+    }
+    if(sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
+        if(format == OB_FORMAT_Y8) {
+            return 0;
+        }
+        if(format == OB_FORMAT_Y16) {
+            return 1;
+        }
+        if(format == OB_FORMAT_MJPG) {
+            return 2;
+        }
+        return 10;
+    }
+    return 10;
+}
+
 static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::shared_ptr<ob::Pipeline> &pipe,
                                                                 OBSensorType sensorType,
                                                                 int width,
@@ -856,42 +899,62 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
     if(!list || list->getCount() == 0) {
         return nullptr;
     }
-    std::shared_ptr<ob::VideoStreamProfile> best;
-    int bestScore = std::numeric_limits<int>::max();
-    for(uint32_t i = 0; i < list->getCount(); i++) {
-        auto p  = list->getProfile(i);
-        auto vp = p->as<ob::VideoStreamProfile>();
-        if(!vp) {
-            continue;
-        }
-        const int pw = static_cast<int>(vp->getWidth());
-        const int ph = static_cast<int>(vp->getHeight());
-        const int pf = static_cast<int>(vp->getFps());
-        if(width > 0 && pw != width) {
-            continue;
-        }
-        if(height > 0 && ph != height) {
-            continue;
-        }
-        if(fps > 0 && pf == fps) {
-            return vp;
-        }
+    auto findBest = [&](int targetW, int targetH, int targetFps) {
+        std::shared_ptr<ob::VideoStreamProfile> best;
+        int bestScore = std::numeric_limits<int>::max();
+        for(uint32_t i = 0; i < list->getCount(); i++) {
+            auto p  = list->getProfile(i);
+            auto vp = p->as<ob::VideoStreamProfile>();
+            if(!vp) {
+                continue;
+            }
+            const int pw = static_cast<int>(vp->getWidth());
+            const int ph = static_cast<int>(vp->getHeight());
+            const int pf = static_cast<int>(vp->getFps());
+            if(targetW > 0 && pw != targetW) {
+                continue;
+            }
+            if(targetH > 0 && ph != targetH) {
+                continue;
+            }
 
-        int score = 0;
-        if(fps > 0) {
-            score += std::abs(pf - fps);
-            if(pf < fps) {
-                score += 2;
+            int score = preferredProfileFormatScore(sensorType, vp->getFormat());
+            if(targetFps > 0) {
+                score += std::abs(pf - targetFps) * 10;
+                if(pf < targetFps) {
+                    score += 2;
+                }
+            }
+            if(score < bestScore) {
+                bestScore = score;
+                best      = vp;
             }
         }
-        if(score < bestScore) {
-            bestScore = score;
-            best      = vp;
-        }
-    }
-    if(best) {
+        return best;
+    };
+
+    if(auto best = findBest(width, height, fps)) {
         return best;
     }
+
+    if(width > 0 || height > 0) {
+        std::vector<std::pair<int, int>> fallbacks;
+        if(sensorType == OB_SENSOR_DEPTH || sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
+            fallbacks = { { 640, 400 }, { 1280, 800 }, { 320, 200 } };
+        }
+        else if(sensorType == OB_SENSOR_COLOR) {
+            fallbacks = { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
+        }
+        for(const auto &fallback: fallbacks) {
+            if(fallback.first == width && fallback.second == height) {
+                continue;
+            }
+            if(auto best = findBest(fallback.first, fallback.second, fps)) {
+                return best;
+            }
+        }
+    }
+
     try {
         return list->getProfile(OB_PROFILE_DEFAULT)->as<ob::VideoStreamProfile>();
     }
@@ -5735,19 +5798,19 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect p1(left, y2 + 44, 260, 44);
             cv::Rect p2(left + 280, y2 + 44, 260, 44);
             cv::Rect p3(left + 560, y2 + 44, 260, 44);
-            if(uiButton(ui, p1, presetLabel(848, 480, 30), fm)) {
-                cfgUi.width  = "848";
+            if(uiButton(ui, p1, presetLabel(1280, 720, 30), fm)) {
+                cfgUi.width  = "1280";
+                cfgUi.height = "720";
+                cfgUi.fps    = "30";
+            }
+            if(uiButton(ui, p2, presetLabel(640, 480, 30), fm)) {
+                cfgUi.width  = "640";
                 cfgUi.height = "480";
                 cfgUi.fps    = "30";
             }
-            if(uiButton(ui, p2, presetLabel(848, 480, 60), fm)) {
-                cfgUi.width  = "848";
-                cfgUi.height = "480";
-                cfgUi.fps    = "60";
-            }
-            if(uiButton(ui, p3, presetLabel(1280, 800, 30), fm)) {
-                cfgUi.width  = "1280";
-                cfgUi.height = "800";
+            if(uiButton(ui, p3, presetLabel(1920, 1080, 30), fm)) {
+                cfgUi.width  = "1920";
+                cfgUi.height = "1080";
                 cfgUi.fps    = "30";
             }
 

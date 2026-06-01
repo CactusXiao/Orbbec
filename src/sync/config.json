@@ -84,7 +84,7 @@
     
     "devices": [
         {
-            "sn": "CPCBC53000MZ",
+            "sn": "AY3794F0038",
             "index": "00",
             "syncConfig": {
                 "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_PRIMARY",
@@ -98,8 +98,8 @@
             "streams": [
                 {
                     "type": "RGB",
-                    "width": 1920,
-                    "height": 1080,
+                    "width": 1280,
+                    "height": 720,
                     "fps": 30,
                     "format": "RGB",
                     "enable": false
@@ -126,7 +126,7 @@
             "sn": "CPC7B53000BV",
             "index": "01",
             "syncConfig": {
-                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED",
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
@@ -165,7 +165,7 @@
             "sn": "CPCBC5300065",
             "index": "02",
             "syncConfig": {
-                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED",
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
