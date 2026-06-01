@@ -9,7 +9,7 @@
     "filters": {
         "_filter_comment": "preset: Default/Hand/High Accuracy/High Density/Medium Density/Custom",
         "preset": "Default",
-        "point_cloud_decimation_factor": 2,
+        "point_cloud_decimation_factor": 1,
         "decimation_filter_scale": 0,
         "noise_removal_filter_max_size": 0,
         "noise_removal_filter_min_diff": 0,

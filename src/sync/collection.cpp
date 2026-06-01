@@ -2880,7 +2880,7 @@ public:
         local.episodeN = episodeN;
         local.dest = saveRoot / subjectId / taskName / ("episode_" + std::to_string(episodeN));
         local.stepUs = sessionStepUs();
-        local.maxAbsDiffUs = sessionMaxAbsDiffUs(local.stepUs);
+        local.maxAbsDiffUs = sessionMaxAbsDiffUs(local.stepUs, cfg_.enableSync);
         if(local.stepUs == 0) {
             return false;
         }
@@ -3711,7 +3711,10 @@ private:
         return static_cast<uint64_t>(1000000.0 / static_cast<double>(fps));
     }
 
-    static uint64_t sessionMaxAbsDiffUs(uint64_t stepUs) {
+    static uint64_t sessionMaxAbsDiffUs(uint64_t stepUs, bool strictSync) {
+        if(strictSync) {
+            return std::max<uint64_t>(2000, std::min<uint64_t>(5000, stepUs / 10));
+        }
         const uint64_t halfWinUs = stepUs / 2;
         const uint64_t tolUs     = std::max<uint64_t>(2000, stepUs / 10);
         return halfWinUs + tolUs;
@@ -4732,7 +4735,7 @@ private:
             std::vector<FusedCloudFrameInput> infos;
             buildCloudInputsLocked(pickedIndices, infos);
             if(!infos.empty()) {
-                const int step = std::max(1, cfg_.filters.pointCloudDecimationFactor > 0 ? cfg_.filters.pointCloudDecimationFactor : 1);
+                const int step = 1;
                 if(session_.saveCloud) {
                     const fs::path outPath = session_.dest / dataTypeLabel(CollectDataType::CloudPoints) / (frameIndex + ".ply");
                     enqueueWriteTask(WriteTask{ [infos, outPath, this, step]() mutable {
