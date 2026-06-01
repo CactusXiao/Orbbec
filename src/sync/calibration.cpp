@@ -459,6 +459,18 @@ private:
             DeviceRuntimeLite rt;
             rt.cfg = dc;
             rt.dev = it->second;
+            try {
+                if(rt.dev->isGlobalTimestampSupported()) {
+                    rt.dev->enableGlobalTimestamp(true);
+                    std::cerr << "[calibration] global timestamp enabled sn=" << dc.sn << std::endl;
+                }
+                else {
+                    std::cerr << "[calibration] global timestamp unsupported sn=" << dc.sn << std::endl;
+                }
+            }
+            catch(const std::exception &e) {
+                std::cerr << "[calibration] global timestamp enable failed sn=" << dc.sn << ": " << e.what() << std::endl;
+            }
             out.push_back(std::move(rt));
         }
         return out;

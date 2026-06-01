@@ -589,6 +589,18 @@ std::vector<DeviceRuntime> selectDevicesWithPipeline(const std::shared_ptr<ob::D
         DeviceRuntime rt;
         rt.cfg         = dc;
         rt.dev         = it->second;
+        try {
+            if(rt.dev->isGlobalTimestampSupported()) {
+                rt.dev->enableGlobalTimestamp(true);
+                std::cerr << "[sync] global timestamp enabled sn=" << dc.sn << std::endl;
+            }
+            else {
+                std::cerr << "[sync] global timestamp unsupported sn=" << dc.sn << std::endl;
+            }
+        }
+        catch(const std::exception &e) {
+            std::cerr << "[sync] global timestamp enable failed sn=" << dc.sn << ": " << e.what() << std::endl;
+        }
         rt.pipe        = std::make_shared<ob::Pipeline>(rt.dev);
         rt.deviceIndex = index++;
         out.push_back(std::move(rt));

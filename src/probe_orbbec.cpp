@@ -81,6 +81,22 @@ void printCurrentSyncConfig(const std::shared_ptr<ob::Device> &device) {
     }
 }
 
+bool enableGlobalTimestampIfSupported(const std::shared_ptr<ob::Device> &device, const char *label) {
+    try {
+        if(!device->isGlobalTimestampSupported()) {
+            std::cout << "  " << label << " global_timestamp: unsupported\n";
+            return false;
+        }
+        device->enableGlobalTimestamp(true);
+        std::cout << "  " << label << " global_timestamp: enabled\n";
+        return true;
+    }
+    catch(const std::exception &e) {
+        std::cout << "  " << label << " global_timestamp: enable_failed (" << e.what() << ")\n";
+        return false;
+    }
+}
+
 void applySyncConfig(const std::shared_ptr<ob::Device> &device, OBMultiDeviceSyncMode mode, bool triggerOutEnable) {
     auto cfg = device->getMultiDeviceSyncConfig();
     cfg.syncMode = mode;
@@ -377,6 +393,16 @@ void runStreamStartTests(const std::shared_ptr<ob::Device> &device) {
 struct SyncSample {
     uint64_t globalTs = 0;
     uint64_t localTs = 0;
+    uint64_t systemTs = 0;
+    uint64_t index = 0;
+    int64_t  metadataTimestamp = 0;
+    int64_t  metadataSensorTimestamp = 0;
+    int64_t  metadataFrameNumber = 0;
+    int64_t  metadataGpioInput = 0;
+    bool     hasMetadataTimestamp = false;
+    bool     hasMetadataSensorTimestamp = false;
+    bool     hasMetadataFrameNumber = false;
+    bool     hasMetadataGpioInput = false;
     bool     hasColor = false;
     bool     hasDepth = false;
 };
@@ -393,6 +419,24 @@ uint64_t frameTimestamp(const std::shared_ptr<ob::Frame> &frame, bool global) {
     }
 }
 
+int64_t metadataValue(const std::shared_ptr<ob::Frame> &frame, OBFrameMetadataType type, bool &hasValue) {
+    hasValue = false;
+    if(!frame) {
+        return 0;
+    }
+    try {
+        if(!frame->hasMetadata(type)) {
+            return 0;
+        }
+        hasValue = true;
+        return frame->getMetadataValue(type);
+    }
+    catch(...) {
+        hasValue = false;
+        return 0;
+    }
+}
+
 bool waitForDepthSample(const std::shared_ptr<ob::Pipeline> &pipe, SyncSample &out) {
     auto fs = pipe->waitForFrameset(1000);
     if(!fs) {
@@ -404,6 +448,26 @@ bool waitForDepthSample(const std::shared_ptr<ob::Pipeline> &pipe, SyncSample &o
     out.hasColor = static_cast<bool>(color);
     out.globalTs = frameTimestamp(depth, true);
     out.localTs = frameTimestamp(depth, false);
+    try {
+        out.systemTs = depth ? depth->systemTimeStampUs() : 0;
+    }
+    catch(...) {
+    }
+    try {
+        out.index = depth ? depth->index() : 0;
+    }
+    catch(...) {
+        try {
+            out.index = depth ? depth->getIndex() : 0;
+        }
+        catch(...) {
+        }
+    }
+    out.metadataTimestamp = metadataValue(depth, OB_FRAME_METADATA_TYPE_TIMESTAMP, out.hasMetadataTimestamp);
+    out.metadataSensorTimestamp =
+        metadataValue(depth, OB_FRAME_METADATA_TYPE_SENSOR_TIMESTAMP, out.hasMetadataSensorTimestamp);
+    out.metadataFrameNumber = metadataValue(depth, OB_FRAME_METADATA_TYPE_FRAME_NUMBER, out.hasMetadataFrameNumber);
+    out.metadataGpioInput = metadataValue(depth, OB_FRAME_METADATA_TYPE_GPIO_INPUT_DATA, out.hasMetadataGpioInput);
     return out.hasDepth;
 }
 
@@ -418,6 +482,8 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
     auto primaryDevice = devices->getDevice(0);
     auto secondaryDevice = devices->getDevice(1);
     try {
+        enableGlobalTimestampIfSupported(primaryDevice, "primary");
+        enableGlobalTimestampIfSupported(secondaryDevice, "secondary");
         applySyncConfig(primaryDevice, OB_MULTI_DEVICE_SYNC_MODE_PRIMARY, true);
         applySyncConfig(secondaryDevice, OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED, false);
         printAppliedSyncConfig(primaryDevice, "primary");
@@ -457,10 +523,14 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
 
         std::vector<int64_t> globalDiffs;
         std::vector<int64_t> localDiffs;
+        std::vector<int64_t> systemDiffs;
+        std::vector<int64_t> frameNumberDiffs;
         int primaryFrames = 0;
         int secondaryFrames = 0;
         int primaryGlobal = 0;
         int secondaryGlobal = 0;
+        int primaryMetadataFrames = 0;
+        int secondaryMetadataFrames = 0;
         int paired = 0;
         int bothColor = 0;
 
@@ -480,15 +550,51 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
                 }
             }
             if(a.hasDepth && b.hasDepth) {
+                if(i < 5) {
+                    auto printSample = [](const char *label, const SyncSample &s) {
+                        std::cout << "  sample " << label
+                                  << " idx=" << s.index
+                                  << " global_us=" << s.globalTs
+                                  << " device_us=" << s.localTs
+                                  << " system_us=" << s.systemTs;
+                        if(s.hasMetadataFrameNumber) {
+                            std::cout << " meta_frame=" << s.metadataFrameNumber;
+                        }
+                        if(s.hasMetadataTimestamp) {
+                            std::cout << " meta_ts=" << s.metadataTimestamp;
+                        }
+                        if(s.hasMetadataSensorTimestamp) {
+                            std::cout << " meta_sensor_ts=" << s.metadataSensorTimestamp;
+                        }
+                        if(s.hasMetadataGpioInput) {
+                            std::cout << " gpio=" << s.metadataGpioInput;
+                        }
+                        std::cout << '\n';
+                    };
+                    printSample("primary", a);
+                    printSample("secondary", b);
+                }
                 paired++;
                 if(a.hasColor && b.hasColor) {
                     bothColor++;
+                }
+                if(a.hasMetadataFrameNumber) {
+                    primaryMetadataFrames++;
+                }
+                if(b.hasMetadataFrameNumber) {
+                    secondaryMetadataFrames++;
                 }
                 if(a.globalTs != 0 && b.globalTs != 0) {
                     globalDiffs.push_back(static_cast<int64_t>(a.globalTs) - static_cast<int64_t>(b.globalTs));
                 }
                 if(a.localTs != 0 && b.localTs != 0) {
                     localDiffs.push_back(static_cast<int64_t>(a.localTs) - static_cast<int64_t>(b.localTs));
+                }
+                if(a.systemTs != 0 && b.systemTs != 0) {
+                    systemDiffs.push_back(static_cast<int64_t>(a.systemTs) - static_cast<int64_t>(b.systemTs));
+                }
+                if(a.hasMetadataFrameNumber && b.hasMetadataFrameNumber) {
+                    frameNumberDiffs.push_back(a.metadataFrameNumber - b.metadataFrameNumber);
                 }
             }
         }
@@ -524,8 +630,12 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
                   << " both_color=" << bothColor << '\n';
         std::cout << "  global_ts_nonzero primary=" << primaryGlobal
                   << " secondary=" << secondaryGlobal << '\n';
+        std::cout << "  metadata_frame_number primary=" << primaryMetadataFrames
+                  << " secondary=" << secondaryMetadataFrames << '\n';
         printStats("global_depth_ts_diff", globalDiffs);
         printStats("local_depth_ts_diff", localDiffs);
+        printStats("system_depth_ts_diff", systemDiffs);
+        printStats("metadata_frame_number_diff", frameNumberDiffs);
     }
     catch(const std::exception &e) {
         try {
@@ -559,6 +669,12 @@ void printDevice(const std::shared_ptr<ob::Device> &device, uint32_t index, bool
     std::cout << "    hardware: " << safeText(info->getHardwareVersion()) << '\n';
     std::cout << "    min_supported_sdk: " << safeText(info->getSupportedMinSdkVersion()) << '\n';
     std::cout << "    asic: " << safeText(info->getAsicName()) << '\n';
+    try {
+        std::cout << "    global_timestamp_supported: " << (device->isGlobalTimestampSupported() ? "true" : "false") << '\n';
+    }
+    catch(const std::exception &e) {
+        std::cout << "    global_timestamp_supported: unavailable (" << e.what() << ")\n";
+    }
 
     printSupportedSyncModes(device);
     printCurrentSyncConfig(device);
