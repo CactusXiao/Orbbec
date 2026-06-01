@@ -49,6 +49,27 @@ OBMultiDeviceSyncMode stringToOBSyncMode(const std::string &modeString) {
     return OB_MULTI_DEVICE_SYNC_MODE_FREE_RUN;
 }
 
+static std::string obSyncModeToString(OBMultiDeviceSyncMode mode) {
+    switch(mode) {
+    case OB_MULTI_DEVICE_SYNC_MODE_FREE_RUN:
+        return "OB_MULTI_DEVICE_SYNC_MODE_FREE_RUN";
+    case OB_MULTI_DEVICE_SYNC_MODE_STANDALONE:
+        return "OB_MULTI_DEVICE_SYNC_MODE_STANDALONE";
+    case OB_MULTI_DEVICE_SYNC_MODE_PRIMARY:
+        return "OB_MULTI_DEVICE_SYNC_MODE_PRIMARY";
+    case OB_MULTI_DEVICE_SYNC_MODE_SECONDARY:
+        return "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY";
+    case OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED:
+        return "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED";
+    case OB_MULTI_DEVICE_SYNC_MODE_SOFTWARE_TRIGGERING:
+        return "OB_MULTI_DEVICE_SYNC_MODE_SOFTWARE_TRIGGERING";
+    case OB_MULTI_DEVICE_SYNC_MODE_HARDWARE_TRIGGERING:
+        return "OB_MULTI_DEVICE_SYNC_MODE_HARDWARE_TRIGGERING";
+    default:
+        return "UNKNOWN_SYNC_MODE";
+    }
+}
+
 OBFormat stringToOBFormat(const std::string &formatString, StreamType type) {
     if(type == StreamType::Color) {
         if(formatString == "RGB") {
@@ -582,12 +603,18 @@ void applySyncConfig(std::vector<DeviceRuntime> &devices) {
         auto  cfg = rt.cfg.hasSyncConfig ? rt.cfg.syncConfig : cur;
         if(!rt.cfg.hasSyncConfig) {
             const bool isPrimary = (i == 0);
-            cfg.syncMode         = isPrimary ? OB_MULTI_DEVICE_SYNC_MODE_PRIMARY : OB_MULTI_DEVICE_SYNC_MODE_SECONDARY;
+            cfg.syncMode         = isPrimary ? OB_MULTI_DEVICE_SYNC_MODE_PRIMARY : OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED;
             cfg.triggerOutEnable = isPrimary;
             cfg.triggerOutDelayUs = 0;
             if(cfg.framesPerTrigger <= 0) {
                 cfg.framesPerTrigger = 1;
             }
+        }
+
+        const bool isTriggerSource = (cfg.syncMode == OB_MULTI_DEVICE_SYNC_MODE_PRIMARY);
+        cfg.triggerOutEnable      = isTriggerSource ? cfg.triggerOutEnable : false;
+        if(cfg.framesPerTrigger <= 0) {
+            cfg.framesPerTrigger = 1;
         }
 
         cur.syncMode             = cfg.syncMode;
@@ -600,6 +627,19 @@ void applySyncConfig(std::vector<DeviceRuntime> &devices) {
 
         rt.dev->setMultiDeviceSyncConfig(cur);
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        try {
+            const auto applied = rt.dev->getMultiDeviceSyncConfig();
+            std::cerr << "[sync] applied sn=" << rt.cfg.sn
+                      << " index=" << rt.cfg.index
+                      << " mode=" << obSyncModeToString(applied.syncMode)
+                      << " triggerOutEnable=" << (applied.triggerOutEnable ? "true" : "false")
+                      << " triggerOutDelayUs=" << applied.triggerOutDelayUs
+                      << " framesPerTrigger=" << applied.framesPerTrigger
+                      << std::endl;
+        }
+        catch(const std::exception &e) {
+            std::cerr << "[sync] failed to read back sync config sn=" << rt.cfg.sn << " error=" << e.what() << std::endl;
+        }
     }
 }
 

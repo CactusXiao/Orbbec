@@ -470,7 +470,16 @@ private:
             auto cur = rt.dev->getMultiDeviceSyncConfig();
             auto cfg = rt.cfg.hasSyncConfig ? rt.cfg.syncConfig : cur;
             if(!rt.cfg.hasSyncConfig) {
-                cfg.syncMode = (i == 0) ? OB_MULTI_DEVICE_SYNC_MODE_PRIMARY : OB_MULTI_DEVICE_SYNC_MODE_SECONDARY;
+                const bool isPrimary = (i == 0);
+                cfg.syncMode = isPrimary ? OB_MULTI_DEVICE_SYNC_MODE_PRIMARY : OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED;
+                cfg.triggerOutEnable = isPrimary;
+                cfg.triggerOutDelayUs = 0;
+            }
+            if(cfg.syncMode != OB_MULTI_DEVICE_SYNC_MODE_PRIMARY) {
+                cfg.triggerOutEnable = false;
+            }
+            if(cfg.framesPerTrigger <= 0) {
+                cfg.framesPerTrigger = 1;
             }
             cur.syncMode = cfg.syncMode;
             cur.depthDelayUs = cfg.depthDelayUs;

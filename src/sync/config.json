@@ -123,14 +123,14 @@
             ]
         },
         {
-            "sn": "CPC7B53000BV",
+            "sn": "AY3794F0039",
             "index": "01",
             "syncConfig": {
                 "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED",
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
-                "triggerOutEnable": true,
+                "triggerOutEnable": false,
                 "triggerOutDelayUs": 0,
                 "framesPerTrigger": 1
             },
@@ -169,7 +169,7 @@
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
-                "triggerOutEnable": true,
+                "triggerOutEnable": false,
                 "triggerOutDelayUs": 0,
                 "framesPerTrigger": 1
             },

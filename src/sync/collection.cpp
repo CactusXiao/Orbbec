@@ -5046,7 +5046,7 @@ private:
         std::shared_ptr<ob::Frame> cachedDepthFrame;
         std::unordered_map<CollectDataType, std::shared_ptr<ob::Frame>> cachedOtherFrames;
 
-        auto getFrameTimestampUs = [&](const std::shared_ptr<ob::Frame> &frame) -> uint64_t {
+        auto getFrameTimestampUs = [&](const std::shared_ptr<ob::Frame> &frame, bool allowLocalTimestampFallback) -> uint64_t {
             if(!frame) {
                 return 0;
             }
@@ -5057,7 +5057,7 @@ private:
             catch(...) {
                 ts = 0;
             }
-            if(ts == 0 && !requireGlobalTs) {
+            if(ts == 0 && (!requireGlobalTs || allowLocalTimestampFallback)) {
                 try {
                     ts = frame->timeStampUs();
                 }
@@ -5094,7 +5094,7 @@ private:
             collectionSetStage("cb_preview_rgb");
             auto frame = getFrameForType(CollectDataType::RGB);
             if(frame) {
-                const uint64_t ts = getFrameTimestampUs(frame);
+                const uint64_t ts = getFrameTimestampUs(frame, true);
                 bool shouldRefreshPreview = (ts != 0);
                 if(shouldRefreshPreview) {
                     std::lock_guard<std::mutex> lock(previewTsMtx_);
@@ -5137,7 +5137,7 @@ private:
                 continue;
             }
 
-            const uint64_t ts = getFrameTimestampUs(frame);
+            const uint64_t ts = getFrameTimestampUs(frame, false);
             if(ts == 0) {
                 continue;
             }
