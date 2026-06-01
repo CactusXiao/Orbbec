@@ -542,13 +542,13 @@ private:
 
     static int preferredProfileFormatScore(OBSensorType sensorType, OBFormat format) {
         if(sensorType == OB_SENSOR_COLOR) {
-            if(format == OB_FORMAT_RGB) {
+            if(format == OB_FORMAT_MJPG) {
                 return 0;
             }
-            if(format == OB_FORMAT_BGR) {
+            if(format == OB_FORMAT_RGB) {
                 return 1;
             }
-            if(format == OB_FORMAT_MJPG) {
+            if(format == OB_FORMAT_BGR) {
                 return 2;
             }
             if(format == OB_FORMAT_YUYV || format == OB_FORMAT_YUY2 || format == OB_FORMAT_UYVY) {
@@ -557,10 +557,10 @@ private:
             return 10;
         }
         if(sensorType == OB_SENSOR_DEPTH) {
-            if(format == OB_FORMAT_Y16 || format == OB_FORMAT_Z16) {
+            if(format == OB_FORMAT_Y14) {
                 return 0;
             }
-            if(format == OB_FORMAT_Y14) {
+            if(format == OB_FORMAT_Y16 || format == OB_FORMAT_Z16) {
                 return 1;
             }
             if(format == OB_FORMAT_RLE) {

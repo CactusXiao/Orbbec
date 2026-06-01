@@ -311,7 +311,7 @@ static cv::Mat extractDepth16Mat(const std::shared_ptr<ob::DepthFrame> &depthFra
         return cv::Mat();
     }
     const auto fmt = depthFrame->getFormat();
-    if(fmt != OB_FORMAT_Y16 && fmt != OB_FORMAT_Z16 && fmt != OB_FORMAT_Y12C4) {
+    if(fmt != OB_FORMAT_Y16 && fmt != OB_FORMAT_Y14 && fmt != OB_FORMAT_Z16 && fmt != OB_FORMAT_Y12C4) {
         return cv::Mat();
     }
     const int width = static_cast<int>(depthFrame->getWidth());
@@ -2755,6 +2755,7 @@ private:
                 }
 
                 cv::Vec3b pointColor = color;
+                bool pointColorMapped = false;
                 if(useColorCloud && rgbDepthParamValid) {
                     const float zM = p.z;
                     if(zM > 0.0f && rgbDepthParam.depthIntrinsic.fx > 0.0f && rgbDepthParam.depthIntrinsic.fy > 0.0f) {
@@ -2782,9 +2783,13 @@ private:
                             const int vc = static_cast<int>(std::lround(dst.y));
                             if(uc >= 0 && vc >= 0 && uc < rgbImg.cols && vc < rgbImg.rows) {
                                 pointColor = rgbImg.at<cv::Vec3b>(vc, uc);
+                                pointColorMapped = true;
                             }
                         }
                     }
+                }
+                if(useColorCloud && rgbDepthParamValid && !pointColorMapped) {
+                    continue;
                 }
 
                 const cv::Vec3f v = pw - camPos;

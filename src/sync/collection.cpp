@@ -704,7 +704,7 @@ struct CollectionConfigUi {
     bool enableColorCloud = false;
     bool enableImu       = false;
     std::string width    = "1280";
-    std::string height   = "720";
+    std::string height   = "800";
     std::string fps      = "30";
     std::string exposureMs;
     std::string brightness;
@@ -732,7 +732,7 @@ struct CollectionConfigUi {
     }
 
     int widthInt() const { return std::max(1, parseIntOr(width, 1280)); }
-    int heightInt() const { return std::max(1, parseIntOr(height, 720)); }
+    int heightInt() const { return std::max(1, parseIntOr(height, 800)); }
     int fpsInt() const { return std::max(1, parseIntOr(fps, 30)); }
     float exposureMsFloat() const {
         if(trimString(exposureMs).empty()) {
@@ -5818,9 +5818,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 cfgUi.height = "720";
                 cfgUi.fps    = "30";
             }
-            if(uiButton(ui, p2, presetLabel(640, 480, 30), fm)) {
-                cfgUi.width  = "640";
-                cfgUi.height = "480";
+            if(uiButton(ui, p2, presetLabel(1280, 800, 30), fm)) {
+                cfgUi.width  = "1280";
+                cfgUi.height = "800";
                 cfgUi.fps    = "30";
             }
             if(uiButton(ui, p3, presetLabel(1920, 1080, 30), fm)) {

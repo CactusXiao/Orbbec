@@ -5,6 +5,7 @@
     "init_extrinsic_path": "extrinsic.json",
     "max_depth": 6.0,
     "different_color": false,
+    "colorful_cloud_points": true,
     "filters": {
         "_filter_comment": "preset: Default/Hand/High Accuracy/High Density/Medium Density/Custom",
         "preset": "Default",
@@ -101,21 +102,21 @@
                     "width": 1280,
                     "height": 720,
                     "fps": 30,
-                    "format": "RGB",
+                    "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
-                    "format": "Y16",
+                    "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true
@@ -140,21 +141,21 @@
                     "width": 1280,
                     "height": 720,
                     "fps": 30,
-                    "format": "RGB",
+                    "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
-                    "format": "Y16",
+                    "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true
@@ -179,21 +180,21 @@
                     "width": 1280,
                     "height": 720,
                     "fps": 30,
-                    "format": "RGB",
+                    "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
-                    "format": "Y16",
+                    "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 640,
-                    "height": 400,
+                    "width": 1280,
+                    "height": 800,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true

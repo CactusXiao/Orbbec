@@ -89,6 +89,15 @@ OBFormat stringToOBFormat(const std::string &formatString, StreamType type) {
     if(formatString == "Y16") {
         return OB_FORMAT_Y16;
     }
+    if(formatString == "Y14") {
+        return OB_FORMAT_Y14;
+    }
+    if(formatString == "Z16") {
+        return OB_FORMAT_Z16;
+    }
+    if(formatString == "RLE") {
+        return OB_FORMAT_RLE;
+    }
     return OB_FORMAT_Y16;
 }
 
@@ -677,9 +686,86 @@ bool hasSoftwareTrigger(const std::vector<DeviceRuntime> &all) {
     return false;
 }
 
-static OBFormat pointCloudSourceFormat(const StreamConfig &sc) {
-    (void)sc;
-    return OB_FORMAT_Y16;
+static int preferredVideoProfileFormatScore(OBSensorType sensorType, OBFormat format) {
+    if(sensorType == OB_SENSOR_COLOR) {
+        if(format == OB_FORMAT_MJPG) {
+            return 0;
+        }
+        if(format == OB_FORMAT_RGB) {
+            return 1;
+        }
+        if(format == OB_FORMAT_BGR) {
+            return 2;
+        }
+        if(format == OB_FORMAT_YUYV || format == OB_FORMAT_YUY2 || format == OB_FORMAT_UYVY) {
+            return 3;
+        }
+        return 10;
+    }
+    if(sensorType == OB_SENSOR_DEPTH) {
+        if(format == OB_FORMAT_Y14) {
+            return 0;
+        }
+        if(format == OB_FORMAT_Y16 || format == OB_FORMAT_Z16) {
+            return 1;
+        }
+        if(format == OB_FORMAT_RLE) {
+            return 2;
+        }
+        return 10;
+    }
+    if(sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
+        if(format == OB_FORMAT_Y8) {
+            return 0;
+        }
+        if(format == OB_FORMAT_Y16) {
+            return 1;
+        }
+        if(format == OB_FORMAT_MJPG) {
+            return 2;
+        }
+        return 10;
+    }
+    return 10;
+}
+
+static std::shared_ptr<ob::VideoStreamProfile> pickBestVideoProfile(const std::shared_ptr<ob::StreamProfileList> &list,
+                                                                    OBSensorType sensorType,
+                                                                    int width,
+                                                                    int height,
+                                                                    int fps) {
+    if(!list || list->getCount() == 0) {
+        return nullptr;
+    }
+    std::shared_ptr<ob::VideoStreamProfile> best;
+    int bestScore = std::numeric_limits<int>::max();
+    for(uint32_t i = 0; i < list->getCount(); ++i) {
+        auto profile = list->getProfile(i)->as<ob::VideoStreamProfile>();
+        if(!profile) {
+            continue;
+        }
+        const int pw = static_cast<int>(profile->getWidth());
+        const int ph = static_cast<int>(profile->getHeight());
+        const int pf = static_cast<int>(profile->getFps());
+        if(width > 0 && pw != width) {
+            continue;
+        }
+        if(height > 0 && ph != height) {
+            continue;
+        }
+        int score = preferredVideoProfileFormatScore(sensorType, profile->getFormat());
+        if(fps > 0) {
+            score += std::abs(pf - fps) * 10;
+            if(pf < fps) {
+                score += 2;
+            }
+        }
+        if(score < bestScore) {
+            bestScore = score;
+            best = profile;
+        }
+    }
+    return best;
 }
 
 std::shared_ptr<ob::VideoStreamProfile> pickDepthProfileForPointCloud(const std::shared_ptr<ob::Pipeline> &pipe,
@@ -699,21 +785,21 @@ std::shared_ptr<ob::VideoStreamProfile> pickDepthProfileForPointCloud(const std:
     }
 
     if(found) {
-        const auto fmt = pointCloudSourceFormat(pointCloudSc);
-        try {
-            auto profile = list->getVideoStreamProfile(pointCloudSc.width > 0 ? pointCloudSc.width : OB_WIDTH_ANY,
-                                                       pointCloudSc.height > 0 ? pointCloudSc.height : OB_HEIGHT_ANY,
-                                                       fmt,
-                                                       pointCloudSc.fps > 0 ? pointCloudSc.fps : OB_FPS_ANY);
-            if(profile) {
-                return profile;
-            }
-        }
-        catch(...) {
+        if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, pointCloudSc.width, pointCloudSc.height, pointCloudSc.fps)) {
+            return profile;
         }
     }
 
-    return list->getProfile(OB_PROFILE_DEFAULT)->as<ob::VideoStreamProfile>();
+    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 1280, 800, 30)) {
+        return profile;
+    }
+    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 640, 400, 30)) {
+        return profile;
+    }
+    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 320, 200, 30)) {
+        return profile;
+    }
+    return pickBestVideoProfile(list, OB_SENSOR_DEPTH, 0, 0, 30);
 }
 
 std::shared_ptr<ob::VideoStreamProfile> pickDefaultVideoProfile(const std::shared_ptr<ob::Pipeline> &pipe, OBSensorType sensorType) {
@@ -727,12 +813,29 @@ std::shared_ptr<ob::VideoStreamProfile> pickDefaultVideoProfile(const std::share
     if(!list || list->getCount() == 0) {
         return nullptr;
     }
-    try {
-        return list->getProfile(OB_PROFILE_DEFAULT)->as<ob::VideoStreamProfile>();
+    if(sensorType == OB_SENSOR_COLOR) {
+        if(auto profile = pickBestVideoProfile(list, sensorType, 1280, 720, 30)) {
+            return profile;
+        }
+        if(auto profile = pickBestVideoProfile(list, sensorType, 1920, 1080, 30)) {
+            return profile;
+        }
+        if(auto profile = pickBestVideoProfile(list, sensorType, 640, 480, 30)) {
+            return profile;
+        }
     }
-    catch(...) {
-        return nullptr;
+    if(sensorType == OB_SENSOR_DEPTH) {
+        if(auto profile = pickBestVideoProfile(list, sensorType, 640, 400, 30)) {
+            return profile;
+        }
+        if(auto profile = pickBestVideoProfile(list, sensorType, 1280, 800, 30)) {
+            return profile;
+        }
+        if(auto profile = pickBestVideoProfile(list, sensorType, 320, 200, 30)) {
+            return profile;
+        }
     }
+    return pickBestVideoProfile(list, sensorType, 0, 0, 30);
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr denoiseCloudSor(const pcl::PointCloud<pcl::PointXYZ>::Ptr &in, int meanK, double stddevMulThresh) {
@@ -767,7 +870,7 @@ void applyEdgeSmoothing(std::shared_ptr<ob::Frame> &frame, double thresholdM) {
         return;
     }
 
-    if(depth->getFormat() != OB_FORMAT_Y16) {
+    if(depth->getFormat() != OB_FORMAT_Y16 && depth->getFormat() != OB_FORMAT_Y14 && depth->getFormat() != OB_FORMAT_Z16) {
         return;
     }
 
@@ -1072,7 +1175,8 @@ cv::Mat visualizeObFrame(const std::shared_ptr<const ob::Frame> &frame) {
     } break;
     case OB_FRAME_DEPTH: {
         auto videoFrame = frame->as<const ob::VideoFrame>();
-        if(videoFrame->getFormat() == OB_FORMAT_Y16 || videoFrame->getFormat() == OB_FORMAT_Z16 || videoFrame->getFormat() == OB_FORMAT_Y12C4) {
+        if(videoFrame->getFormat() == OB_FORMAT_Y16 || videoFrame->getFormat() == OB_FORMAT_Y14 || videoFrame->getFormat() == OB_FORMAT_Z16
+           || videoFrame->getFormat() == OB_FORMAT_Y12C4) {
             cv::Mat rawMat(static_cast<int>(videoFrame->getHeight()), static_cast<int>(videoFrame->getWidth()), CV_16UC1, videoFrame->getData());
             float   scale = videoFrame->as<ob::DepthFrame>()->getValueScale();
 
