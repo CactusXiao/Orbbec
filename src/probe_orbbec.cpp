@@ -6,6 +6,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -521,10 +522,15 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
         secondaryPipe->start(makeConfig(secondaryPipe));
         primaryPipe->start(makeConfig(primaryPipe));
 
-        std::vector<int64_t> globalDiffs;
-        std::vector<int64_t> localDiffs;
-        std::vector<int64_t> systemDiffs;
-        std::vector<int64_t> frameNumberDiffs;
+        std::vector<SyncSample> primarySamples;
+        std::vector<SyncSample> secondarySamples;
+        std::vector<int64_t> readOrderGlobalDiffs;
+        std::vector<int64_t> readOrderLocalDiffs;
+        std::vector<int64_t> readOrderSystemDiffs;
+        std::vector<int64_t> matchedIndexGlobalDiffs;
+        std::vector<int64_t> matchedIndexLocalDiffs;
+        std::vector<int64_t> matchedIndexSystemDiffs;
+        std::vector<int64_t> matchedIndexFrameNumberDiffs;
         int primaryFrames = 0;
         int secondaryFrames = 0;
         int primaryGlobal = 0;
@@ -539,12 +545,14 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
             SyncSample b;
             if(waitForDepthSample(primaryPipe, a)) {
                 primaryFrames++;
+                primarySamples.push_back(a);
                 if(a.globalTs != 0) {
                     primaryGlobal++;
                 }
             }
             if(waitForDepthSample(secondaryPipe, b)) {
                 secondaryFrames++;
+                secondarySamples.push_back(b);
                 if(b.globalTs != 0) {
                     secondaryGlobal++;
                 }
@@ -585,16 +593,13 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
                     secondaryMetadataFrames++;
                 }
                 if(a.globalTs != 0 && b.globalTs != 0) {
-                    globalDiffs.push_back(static_cast<int64_t>(a.globalTs) - static_cast<int64_t>(b.globalTs));
+                    readOrderGlobalDiffs.push_back(static_cast<int64_t>(a.globalTs) - static_cast<int64_t>(b.globalTs));
                 }
                 if(a.localTs != 0 && b.localTs != 0) {
-                    localDiffs.push_back(static_cast<int64_t>(a.localTs) - static_cast<int64_t>(b.localTs));
+                    readOrderLocalDiffs.push_back(static_cast<int64_t>(a.localTs) - static_cast<int64_t>(b.localTs));
                 }
                 if(a.systemTs != 0 && b.systemTs != 0) {
-                    systemDiffs.push_back(static_cast<int64_t>(a.systemTs) - static_cast<int64_t>(b.systemTs));
-                }
-                if(a.hasMetadataFrameNumber && b.hasMetadataFrameNumber) {
-                    frameNumberDiffs.push_back(a.metadataFrameNumber - b.metadataFrameNumber);
+                    readOrderSystemDiffs.push_back(static_cast<int64_t>(a.systemTs) - static_cast<int64_t>(b.systemTs));
                 }
             }
         }
@@ -624,6 +629,38 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
                       << '\n';
         };
 
+        std::unordered_map<uint64_t, SyncSample> secondaryByIndex;
+        for(const auto &sample: secondarySamples) {
+            if(sample.hasDepth) {
+                secondaryByIndex[sample.index] = sample;
+            }
+        }
+        int matchedIndexPairs = 0;
+        int matchedIndexBothColor = 0;
+        for(const auto &a: primarySamples) {
+            auto it = secondaryByIndex.find(a.index);
+            if(it == secondaryByIndex.end()) {
+                continue;
+            }
+            const auto &b = it->second;
+            matchedIndexPairs++;
+            if(a.hasColor && b.hasColor) {
+                matchedIndexBothColor++;
+            }
+            if(a.globalTs != 0 && b.globalTs != 0) {
+                matchedIndexGlobalDiffs.push_back(static_cast<int64_t>(a.globalTs) - static_cast<int64_t>(b.globalTs));
+            }
+            if(a.localTs != 0 && b.localTs != 0) {
+                matchedIndexLocalDiffs.push_back(static_cast<int64_t>(a.localTs) - static_cast<int64_t>(b.localTs));
+            }
+            if(a.systemTs != 0 && b.systemTs != 0) {
+                matchedIndexSystemDiffs.push_back(static_cast<int64_t>(a.systemTs) - static_cast<int64_t>(b.systemTs));
+            }
+            if(a.hasMetadataFrameNumber && b.hasMetadataFrameNumber) {
+                matchedIndexFrameNumberDiffs.push_back(a.metadataFrameNumber - b.metadataFrameNumber);
+            }
+        }
+
         std::cout << "  frames primary=" << primaryFrames
                   << " secondary=" << secondaryFrames
                   << " paired=" << paired
@@ -632,10 +669,15 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
                   << " secondary=" << secondaryGlobal << '\n';
         std::cout << "  metadata_frame_number primary=" << primaryMetadataFrames
                   << " secondary=" << secondaryMetadataFrames << '\n';
-        printStats("global_depth_ts_diff", globalDiffs);
-        printStats("local_depth_ts_diff", localDiffs);
-        printStats("system_depth_ts_diff", systemDiffs);
-        printStats("metadata_frame_number_diff", frameNumberDiffs);
+        std::cout << "  matched_index pairs=" << matchedIndexPairs
+                  << " both_color=" << matchedIndexBothColor << '\n';
+        printStats("read_order_global_depth_ts_diff", readOrderGlobalDiffs);
+        printStats("read_order_local_depth_ts_diff", readOrderLocalDiffs);
+        printStats("read_order_system_depth_ts_diff", readOrderSystemDiffs);
+        printStats("matched_index_global_depth_ts_diff", matchedIndexGlobalDiffs);
+        printStats("matched_index_local_depth_ts_diff", matchedIndexLocalDiffs);
+        printStats("matched_index_system_depth_ts_diff", matchedIndexSystemDiffs);
+        printStats("matched_index_metadata_frame_number_diff", matchedIndexFrameNumberDiffs);
     }
     catch(const std::exception &e) {
         try {
