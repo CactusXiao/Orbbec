@@ -2,6 +2,7 @@
 
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -78,6 +79,29 @@ void printCurrentSyncConfig(const std::shared_ptr<ob::Device> &device) {
     catch(const std::exception &e) {
         std::cout << "    current_sync_config: unavailable (" << e.what() << ")\n";
     }
+}
+
+void applySyncConfig(const std::shared_ptr<ob::Device> &device, OBMultiDeviceSyncMode mode, bool triggerOutEnable) {
+    auto cfg = device->getMultiDeviceSyncConfig();
+    cfg.syncMode = mode;
+    cfg.depthDelayUs = 0;
+    cfg.colorDelayUs = 0;
+    cfg.trigger2ImageDelayUs = 0;
+    cfg.triggerOutEnable = triggerOutEnable;
+    cfg.triggerOutDelayUs = 0;
+    cfg.framesPerTrigger = 1;
+    device->setMultiDeviceSyncConfig(cfg);
+}
+
+void printAppliedSyncConfig(const std::shared_ptr<ob::Device> &device, const char *label) {
+    const auto info = device->getDeviceInfo();
+    const auto cfg = device->getMultiDeviceSyncConfig();
+    std::cout << "  " << label
+              << " sn=" << safeText(info->getSerialNumber())
+              << " mode=" << syncModeName(cfg.syncMode)
+              << " triggerOutEnable=" << (cfg.triggerOutEnable ? "true" : "false")
+              << " framesPerTrigger=" << cfg.framesPerTrigger
+              << '\n';
 }
 
 void printPresetList(const std::shared_ptr<ob::Device> &device) {
@@ -203,18 +227,26 @@ std::shared_ptr<ob::VideoStreamProfile> findVideoProfile(const std::shared_ptr<o
                                                          OBSensorType sensorType,
                                                          uint32_t width,
                                                          uint32_t height,
-                                                         uint32_t fps) {
+                                                         uint32_t fps,
+                                                         OBFormat preferredFormat = OB_FORMAT_UNKNOWN) {
     auto list = pipe->getStreamProfileList(sensorType);
     if(!list) {
         return nullptr;
     }
+    std::shared_ptr<ob::VideoStreamProfile> fallback;
     for(uint32_t i = 0; i < list->getCount(); ++i) {
         auto profile = list->getProfile(i)->as<ob::VideoStreamProfile>();
-        if(profile && profile->getWidth() == width && profile->getHeight() == height && profile->getFps() == fps) {
+        if(!profile || profile->getWidth() != width || profile->getHeight() != height || profile->getFps() != fps) {
+            continue;
+        }
+        if(preferredFormat == OB_FORMAT_UNKNOWN || profile->getFormat() == preferredFormat) {
             return profile;
         }
+        if(!fallback) {
+            fallback = profile;
+        }
     }
-    return nullptr;
+    return fallback;
 }
 
 void printProfileSummary(const char *label, const std::shared_ptr<ob::VideoStreamProfile> &profile) {
@@ -250,7 +282,7 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
         std::shared_ptr<ob::VideoStreamProfile> colorProfile;
         std::shared_ptr<ob::VideoStreamProfile> depthProfile;
         if(test.color) {
-            colorProfile = findVideoProfile(pipe, OB_SENSOR_COLOR, test.colorW, test.colorH, test.fps);
+            colorProfile = findVideoProfile(pipe, OB_SENSOR_COLOR, test.colorW, test.colorH, test.fps, OB_FORMAT_RGB);
             if(!colorProfile) {
                 std::cout << "      result: profile_missing color="
                           << test.colorW << "x" << test.colorH << "@" << test.fps << '\n';
@@ -260,7 +292,7 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
             printProfileSummary("color", colorProfile);
         }
         if(test.depth) {
-            depthProfile = findVideoProfile(pipe, OB_SENSOR_DEPTH, test.depthW, test.depthH, test.fps);
+            depthProfile = findVideoProfile(pipe, OB_SENSOR_DEPTH, test.depthW, test.depthH, test.fps, OB_FORMAT_Y16);
             if(!depthProfile) {
                 std::cout << "      result: profile_missing depth="
                           << test.depthW << "x" << test.depthH << "@" << test.fps << '\n';
@@ -324,10 +356,10 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
 
 void runStreamStartTests(const std::shared_ptr<ob::Device> &device) {
     const std::vector<StreamStartTest> tests = {
-        { "collection_ui_default_rgb_depth", true, 848, 480, true, 848, 480, 30, true },
+        { "collection_ui_default_rgb_depth", true, 1280, 720, true, 640, 400, 30, true },
         { "current_config_rgb_depth", true, 1280, 720, true, 640, 400, 30, true },
         { "current_config_high_rgb_depth", true, 1920, 1080, true, 640, 400, 30, true },
-        { "calibration_preview_color", true, 1280, 800, false, 0, 0, 30, false },
+        { "calibration_preview_color", true, 1280, 720, false, 0, 0, 30, false },
         { "point_cloud_source_depth", false, 0, 0, true, 640, 400, 30, false },
         { "gemini2_max_depth", false, 0, 0, true, 1280, 800, 30, false },
     };
@@ -335,6 +367,176 @@ void runStreamStartTests(const std::shared_ptr<ob::Device> &device) {
     std::cout << "    stream_start_tests:\n";
     for(const auto &test: tests) {
         runStreamStartTest(device, test);
+    }
+}
+
+struct SyncSample {
+    uint64_t globalTs = 0;
+    uint64_t localTs = 0;
+    bool     hasColor = false;
+    bool     hasDepth = false;
+};
+
+uint64_t frameTimestamp(const std::shared_ptr<ob::Frame> &frame, bool global) {
+    if(!frame) {
+        return 0;
+    }
+    try {
+        return global ? frame->globalTimeStampUs() : frame->timeStampUs();
+    }
+    catch(...) {
+        return 0;
+    }
+}
+
+bool waitForDepthSample(const std::shared_ptr<ob::Pipeline> &pipe, SyncSample &out) {
+    auto fs = pipe->waitForFrameset(1000);
+    if(!fs) {
+        return false;
+    }
+    auto depth = fs->depthFrame();
+    auto color = fs->colorFrame();
+    out.hasDepth = static_cast<bool>(depth);
+    out.hasColor = static_cast<bool>(color);
+    out.globalTs = frameTimestamp(depth, true);
+    out.localTs = frameTimestamp(depth, false);
+    return out.hasDepth;
+}
+
+void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
+    const uint32_t count = devices ? devices->getCount() : 0;
+    std::cout << "\nMulti-device sync test\n";
+    if(count < 2) {
+        std::cout << "  result: need at least 2 connected Orbbec devices\n";
+        return;
+    }
+
+    auto primaryDevice = devices->getDevice(0);
+    auto secondaryDevice = devices->getDevice(1);
+    try {
+        applySyncConfig(primaryDevice, OB_MULTI_DEVICE_SYNC_MODE_PRIMARY, true);
+        applySyncConfig(secondaryDevice, OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED, false);
+        printAppliedSyncConfig(primaryDevice, "primary");
+        printAppliedSyncConfig(secondaryDevice, "secondary");
+    }
+    catch(const std::exception &e) {
+        std::cout << "  result: failed_to_apply_sync_config (" << e.what() << ")\n";
+        return;
+    }
+
+    std::shared_ptr<ob::Pipeline> primaryPipe;
+    std::shared_ptr<ob::Pipeline> secondaryPipe;
+    try {
+        primaryPipe = std::make_shared<ob::Pipeline>(primaryDevice);
+        secondaryPipe = std::make_shared<ob::Pipeline>(secondaryDevice);
+
+        auto makeConfig = [](const std::shared_ptr<ob::Pipeline> &pipe) {
+            auto cfg = std::make_shared<ob::Config>();
+            auto color = findVideoProfile(pipe, OB_SENSOR_COLOR, 1280, 720, 30, OB_FORMAT_RGB);
+            auto depth = findVideoProfile(pipe, OB_SENSOR_DEPTH, 640, 400, 30, OB_FORMAT_Y16);
+            if(!color || !depth) {
+                throw std::runtime_error("missing 1280x720@30 color or 640x400@30 depth profile");
+            }
+            cfg->enableStream(color);
+            cfg->enableStream(depth);
+            cfg->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+            return cfg;
+        };
+
+        primaryPipe->enableFrameSync();
+        secondaryPipe->enableFrameSync();
+
+        secondaryPipe->start(makeConfig(secondaryPipe));
+        primaryPipe->start(makeConfig(primaryPipe));
+
+        std::vector<int64_t> globalDiffs;
+        std::vector<int64_t> localDiffs;
+        int primaryFrames = 0;
+        int secondaryFrames = 0;
+        int primaryGlobal = 0;
+        int secondaryGlobal = 0;
+        int paired = 0;
+        int bothColor = 0;
+
+        for(int i = 0; i < 60; ++i) {
+            SyncSample a;
+            SyncSample b;
+            if(waitForDepthSample(primaryPipe, a)) {
+                primaryFrames++;
+                if(a.globalTs != 0) {
+                    primaryGlobal++;
+                }
+            }
+            if(waitForDepthSample(secondaryPipe, b)) {
+                secondaryFrames++;
+                if(b.globalTs != 0) {
+                    secondaryGlobal++;
+                }
+            }
+            if(a.hasDepth && b.hasDepth) {
+                paired++;
+                if(a.hasColor && b.hasColor) {
+                    bothColor++;
+                }
+                if(a.globalTs != 0 && b.globalTs != 0) {
+                    globalDiffs.push_back(static_cast<int64_t>(a.globalTs) - static_cast<int64_t>(b.globalTs));
+                }
+                if(a.localTs != 0 && b.localTs != 0) {
+                    localDiffs.push_back(static_cast<int64_t>(a.localTs) - static_cast<int64_t>(b.localTs));
+                }
+            }
+        }
+
+        primaryPipe->stop();
+        secondaryPipe->stop();
+
+        auto printStats = [](const char *label, const std::vector<int64_t> &values) {
+            if(values.empty()) {
+                std::cout << "  " << label << ": none\n";
+                return;
+            }
+            int64_t minAbs = std::numeric_limits<int64_t>::max();
+            int64_t maxAbs = 0;
+            long double sumAbs = 0.0;
+            for(const auto v: values) {
+                const int64_t av = v < 0 ? -v : v;
+                minAbs = std::min(minAbs, av);
+                maxAbs = std::max(maxAbs, av);
+                sumAbs += static_cast<long double>(av);
+            }
+            std::cout << "  " << label
+                      << ": pairs=" << values.size()
+                      << " min_abs_us=" << minAbs
+                      << " avg_abs_us=" << static_cast<double>(sumAbs / values.size())
+                      << " max_abs_us=" << maxAbs
+                      << '\n';
+        };
+
+        std::cout << "  frames primary=" << primaryFrames
+                  << " secondary=" << secondaryFrames
+                  << " paired=" << paired
+                  << " both_color=" << bothColor << '\n';
+        std::cout << "  global_ts_nonzero primary=" << primaryGlobal
+                  << " secondary=" << secondaryGlobal << '\n';
+        printStats("global_depth_ts_diff", globalDiffs);
+        printStats("local_depth_ts_diff", localDiffs);
+    }
+    catch(const std::exception &e) {
+        try {
+            if(primaryPipe) {
+                primaryPipe->stop();
+            }
+        }
+        catch(...) {
+        }
+        try {
+            if(secondaryPipe) {
+                secondaryPipe->stop();
+            }
+        }
+        catch(...) {
+        }
+        std::cout << "  result: failed (" << e.what() << ")\n";
     }
 }
 
@@ -390,15 +592,20 @@ void printDevice(const std::shared_ptr<ob::Device> &device, uint32_t index, bool
 int main(int argc, char **argv) {
     try {
         bool runStreamTests = false;
+        bool runSyncTest = false;
         for(int i = 1; i < argc; ++i) {
             const std::string arg = argv[i] ? argv[i] : "";
             if(arg == "--stream-test") {
                 runStreamTests = true;
             }
+            else if(arg == "--sync-test") {
+                runSyncTest = true;
+            }
             else if(arg == "-h" || arg == "--help") {
-                std::cout << "Usage: orbbec_probe [--stream-test]\n"
+                std::cout << "Usage: orbbec_probe [--stream-test] [--sync-test]\n"
                           << "  default: print device metadata, sync capability, calibration probes, and profiles\n"
-                          << "  --stream-test: also start common RGB/depth stream combinations and wait for frames\n";
+                          << "  --stream-test: also start common RGB/depth stream combinations and wait for frames\n"
+                          << "  --sync-test: configure device 0 as primary and device 1 as secondary-synced, then compare timestamps\n";
                 return 0;
             }
             else {
@@ -426,6 +633,9 @@ int main(int argc, char **argv) {
 
         for(uint32_t i = 0; i < count; ++i) {
             printDevice(devices->getDevice(i), i, runStreamTests);
+        }
+        if(runSyncTest) {
+            runMultiDeviceSyncTest(devices);
         }
         return 0;
     }
