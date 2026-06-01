@@ -264,9 +264,11 @@ struct StreamStartTest {
     bool        color;
     uint32_t    colorW;
     uint32_t    colorH;
+    OBFormat    colorFormat;
     bool        depth;
     uint32_t    depthW;
     uint32_t    depthH;
+    OBFormat    depthFormat;
     uint32_t    fps;
     bool        frameSync;
 };
@@ -282,7 +284,7 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
         std::shared_ptr<ob::VideoStreamProfile> colorProfile;
         std::shared_ptr<ob::VideoStreamProfile> depthProfile;
         if(test.color) {
-            colorProfile = findVideoProfile(pipe, OB_SENSOR_COLOR, test.colorW, test.colorH, test.fps, OB_FORMAT_RGB);
+            colorProfile = findVideoProfile(pipe, OB_SENSOR_COLOR, test.colorW, test.colorH, test.fps, test.colorFormat);
             if(!colorProfile) {
                 std::cout << "      result: profile_missing color="
                           << test.colorW << "x" << test.colorH << "@" << test.fps << '\n';
@@ -292,7 +294,7 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
             printProfileSummary("color", colorProfile);
         }
         if(test.depth) {
-            depthProfile = findVideoProfile(pipe, OB_SENSOR_DEPTH, test.depthW, test.depthH, test.fps, OB_FORMAT_Y16);
+            depthProfile = findVideoProfile(pipe, OB_SENSOR_DEPTH, test.depthW, test.depthH, test.fps, test.depthFormat);
             if(!depthProfile) {
                 std::cout << "      result: profile_missing depth="
                           << test.depthW << "x" << test.depthH << "@" << test.fps << '\n';
@@ -356,12 +358,14 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
 
 void runStreamStartTests(const std::shared_ptr<ob::Device> &device) {
     const std::vector<StreamStartTest> tests = {
-        { "collection_ui_default_rgb_depth", true, 1280, 720, true, 640, 400, 30, true },
-        { "current_config_rgb_depth", true, 1280, 720, true, 640, 400, 30, true },
-        { "current_config_high_rgb_depth", true, 1920, 1080, true, 640, 400, 30, true },
-        { "calibration_preview_color", true, 1280, 720, false, 0, 0, 30, false },
-        { "point_cloud_source_depth", false, 0, 0, true, 640, 400, 30, false },
-        { "gemini2_max_depth", false, 0, 0, true, 1280, 800, 30, false },
+        { "collection_default_mjpg_y16", true, 1280, 720, OB_FORMAT_MJPG, true, 640, 400, OB_FORMAT_Y16, 30, true },
+        { "collection_default_mjpg_y14", true, 1280, 720, OB_FORMAT_MJPG, true, 640, 400, OB_FORMAT_Y14, 30, true },
+        { "collection_default_rgb_y16", true, 1280, 720, OB_FORMAT_RGB, true, 640, 400, OB_FORMAT_Y16, 30, true },
+        { "collection_default_rgb_y14", true, 1280, 720, OB_FORMAT_RGB, true, 640, 400, OB_FORMAT_Y14, 30, true },
+        { "current_config_high_rgb_depth", true, 1920, 1080, OB_FORMAT_RGB, true, 640, 400, OB_FORMAT_Y16, 30, true },
+        { "calibration_preview_color", true, 1280, 720, OB_FORMAT_RGB, false, 0, 0, OB_FORMAT_UNKNOWN, 30, false },
+        { "point_cloud_source_depth", false, 0, 0, OB_FORMAT_UNKNOWN, true, 640, 400, OB_FORMAT_Y16, 30, false },
+        { "gemini2_max_depth", false, 0, 0, OB_FORMAT_UNKNOWN, true, 1280, 800, OB_FORMAT_Y16, 30, false },
     };
 
     std::cout << "    stream_start_tests:\n";
@@ -432,13 +436,15 @@ void runMultiDeviceSyncTest(const std::shared_ptr<ob::DeviceList> &devices) {
 
         auto makeConfig = [](const std::shared_ptr<ob::Pipeline> &pipe) {
             auto cfg = std::make_shared<ob::Config>();
-            auto color = findVideoProfile(pipe, OB_SENSOR_COLOR, 1280, 720, 30, OB_FORMAT_RGB);
-            auto depth = findVideoProfile(pipe, OB_SENSOR_DEPTH, 640, 400, 30, OB_FORMAT_Y16);
+            auto color = findVideoProfile(pipe, OB_SENSOR_COLOR, 1280, 720, 30, OB_FORMAT_MJPG);
+            auto depth = findVideoProfile(pipe, OB_SENSOR_DEPTH, 640, 400, 30, OB_FORMAT_Y14);
             if(!color || !depth) {
                 throw std::runtime_error("missing 1280x720@30 color or 640x400@30 depth profile");
             }
             cfg->enableStream(color);
             cfg->enableStream(depth);
+            printProfileSummary("sync_color", color);
+            printProfileSummary("sync_depth", depth);
             cfg->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
             return cfg;
         };
