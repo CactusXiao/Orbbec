@@ -706,7 +706,7 @@ struct CollectionConfigUi {
     std::string width    = "1280";
     std::string height   = "720";
     std::string fps      = "30";
-    std::string exposureMs = "0.1";
+    std::string exposureMs;
     std::string brightness;
     std::string saveRoot;
     std::string subjectId = "test";
@@ -734,7 +734,12 @@ struct CollectionConfigUi {
     int widthInt() const { return std::max(1, parseIntOr(width, 1280)); }
     int heightInt() const { return std::max(1, parseIntOr(height, 720)); }
     int fpsInt() const { return std::max(1, parseIntOr(fps, 30)); }
-    float exposureMsFloat() const { return static_cast<float>(parseDoubleBound(exposureMs, 0.1, 0.05, 100.0)); }
+    float exposureMsFloat() const {
+        if(trimString(exposureMs).empty()) {
+            return 0.0f;
+        }
+        return static_cast<float>(parseDoubleBound(exposureMs, 0.0, 0.05, 100.0));
+    }
     int brightnessInt() const { return parseIntOr(brightness, -1); }
     int maxDurationInt() const { return std::max(1, parseIntOr(maxDurationSec, 120)); }
 
@@ -2532,29 +2537,39 @@ public:
             return;
         }
 
+        const bool manualExposure = colorExposureMs_ > 0.0f;
+
         try {
             if(rt.dev->isPropertySupported(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, OB_PERMISSION_READ_WRITE)) {
-                const bool ae = rt.dev->getBoolProperty(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL);
-                if(ae) {
-                    rt.dev->setBoolProperty(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, false);
-                }
+                rt.dev->setBoolProperty(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, !manualExposure);
+                std::cerr << "[collection] color auto exposure sn=" << rt.cfg.sn << " value=" << (!manualExposure ? "true" : "false") << std::endl;
             }
         }
         catch(...) {
         }
 
         try {
-            const bool canRead = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_READ);
-            const bool canWrite = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_WRITE);
-            if(canRead && canWrite) {
-                const auto range = rt.dev->getIntPropertyRange(OB_PROP_COLOR_EXPOSURE_INT);
-                const int targetUsRaw = static_cast<int>(colorExposureMs_ * 1000.0f + 0.5f);
-                const int targetUs = clampPropertyValue(targetUsRaw, range);
-                rt.dev->setIntProperty(OB_PROP_COLOR_EXPOSURE_INT, targetUs);
-                std::cerr << "[collection] set color exposure sn=" << rt.cfg.sn << " value=" << targetUs << std::endl;
+            if(rt.dev->isPropertySupported(OB_PROP_COLOR_AUTO_WHITE_BALANCE_BOOL, OB_PERMISSION_READ_WRITE)) {
+                rt.dev->setBoolProperty(OB_PROP_COLOR_AUTO_WHITE_BALANCE_BOOL, true);
             }
         }
         catch(...) {
+        }
+
+        if(manualExposure) {
+            try {
+                const bool canRead = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_READ);
+                const bool canWrite = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_WRITE);
+                if(canRead && canWrite) {
+                    const auto range = rt.dev->getIntPropertyRange(OB_PROP_COLOR_EXPOSURE_INT);
+                    const int targetUsRaw = static_cast<int>(colorExposureMs_ * 1000.0f + 0.5f);
+                    const int targetUs = clampPropertyValue(targetUsRaw, range);
+                    rt.dev->setIntProperty(OB_PROP_COLOR_EXPOSURE_INT, targetUs);
+                    std::cerr << "[collection] set color exposure sn=" << rt.cfg.sn << " value=" << targetUs << std::endl;
+                }
+            }
+            catch(...) {
+            }
         }
 
         if(colorBrightness_ < 0) {
