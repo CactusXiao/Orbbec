@@ -345,6 +345,9 @@ AppConfig loadConfig(const fs::path &configPath) {
     else if(auto v = getInt(root, "brightness")) {
         cfg.colorBrightness = *v;
     }
+    if(auto v = getInt(root, "colorCloudRgbFrameOffset")) {
+        cfg.colorCloudRgbFrameOffset = std::max(-5, std::min(5, *v));
+    }
 
     if(auto *saveObj = cJSON_GetObjectItemCaseSensitive(root, "save")) {
         if(cJSON_IsObject(saveObj)) {

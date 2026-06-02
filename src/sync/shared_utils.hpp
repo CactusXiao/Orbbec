@@ -126,6 +126,7 @@ struct AppConfig {
     int                       writerThreads  = 0;
     float                     colorExposureMs = 0.0f;
     int                       colorBrightness = -1;
+    int                       colorCloudRgbFrameOffset = 0;
     SaveOptions               save;
     FisheyeModuleConfig       fisheye;
     DepthPointCloudFiltersConfig filters;

@@ -4353,6 +4353,15 @@ private:
         return true;
     }
 
+    static bool offsetPacketIndex(size_t base, int offset, size_t count, size_t &out) {
+        const long long idx = static_cast<long long>(base) + static_cast<long long>(offset);
+        if(idx < 0 || idx >= static_cast<long long>(count)) {
+            return false;
+        }
+        out = static_cast<size_t>(idx);
+        return true;
+    }
+
     bool multiviewCanFinalizeLocked(uint64_t centerUs) const {
         for(const auto &sn: session_.deviceSns) {
             for(const auto t: session_.typesAlign) {
@@ -4485,6 +4494,15 @@ private:
                     else if(pickNearestPacket(itRgbState->second.committed, depthPacket.tsUs, session_.maxAbsDiffUs, pickedRgb)
                             && pickedRgb < itRgbState->second.committed.size()) {
                         hasPickedRgb = true;
+                    }
+                    if(hasPickedRgb && cfg_.colorCloudRgbFrameOffset != 0) {
+                        size_t offsetRgb = pickedRgb;
+                        if(offsetPacketIndex(pickedRgb, cfg_.colorCloudRgbFrameOffset, itRgbState->second.committed.size(), offsetRgb)) {
+                            pickedRgb = offsetRgb;
+                        }
+                        else {
+                            hasPickedRgb = false;
+                        }
                     }
                     if(hasPickedRgb) {
                         info.rgbFrame = itRgbState->second.committed[pickedRgb].frame;
