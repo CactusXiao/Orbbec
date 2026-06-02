@@ -4503,24 +4503,6 @@ private:
 
         std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> pickedIndices;
         bool fullThis = true;
-        std::unordered_map<CollectDataType, uint64_t> typeCenters;
-        typeCenters[refType_] = centerUs;
-        for(const auto t: session_.typesAlign) {
-            if(t == refType_) {
-                continue;
-            }
-            auto itRefType = itRefStreams->second.find(t);
-            if(itRefType == itRefStreams->second.end()) {
-                fullThis = false;
-                continue;
-            }
-            size_t pickedRefType = 0;
-            if(!pickNearestPacket(itRefType->second.committed, centerUs, sessionCrossTypeMaxAbsDiffUs(session_.stepUs), pickedRefType)) {
-                fullThis = false;
-                continue;
-            }
-            typeCenters[t] = itRefType->second.committed[pickedRefType].tsUs;
-        }
         uint64_t tsMin = std::numeric_limits<uint64_t>::max();
         uint64_t tsMax = 0;
 
@@ -4536,13 +4518,8 @@ private:
                     fullThis = false;
                     continue;
                 }
-                const auto itCenter = typeCenters.find(t);
-                if(itCenter == typeCenters.end()) {
-                    fullThis = false;
-                    continue;
-                }
                 size_t picked = 0;
-                if(!pickNearestPacket(itStream->second.committed, itCenter->second, session_.maxAbsDiffUs, picked)) {
+                if(!pickNearestPacket(itStream->second.committed, centerUs, session_.maxAbsDiffUs, picked)) {
                     fullThis = false;
                     continue;
                 }
@@ -4601,23 +4578,16 @@ private:
         row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount + 2);
         row.push_back(frameIndex);
         row.push_back(std::to_string(centerUs));
-        std::unordered_map<CollectDataType, uint64_t> rgbdTsMinByType;
-        std::unordered_map<CollectDataType, uint64_t> rgbdTsMaxByType;
-        std::unordered_map<CollectDataType, size_t> rgbdTsCountByType;
+        uint64_t rgbdTsMin = std::numeric_limits<uint64_t>::max();
+        uint64_t rgbdTsMax = 0;
+        size_t   rgbdTsCount = 0;
         uint64_t allTsMin = std::numeric_limits<uint64_t>::max();
         uint64_t allTsMax = 0;
         size_t   allTsCount = 0;
-        auto noteRgbdTimestamp = [&](CollectDataType t, uint64_t ts) {
-            auto itMin = rgbdTsMinByType.find(t);
-            if(itMin == rgbdTsMinByType.end()) {
-                rgbdTsMinByType[t] = ts;
-                rgbdTsMaxByType[t] = ts;
-                rgbdTsCountByType[t] = 1;
-                return;
-            }
-            itMin->second = std::min(itMin->second, ts);
-            rgbdTsMaxByType[t] = std::max(rgbdTsMaxByType[t], ts);
-            rgbdTsCountByType[t]++;
+        auto noteRgbdTimestamp = [&](uint64_t ts) {
+            rgbdTsMin = std::min(rgbdTsMin, ts);
+            rgbdTsMax = std::max(rgbdTsMax, ts);
+            rgbdTsCount++;
         };
 
         for(const auto &sn: session_.deviceSns) {
@@ -4638,7 +4608,7 @@ private:
                 }
                 const auto &packet = session_.streams.at(sn).at(t).committed[itPicked->second];
                 row.push_back(std::to_string(packet.tsUs));
-                noteRgbdTimestamp(t, packet.tsUs);
+                noteRgbdTimestamp(packet.tsUs);
                 allTsMin = std::min(allTsMin, packet.tsUs);
                 allTsMax = std::max(allTsMax, packet.tsUs);
                 allTsCount++;
@@ -4746,15 +4716,8 @@ private:
 
         {
             double rgbdMaxDiffMs = 0.0;
-            for(const auto &kv: rgbdTsCountByType) {
-                if(kv.second <= 1) {
-                    continue;
-                }
-                const auto itMin = rgbdTsMinByType.find(kv.first);
-                const auto itMax = rgbdTsMaxByType.find(kv.first);
-                if(itMin != rgbdTsMinByType.end() && itMax != rgbdTsMaxByType.end() && itMax->second >= itMin->second) {
-                    rgbdMaxDiffMs = std::max(rgbdMaxDiffMs, static_cast<double>(itMax->second - itMin->second) / 1000.0);
-                }
+            if(rgbdTsCount > 1 && rgbdTsMax >= rgbdTsMin) {
+                rgbdMaxDiffMs = static_cast<double>(rgbdTsMax - rgbdTsMin) / 1000.0;
             }
             std::ostringstream oss;
             oss.setf(std::ios::fixed);
