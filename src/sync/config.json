@@ -34,6 +34,8 @@
     "maxFrames": 1000,
     "collectFps": 30,
     "enableSync": true,
+    "colorExposureMs": 0.8,
+    "colorBrightness": -1,
     "queueCapacity": 1024,
     "writerThreads": 0,
     "save": {

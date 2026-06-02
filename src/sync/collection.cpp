@@ -2565,10 +2565,23 @@ public:
                     const int targetUsRaw = static_cast<int>(colorExposureMs_ * 1000.0f + 0.5f);
                     const int targetUs = clampPropertyValue(targetUsRaw, range);
                     rt.dev->setIntProperty(OB_PROP_COLOR_EXPOSURE_INT, targetUs);
-                    std::cerr << "[collection] set color exposure sn=" << rt.cfg.sn << " value=" << targetUs << std::endl;
+                    const int appliedUs = rt.dev->getIntProperty(OB_PROP_COLOR_EXPOSURE_INT);
+                    std::cerr << "[collection] set color exposure sn=" << rt.cfg.sn << " target_us=" << targetUs
+                              << " applied_us=" << appliedUs << std::endl;
+                    const int readbackDiff = (appliedUs > targetUs) ? (appliedUs - targetUs) : (targetUs - appliedUs);
+                    if(readbackDiff > std::max(1, range.step)) {
+                        std::cerr << "[collection] warning color exposure readback mismatch sn=" << rt.cfg.sn << std::endl;
+                    }
+                }
+                else {
+                    std::cerr << "[collection] color exposure property not writable sn=" << rt.cfg.sn << std::endl;
                 }
             }
+            catch(const std::exception &e) {
+                std::cerr << "[collection] set color exposure failed sn=" << rt.cfg.sn << " error=" << e.what() << std::endl;
+            }
             catch(...) {
+                std::cerr << "[collection] set color exposure failed sn=" << rt.cfg.sn << std::endl;
             }
         }
 
@@ -4503,6 +4516,24 @@ private:
 
         std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> pickedIndices;
         bool fullThis = true;
+        std::unordered_map<CollectDataType, uint64_t> typeCenters;
+        typeCenters[refType_] = centerUs;
+        for(const auto t: session_.typesAlign) {
+            if(t == refType_) {
+                continue;
+            }
+            auto itRefType = itRefStreams->second.find(t);
+            if(itRefType == itRefStreams->second.end()) {
+                fullThis = false;
+                continue;
+            }
+            size_t pickedRefType = 0;
+            if(!pickNearestPacket(itRefType->second.committed, centerUs, sessionCrossTypeMaxAbsDiffUs(session_.stepUs), pickedRefType)) {
+                fullThis = false;
+                continue;
+            }
+            typeCenters[t] = itRefType->second.committed[pickedRefType].tsUs;
+        }
         uint64_t tsMin = std::numeric_limits<uint64_t>::max();
         uint64_t tsMax = 0;
 
@@ -4518,8 +4549,13 @@ private:
                     fullThis = false;
                     continue;
                 }
+                const auto itCenter = typeCenters.find(t);
+                if(itCenter == typeCenters.end()) {
+                    fullThis = false;
+                    continue;
+                }
                 size_t picked = 0;
-                if(!pickNearestPacket(itStream->second.committed, centerUs, session_.maxAbsDiffUs, picked)) {
+                if(!pickNearestPacket(itStream->second.committed, itCenter->second, session_.maxAbsDiffUs, picked)) {
                     fullThis = false;
                     continue;
                 }
@@ -4578,16 +4614,23 @@ private:
         row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount + 2);
         row.push_back(frameIndex);
         row.push_back(std::to_string(centerUs));
-        uint64_t rgbdTsMin = std::numeric_limits<uint64_t>::max();
-        uint64_t rgbdTsMax = 0;
-        size_t   rgbdTsCount = 0;
+        std::unordered_map<CollectDataType, uint64_t> rgbdTsMinByType;
+        std::unordered_map<CollectDataType, uint64_t> rgbdTsMaxByType;
+        std::unordered_map<CollectDataType, size_t> rgbdTsCountByType;
         uint64_t allTsMin = std::numeric_limits<uint64_t>::max();
         uint64_t allTsMax = 0;
         size_t   allTsCount = 0;
-        auto noteRgbdTimestamp = [&](uint64_t ts) {
-            rgbdTsMin = std::min(rgbdTsMin, ts);
-            rgbdTsMax = std::max(rgbdTsMax, ts);
-            rgbdTsCount++;
+        auto noteRgbdTimestamp = [&](CollectDataType t, uint64_t ts) {
+            auto itMin = rgbdTsMinByType.find(t);
+            if(itMin == rgbdTsMinByType.end()) {
+                rgbdTsMinByType[t] = ts;
+                rgbdTsMaxByType[t] = ts;
+                rgbdTsCountByType[t] = 1;
+                return;
+            }
+            itMin->second = std::min(itMin->second, ts);
+            rgbdTsMaxByType[t] = std::max(rgbdTsMaxByType[t], ts);
+            rgbdTsCountByType[t]++;
         };
 
         for(const auto &sn: session_.deviceSns) {
@@ -4608,7 +4651,7 @@ private:
                 }
                 const auto &packet = session_.streams.at(sn).at(t).committed[itPicked->second];
                 row.push_back(std::to_string(packet.tsUs));
-                noteRgbdTimestamp(packet.tsUs);
+                noteRgbdTimestamp(t, packet.tsUs);
                 allTsMin = std::min(allTsMin, packet.tsUs);
                 allTsMax = std::max(allTsMax, packet.tsUs);
                 allTsCount++;
@@ -4716,8 +4759,15 @@ private:
 
         {
             double rgbdMaxDiffMs = 0.0;
-            if(rgbdTsCount > 1 && rgbdTsMax >= rgbdTsMin) {
-                rgbdMaxDiffMs = static_cast<double>(rgbdTsMax - rgbdTsMin) / 1000.0;
+            for(const auto &kv: rgbdTsCountByType) {
+                if(kv.second <= 1) {
+                    continue;
+                }
+                const auto itMin = rgbdTsMinByType.find(kv.first);
+                const auto itMax = rgbdTsMaxByType.find(kv.first);
+                if(itMin != rgbdTsMinByType.end() && itMax != rgbdTsMaxByType.end() && itMax->second >= itMin->second) {
+                    rgbdMaxDiffMs = std::max(rgbdMaxDiffMs, static_cast<double>(itMax->second - itMin->second) / 1000.0);
+                }
             }
             std::ostringstream oss;
             oss.setf(std::ios::fixed);
@@ -5665,6 +5715,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
+    if(cfg.colorExposureMs > 0.0f) {
+        std::ostringstream oss;
+        oss << std::setprecision(4) << cfg.colorExposureMs;
+        cfgUi.exposureMs = oss.str();
+    }
+    if(cfg.colorBrightness >= 0) {
+        cfgUi.brightness = std::to_string(cfg.colorBrightness);
+    }
 
     auto pushUiLog = [&](std::string s) {
         s = trimString(std::move(s));

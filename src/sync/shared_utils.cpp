@@ -330,6 +330,21 @@ AppConfig loadConfig(const fs::path &configPath) {
     if(auto v = getInt(root, "writerThreads")) {
         cfg.writerThreads = *v;
     }
+    if(auto v = getDouble(root, "colorExposureMs")) {
+        cfg.colorExposureMs = static_cast<float>(std::max(0.0, *v));
+    }
+    else if(auto v = getDouble(root, "exposure_ms")) {
+        cfg.colorExposureMs = static_cast<float>(std::max(0.0, *v));
+    }
+    else if(auto v = getDouble(root, "exposureMs")) {
+        cfg.colorExposureMs = static_cast<float>(std::max(0.0, *v));
+    }
+    if(auto v = getInt(root, "colorBrightness")) {
+        cfg.colorBrightness = *v;
+    }
+    else if(auto v = getInt(root, "brightness")) {
+        cfg.colorBrightness = *v;
+    }
 
     if(auto *saveObj = cJSON_GetObjectItemCaseSensitive(root, "save")) {
         if(cJSON_IsObject(saveObj)) {
