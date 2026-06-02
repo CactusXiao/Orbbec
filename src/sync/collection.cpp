@@ -4694,20 +4694,8 @@ private:
                     const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png");
                     cv::Mat frame = packet.frame;
                     const SaveOptions saveOptions = cfg_.save;
-                    const auto itRgbParam = buf.params.find(CollectDataType::RGB);
-                    const int rgbW = (itRgbParam != buf.params.end() && itRgbParam->second.valid) ? itRgbParam->second.width : 0;
-                    const int rgbH = (itRgbParam != buf.params.end() && itRgbParam->second.valid) ? itRgbParam->second.height : 0;
-                    const auto rgbDepthParam = buf.rgbDepthParam;
-                    const bool rgbDepthParamValid = buf.rgbDepthParamValid;
-                    const float valueScale = packet.valueScale;
-                    enqueueWriteTask(WriteTask{ [frame = std::move(frame), outPath, saveOptions, rgbW, rgbH, rgbDepthParam, rgbDepthParamValid, valueScale]() mutable {
-                        if(rgbDepthParamValid && rgbW > 0 && rgbH > 0 && valueScale > 0.0f) {
-                            cv::Mat alignedDepth = alignDepthToRgb(frame, valueScale, rgbDepthParam, rgbW, rgbH);
-                            saveRawMatToPng(alignedDepth, outPath, saveOptions.pngCompression);
-                        }
-                        else {
-                            saveRawMatToPng(frame, outPath, saveOptions.pngCompression);
-                        }
+                    enqueueWriteTask(WriteTask{ [frame = std::move(frame), outPath, saveOptions]() mutable {
+                        saveRawMatToPng(frame, outPath, saveOptions.pngCompression);
                     } });
                 }
                 else {
