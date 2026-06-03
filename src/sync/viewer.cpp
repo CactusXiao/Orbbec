@@ -742,6 +742,8 @@ struct CameraParamsBundle {
     std::unordered_map<std::string, CameraStreamParams> irLeft;
     std::unordered_map<std::string, CameraStreamParams> irRight;
     std::unordered_map<std::string, CameraRgbToDepthParams> rgbToDepth;
+    int colorCloudRgbFrameOffset = 0;
+    bool hasColorCloudRgbFrameOffset = false;
 };
 
 static bool parseStreamParams(cJSON *obj, CameraStreamParams &out) {
@@ -810,6 +812,17 @@ static CameraParamsBundle loadCameraParams(const fs::path &path) {
             cJSON_Delete(root);
         }
         return bundle;
+    }
+    if(auto *viewerObj = cJSON_GetObjectItemCaseSensitive(root, "viewer"); viewerObj && cJSON_IsObject(viewerObj)) {
+        auto *offsetObj = cJSON_GetObjectItemCaseSensitive(viewerObj, "colorCloudRgbFrameOffset");
+        if(offsetObj && cJSON_IsNumber(offsetObj)) {
+            bundle.colorCloudRgbFrameOffset = std::max(-5, std::min(5, offsetObj->valueint));
+            bundle.hasColorCloudRgbFrameOffset = true;
+        }
+    }
+    else if(auto *offsetObj = cJSON_GetObjectItemCaseSensitive(root, "colorCloudRgbFrameOffset"); offsetObj && cJSON_IsNumber(offsetObj)) {
+        bundle.colorCloudRgbFrameOffset = std::max(-5, std::min(5, offsetObj->valueint));
+        bundle.hasColorCloudRgbFrameOffset = true;
     }
     for(cJSON *camItem = root->child; camItem != nullptr; camItem = camItem->next) {
         if(!camItem->string || !cJSON_IsObject(camItem)) {
@@ -2349,6 +2362,9 @@ private:
     }
 
     bool canUseSavedColorCloud() const {
+        if(taskCamParams_.colorCloudRgbFrameOffset != 0) {
+            return false;
+        }
         if(!headCamPoseAvailable_) {
             return true;
         }
@@ -2427,6 +2443,10 @@ private:
             return cv::Mat();
         }
         return cv::imread(p.string(), cv::IMREAD_COLOR);
+    }
+
+    int colorCloudRgbFrameIndex(int depthFrameIdx) const {
+        return depthFrameIdx + taskCamParams_.colorCloudRgbFrameOffset;
     }
 
     cv::Mat loadDepthFrameNoCache(const std::string &cam, int frameIdx) const {
@@ -2572,7 +2592,8 @@ private:
             AlignMapCache *align = nullptr;
             const OBCameraIntrinsic *pointIntr = nullptr;
             if(colorCloud || outWith) {
-                rgb = loadRgbFrameNoCache(cam, frameIdx);
+                const int rgbFrameIdx = colorCloud ? colorCloudRgbFrameIndex(frameIdx) : frameIdx;
+                rgb = rgbFrameIdx >= 0 ? loadRgbFrameNoCache(cam, rgbFrameIdx) : cv::Mat();
                 pointIntr = pointCloudIntrinsicForDepth(cam, depth16, rgb);
                 const auto *rp = findByCamKeyVariants(taskCamParams_.rgbToDepth, cam);
                 if(!rgb.empty() && !isAlignedDepthToRgb(depth16, rgb) && rp && rp->valid) {
@@ -2659,6 +2680,9 @@ private:
                                 cp.hasColor = true;
                             }
                         }
+                    }
+                    if(colorCloud && !cp.hasColor) {
+                        continue;
                     }
                     cloud.push_back(cp);
                 }
@@ -3407,7 +3431,9 @@ private:
     std::string pointCloudFrameKey(int frameIdx, bool colorCloud) const {
         const std::string signature =
             activeMultiviewSignature(colorCloud ? ViewerDataType::ColorCloud : ViewerDataType::PointCloud) + "|head=" + headCamPoseSpec();
-        return makeCacheKey(colorCloud ? 30 : 29, signature, frameIdx);
+        return makeCacheKey(colorCloud ? 30 : 29,
+                            signature + "|rgbOffset=" + std::to_string(colorCloud ? taskCamParams_.colorCloudRgbFrameOffset : 0),
+                            frameIdx);
     }
 
     std::string jointWorldFrameKey(int frameIdx) const {
@@ -3486,6 +3512,9 @@ private:
         }
 
         taskCamParams_ = loadCameraParams(dataDir / "camera_params.json");
+        if(!taskCamParams_.hasColorCloudRgbFrameOffset) {
+            taskCamParams_.colorCloudRgbFrameOffset = cfg_.colorCloudRgbFrameOffset;
+        }
         extrinsics_ = loadExtrinsicsCamToWorld(dataDir / "extrinsics.json");
         refreshHeadCamPoseAvailability(dataDir);
 
@@ -3943,7 +3972,8 @@ private:
             AlignMapCache cache;
             const OBCameraIntrinsic *pointIntr = nullptr;
             if(colorCloud) {
-                rgb = loadRgbFrame(cam, frameIdx);
+                const int rgbFrameIdx = colorCloudRgbFrameIndex(frameIdx);
+                rgb = rgbFrameIdx >= 0 ? loadRgbFrame(cam, rgbFrameIdx) : cv::Mat();
                 const auto *rp = findByCamKeyVariants(taskCamParams_.rgbToDepth, cam);
                 pointIntr = pointCloudIntrinsicForDepth(cam, depth16, rgb);
                 if(!rgb.empty() && !isAlignedDepthToRgb(depth16, rgb) && (!rp || !rp->valid)) {
@@ -3997,6 +4027,9 @@ private:
                                 cp.hasColor = true;
                             }
                         }
+                    }
+                    if(colorCloud && !cp.hasColor) {
+                        continue;
                     }
                     out->push_back(cp);
                 }
