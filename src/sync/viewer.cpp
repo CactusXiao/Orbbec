@@ -474,64 +474,6 @@ static void handleTextInput(std::string &fieldValue, int key) {
     }
 }
 
-static std::string promptDataRootInViewerWindow(const std::string &defaultValue, const std::atomic_bool *cancel) {
-    const std::string winName = "Viewer";
-    CvMouseState ms;
-    MainMouseContext mouseCtx;
-    mouseCtx.ui = &ms;
-    mouseCtx.pc = nullptr;
-
-    std::string value = defaultValue;
-    std::string error;
-    bool active = true;
-
-    cv::namedWindow(winName, cv::WINDOW_NORMAL);
-    cv::resizeWindow(winName, 900, 260);
-    cv::setMouseCallback(winName, mouseCallbackMain, &mouseCtx);
-
-    while(true) {
-        if(cancel && cancel->load()) {
-            return std::string();
-        }
-
-        cv::Mat ui(260, 900, CV_8UC3, cv::Scalar(20, 20, 20));
-        cv::putText(ui, "Viewer", cv::Point(28, 42), cv::FONT_HERSHEY_DUPLEX, 1.0, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-        cv::putText(ui, "Data root", cv::Point(30, 88), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-
-        const cv::Rect fieldRect(30, 108, 840, 42);
-        if(uiTextField(ui, fieldRect, "", value, active, ms)) {
-            active = true;
-        }
-
-        if(!error.empty()) {
-            cv::putText(ui, error, cv::Point(32, 180), cv::FONT_HERSHEY_DUPLEX, 0.58, cv::Scalar(80, 180, 255), 1, cv::LINE_AA);
-        }
-
-        const cv::Rect openBtn(610, 202, 120, 36);
-        const cv::Rect cancelBtn(750, 202, 120, 36);
-        const bool openClicked = uiButton(ui, openBtn, "Open", ms);
-        const bool cancelClicked = uiButton(ui, cancelBtn, "Cancel", ms);
-
-        cv::imshow(winName, ui);
-        const int key = cv::waitKeyEx(10);
-        if(cancelClicked || key == 27) {
-            return std::string();
-        }
-        if(key == 13 || key == 10 || openClicked) {
-            const std::string trimmed = trimWhitespace(value);
-            const fs::path root = fs::path(trimmed);
-            if(!trimmed.empty() && fs::exists(root) && fs::is_directory(root)) {
-                return trimmed;
-            }
-            error = "Directory not found";
-            continue;
-        }
-        if(active && key > 0) {
-            handleTextInput(value, key);
-        }
-    }
-}
-
 static std::string readFileAllLocal(const fs::path &path) {
     std::ifstream file(path, std::ios::binary);
     if(!file.is_open()) {
@@ -2255,13 +2197,21 @@ public:
     }
 
     int run() {
-        const std::string defaultRoot = cfg_.outputDir.empty() ? std::string() : cfg_.outputDir.string();
-        const std::string selectedRoot = promptDataRootInViewerWindow(defaultRoot, cancel_);
-        if(selectedRoot.empty()) {
-            return 0;
+        std::string last = "";
+        for(int i = 0; i < 8; i++) {
+            const std::string s = promptTextDialogBestEffort("Viewer", "Input data root", last);
+            if(s.empty()) {
+                return 0;
+            }
+            last = s;
+            const fs::path root = fs::path(trimString(s));
+            if(root.empty() || !fs::exists(root) || !fs::is_directory(root)) {
+                continue;
+            }
+            dataRoot_ = root;
+            subjects_ = scanSubjects(dataRoot_);
+            break;
         }
-        dataRoot_ = fs::path(trimWhitespace(selectedRoot));
-        subjects_ = scanSubjects(dataRoot_);
         if(dataRoot_.empty() || !fs::exists(dataRoot_) || !fs::is_directory(dataRoot_)) {
             return 1;
         }
