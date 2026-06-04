@@ -371,6 +371,9 @@ AppConfig loadConfig(const fs::path &configPath) {
             if(auto v = getBool(saveObj, "rgbH265")) {
                 cfg.save.rgbH265 = *v;
             }
+            if(auto v = getBool(saveObj, "saveRaw")) {
+                cfg.save.saveRaw = *v;
+            }
             if(auto v = getString(saveObj, "rgbEncoding")) {
                 const std::string mode = normalizePresetKey(*v);
                 cfg.save.rgbH265 = (mode == "h265" || mode == "hevc");

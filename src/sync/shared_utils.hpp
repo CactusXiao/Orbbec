@@ -70,6 +70,7 @@ struct SaveOptions {
     int         jpegQuality    = 90;
     int         pngCompression = 1;
     bool        rgbH265        = false;
+    bool        saveRaw        = false;
     std::string depthEncoding  = "png";
     std::string h265Ext        = "mp4";
     std::string h265EncoderMode = "software";

@@ -975,6 +975,25 @@ static void saveRawMatToPng(const cv::Mat &m, const fs::path &path, int pngCompr
     cv::imwrite(path.string(), m, { cv::IMWRITE_PNG_COMPRESSION, pngCompression });
 }
 
+static void saveMatToRawFile(const cv::Mat &m, const fs::path &path) {
+    if(m.empty()) {
+        return;
+    }
+    std::ofstream ofs(path, std::ios::binary);
+    if(!ofs.is_open()) {
+        return;
+    }
+    if(m.isContinuous()) {
+        const size_t bytes = static_cast<size_t>(m.total()) * m.elemSize();
+        ofs.write(reinterpret_cast<const char *>(m.data), static_cast<std::streamsize>(bytes));
+        return;
+    }
+    const size_t rowBytes = static_cast<size_t>(m.cols) * m.elemSize();
+    for(int r = 0; r < m.rows; ++r) {
+        ofs.write(reinterpret_cast<const char *>(m.ptr(r)), static_cast<std::streamsize>(rowBytes));
+    }
+}
+
 static bool endsWith(const std::string &s, const std::string &suffix) {
     if(s.size() < suffix.size()) {
         return false;
@@ -1071,6 +1090,10 @@ static std::string rgbStorageEncodingName(const SaveOptions &options) {
 
 static std::string depthFfv1OutputFileName() {
     return "depth.mkv";
+}
+
+static const char *depthRawDirName() {
+    return "depth_raw";
 }
 
 static bool h265OutputIsRawStream(const fs::path &path) {
@@ -3003,6 +3026,9 @@ public:
                 const auto &camKey = local.buffers.at(sn).camKey;
                 for(const auto t: local.typesPerCamSave) {
                     fs::create_directories(local.dest / camKey / dataTypeLabel(t));
+                }
+                if(cfg_.save.saveRaw && local.saveDepthTimesteps) {
+                    fs::create_directories(local.dest / camKey / depthRawDirName());
                 }
                 if(imuEnabled_) {
                     fs::create_directories(local.dest / camKey / "IMU");
@@ -4949,6 +4975,13 @@ private:
                     }
                 }
                 else if(t == CollectDataType::Depth) {
+                    if(cfg_.save.saveRaw) {
+                        const fs::path rawOutPath = session_.dest / buf.camKey / depthRawDirName() / (frameIndex + ".raw");
+                        cv::Mat rawFrame = packet.frame;
+                        enqueueWriteTask(WriteTask{ [rawFrame = std::move(rawFrame), rawOutPath]() mutable {
+                            saveMatToRawFile(rawFrame, rawOutPath);
+                        } });
+                    }
                     if(depthOutputIsFfv1Mkv(cfg_.save)) {
                         cv::Mat frame = packet.frame;
                         if(enqueueDepthFfv1Frame(sn, frameIndex, packet.tsUs, std::move(frame))) {

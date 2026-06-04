@@ -42,6 +42,7 @@
     "save": {
         "rgbEncoding": "image",
         "depthEncoding": "png",
+        "saveRaw": false,
         "colorExt": "jpg",
         "jpegQuality": 90,
         "pngCompression": 1,
