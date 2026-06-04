@@ -171,6 +171,68 @@ static std::string trimWhitespace(std::string s) {
     return s.substr(b, e - b);
 }
 
+static std::string toLowerAscii(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static std::string normalizeStorageEncoding(std::string s) {
+    s = trimWhitespace(std::move(s));
+    std::string out;
+    out.reserve(s.size());
+    for(unsigned char c: s) {
+        if(std::isspace(c) || c == '_' || c == '-' || c == '/') {
+            continue;
+        }
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+static bool encodingIsRgbH265(const std::string &encoding) {
+    const std::string s = normalizeStorageEncoding(encoding);
+    return s == "h265" || s == "hevc";
+}
+
+static bool encodingIsDepthFfv1Mkv(const std::string &encoding) {
+    const std::string s = normalizeStorageEncoding(encoding);
+    return s == "ffv1mkv" || s == "ffv1" || s == "mkv";
+}
+
+static std::string h265ExtNormalized(std::string ext) {
+    if(ext.empty()) {
+        ext = "mp4";
+    }
+    if(ext[0] != '.') {
+        ext = "." + ext;
+    }
+    return ext;
+}
+
+static std::string h265OutputFileName(const SaveOptions &options) {
+    return "rgb" + h265ExtNormalized(options.h265Ext);
+}
+
+static std::string depthFfv1OutputFileName() {
+    return "depth.mkv";
+}
+
+static std::string shellQuote(const std::string &s) {
+    std::string out = "'";
+    for(char c: s) {
+        if(c == '\'') {
+            out += "'\\''";
+        }
+        else {
+            out.push_back(c);
+        }
+    }
+    out += "'";
+    return out;
+}
+
 static std::string pickDirectoryDialogBestEffort() {
 #if defined(__APPLE__)
     {
@@ -634,6 +696,10 @@ struct CameraStreamParams {
     int height = 0;
     int fps = 0;
     int format = 0;
+    std::string storageEncoding;
+    std::string storageFile;
+    std::string timestampFile;
+    std::string filePattern;
     OBCameraIntrinsic intrinsic{};
     OBCameraDistortion distortion{};
 };
@@ -758,11 +824,22 @@ static bool parseStreamParams(cJSON *obj, CameraStreamParams &out) {
         v = it->valueint;
         return true;
     };
+    auto getString = [&](const char *k, std::string &v) {
+        auto *it = cJSON_GetObjectItemCaseSensitive(obj, k);
+        if(!it || !cJSON_IsString(it) || !it->valuestring) {
+            return;
+        }
+        v = it->valuestring;
+    };
     cJSON *intr = cJSON_GetObjectItemCaseSensitive(obj, "intrinsic");
     cJSON *dist = cJSON_GetObjectItemCaseSensitive(obj, "distortion");
     if(!getInt("width", out.width, false) || !getInt("height", out.height, false) || !getInt("fps", out.fps, false) || !getInt("format", out.format, false)) {
         return false;
     }
+    getString("storageEncoding", out.storageEncoding);
+    getString("storageFile", out.storageFile);
+    getString("timestampFile", out.timestampFile);
+    getString("filePattern", out.filePattern);
     parseIntrinsic(intr, out.intrinsic);
     parseDistortion(dist, out.distortion);
     if(out.width > 0 && out.height > 0) {
@@ -982,6 +1059,105 @@ static int countCsvDataRows(const fs::path &path) {
         rows++;
     }
     return rows;
+}
+
+struct VideoStreamInfo {
+    int width = 0;
+    int height = 0;
+    int frames = 0;
+};
+
+static int countVideoTimestampRows(const fs::path &videoPath) {
+    return countCsvDataRows(fs::path(videoPath.string() + ".timestamps.csv"));
+}
+
+static int countVideoTimestampRows(const fs::path &videoPath, const fs::path &timestampPath) {
+    if(!timestampPath.empty()) {
+        const int rows = countCsvDataRows(timestampPath);
+        if(rows > 0) {
+            return rows;
+        }
+    }
+    return countVideoTimestampRows(videoPath);
+}
+
+static VideoStreamInfo probeVideoStreamInfo(const fs::path &path) {
+    VideoStreamInfo info;
+    if(path.empty() || !fs::exists(path) || !fs::is_regular_file(path)) {
+        return info;
+    }
+
+    {
+        std::ostringstream cmd;
+        cmd << "ffprobe -v error -select_streams v:0"
+            << " -show_entries stream=width,height"
+            << " -of csv=p=0:s=x "
+            << shellQuote(path.string());
+        const std::string out = trimWhitespace(popenReadAll(cmd.str().c_str()));
+        const size_t x = out.find('x');
+        if(x != std::string::npos) {
+            try {
+                info.width = std::stoi(out.substr(0, x));
+                info.height = std::stoi(out.substr(x + 1));
+            }
+            catch(...) {
+                info.width = 0;
+                info.height = 0;
+            }
+        }
+    }
+
+    info.frames = countVideoTimestampRows(path);
+    if(info.frames <= 0) {
+        std::ostringstream cmd;
+        cmd << "ffprobe -v error -count_frames -select_streams v:0"
+            << " -show_entries stream=nb_read_frames"
+            << " -of default=nk=1:nw=1 "
+            << shellQuote(path.string());
+        const std::string out = trimWhitespace(popenReadAll(cmd.str().c_str()));
+        if(!out.empty() && out != "N/A") {
+            try {
+                info.frames = std::stoi(out);
+            }
+            catch(...) {
+                info.frames = 0;
+            }
+        }
+    }
+    return info;
+}
+
+static cv::Mat decodeVideoFrameRaw(const fs::path &path, int frameIdx, int width, int height, const std::string &pixFmt, int cvType) {
+    if(path.empty() || frameIdx < 0 || !fs::exists(path) || !fs::is_regular_file(path)) {
+        return cv::Mat();
+    }
+    if(width <= 0 || height <= 0) {
+        const auto info = probeVideoStreamInfo(path);
+        width = info.width;
+        height = info.height;
+    }
+    if(width <= 0 || height <= 0) {
+        return cv::Mat();
+    }
+
+    std::ostringstream select;
+    select << "select=eq(n\\," << frameIdx << ")";
+    std::ostringstream cmd;
+    cmd << "ffmpeg -hide_banner -v error"
+        << " -i " << shellQuote(path.string())
+        << " -vf " << shellQuote(select.str())
+        << " -frames:v 1"
+        << " -pix_fmt " << shellQuote(pixFmt)
+        << " -f rawvideo -";
+    const std::string raw = popenReadAll(cmd.str().c_str());
+
+    const cv::Mat probe(height, width, cvType);
+    const size_t expectedBytes = probe.total() * probe.elemSize();
+    if(raw.size() < expectedBytes) {
+        return cv::Mat();
+    }
+    cv::Mat m(height, width, cvType, const_cast<char *>(raw.data()));
+    return m.clone();
 }
 
 static fs::path findFrameFile(const fs::path &dir, int frameIdx, const std::vector<std::string> &extensions) {
@@ -1207,6 +1383,10 @@ struct ViewerSource {
     fs::path         rgbDir;
     fs::path         depthDir;
     fs::path         irDir;
+    std::string      rgbEncoding;
+    std::string      depthEncoding;
+    fs::path         rgbVideoPath;
+    fs::path         depthVideoPath;
     bool             hasRgb = false;
     bool             hasDepth = false;
     bool             hasIr = false;
@@ -2436,8 +2616,93 @@ private:
         preloadSpan_ = 0;
     }
 
+    const CameraStreamParams *rgbParamsForCam(const std::string &cam) const {
+        return findByCamKeyVariants(taskCamParams_.rgb, cam);
+    }
+
+    const CameraStreamParams *depthParamsForCam(const std::string &cam) const {
+        return findByCamKeyVariants(taskCamParams_.depth, cam);
+    }
+
+    std::string rgbEncodingForCam(const std::string &cam) const {
+        if(const auto *p = rgbParamsForCam(cam); p && !trimWhitespace(p->storageEncoding).empty()) {
+            return p->storageEncoding;
+        }
+        return cfg_.save.rgbH265 ? "h265" : "image";
+    }
+
+    std::string depthEncodingForCam(const std::string &cam) const {
+        if(const auto *p = depthParamsForCam(cam); p && !trimWhitespace(p->storageEncoding).empty()) {
+            return p->storageEncoding;
+        }
+        return encodingIsDepthFfv1Mkv(cfg_.save.depthEncoding) ? "ffv1_mkv" : "png";
+    }
+
+    static fs::path resolveStoragePath(const fs::path &dir, const std::string &configuredFile, const std::string &defaultFile) {
+        fs::path p = trimWhitespace(configuredFile).empty() ? fs::path(defaultFile) : fs::path(configuredFile);
+        if(p.is_relative()) {
+            p = dir / p;
+        }
+        return p;
+    }
+
+    fs::path rgbVideoPathForCam(const std::string &cam, const fs::path &rgbDir) const {
+        const auto *p = rgbParamsForCam(cam);
+        return resolveStoragePath(rgbDir, p ? p->storageFile : std::string(), h265OutputFileName(cfg_.save));
+    }
+
+    fs::path rgbVideoTimestampPathForCam(const std::string &cam, const fs::path &rgbDir) const {
+        const auto *p = rgbParamsForCam(cam);
+        return resolveStoragePath(rgbDir, p ? p->timestampFile : std::string(), h265OutputFileName(cfg_.save) + ".timestamps.csv");
+    }
+
+    fs::path depthVideoPathForCam(const std::string &cam, const fs::path &depthDir) const {
+        const auto *p = depthParamsForCam(cam);
+        return resolveStoragePath(depthDir, p ? p->storageFile : std::string(), depthFfv1OutputFileName());
+    }
+
+    fs::path depthVideoTimestampPathForCam(const std::string &cam, const fs::path &depthDir) const {
+        const auto *p = depthParamsForCam(cam);
+        return resolveStoragePath(depthDir, p ? p->timestampFile : std::string(), depthFfv1OutputFileName() + ".timestamps.csv");
+    }
+
+    int rgbFrameCountForCam(const std::string &cam, const fs::path &rgbDir) const {
+        if(encodingIsRgbH265(rgbEncodingForCam(cam))) {
+            const fs::path videoPath = rgbVideoPathForCam(cam, rgbDir);
+            const int sidecarFrames = countVideoTimestampRows(videoPath, rgbVideoTimestampPathForCam(cam, rgbDir));
+            if(sidecarFrames > 0) {
+                return sidecarFrames;
+            }
+            const int videoFrames = probeVideoStreamInfo(videoPath).frames;
+            return videoFrames > 0 ? videoFrames : computeTotalFramesFromDir(rgbDir);
+        }
+        return computeTotalFramesFromDir(rgbDir);
+    }
+
+    int depthFrameCountForCam(const std::string &cam, const fs::path &depthDir) const {
+        if(encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
+            const fs::path videoPath = depthVideoPathForCam(cam, depthDir);
+            const int sidecarFrames = countVideoTimestampRows(videoPath, depthVideoTimestampPathForCam(cam, depthDir));
+            if(sidecarFrames > 0) {
+                return sidecarFrames;
+            }
+            const int videoFrames = probeVideoStreamInfo(videoPath).frames;
+            return videoFrames > 0 ? videoFrames : computeTotalFramesFromDir(depthDir);
+        }
+        return computeTotalFramesFromDir(depthDir);
+    }
+
     cv::Mat loadRgbFrameNoCache(const std::string &cam, int frameIdx) const {
         const fs::path dir = selectedDataDir() / cam / "RGB";
+        if(encodingIsRgbH265(rgbEncodingForCam(cam))) {
+            const auto *p = rgbParamsForCam(cam);
+            const int width = p ? p->width : 0;
+            const int height = p ? p->height : 0;
+            cv::Mat decoded = decodeVideoFrameRaw(rgbVideoPathForCam(cam, dir), frameIdx, width, height, "bgr24", CV_8UC3);
+            if(!decoded.empty()) {
+                return decoded;
+            }
+        }
         const fs::path p = findFrameFile(dir, frameIdx, { ".jpg", ".jpeg", ".png" });
         if(p.empty()) {
             return cv::Mat();
@@ -2451,6 +2716,15 @@ private:
 
     cv::Mat loadDepthFrameNoCache(const std::string &cam, int frameIdx) const {
         const fs::path dir = selectedDataDir() / cam / "Depth";
+        if(encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
+            const auto *p = depthParamsForCam(cam);
+            const int width = p ? p->width : 0;
+            const int height = p ? p->height : 0;
+            cv::Mat decoded = decodeVideoFrameRaw(depthVideoPathForCam(cam, dir), frameIdx, width, height, "gray16le", CV_16UC1);
+            if(!decoded.empty()) {
+                return decoded;
+            }
+        }
         const fs::path p = findFrameFile(dir, frameIdx, { ".png" });
         if(p.empty()) {
             return cv::Mat();
@@ -3447,6 +3721,10 @@ private:
             statusLine_ = "Task or episode directory missing";
             return;
         }
+        taskCamParams_ = loadCameraParams(dataDir / "camera_params.json");
+        if(!taskCamParams_.hasColorCloudRgbFrameOffset) {
+            taskCamParams_.colorCloudRgbFrameOffset = cfg_.colorCloudRgbFrameOffset;
+        }
         for(const auto &e: fs::directory_iterator(dataDir)) {
             if(e.is_directory()) {
                 const std::string name = e.path().filename().string();
@@ -3466,8 +3744,12 @@ private:
                     if(!fs::exists(source.irDir)) {
                         source.irDir = e.path() / "IR_right";
                     }
-                    source.hasRgb = computeTotalFramesFromDir(source.rgbDir) > 0;
-                    source.hasDepth = computeTotalFramesFromDir(source.depthDir) > 0;
+                    source.rgbEncoding = rgbEncodingForCam(name);
+                    source.depthEncoding = depthEncodingForCam(name);
+                    source.rgbVideoPath = rgbVideoPathForCam(name, source.rgbDir);
+                    source.depthVideoPath = depthVideoPathForCam(name, source.depthDir);
+                    source.hasRgb = rgbFrameCountForCam(name, source.rgbDir) > 0;
+                    source.hasDepth = depthFrameCountForCam(name, source.depthDir) > 0;
                     source.hasIr = computeTotalFramesFromDir(source.irDir) > 0;
                     sources_.push_back(std::move(source));
                 }
@@ -3493,6 +3775,7 @@ private:
                 source.kind = ViewerSourceKind::Fisheye;
                 source.camKey = cameraDir.filename().string();
                 source.rgbDir = cameraDir / "RGB";
+                source.rgbEncoding = "image";
                 source.hasRgb = computeTotalFramesFromDir(source.rgbDir) > 0;
                 if(source.hasRgb) {
                     sources_.push_back(std::move(source));
@@ -3511,10 +3794,6 @@ private:
             return;
         }
 
-        taskCamParams_ = loadCameraParams(dataDir / "camera_params.json");
-        if(!taskCamParams_.hasColorCloudRgbFrameOffset) {
-            taskCamParams_.colorCloudRgbFrameOffset = cfg_.colorCloudRgbFrameOffset;
-        }
         extrinsics_ = loadExtrinsicsCamToWorld(dataDir / "extrinsics.json");
         refreshHeadCamPoseAvailability(dataDir);
 
@@ -3561,8 +3840,8 @@ private:
         int totalIr = 0;
         for(const auto &cam: cameras_) {
             const fs::path camDir = dataDir / cam;
-            const int nRgb = computeTotalFramesFromDir(camDir / "RGB");
-            const int nDepth = computeTotalFramesFromDir(camDir / "Depth");
+            const int nRgb = rgbFrameCountForCam(cam, camDir / "RGB");
+            const int nDepth = depthFrameCountForCam(cam, camDir / "Depth");
             int nIr = computeTotalFramesFromDir(camDir / "IR");
             if(nIr == 0) {
                 nIr = computeTotalFramesFromDir(camDir / "IR_left");
@@ -3674,14 +3953,9 @@ private:
         };
 
         auto preRgb = [&](const std::string &cam, int f) {
-            const fs::path dir = selectedDataDir() / cam / "RGB";
             const std::string key = makeCacheKey(0, cam, f);
             rgbCache_.prefetch(key, [&]() {
-                const fs::path p = findFrameFile(dir, f, { ".jpg", ".jpeg", ".png" });
-                if(p.empty()) {
-                    return cv::Mat();
-                }
-                return cv::imread(p.string(), cv::IMREAD_COLOR);
+                return loadRgbFrameNoCache(cam, f);
             });
         };
         auto preRgbSource = [&](const ViewerSource &source, int f) {
@@ -3699,25 +3973,9 @@ private:
             });
         };
         auto preDepth = [&](const std::string &cam, int f) {
-            const fs::path dir = selectedDataDir() / cam / "Depth";
             const std::string key = makeCacheKey(1, cam, f);
             depthCache_.prefetch(key, [&]() {
-                const fs::path p = findFrameFile(dir, f, { ".png" });
-                if(p.empty()) {
-                    return cv::Mat();
-                }
-                cv::Mat m = cv::imread(p.string(), cv::IMREAD_UNCHANGED);
-                if(!m.empty() && m.type() != CV_16UC1) {
-                    if(m.type() == CV_8UC1) {
-                        cv::Mat tmp;
-                        m.convertTo(tmp, CV_16UC1);
-                        m = tmp;
-                    }
-                    else {
-                        m.release();
-                    }
-                }
-                return m;
+                return loadDepthFrameNoCache(cam, f);
             });
         };
         auto preIr = [&](const std::string &cam, int f) {
@@ -3827,14 +4085,9 @@ private:
     }
 
     cv::Mat loadRgbFrame(const std::string &cam, int frameIdx) {
-        const fs::path dir = selectedDataDir() / cam / "RGB";
         const std::string key = makeCacheKey(0, cam, frameIdx);
         cv::Mat img = rgbCache_.getOrLoad(key, [&]() {
-            const fs::path p = findFrameFile(dir, frameIdx, { ".jpg", ".jpeg", ".png" });
-            if(p.empty()) {
-                return cv::Mat();
-            }
-            return cv::imread(p.string(), cv::IMREAD_COLOR);
+            return loadRgbFrameNoCache(cam, frameIdx);
         });
         return img.clone();
     }
@@ -3855,25 +4108,9 @@ private:
     }
 
     cv::Mat loadDepthFrame(const std::string &cam, int frameIdx) {
-        const fs::path dir = selectedDataDir() / cam / "Depth";
         const std::string key = makeCacheKey(1, cam, frameIdx);
         cv::Mat img = depthCache_.getOrLoad(key, [&]() {
-            const fs::path p = findFrameFile(dir, frameIdx, { ".png" });
-            if(p.empty()) {
-                return cv::Mat();
-            }
-            cv::Mat m = cv::imread(p.string(), cv::IMREAD_UNCHANGED);
-            if(!m.empty() && m.type() != CV_16UC1) {
-                if(m.type() == CV_8UC1) {
-                    cv::Mat tmp;
-                    m.convertTo(tmp, CV_16UC1);
-                    m = tmp;
-                }
-                else {
-                    m.release();
-                }
-            }
-            return m;
+            return loadDepthFrameNoCache(cam, frameIdx);
         });
         return img.clone();
     }

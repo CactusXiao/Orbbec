@@ -158,6 +158,14 @@ static std::optional<FisheyeImageFormat> fisheyeImageFormatFromString(const std:
     return std::nullopt;
 }
 
+static std::string normalizeDepthEncodingConfig(std::string s) {
+    s = normalizePresetKey(std::move(s));
+    if(s == "ffv1mkv" || s == "ffv1" || s == "mkv") {
+        return "ffv1_mkv";
+    }
+    return "png";
+}
+
 static std::string readFileAll(const fs::path &path) {
     std::ifstream file(path, std::ios::binary);
     if(!file.is_open()) {
@@ -364,8 +372,17 @@ AppConfig loadConfig(const fs::path &configPath) {
                 cfg.save.rgbH265 = *v;
             }
             if(auto v = getString(saveObj, "rgbEncoding")) {
-                const std::string mode = trimString(*v);
-                cfg.save.rgbH265 = (mode == "h265" || mode == "H265" || mode == "hevc" || mode == "HEVC");
+                const std::string mode = normalizePresetKey(*v);
+                cfg.save.rgbH265 = (mode == "h265" || mode == "hevc");
+            }
+            if(auto v = getString(saveObj, "depthEncoding")) {
+                cfg.save.depthEncoding = normalizeDepthEncodingConfig(*v);
+            }
+            if(auto v = getString(saveObj, "depthFormat")) {
+                cfg.save.depthEncoding = normalizeDepthEncodingConfig(*v);
+            }
+            if(auto v = getBool(saveObj, "depthFfv1Mkv")) {
+                cfg.save.depthEncoding = *v ? "ffv1_mkv" : "png";
             }
             if(auto v = getString(saveObj, "h265Ext")) {
                 cfg.save.h265Ext = *v;

@@ -1056,6 +1056,23 @@ static std::string h265OutputFileName(const SaveOptions &options) {
     return "rgb" + h265ExtNormalized(options.h265Ext);
 }
 
+static bool depthOutputIsFfv1Mkv(const SaveOptions &options) {
+    const std::string mode = normalizePresetKey(options.depthEncoding);
+    return mode == "ffv1mkv" || mode == "ffv1" || mode == "mkv";
+}
+
+static std::string depthStorageEncodingName(const SaveOptions &options) {
+    return depthOutputIsFfv1Mkv(options) ? "ffv1_mkv" : "png";
+}
+
+static std::string rgbStorageEncodingName(const SaveOptions &options) {
+    return options.rgbH265 ? "h265" : "image";
+}
+
+static std::string depthFfv1OutputFileName() {
+    return "depth.mkv";
+}
+
 static bool h265OutputIsRawStream(const fs::path &path) {
     const std::string p = toLowerAscii(path.string());
     return endsWith(p, ".h265") || endsWith(p, ".hevc");
@@ -2311,7 +2328,7 @@ public:
             return true;
         }
         return session_.coordinatorDone && queuedWriteCount_.load() == 0 && writeInFlight_.load() == 0
-               && !h265EncodingActive_.load();
+               && !h265EncodingActive_.load() && !depthFfv1EncodingActive_.load();
     }
 
     std::string currentSessionLabel() const {
@@ -3004,7 +3021,7 @@ public:
             }
 
             if(multiviewEnabled_) {
-                writeParamsJson(local.dest, local.buffers, typesSaving_, cfg_.colorCloudRgbFrameOffset);
+                writeParamsJson(local.dest, local.buffers, typesSaving_, cfg_.colorCloudRgbFrameOffset, cfg_.save);
             }
             writeExtrinsicsJson(local.dest);
         }
@@ -3088,6 +3105,7 @@ public:
         }
         passthroughRgbMjpg_.store(session_.passthroughRgbMjpg);
         startH265Encoders(session_);
+        startDepthFfv1Encoders(session_);
 
         recordInputClosing_.store(false);
         multiviewEosNotified_.store(!multiviewEnabled_);
@@ -3324,6 +3342,12 @@ private:
     };
 
     struct H265FrameItem {
+        cv::Mat frame;
+        std::string frameIndex;
+        uint64_t tsUs = 0;
+    };
+
+    struct DepthFfv1FrameItem {
         cv::Mat frame;
         std::string frameIndex;
         uint64_t tsUs = 0;
@@ -3573,6 +3597,178 @@ private:
         mutable std::mutex mtx_;
         std::condition_variable cv_;
         std::deque<H265FrameItem> queue_;
+        std::thread worker_;
+        bool stop_ = false;
+        std::atomic<size_t> queued_{ 0 };
+        std::atomic<int> inFlight_{ 0 };
+        size_t encodedFrameCount_ = 0;
+    };
+
+    class DepthFfv1Encoder {
+    public:
+        DepthFfv1Encoder(fs::path outputPath, int width, int height, int fps, size_t queueMax)
+            : outputPath_(std::move(outputPath)),
+              width_(width),
+              height_(height),
+              fps_(std::max(1, fps)),
+              queueMax_(std::max<size_t>(64, queueMax)) {}
+
+        ~DepthFfv1Encoder() {
+            stop();
+        }
+
+        DepthFfv1Encoder(const DepthFfv1Encoder &) = delete;
+        DepthFfv1Encoder &operator=(const DepthFfv1Encoder &) = delete;
+
+        void start() {
+            worker_ = std::thread([this]() { loop(); });
+        }
+
+        bool enqueue(std::string frameIndex, uint64_t tsUs, cv::Mat frame) {
+            if(frame.empty() || frame.cols != width_ || frame.rows != height_ || frame.type() != CV_16UC1) {
+                return false;
+            }
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [&]() {
+                    return stop_ || queue_.size() < queueMax_;
+                });
+                if(stop_) {
+                    return false;
+                }
+                queue_.push_back(DepthFfv1FrameItem{ std::move(frame), std::move(frameIndex), tsUs });
+                queued_.fetch_add(1);
+            }
+            cv_.notify_one();
+            return true;
+        }
+
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                stop_ = true;
+                cv_.notify_all();
+            }
+            if(worker_.joinable()) {
+                worker_.join();
+            }
+        }
+
+    private:
+        std::string buildCommand() const {
+            std::ostringstream cmd;
+            cmd << "ffmpeg -hide_banner -loglevel info -stats -y"
+                << " -f rawvideo -pix_fmt gray16le"
+                << " -s " << width_ << "x" << height_
+                << " -r " << fps_
+                << " -i - -an"
+                << " -c:v ffv1 -level 3 -g 1 -slices 16 -slicecrc 1"
+                << " -pix_fmt gray16le"
+                << " " << shellQuote(outputPath_.string());
+            return cmd.str();
+        }
+
+        void loop() {
+            try {
+                fs::create_directories(outputPath_.parent_path());
+            }
+            catch(...) {
+                return;
+            }
+
+            const fs::path timestampPath = outputPath_.string() + ".timestamps.csv";
+            std::ofstream timestampOfs(timestampPath, std::ios::out | std::ios::trunc);
+            if(timestampOfs.is_open()) {
+                timestampOfs << "video_frame_index,frame_index,depth_timestamp_us\n";
+            }
+            else {
+                std::cerr << "[collection][depth_ffv1] warning: failed to open timestamp sidecar: " << timestampPath << std::endl;
+            }
+
+            const std::string command = buildCommand();
+            std::cerr << "[collection][depth_ffv1] start encoder"
+                      << " output=" << outputPath_
+                      << " size=" << width_ << "x" << height_
+                      << " fps=" << fps_
+                      << " codec=ffv1 pix_fmt=gray16le" << std::endl;
+            std::cerr << "[collection][depth_ffv1] ffmpeg command: " << command << std::endl;
+            FILE *pipe = popen(command.c_str(), "w");
+            if(!pipe) {
+                std::cerr << "[collection][depth_ffv1] failed to start ffmpeg process: " << outputPath_ << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    stop_ = true;
+                    queue_.clear();
+                    queued_.store(0);
+                }
+                cv_.notify_all();
+                return;
+            }
+
+            while(true) {
+                DepthFfv1FrameItem item;
+                {
+                    std::unique_lock<std::mutex> lock(mtx_);
+                    cv_.wait(lock, [&]() {
+                        return stop_ || !queue_.empty();
+                    });
+                    if(queue_.empty() && stop_) {
+                        break;
+                    }
+                    if(queue_.empty()) {
+                        continue;
+                    }
+                    item = std::move(queue_.front());
+                    queue_.pop_front();
+                    queued_.fetch_sub(1);
+                    inFlight_.fetch_add(1);
+                    cv_.notify_all();
+                }
+
+                const cv::Mat &frame = item.frame;
+                if(frame.isContinuous()) {
+                    const size_t bytes = static_cast<size_t>(frame.total()) * frame.elemSize();
+                    (void)fwrite(frame.data, 1, bytes, pipe);
+                }
+                else {
+                    const size_t rowBytes = static_cast<size_t>(frame.cols) * frame.elemSize();
+                    for(int r = 0; r < frame.rows; ++r) {
+                        (void)fwrite(frame.ptr(r), 1, rowBytes, pipe);
+                    }
+                }
+                if(timestampOfs.is_open()) {
+                    timestampOfs << encodedFrameCount_ << "," << item.frameIndex << "," << item.tsUs << "\n";
+                }
+                encodedFrameCount_++;
+                inFlight_.fetch_sub(1);
+            }
+
+            if(timestampOfs.is_open()) {
+                timestampOfs.flush();
+                timestampOfs.close();
+                std::cerr << "[collection][depth_ffv1] timestamp sidecar written path=" << timestampPath
+                          << " frames=" << encodedFrameCount_ << std::endl;
+            }
+
+            const int status = pclose(pipe);
+            if(status != 0) {
+                std::cerr << "[collection][depth_ffv1] ffmpeg encoder failed"
+                          << " output=" << outputPath_
+                          << " status=" << status << std::endl;
+            }
+            else {
+                std::cerr << "[collection][depth_ffv1] encoder finished output=" << outputPath_ << std::endl;
+            }
+        }
+
+        fs::path outputPath_;
+        int width_ = 0;
+        int height_ = 0;
+        int fps_ = 30;
+        size_t queueMax_ = 1024;
+        mutable std::mutex mtx_;
+        std::condition_variable cv_;
+        std::deque<DepthFfv1FrameItem> queue_;
         std::thread worker_;
         bool stop_ = false;
         std::atomic<size_t> queued_{ 0 };
@@ -4267,6 +4463,67 @@ private:
         }
     }
 
+    void startDepthFfv1Encoders(const SessionState &session) {
+        stopDepthFfv1Encoders();
+        if(!depthOutputIsFfv1Mkv(cfg_.save) || !session.saveDepthTimesteps) {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+        const size_t queueMax = std::max<size_t>(256, writeQueueMax_ / 2);
+        for(const auto &sn: session.deviceSns) {
+            const auto itBuf = session.buffers.find(sn);
+            if(itBuf == session.buffers.end()) {
+                continue;
+            }
+            const auto itParams = itBuf->second.params.find(CollectDataType::Depth);
+            if(itParams == itBuf->second.params.end() || !itParams->second.valid
+               || itParams->second.width <= 0 || itParams->second.height <= 0) {
+                continue;
+            }
+            const std::string &camKey = itBuf->second.camKey;
+            const fs::path outPath = session.dest / camKey / dataTypeLabel(CollectDataType::Depth) / depthFfv1OutputFileName();
+            auto encoder = std::make_unique<DepthFfv1Encoder>(
+                outPath,
+                itParams->second.width,
+                itParams->second.height,
+                itParams->second.fps > 0 ? itParams->second.fps : (cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_)),
+                queueMax);
+            encoder->start();
+            depthFfv1Encoders_[sn] = std::move(encoder);
+        }
+        depthFfv1EncodingActive_.store(!depthFfv1Encoders_.empty());
+    }
+
+    void stopDepthFfv1Encoders() {
+        std::unordered_map<std::string, std::unique_ptr<DepthFfv1Encoder>> encoders;
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            encoders.swap(depthFfv1Encoders_);
+        }
+        for(auto &kv: encoders) {
+            if(kv.second) {
+                kv.second->stop();
+            }
+        }
+        depthFfv1EncodingActive_.store(false);
+    }
+
+    bool enqueueDepthFfv1Frame(const std::string &sn, const std::string &frameIndex, uint64_t tsUs, cv::Mat frame) {
+        DepthFfv1Encoder *encoder = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            auto it = depthFfv1Encoders_.find(sn);
+            if(it != depthFfv1Encoders_.end()) {
+                encoder = it->second.get();
+            }
+        }
+        if(encoder) {
+            return encoder->enqueue(frameIndex, tsUs, std::move(frame));
+        }
+        return false;
+    }
+
     void startCoordinatorThread() {
         if(coordinatorThread_.joinable()) {
             coordinatorThread_.join();
@@ -4274,6 +4531,7 @@ private:
         coordinatorThread_ = std::thread([this]() {
             coordinatorLoop();
             stopH265Encoders();
+            stopDepthFfv1Encoders();
         });
     }
 
@@ -4691,6 +4949,14 @@ private:
                     }
                 }
                 else if(t == CollectDataType::Depth) {
+                    if(depthOutputIsFfv1Mkv(cfg_.save)) {
+                        cv::Mat frame = packet.frame;
+                        if(enqueueDepthFfv1Frame(sn, frameIndex, packet.tsUs, std::move(frame))) {
+                            continue;
+                        }
+                        std::cerr << "[collection][depth_ffv1] warning: encoder unavailable, fallback PNG frame="
+                                  << frameIndex << " cam=" << buf.camKey << std::endl;
+                    }
                     const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png");
                     cv::Mat frame = packet.frame;
                     const SaveOptions saveOptions = cfg_.save;
@@ -5271,7 +5537,8 @@ private:
     static void writeParamsJson(const fs::path &dest,
                                 const std::unordered_map<std::string, DeviceBuffer> &buffers,
                                 const std::vector<CollectDataType> &typesSaving,
-                                int colorCloudRgbFrameOffset) {
+                                int colorCloudRgbFrameOffset,
+                                const SaveOptions &saveOptions) {
         cJSON *root = cJSON_CreateObject();
         cJSON *viewerObj = cJSON_CreateObject();
         cJSON_AddNumberToObject(viewerObj, "colorCloudRgbFrameOffset", colorCloudRgbFrameOffset);
@@ -5287,6 +5554,28 @@ private:
                     continue;
                 }
                 cJSON *stObj = cJSON_CreateObject();
+                if(t == CollectDataType::RGB) {
+                    jsonAddString(stObj, "storageEncoding", rgbStorageEncodingName(saveOptions));
+                    if(saveOptions.rgbH265) {
+                        const std::string fileName = h265OutputFileName(saveOptions);
+                        jsonAddString(stObj, "storageFile", fileName);
+                        jsonAddString(stObj, "timestampFile", fileName + ".timestamps.csv");
+                    }
+                    else {
+                        jsonAddString(stObj, "filePattern", "%05d" + colorExtNormalized(saveOptions.colorExt));
+                    }
+                }
+                else if(t == CollectDataType::Depth) {
+                    jsonAddString(stObj, "storageEncoding", depthStorageEncodingName(saveOptions));
+                    if(depthOutputIsFfv1Mkv(saveOptions)) {
+                        const std::string fileName = depthFfv1OutputFileName();
+                        jsonAddString(stObj, "storageFile", fileName);
+                        jsonAddString(stObj, "timestampFile", fileName + ".timestamps.csv");
+                    }
+                    else {
+                        jsonAddString(stObj, "filePattern", "%05d.png");
+                    }
+                }
                 const auto itP = buf.params.find(t);
                 if(itP != buf.params.end() && itP->second.valid) {
                     jsonAddNumber(stObj, "width",  itP->second.width);
@@ -5422,6 +5711,10 @@ private:
     std::mutex h265Mtx_;
     std::unordered_map<std::string, std::unique_ptr<H265Encoder>> h265Encoders_;
     std::atomic_bool h265EncodingActive_{ false };
+
+    std::mutex depthFfv1Mtx_;
+    std::unordered_map<std::string, std::unique_ptr<DepthFfv1Encoder>> depthFfv1Encoders_;
+    std::atomic_bool depthFfv1EncodingActive_{ false };
 
     std::atomic_bool capturing_{ false };
     std::atomic_bool recording_{ false };

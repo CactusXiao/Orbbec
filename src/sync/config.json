@@ -41,6 +41,7 @@
     "writerThreads": 0,
     "save": {
         "rgbEncoding": "image",
+        "depthEncoding": "png",
         "colorExt": "jpg",
         "jpegQuality": 90,
         "pngCompression": 1,
