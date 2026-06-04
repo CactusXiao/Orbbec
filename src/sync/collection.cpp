@@ -689,6 +689,22 @@ static OBFrameType dataTypeFrameType(CollectDataType t) {
     return OB_FRAME_UNKNOWN;
 }
 
+static std::optional<StreamType> dataTypeStreamType(CollectDataType t) {
+    switch(t) {
+    case CollectDataType::RGB:
+        return StreamType::Color;
+    case CollectDataType::Depth:
+        return StreamType::Depth;
+    case CollectDataType::IRLeft:
+    case CollectDataType::IRRight:
+        return StreamType::IR;
+    case CollectDataType::CloudPoints:
+    case CollectDataType::ColorCloudPoints:
+        return StreamType::PointCloud;
+    }
+    return std::nullopt;
+}
+
 static std::string presetLabel(int w, int h, int fps) {
     return std::to_string(w) + "x" + std::to_string(h) + "@" + std::to_string(fps);
 }
@@ -889,11 +905,30 @@ static int preferredProfileFormatScore(OBSensorType sensorType, OBFormat format)
     return 10;
 }
 
+static OBFormat configuredStreamFormat(const DeviceConfig &cfg, CollectDataType type) {
+    const auto streamType = dataTypeStreamType(type);
+    if(!streamType.has_value()) {
+        return OB_FORMAT_UNKNOWN;
+    }
+    for(const auto &stream: cfg.streams) {
+        if(stream.type != *streamType) {
+            continue;
+        }
+        const std::string fmt = trimString(stream.format);
+        if(fmt.empty()) {
+            continue;
+        }
+        return stringToOBFormat(fmt, *streamType);
+    }
+    return OB_FORMAT_UNKNOWN;
+}
+
 static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::shared_ptr<ob::Pipeline> &pipe,
                                                                 OBSensorType sensorType,
                                                                 int width,
                                                                 int height,
-                                                                int fps) {
+                                                                int fps,
+                                                                OBFormat desiredFormat = OB_FORMAT_UNKNOWN) {
     std::shared_ptr<ob::StreamProfileList> list;
     try {
         list = pipe->getStreamProfileList(sensorType);
@@ -904,7 +939,7 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
     if(!list || list->getCount() == 0) {
         return nullptr;
     }
-    auto findBest = [&](int targetW, int targetH, int targetFps) {
+    auto findBest = [&](int targetW, int targetH, int targetFps, OBFormat requiredFormat) {
         std::shared_ptr<ob::VideoStreamProfile> best;
         int bestScore = std::numeric_limits<int>::max();
         for(uint32_t i = 0; i < list->getCount(); i++) {
@@ -920,6 +955,9 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
                 continue;
             }
             if(targetH > 0 && ph != targetH) {
+                continue;
+            }
+            if(requiredFormat != OB_FORMAT_UNKNOWN && vp->getFormat() != requiredFormat) {
                 continue;
             }
 
@@ -938,24 +976,47 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
         return best;
     };
 
-    if(auto best = findBest(width, height, fps)) {
-        return best;
-    }
-
+    std::vector<std::pair<int, int>> targets;
+    targets.emplace_back(width, height);
     if(width > 0 || height > 0) {
-        std::vector<std::pair<int, int>> fallbacks;
         if(sensorType == OB_SENSOR_DEPTH || sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
-            fallbacks = { { 640, 400 }, { 1280, 800 }, { 320, 200 } };
+            targets.insert(targets.end(), { { 640, 400 }, { 1280, 800 }, { 320, 200 } });
         }
         else if(sensorType == OB_SENSOR_COLOR) {
-            fallbacks = { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
+            targets.insert(targets.end(), { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } });
         }
-        for(const auto &fallback: fallbacks) {
-            if(fallback.first == width && fallback.second == height) {
+    }
+
+    if(desiredFormat != OB_FORMAT_UNKNOWN) {
+        for(size_t i = 0; i < targets.size(); ++i) {
+            if(i > 0 && targets[i].first == width && targets[i].second == height) {
                 continue;
             }
-            if(auto best = findBest(fallback.first, fallback.second, fps)) {
+            if(auto best = findBest(targets[i].first, targets[i].second, fps, desiredFormat)) {
                 return best;
+            }
+        }
+    }
+
+    for(size_t i = 0; i < targets.size(); ++i) {
+        if(i > 0 && targets[i].first == width && targets[i].second == height) {
+            continue;
+        }
+        if(auto best = findBest(targets[i].first, targets[i].second, fps, OB_FORMAT_UNKNOWN)) {
+            if(desiredFormat != OB_FORMAT_UNKNOWN && best->getFormat() != desiredFormat) {
+                std::cerr << "[collection] warning: requested stream format " << static_cast<int>(desiredFormat)
+                          << " unavailable, using format " << static_cast<int>(best->getFormat()) << std::endl;
+            }
+            return best;
+        }
+    }
+
+    if(desiredFormat != OB_FORMAT_UNKNOWN) {
+        for(uint32_t i = 0; i < list->getCount(); i++) {
+            auto p  = list->getProfile(i);
+            auto vp = p->as<ob::VideoStreamProfile>();
+            if(vp && vp->getFormat() == desiredFormat) {
+                return vp;
             }
         }
     }
@@ -1133,6 +1194,14 @@ static bool h265CodecIsNvenc(const std::string &codec) {
 
 static bool h265CodecIsHardware(const std::string &codec) {
     return !h265CodecIsSoftware(codec);
+}
+
+static OBFormat h265RawInputFormatForColorProfile(OBFormat profileFormat) {
+    return profileFormat == OB_FORMAT_RGB ? OB_FORMAT_RGB : OB_FORMAT_BGR;
+}
+
+static const char *h265RawInputPixFmt(OBFormat inputFormat) {
+    return inputFormat == OB_FORMAT_RGB ? "rgb24" : "bgr24";
 }
 
 static bool copyColorFrameToBgr(const std::shared_ptr<ob::Frame> &frame, cv::Mat &outBgr) {
@@ -1404,6 +1473,29 @@ static bool copyDetachedColorToBgr(const DetachedVideoFrame &frame, cv::Mat &out
         return !outBgr.empty();
     }
     return false;
+}
+
+static bool copyDetachedColorRawRgbOrBgr(const DetachedVideoFrame &frame, cv::Mat &out) {
+    out.release();
+    if(frame.width <= 0 || frame.height <= 0 || frame.data.empty()) {
+        return false;
+    }
+    if(frame.format != OB_FORMAT_RGB && frame.format != OB_FORMAT_BGR) {
+        return false;
+    }
+    const int width = frame.width;
+    const int height = frame.height;
+    const size_t dataSize = frame.data.size();
+    const size_t stride = height > 0 ? (dataSize / static_cast<size_t>(height)) : 0;
+    if(stride < static_cast<size_t>(width) * 3) {
+        return false;
+    }
+    cv::Mat tmp(height, width, CV_8UC3, const_cast<uint8_t *>(frame.data.data()), stride);
+    out = tmp.clone();
+    if(out.empty()) {
+        return false;
+    }
+    return true;
 }
 
 static bool copyDetachedVideoToRawMat(const DetachedVideoFrame &frame, cv::Mat &out, float *outValueScale = nullptr) {
@@ -2801,7 +2893,8 @@ public:
                     continue;
                 }
                 collectionSetStage("start_pickVideoProfile");
-                auto profile = pickVideoProfile(rt.pipe, sensor, w, h, f);
+                const OBFormat desiredFormat = configuredStreamFormat(rt.cfg, t);
+                auto profile = pickVideoProfile(rt.pipe, sensor, w, h, f, desiredFormat);
                 if(profile) {
                     config->enableStream(profile);
                     enabledSensors.insert(sensor);
@@ -2810,6 +2903,15 @@ public:
                     sp.height = static_cast<int>(profile->getHeight());
                     sp.fps    = static_cast<int>(profile->getFps());
                     sp.format = profile->getFormat();
+                    std::cerr << "[collection] selected stream sn=" << rt.cfg.sn
+                              << " type=" << dataTypeLabel(t)
+                              << " size=" << sp.width << "x" << sp.height
+                              << " fps=" << sp.fps
+                              << " format=" << static_cast<int>(sp.format);
+                    if(desiredFormat != OB_FORMAT_UNKNOWN) {
+                        std::cerr << " requestedFormat=" << static_cast<int>(desiredFormat);
+                    }
+                    std::cerr << std::endl;
                     try {
                         sp.intrinsic = profile->getIntrinsic();
                         sp.distortion = profile->getDistortion();
@@ -3381,12 +3483,13 @@ private:
 
     class H265Encoder {
     public:
-        H265Encoder(fs::path outputPath, int width, int height, int fps, int threads, SaveOptions options, size_t queueMax)
+        H265Encoder(fs::path outputPath, int width, int height, int fps, int threads, OBFormat inputFormat, SaveOptions options, size_t queueMax)
             : outputPath_(std::move(outputPath)),
               width_(width),
               height_(height),
               fps_(std::max(1, fps)),
               threads_(std::max(0, threads)),
+              inputFormat_(h265RawInputFormatForColorProfile(inputFormat)),
               options_(std::move(options)),
               queueMax_(std::max<size_t>(64, queueMax)) {}
 
@@ -3440,7 +3543,7 @@ private:
             const std::string logLevel = trimString(options_.h265LogLevel).empty() ? "info" : trimString(options_.h265LogLevel);
             std::ostringstream cmd;
             cmd << "ffmpeg -hide_banner -loglevel " << shellQuote(logLevel) << " -stats -y"
-                << " -f rawvideo -pix_fmt bgr24"
+                << " -f rawvideo -pix_fmt " << h265RawInputPixFmt(inputFormat_)
                 << " -s " << width_ << "x" << height_
                 << " -r " << fps_
                 << " -i - -an";
@@ -3499,6 +3602,7 @@ private:
                       << " codec=" << codec
                       << " size=" << width_ << "x" << height_
                       << " fps=" << fps_
+                      << " inputPixFmt=" << h265RawInputPixFmt(inputFormat_)
                       << " threads=" << threads_
                       << " preset=" << (trimString(options_.h265Preset).empty() ? "(none)" : trimString(options_.h265Preset))
                       << " quality=" << std::max(0, std::min(51, options_.h265Crf));
@@ -3618,6 +3722,7 @@ private:
         int height_ = 0;
         int fps_ = 30;
         int threads_ = 0;
+        OBFormat inputFormat_ = OB_FORMAT_BGR;
         SaveOptions options_;
         size_t queueMax_ = 1024;
         mutable std::mutex mtx_;
@@ -4295,7 +4400,12 @@ private:
                     continue;
                 }
                 if(task.type == CollectDataType::RGB) {
-                    okCopy = copyDetachedColorToBgr(task.detached, copied);
+                    if(cfg_.save.rgbH265) {
+                        okCopy = copyDetachedColorRawRgbOrBgr(task.detached, copied);
+                    }
+                    if(!okCopy) {
+                        okCopy = copyDetachedColorToBgr(task.detached, copied);
+                    }
                 }
                 else if(task.type == CollectDataType::Depth) {
                     okCopy = copyDetachedVideoToRawMat(task.detached, copied, &valueScale);
@@ -4453,6 +4563,7 @@ private:
                 itParams->second.height,
                 itParams->second.fps > 0 ? itParams->second.fps : (cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_)),
                 h265ThreadsForCamera(sn, camKey),
+                h265RawInputFormatForColorProfile(itParams->second.format),
                 cfg_.save,
                 queueMax);
             encoder->start();
