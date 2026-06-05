@@ -2902,7 +2902,9 @@ public:
                     continue;
                 }
                 collectionSetStage("start_pickVideoProfile");
-                const OBFormat desiredFormat = configuredStreamFormat(rt.cfg, t);
+                const OBFormat desiredFormat = (t == CollectDataType::RGB)
+                    ? OB_FORMAT_UNKNOWN
+                    : configuredStreamFormat(rt.cfg, t);
                 auto profile = pickVideoProfile(rt.pipe, sensor, w, h, f, desiredFormat);
                 if(profile) {
                     config->enableStream(profile);
