@@ -669,10 +669,6 @@ void applySyncConfig(std::vector<DeviceRuntime> &devices) {
                 cfg.framesPerTrigger = 1;
             }
         }
-        else if(cfg.syncMode == OB_MULTI_DEVICE_SYNC_MODE_SECONDARY) {
-            std::cerr << "[sync] warning: configured SECONDARY mode upgraded to SECONDARY_SYNCED sn=" << rt.cfg.sn << std::endl;
-            cfg.syncMode = OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED;
-        }
 
         const bool isTriggerSource = (cfg.syncMode == OB_MULTI_DEVICE_SYNC_MODE_PRIMARY);
         cfg.triggerOutEnable      = isTriggerSource ? cfg.triggerOutEnable : false;
