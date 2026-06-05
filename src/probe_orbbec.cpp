@@ -375,6 +375,7 @@ bool runStreamStartTest(const std::shared_ptr<ob::Device> &device, const StreamS
 
 void runStreamStartTests(const std::shared_ptr<ob::Device> &device) {
     const std::vector<StreamStartTest> tests = {
+        { "gemini336l_rgb_depth_1280x800", true, 1280, 800, OB_FORMAT_UNKNOWN, true, 1280, 800, OB_FORMAT_UNKNOWN, 30, true },
         { "collection_default_mjpg_y16", true, 1280, 720, OB_FORMAT_MJPG, true, 640, 400, OB_FORMAT_Y16, 30, true },
         { "collection_default_mjpg_y14", true, 1280, 720, OB_FORMAT_MJPG, true, 640, 400, OB_FORMAT_Y14, 30, true },
         { "collection_default_rgb_y16", true, 1280, 720, OB_FORMAT_RGB, true, 640, 400, OB_FORMAT_Y16, 30, true },

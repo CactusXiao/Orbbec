@@ -976,39 +976,48 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
         return best;
     };
 
-    std::vector<std::pair<int, int>> targets;
-    targets.emplace_back(width, height);
+    auto warnIfFormatFallback = [&](const std::shared_ptr<ob::VideoStreamProfile> &profile) {
+        if(profile && desiredFormat != OB_FORMAT_UNKNOWN && profile->getFormat() != desiredFormat) {
+            std::cerr << "[collection] warning: requested stream format " << static_cast<int>(desiredFormat)
+                      << " unavailable, using format " << static_cast<int>(profile->getFormat()) << std::endl;
+        }
+    };
+    auto tryResolution = [&](int targetW, int targetH) -> std::shared_ptr<ob::VideoStreamProfile> {
+        if(desiredFormat != OB_FORMAT_UNKNOWN) {
+            if(auto best = findBest(targetW, targetH, fps, desiredFormat)) {
+                return best;
+            }
+        }
+        if(auto best = findBest(targetW, targetH, fps, OB_FORMAT_UNKNOWN)) {
+            warnIfFormatFallback(best);
+            return best;
+        }
+        return nullptr;
+    };
+
     if(width > 0 || height > 0) {
+        if(auto best = tryResolution(width, height)) {
+            return best;
+        }
+
+        std::vector<std::pair<int, int>> fallbacks;
         if(sensorType == OB_SENSOR_DEPTH || sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
-            targets.insert(targets.end(), { { 640, 400 }, { 1280, 800 }, { 320, 200 } });
+            fallbacks = { { 1280, 800 }, { 640, 400 }, { 320, 200 } };
         }
         else if(sensorType == OB_SENSOR_COLOR) {
-            targets.insert(targets.end(), { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } });
+            fallbacks = { { 1280, 800 }, { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
         }
-    }
-
-    if(desiredFormat != OB_FORMAT_UNKNOWN) {
-        for(size_t i = 0; i < targets.size(); ++i) {
-            if(i > 0 && targets[i].first == width && targets[i].second == height) {
+        for(const auto &fallback: fallbacks) {
+            if(fallback.first == width && fallback.second == height) {
                 continue;
             }
-            if(auto best = findBest(targets[i].first, targets[i].second, fps, desiredFormat)) {
+            if(auto best = tryResolution(fallback.first, fallback.second)) {
                 return best;
             }
         }
     }
-
-    for(size_t i = 0; i < targets.size(); ++i) {
-        if(i > 0 && targets[i].first == width && targets[i].second == height) {
-            continue;
-        }
-        if(auto best = findBest(targets[i].first, targets[i].second, fps, OB_FORMAT_UNKNOWN)) {
-            if(desiredFormat != OB_FORMAT_UNKNOWN && best->getFormat() != desiredFormat) {
-                std::cerr << "[collection] warning: requested stream format " << static_cast<int>(desiredFormat)
-                          << " unavailable, using format " << static_cast<int>(best->getFormat()) << std::endl;
-            }
-            return best;
-        }
+    else if(auto best = tryResolution(width, height)) {
+        return best;
     }
 
     if(desiredFormat != OB_FORMAT_UNKNOWN) {
@@ -6308,14 +6317,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect p1(left, y2 + 44, 260, 44);
             cv::Rect p2(left + 280, y2 + 44, 260, 44);
             cv::Rect p3(left + 560, y2 + 44, 260, 44);
-            if(uiButton(ui, p1, presetLabel(1280, 720, 30), fm)) {
-                cfgUi.width  = "1280";
-                cfgUi.height = "720";
-                cfgUi.fps    = "30";
-            }
-            if(uiButton(ui, p2, presetLabel(1280, 800, 30), fm)) {
+            if(uiButton(ui, p1, presetLabel(1280, 800, 30), fm)) {
                 cfgUi.width  = "1280";
                 cfgUi.height = "800";
+                cfgUi.fps    = "30";
+            }
+            if(uiButton(ui, p2, presetLabel(1280, 720, 30), fm)) {
+                cfgUi.width  = "1280";
+                cfgUi.height = "720";
                 cfgUi.fps    = "30";
             }
             if(uiButton(ui, p3, presetLabel(1920, 1080, 30), fm)) {

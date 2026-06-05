@@ -626,10 +626,10 @@ private:
         if(width > 0 || height > 0) {
             std::vector<std::pair<int, int>> fallbacks;
             if(sensorType == OB_SENSOR_DEPTH) {
-                fallbacks = { { 640, 400 }, { 1280, 800 }, { 320, 200 } };
+                fallbacks = { { 1280, 800 }, { 640, 400 }, { 320, 200 } };
             }
             else if(sensorType == OB_SENSOR_COLOR) {
-                fallbacks = { { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
+                fallbacks = { { 1280, 800 }, { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
             }
             for(const auto &fallback: fallbacks) {
                 if(fallback.first == width && fallback.second == height) {
@@ -655,15 +655,15 @@ private:
         activePair_.p2 = std::make_shared<ob::Pipeline>(b.dev);
         const int targetFps = std::max(1, cfg_.viewerFps > 0 ? cfg_.viewerFps : 30);
         const int targetW = 1280;
-        const int targetH = 720;
+        const int targetH = 800;
         auto c1 = pickVideoProfile(activePair_.p1, OB_SENSOR_COLOR, targetW, targetH, targetFps);
         auto c2 = pickVideoProfile(activePair_.p2, OB_SENSOR_COLOR, targetW, targetH, targetFps);
         if(!c1 || !c2) {
             stopActivePair();
             return false;
         }
-        auto d1 = pickVideoProfile(activePair_.p1, OB_SENSOR_DEPTH, 0, 0, 0);
-        auto d2 = pickVideoProfile(activePair_.p2, OB_SENSOR_DEPTH, 0, 0, 0);
+        auto d1 = pickVideoProfile(activePair_.p1, OB_SENSOR_DEPTH, targetW, targetH, 30);
+        auto d2 = pickVideoProfile(activePair_.p2, OB_SENSOR_DEPTH, targetW, targetH, 30);
         if(!d1 || !d2) {
             stopActivePair();
             return false;
