@@ -1891,7 +1891,7 @@ static FisheyeModuleConfig buildAutoFisheyeConfig(const SaveOptions &saveOptions
     return cfg;
 }
 
-static bool writeFisheyeCameraParamsJson(const fs::path &cameraDir, size_t cameraIdx, const cv::Mat &frame, int fps) {
+static bool writeFisheyeCameraParamsJson(const fs::path &cameraDir, size_t cameraIdx, const cv::Mat &frame, int fps, const SaveOptions &saveOptions) {
     const int width = std::max(0, frame.cols);
     const int height = std::max(0, frame.rows);
 
@@ -1911,6 +1911,10 @@ static bool writeFisheyeCameraParamsJson(const fs::path &cameraDir, size_t camer
     jsonAddString(camObj, "sn", "fisheye_" + std::to_string(cameraIdx));
 
     cJSON *rgbObj = cJSON_CreateObject();
+    const std::string fileName = h265OutputFileName(saveOptions);
+    jsonAddString(rgbObj, "storageEncoding", "h265");
+    jsonAddString(rgbObj, "storageFile", fileName);
+    jsonAddString(rgbObj, "timestampFile", fileName + ".timestamps.csv");
     jsonAddNumber(rgbObj, "width", width);
     jsonAddNumber(rgbObj, "height", height);
     jsonAddNumber(rgbObj, "fps", fps);
@@ -4611,6 +4615,53 @@ private:
         }
     }
 
+    void enqueueFisheyeH265Frame(size_t cameraIdx, const std::string &frameIndex, uint64_t tsUs, cv::Mat frame) {
+        if(frame.empty()) {
+            return;
+        }
+        if(frame.type() == CV_8UC4) {
+            cv::cvtColor(frame, frame, cv::COLOR_BGRA2BGR);
+        }
+        else if(frame.type() == CV_8UC1) {
+            cv::cvtColor(frame, frame, cv::COLOR_GRAY2BGR);
+        }
+        if(frame.empty() || frame.type() != CV_8UC3 || frame.cols <= 0 || frame.rows <= 0) {
+            return;
+        }
+
+        const std::string encoderKey = "fisheye:" + std::to_string(cameraIdx);
+        H265Encoder *encoder = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(h265Mtx_);
+            auto it = h265Encoders_.find(encoderKey);
+            if(it != h265Encoders_.end()) {
+                encoder = it->second.get();
+            }
+            else {
+                const std::string cameraKey = "fisheye_" + std::to_string(cameraIdx);
+                const fs::path outPath = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx) / "RGB" / h265OutputFileName(cfg_.save);
+                const int fps = cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_);
+                const size_t queueMax = std::max<size_t>(256, writeQueueMax_ / 2);
+                auto newEncoder = std::make_unique<H265Encoder>(
+                    outPath,
+                    frame.cols,
+                    frame.rows,
+                    fps,
+                    h265ThreadsForCamera(cameraKey, cameraKey),
+                    OB_FORMAT_BGR,
+                    cfg_.save,
+                    queueMax);
+                newEncoder->start();
+                encoder = newEncoder.get();
+                h265Encoders_[encoderKey] = std::move(newEncoder);
+                h265EncodingActive_.store(true);
+            }
+        }
+        if(encoder) {
+            encoder->enqueue(frameIndex, tsUs, std::move(frame));
+        }
+    }
+
     void startDepthFfv1Encoders(const SessionState &session) {
         stopDepthFfv1Encoders();
         if(!depthOutputIsFfv1Mkv(cfg_.save) || !session.saveDepthTimesteps) {
@@ -5141,16 +5192,11 @@ private:
                         allTsMin = std::min(allTsMin, frame.captureTimestampUs);
                         allTsMax = std::max(allTsMax, frame.captureTimestampUs);
                         allTsCount++;
-                        const fs::path outPath = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx) / "RGB"
-                                                 / (frameIndex + colorExtNormalized(cfg_.save.colorExt));
                         cv::Mat frameImg = frame.bgr;
-                        const SaveOptions saveOptions = cfg_.save;
-                        enqueueWriteTask(WriteTask{ [frameImg = std::move(frameImg), outPath, saveOptions]() mutable {
-                            saveBgrMatToFile(frameImg, outPath, saveOptions);
-                        } });
+                        enqueueFisheyeH265Frame(cameraIdx, frameIndex, frame.captureTimestampUs, std::move(frameImg));
                         if(!session_.wroteFisheyeCameraParams[cameraIdx] && !frame.bgr.empty()) {
                             const fs::path cameraDir = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx);
-                            writeFisheyeCameraParamsJson(cameraDir, cameraIdx, frame.bgr, cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_));
+                            writeFisheyeCameraParamsJson(cameraDir, cameraIdx, frame.bgr, cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_), cfg_.save);
                             session_.wroteFisheyeCameraParams[cameraIdx] = true;
                         }
                     }
@@ -5251,16 +5297,11 @@ private:
                     rowTsMin = std::min(rowTsMin, frame.captureTimestampUs);
                     rowTsMax = std::max(rowTsMax, frame.captureTimestampUs);
                     rowTsCount++;
-                    const fs::path outPath = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx) / "RGB"
-                                             / (frameIndex + colorExtNormalized(cfg_.save.colorExt));
                     cv::Mat frameImg = frame.bgr;
-                    const SaveOptions saveOptions = cfg_.save;
-                    enqueueWriteTask(WriteTask{ [frameImg = std::move(frameImg), outPath, saveOptions]() mutable {
-                        saveBgrMatToFile(frameImg, outPath, saveOptions);
-                    } });
+                    enqueueFisheyeH265Frame(cameraIdx, frameIndex, frame.captureTimestampUs, std::move(frameImg));
                     if(!session_.wroteFisheyeCameraParams[cameraIdx] && !frame.bgr.empty()) {
                         const fs::path cameraDir = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx);
-                        writeFisheyeCameraParamsJson(cameraDir, cameraIdx, frame.bgr, cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_));
+                        writeFisheyeCameraParamsJson(cameraDir, cameraIdx, frame.bgr, cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_), cfg_.save);
                         session_.wroteFisheyeCameraParams[cameraIdx] = true;
                     }
                 }
