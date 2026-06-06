@@ -1160,6 +1160,47 @@ static cv::Mat decodeVideoFrameRaw(const fs::path &path, int frameIdx, int width
     return m.clone();
 }
 
+static std::vector<cv::Mat> decodeVideoFrameRangeRaw(const fs::path &path, int firstFrameIdx, int frameCount, int width, int height, const std::string &pixFmt, int cvType) {
+    std::vector<cv::Mat> out;
+    if(path.empty() || firstFrameIdx < 0 || frameCount <= 0 || !fs::exists(path) || !fs::is_regular_file(path)) {
+        return out;
+    }
+    if(width <= 0 || height <= 0) {
+        const auto info = probeVideoStreamInfo(path);
+        width = info.width;
+        height = info.height;
+    }
+    if(width <= 0 || height <= 0) {
+        return out;
+    }
+
+    const int lastFrameIdx = firstFrameIdx + frameCount - 1;
+    std::ostringstream select;
+    select << "select=between(n\\," << firstFrameIdx << "\\," << lastFrameIdx << ")";
+    std::ostringstream cmd;
+    cmd << "ffmpeg -hide_banner -v error"
+        << " -i " << shellQuote(path.string())
+        << " -vf " << shellQuote(select.str())
+        << " -frames:v " << frameCount
+        << " -pix_fmt " << shellQuote(pixFmt)
+        << " -f rawvideo -";
+    const std::string raw = popenReadAll(cmd.str().c_str());
+
+    const cv::Mat probe(height, width, cvType);
+    const size_t frameBytes = probe.total() * probe.elemSize();
+    if(frameBytes == 0 || raw.size() < frameBytes) {
+        return out;
+    }
+    const size_t availableFrames = std::min(static_cast<size_t>(frameCount), raw.size() / frameBytes);
+    out.reserve(availableFrames);
+    for(size_t i = 0; i < availableFrames; ++i) {
+        const char *ptr = raw.data() + i * frameBytes;
+        cv::Mat m(height, width, cvType, const_cast<char *>(ptr));
+        out.push_back(m.clone());
+    }
+    return out;
+}
+
 static fs::path findFrameFile(const fs::path &dir, int frameIdx, const std::vector<std::string> &extensions) {
     std::ostringstream oss;
     oss << std::setw(5) << std::setfill('0') << frameIdx;
@@ -1661,7 +1702,6 @@ public:
         put(key, v);
     }
 
-private:
     void put(const std::string &key, const cv::Mat &v) {
         if(v.empty()) {
             return;
@@ -1682,6 +1722,7 @@ private:
         }
     }
 
+private:
     size_t capacity_;
     std::list<std::pair<std::string, cv::Mat>> lru_;
     std::unordered_map<std::string, std::list<std::pair<std::string, cv::Mat>>::iterator> map_;
@@ -3551,13 +3592,9 @@ private:
         x += 140;
         auto stepButton = [&](const std::string &label, int deltaFrames) {
             cv::Rect r(x, y, bw, bh);
-            if(playing_) {
-                uiButtonDisabled(ui, r, label);
-            }
-            else {
-                if(uiButton(ui, r, label, ms_)) {
-                    seekFrames(deltaFrames);
-                }
+            if(uiButton(ui, r, label, ms_)) {
+                seekFrames(deltaFrames);
+                lastStep_ = std::chrono::steady_clock::now();
             }
             x += bw + 10;
         };
@@ -3775,8 +3812,11 @@ private:
                 source.kind = ViewerSourceKind::Fisheye;
                 source.camKey = cameraDir.filename().string();
                 source.rgbDir = cameraDir / "RGB";
-                source.rgbEncoding = "image";
-                source.hasRgb = computeTotalFramesFromDir(source.rgbDir) > 0;
+                source.rgbVideoPath = source.rgbDir / h265OutputFileName(cfg_.save);
+                source.rgbEncoding = fs::exists(source.rgbVideoPath) ? "h265" : "image";
+                source.hasRgb = encodingIsRgbH265(source.rgbEncoding)
+                                    ? (countVideoTimestampRows(source.rgbVideoPath) > 0 || probeVideoStreamInfo(source.rgbVideoPath).frames > 0)
+                                    : (computeTotalFramesFromDir(source.rgbDir) > 0);
                 if(source.hasRgb) {
                     sources_.push_back(std::move(source));
                 }
@@ -3869,7 +3909,16 @@ private:
                 continue;
             }
             hasAnyRgb = true;
-            const int nRgb = computeTotalFramesFromDir(source.rgbDir);
+            int nRgb = 0;
+            if(encodingIsRgbH265(source.rgbEncoding)) {
+                nRgb = countVideoTimestampRows(source.rgbVideoPath);
+                if(nRgb <= 0) {
+                    nRgb = probeVideoStreamInfo(source.rgbVideoPath).frames;
+                }
+            }
+            else {
+                nRgb = computeTotalFramesFromDir(source.rgbDir);
+            }
             if(nRgb > 0) {
                 fisheyeRgbTotal = (fisheyeRgbTotal == 0) ? nRgb : std::min(fisheyeRgbTotal, nRgb);
             }
@@ -3936,6 +3985,94 @@ private:
         currentFrame_ = next;
     }
 
+    void prefetchRgbVideoRange(const std::string &cam, const fs::path &rgbDir, int startFrame, int ahead) {
+        if(!encodingIsRgbH265(rgbEncodingForCam(cam))) {
+            return;
+        }
+        int firstMissing = -1;
+        for(int i = 0; i <= ahead; ++i) {
+            const int f = startFrame + i;
+            if(f < 0 || f >= totalFrames_) {
+                break;
+            }
+            cv::Mat cached;
+            if(!rgbCache_.tryGet(makeCacheKey(0, cam, f), cached)) {
+                firstMissing = f;
+                break;
+            }
+        }
+        if(firstMissing < 0) {
+            return;
+        }
+        const auto *p = rgbParamsForCam(cam);
+        const int width = p ? p->width : 0;
+        const int height = p ? p->height : 0;
+        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
+        const auto frames = decodeVideoFrameRangeRaw(rgbVideoPathForCam(cam, rgbDir), firstMissing, count, width, height, "bgr24", CV_8UC3);
+        for(size_t i = 0; i < frames.size(); ++i) {
+            rgbCache_.put(makeCacheKey(0, cam, firstMissing + static_cast<int>(i)), frames[i]);
+        }
+    }
+
+    void prefetchRgbVideoRange(const ViewerSource &source, int startFrame, int ahead) {
+        if(source.kind == ViewerSourceKind::Multiview) {
+            prefetchRgbVideoRange(source.camKey, source.rgbDir, startFrame, ahead);
+            return;
+        }
+        if(!encodingIsRgbH265(source.rgbEncoding)) {
+            return;
+        }
+        int firstMissing = -1;
+        for(int i = 0; i <= ahead; ++i) {
+            const int f = startFrame + i;
+            if(f < 0 || f >= totalFrames_) {
+                break;
+            }
+            cv::Mat cached;
+            if(!rgbCache_.tryGet(makeCacheKey(0, source.sourceId, f), cached)) {
+                firstMissing = f;
+                break;
+            }
+        }
+        if(firstMissing < 0) {
+            return;
+        }
+        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
+        const auto frames = decodeVideoFrameRangeRaw(source.rgbVideoPath, firstMissing, count, 0, 0, "bgr24", CV_8UC3);
+        for(size_t i = 0; i < frames.size(); ++i) {
+            rgbCache_.put(makeCacheKey(0, source.sourceId, firstMissing + static_cast<int>(i)), frames[i]);
+        }
+    }
+
+    void prefetchDepthVideoRange(const std::string &cam, const fs::path &depthDir, int startFrame, int ahead) {
+        if(!encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
+            return;
+        }
+        int firstMissing = -1;
+        for(int i = 0; i <= ahead; ++i) {
+            const int f = startFrame + i;
+            if(f < 0 || f >= totalFrames_) {
+                break;
+            }
+            cv::Mat cached;
+            if(!depthCache_.tryGet(makeCacheKey(1, cam, f), cached)) {
+                firstMissing = f;
+                break;
+            }
+        }
+        if(firstMissing < 0) {
+            return;
+        }
+        const auto *p = depthParamsForCam(cam);
+        const int width = p ? p->width : 0;
+        const int height = p ? p->height : 0;
+        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
+        const auto frames = decodeVideoFrameRangeRaw(depthVideoPathForCam(cam, depthDir), firstMissing, count, width, height, "gray16le", CV_16UC1);
+        for(size_t i = 0; i < frames.size(); ++i) {
+            depthCache_.put(makeCacheKey(1, cam, firstMissing + static_cast<int>(i)), frames[i]);
+        }
+    }
+
     void prefetchAroundCurrent() {
         if(totalFrames_ <= 0 || selectedSubject_.empty() || selectedTask_.empty() || selectedDataDir().empty()) {
             return;
@@ -3953,6 +4090,12 @@ private:
         };
 
         auto preRgb = [&](const std::string &cam, int f) {
+            if(encodingIsRgbH265(rgbEncodingForCam(cam))) {
+                if(f == currentFrame_) {
+                    prefetchRgbVideoRange(cam, selectedDataDir() / cam / "RGB", f, ahead);
+                }
+                return;
+            }
             const std::string key = makeCacheKey(0, cam, f);
             rgbCache_.prefetch(key, [&]() {
                 return loadRgbFrameNoCache(cam, f);
@@ -3961,6 +4104,12 @@ private:
         auto preRgbSource = [&](const ViewerSource &source, int f) {
             if(source.kind == ViewerSourceKind::Multiview) {
                 preRgb(source.camKey, f);
+                return;
+            }
+            if(encodingIsRgbH265(source.rgbEncoding)) {
+                if(f == currentFrame_) {
+                    prefetchRgbVideoRange(source, f, ahead);
+                }
                 return;
             }
             const std::string key = makeCacheKey(0, source.sourceId, f);
@@ -3973,6 +4122,12 @@ private:
             });
         };
         auto preDepth = [&](const std::string &cam, int f) {
+            if(encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
+                if(f == currentFrame_) {
+                    prefetchDepthVideoRange(cam, selectedDataDir() / cam / "Depth", f, ahead);
+                }
+                return;
+            }
             const std::string key = makeCacheKey(1, cam, f);
             depthCache_.prefetch(key, [&]() {
                 return loadDepthFrameNoCache(cam, f);
@@ -4098,6 +4253,12 @@ private:
         }
         const std::string key = makeCacheKey(0, source.sourceId, frameIdx);
         cv::Mat img = rgbCache_.getOrLoad(key, [&]() {
+            if(encodingIsRgbH265(source.rgbEncoding)) {
+                cv::Mat decoded = decodeVideoFrameRaw(source.rgbVideoPath, frameIdx, 0, 0, "bgr24", CV_8UC3);
+                if(!decoded.empty()) {
+                    return decoded;
+                }
+            }
             const fs::path p = findFrameFile(source.rgbDir, frameIdx, { ".jpg", ".jpeg", ".png" });
             if(p.empty()) {
                 return cv::Mat();
