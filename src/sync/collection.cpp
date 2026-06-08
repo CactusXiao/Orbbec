@@ -6385,7 +6385,7 @@ static CameraFaultModalActions drawCameraFaultModal(cv::Mat &ui,
         y += (i == 0) ? 34 : 28;
     }
 
-    cv::putText(ui, "Ctrl+1 exit collection    Ctrl+2 delete episode, restart cameras, and retry",
+    cv::putText(ui, "Ctrl+1 exit collection    Ctrl+2 delete episode, restart cameras, and return to READY",
                 cv::Point(textLeft, modal.y + modal.height - 94),
                 cv::FONT_HERSHEY_DUPLEX, 0.58, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
 
@@ -6421,7 +6421,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
     std::optional<MultiDeviceStreamingRecorder::CameraStreamFault> activeCameraFault;
-    bool cameraFaultRecoveryShouldRecord = false;
     bool cameraFaultDrainCompleteLogged = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     if(cfg.colorExposureMs > 0.0f) {
@@ -6472,56 +6471,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     auto enterDeleteConfirm = [&]() {
         captureState = CaptureState::DELETE_CONFIRM;
         capUi.msg.clear();
-    };
-
-    auto beginCurrentTaskRecording = [&](std::string *errorMessage) -> bool {
-        cfgUi.enforceRules();
-        if(capUi.currentTaskIdx < 0 || capUi.currentTaskIdx >= static_cast<int>(capUi.tasks.size())) {
-            if(errorMessage) {
-                *errorMessage = "No current task";
-            }
-            return false;
-        }
-
-        const fs::path root = fs::path(trimString(cfgUi.saveRoot));
-        const std::string subject = trimString(cfgUi.subjectId);
-        const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
-        const int episodeN = capUi.currentEpisode;
-        if(!recorder.start(cfgUi)) {
-            if(errorMessage) {
-                const std::string line = recorder.lastInfoLine();
-                *errorMessage = line.empty() ? "Failed to start cameras" : line;
-            }
-            return false;
-        }
-        if(!recorder.beginRecord(root, subject, taskName, episodeN)) {
-            if(errorMessage) {
-                const std::string line = recorder.lastInfoLine();
-                *errorMessage = line.empty() ? "Failed to start capture" : line;
-            }
-            return false;
-        }
-        return true;
-    };
-
-    auto pushRecordingStarted = [&]() {
-        if(capUi.currentTaskIdx < 0 || capUi.currentTaskIdx >= static_cast<int>(capUi.tasks.size())) {
-            return;
-        }
-        pushUiLog("Recording: " + capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name
-                  + " ep" + std::to_string(capUi.currentEpisode));
-        {
-            const std::string label = recorder.currentSessionLabel();
-            if(!label.empty()) {
-                pushUiLog("Session: " + label);
-            }
-        }
-        {
-            const std::string s = recorder.streamProfilesLine();
-            if(!s.empty()) {
-                pushUiLog(s);
-            }
-        }
     };
 
     bool running = true;
@@ -6772,10 +6721,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 auto fault = recorder.pollCameraStreamFault();
                 if(fault.has_value()) {
                     activeCameraFault = fault;
-                    cameraFaultRecoveryShouldRecord = recorder.hasCurrentSession()
-                                                      || captureState == CaptureState::RECORDING
-                                                      || captureState == CaptureState::DRAINING
-                                                      || captureState == CaptureState::STOPPED_READY;
                     cameraFaultDrainCompleteLogged = false;
                     pendingResetAfterDrain = false;
                     capUi.msg = "Camera stream timeout. Choose an action.";
@@ -7157,7 +7102,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(modalFault && activeCameraFault.has_value()) {
                 const std::string detailLine = cameraFaultRestartBlocked
                     ? "Waiting for current episode data to finish saving. Restart will be enabled after that."
-                    : "Restart will delete the current episode, restart all cameras, and retry this task.";
+                    : "Restart will delete the current episode, restart all cameras, and return to READY.";
                 const auto actions = drawCameraFaultModal(ui, fm, *activeCameraFault,
                                                           !cameraFaultRestartBlocked,
                                                           detailLine);
@@ -7168,8 +7113,35 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             // --- 处理按钮动作 ---
             if(doFaultExit) {
                 collectionSetStage("ui_camera_fault_exit");
-                recorder.stopIfRunning();
-                running = false;
+                if(recorder.isRecording()) {
+                    recorder.stopRecording();
+                }
+
+                bool okToExit = true;
+                if(recorder.hasCurrentSession()) {
+                    capUi.msg = "Deleting faulted episode before exit...";
+                    pushUiLog("Exit requested. Deleting faulted episode before leaving collection.");
+                    collectionSetStage("ui_camera_fault_exit_wait_drain");
+                    while(!recorder.isDrainComplete()) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    }
+
+                    std::string error;
+                    if(recorder.discardCurrentSession(&error)) {
+                        pushUiLog("Faulted episode deleted.");
+                    }
+                    else {
+                        okToExit = false;
+                        capUi.msg = "Delete failed";
+                        pushUiLog("Delete failed before exit: " + error);
+                        std::cerr << "[collection][camera_fault] delete before exit failed: " << error << std::endl;
+                    }
+                }
+
+                if(okToExit) {
+                    recorder.stopIfRunning();
+                    running = false;
+                }
             }
             if(doFaultRestart && running) {
                 collectionSetStage("ui_camera_fault_restart");
@@ -7195,37 +7167,22 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         latestFrameCache.clear();
 
                         std::string startError;
-                        bool restarted = false;
-                        if(cameraFaultRecoveryShouldRecord) {
-                            restarted = beginCurrentTaskRecording(&startError);
-                        }
-                        else {
-                            restarted = recorder.start(cfgUi);
-                            if(!restarted) {
-                                startError = recorder.lastInfoLine();
-                                if(startError.empty()) {
-                                    startError = "Failed to restart cameras";
-                                }
+                        bool restarted = recorder.start(cfgUi);
+                        if(!restarted) {
+                            startError = recorder.lastInfoLine();
+                            if(startError.empty()) {
+                                startError = "Failed to restart cameras";
                             }
                         }
 
                         if(restarted) {
                             activeCameraFault.reset();
                             recorder.clearCameraStreamFault();
-                            cameraFaultRecoveryShouldRecord = false;
                             cameraFaultDrainCompleteLogged = false;
                             pendingResetAfterDrain = false;
-                            if(recorder.isRecording()) {
-                                captureState = CaptureState::RECORDING;
-                                capUi.msg.clear();
-                                pushUiLog("Cameras restarted. Retrying current task from the beginning.");
-                                pushRecordingStarted();
-                            }
-                            else {
-                                captureState = CaptureState::IDLE;
-                                capUi.msg = "Cameras restarted";
-                                pushUiLog("Cameras restarted.");
-                            }
+                            captureState = CaptureState::IDLE;
+                            capUi.msg = "Cameras restarted. Press Start to retry.";
+                            pushUiLog("Cameras restarted. Ready to start current episode again.");
                         }
                         else {
                             recorder.stopIfRunning();
