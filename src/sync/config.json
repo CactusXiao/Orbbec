@@ -39,6 +39,7 @@
     "colorCloudRgbFrameOffset": -1,
     "queueCapacity": 1024,
     "writerThreads": 0,
+    "cameraStreamTimeoutSec": 2.0,
     "save": {
         "rgbEncoding": "image",
         "depthEncoding": "png",

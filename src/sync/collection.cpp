@@ -2447,6 +2447,13 @@ public:
         std::string     message;
     };
 
+    struct CameraStreamReadiness {
+        size_t readyStreams = 0;
+        size_t totalStreams = 0;
+        bool   allReady = true;
+        std::string message;
+    };
+
     explicit MultiDeviceStreamingRecorder(AppConfig baseCfg)
         : cfg_(std::move(baseCfg)) {
         const size_t baseQueue = cfg_.queueCapacity > 0 ? static_cast<size_t>(cfg_.queueCapacity) : 1024;
@@ -2684,8 +2691,57 @@ public:
         return out;
     }
 
+    CameraStreamReadiness cameraStreamReadiness() const {
+        CameraStreamReadiness readiness;
+        if(!multiviewEnabled_) {
+            readiness.allReady = true;
+            readiness.message = "Cameras ready";
+            return readiness;
+        }
+        if(!capturing_.load()) {
+            readiness.allReady = false;
+            readiness.message = "Starting cameras...";
+            return readiness;
+        }
+
+        std::vector<std::string> missing;
+        {
+            std::lock_guard<std::mutex> lock(streamHealthMtx_);
+            readiness.totalStreams = streamHealth_.size();
+            for(const auto &kv: streamHealth_) {
+                const auto &state = kv.second;
+                if(state.everReceived) {
+                    readiness.readyStreams++;
+                }
+                else if(missing.size() < 3) {
+                    missing.push_back("cam" + state.camKey + " " + dataTypeLabel(state.type));
+                }
+            }
+        }
+
+        readiness.allReady = readiness.totalStreams > 0 && readiness.readyStreams == readiness.totalStreams;
+        std::ostringstream oss;
+        if(readiness.allReady) {
+            oss << "Cameras ready";
+        }
+        else {
+            oss << "Warming up cameras: " << readiness.readyStreams << "/" << readiness.totalStreams << " streams ready";
+            if(!missing.empty()) {
+                oss << "  waiting for ";
+                for(size_t i = 0; i < missing.size(); ++i) {
+                    if(i > 0) {
+                        oss << ", ";
+                    }
+                    oss << missing[i];
+                }
+            }
+        }
+        readiness.message = oss.str();
+        return readiness;
+    }
+
     std::optional<CameraStreamFault> pollCameraStreamFault() {
-        if(!capturing_.load() || !multiviewEnabled_) {
+        if(!capturing_.load() || !recording_.load() || !multiviewEnabled_) {
             return std::nullopt;
         }
 
@@ -3335,6 +3391,7 @@ public:
         multiviewEosNotified_.store(!multiviewEnabled_);
         hasData_.store(false);
         captureStartSteady_ = std::chrono::steady_clock::now();
+        markStreamHealthCaptureStarted(captureStartSteady_);
         recording_.store(true);
 
         if(multiviewEnabled_) {
@@ -4150,8 +4207,8 @@ private:
         return !packet.frame.empty();
     }
 
-    static constexpr double cameraStreamTimeoutSec() {
-        return 2.0;
+    double cameraStreamTimeoutSec() const {
+        return cfg_.cameraStreamTimeoutSec > 0.0 ? cfg_.cameraStreamTimeoutSec : 2.0;
     }
 
     static bool isCameraHealthStream(CollectDataType t) {
@@ -4210,6 +4267,16 @@ private:
         }
         it->second.lastFrameSteady = now;
         it->second.everReceived = true;
+    }
+
+    void markStreamHealthCaptureStarted(std::chrono::steady_clock::time_point startTime) {
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        activeCameraFault_.reset();
+        for(auto &kv: streamHealth_) {
+            kv.second.startedSteady = startTime;
+            kv.second.lastFrameSteady = startTime;
+            kv.second.faulted = false;
+        }
     }
 
     uint64_t sessionStepUs() const {
@@ -6735,6 +6802,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
             const bool cameraFaultActive = activeCameraFault.has_value();
             const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
+            const auto cameraReadiness = recorder.cameraStreamReadiness();
 
             if(!cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()) {
                 updateReadyState();
@@ -6836,7 +6904,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             std::string stateFootnoteLine;
             switch(captureState) {
             case CaptureState::IDLE:
-                sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
+                if(cameraReadiness.allReady) {
+                    sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
+                    stateEmphasisLine = cameraReadiness.message;
+                }
+                else {
+                    sd = {"WARMING UP", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                    stateEmphasisLine = cameraReadiness.message;
+                    stateFootnoteLine = "Start is enabled after every active RGB/Depth stream has a frame";
+                }
                 break;
             case CaptureState::RECORDING:
                 sd = {"RECORDING", cv::Scalar(50, 220, 50), cv::Scalar(20, 60, 20)};
@@ -6967,7 +7043,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             // --- 状态机：允许操作判断 ---
             const bool modalFault = cameraFaultActive;
             const bool modalDelete = !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
-            const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE) && (capUi.currentTaskIdx != -1);
+            const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE)
+                                     && (capUi.currentTaskIdx != -1) && cameraReadiness.allReady;
             const bool allowStop   = !modalFault && !modalDelete && (captureState == CaptureState::RECORDING);
             const bool allowSave   = !modalFault && !modalDelete && (captureState == CaptureState::STOPPED_READY) && recorder.hasData();
             const bool allowReset  = !modalFault && !modalDelete
@@ -6986,7 +7063,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect bMenu (btnX, winH - 38,  btnW / 2 - 5, 30);
             cv::Rect bConfig(btnX + btnW / 2 + 5, winH - 38, btnW / 2 - 5, 30);
 
-            bool doStart    = uiButtonEx(ui, bStart, "Start  [Ctrl+1]", fm, allowStart);
+            const std::string startLabel = (!allowStart && captureState == CaptureState::IDLE
+                                            && capUi.currentTaskIdx != -1 && !cameraReadiness.allReady)
+                                         ? "Start (warming up)"
+                                         : "Start  [Ctrl+1]";
+            bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
             bool doSave     = uiButtonEx(ui, bSave,  "Confirm [Ctrl+3]", fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);

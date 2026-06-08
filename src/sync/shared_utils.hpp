@@ -126,6 +126,7 @@ struct AppConfig {
     bool                      enableSync     = true;
     int                       queueCapacity  = 512;
     int                       writerThreads  = 0;
+    double                    cameraStreamTimeoutSec = 2.0;
     float                     colorExposureMs = 0.0f;
     int                       colorBrightness = -1;
     int                       colorCloudRgbFrameOffset = 0;

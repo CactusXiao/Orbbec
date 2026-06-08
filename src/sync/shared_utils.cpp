@@ -338,6 +338,21 @@ AppConfig loadConfig(const fs::path &configPath) {
     if(auto v = getInt(root, "writerThreads")) {
         cfg.writerThreads = *v;
     }
+    if(auto v = getDouble(root, "cameraStreamTimeoutSec")) {
+        if(*v > 0.0) {
+            cfg.cameraStreamTimeoutSec = *v;
+        }
+    }
+    else if(auto v = getDouble(root, "camera_frame_timeout_sec")) {
+        if(*v > 0.0) {
+            cfg.cameraStreamTimeoutSec = *v;
+        }
+    }
+    else if(auto v = getDouble(root, "cameraFrameTimeoutSec")) {
+        if(*v > 0.0) {
+            cfg.cameraStreamTimeoutSec = *v;
+        }
+    }
     if(auto v = getDouble(root, "colorExposureMs")) {
         cfg.colorExposureMs = static_cast<float>(std::max(0.0, *v));
     }
