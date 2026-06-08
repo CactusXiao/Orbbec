@@ -2438,6 +2438,15 @@ static cv::Mat alignDepthToRgb(const cv::Mat &depth16,
 
 class MultiDeviceStreamingRecorder {
 public:
+    struct CameraStreamFault {
+        std::string     sn;
+        std::string     camKey;
+        CollectDataType type = CollectDataType::RGB;
+        double          silentSeconds = 0.0;
+        bool            everReceived = false;
+        std::string     message;
+    };
+
     explicit MultiDeviceStreamingRecorder(AppConfig baseCfg)
         : cfg_(std::move(baseCfg)) {
         const size_t baseQueue = cfg_.queueCapacity > 0 ? static_cast<size_t>(cfg_.queueCapacity) : 1024;
@@ -2449,6 +2458,11 @@ public:
     bool isCapturing() const { return capturing_.load(); }
     bool isRecording() const { return recording_.load(); }
     bool hasData() const { return hasData_.load(); }
+
+    bool hasCurrentSession() const {
+        std::lock_guard<std::mutex> lock(coordMtx_);
+        return session_.active;
+    }
 
     bool isDrainComplete() const {
         std::lock_guard<std::mutex> lock(coordMtx_);
@@ -2528,6 +2542,7 @@ public:
         recordInputClosing_.store(false);
         multiviewEosNotified_.store(false);
         passthroughRgbMjpg_.store(false);
+        resetStreamHealth();
     }
 
     void clearStatus() {
@@ -2667,6 +2682,70 @@ public:
             }
         }
         return out;
+    }
+
+    std::optional<CameraStreamFault> pollCameraStreamFault() {
+        if(!capturing_.load() || !multiviewEnabled_) {
+            return std::nullopt;
+        }
+
+        std::optional<CameraStreamFault> faultToLog;
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(streamHealthMtx_);
+            if(activeCameraFault_.has_value()) {
+                return activeCameraFault_;
+            }
+
+            for(auto &kv: streamHealth_) {
+                auto &state = kv.second;
+                const auto base = state.everReceived ? state.lastFrameSteady : state.startedSteady;
+                if(base.time_since_epoch().count() == 0) {
+                    continue;
+                }
+
+                const double silentSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(now - base).count();
+                if(silentSeconds < cameraStreamTimeoutSec()) {
+                    continue;
+                }
+
+                state.faulted = true;
+                CameraStreamFault fault;
+                fault.sn = state.sn;
+                fault.camKey = state.camKey;
+                fault.type = state.type;
+                fault.silentSeconds = silentSeconds;
+                fault.everReceived = state.everReceived;
+                std::ostringstream oss;
+                oss.setf(std::ios::fixed);
+                oss << "Camera stream timeout: cam" << state.camKey
+                    << " sn=" << state.sn
+                    << " " << dataTypeLabel(state.type)
+                    << " no frame for " << std::setprecision(2) << silentSeconds << "s";
+                if(!state.everReceived) {
+                    oss << " since stream start";
+                }
+                fault.message = oss.str();
+                activeCameraFault_ = fault;
+                faultToLog = fault;
+                break;
+            }
+        }
+
+        if(faultToLog.has_value()) {
+            std::cerr << "[collection][camera_fault] " << faultToLog->message << std::endl;
+            std::lock_guard<std::mutex> lock(mtx_);
+            captureInfoLine_ = faultToLog->message;
+        }
+        return faultToLog;
+    }
+
+    void clearCameraStreamFault() {
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        activeCameraFault_.reset();
+        for(auto &kv: streamHealth_) {
+            kv.second.faulted = false;
+        }
     }
 
     static int clampPropertyValue(int v, const OBIntPropertyRange &r) {
@@ -2836,6 +2915,7 @@ public:
             stopping_.store(false);
             capturing_.store(true);
             recording_.store(false);
+            resetStreamHealth();
             softwareTriggerDevices_.clear();
             useSoftwareTrigger_ = false;
             if(!fisheyeStatusLine.empty()) {
@@ -3012,6 +3092,7 @@ public:
         stopping_.store(false);
         capturing_.store(true);
         recording_.store(false);
+        initStreamHealthForActiveStreams();
         if(!fisheyeStatusLine.empty()) {
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = fisheyeStatusLine;
@@ -3348,6 +3429,7 @@ public:
         recording_.store(false);
         hasData_.store(false);
         passthroughRgbMjpg_.store(false);
+        resetStreamHealth();
         {
             std::lock_guard<std::mutex> lock(mtx_);
             buffers_.clear();
@@ -3445,6 +3527,16 @@ public:
     }
 
 private:
+    struct StreamHealthState {
+        std::string sn;
+        std::string camKey;
+        CollectDataType type = CollectDataType::RGB;
+        std::chrono::steady_clock::time_point startedSteady{};
+        std::chrono::steady_clock::time_point lastFrameSteady{};
+        bool everReceived = false;
+        bool faulted = false;
+    };
+
     struct RecordTask {
         std::string       sn;
         CollectDataType   type = CollectDataType::RGB;
@@ -4056,6 +4148,68 @@ private:
             return !packet.frame.empty() || (packet.encodedBytes && !packet.encodedBytes->empty());
         }
         return !packet.frame.empty();
+    }
+
+    static constexpr double cameraStreamTimeoutSec() {
+        return 2.0;
+    }
+
+    static bool isCameraHealthStream(CollectDataType t) {
+        return t == CollectDataType::RGB || t == CollectDataType::Depth;
+    }
+
+    static std::string streamHealthKey(const std::string &sn, CollectDataType type) {
+        return sn + ":" + dataTypeLabel(type);
+    }
+
+    void resetStreamHealth() {
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        streamHealth_.clear();
+        activeCameraFault_.reset();
+    }
+
+    void initStreamHealthForActiveStreams() {
+        std::vector<StreamHealthState> states;
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            states.reserve(buffers_.size() * 2);
+            for(const auto &kv: buffers_) {
+                for(const auto t: { CollectDataType::RGB, CollectDataType::Depth }) {
+                    if(kv.second.params.find(t) == kv.second.params.end()) {
+                        continue;
+                    }
+                    StreamHealthState state;
+                    state.sn = kv.first;
+                    state.camKey = kv.second.camKey;
+                    state.type = t;
+                    state.startedSteady = now;
+                    state.lastFrameSteady = now;
+                    states.push_back(std::move(state));
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        streamHealth_.clear();
+        activeCameraFault_.reset();
+        for(auto &state: states) {
+            streamHealth_.emplace(streamHealthKey(state.sn, state.type), std::move(state));
+        }
+    }
+
+    void noteCameraStreamFrame(const std::string &deviceSn, CollectDataType type) {
+        if(!isCameraHealthStream(type)) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        auto it = streamHealth_.find(streamHealthKey(deviceSn, type));
+        if(it == streamHealth_.end()) {
+            return;
+        }
+        it->second.lastFrameSteady = now;
+        it->second.everReceived = true;
     }
 
     uint64_t sessionStepUs() const {
@@ -5598,6 +5752,12 @@ private:
             return frame;
         };
 
+        for(const auto t: { CollectDataType::RGB, CollectDataType::Depth }) {
+            if(getFrameForType(t)) {
+                noteCameraStreamFrame(deviceSn, t);
+            }
+        }
+
         {
             collectionSetStage("cb_preview_rgb");
             auto frame = getFrameForType(CollectDataType::RGB);
@@ -5945,6 +6105,9 @@ private:
     std::unordered_map<std::string, uint64_t> streamNextSeq_;
     std::mutex streamSeqMtx_;
     std::atomic_bool passthroughRgbMjpg_{ false };
+    mutable std::mutex streamHealthMtx_;
+    std::unordered_map<std::string, StreamHealthState> streamHealth_;
+    std::optional<CameraStreamFault> activeCameraFault_;
 
     std::string captureInfoLine_;
     std::string slotStatsLine_;
@@ -6171,6 +6334,68 @@ static void drawRgbGrid(cv::Mat &ui, const cv::Rect &r, const std::vector<std::p
     }
 }
 
+struct CameraFaultModalActions {
+    bool exitCollection = false;
+    bool restartCapture = false;
+};
+
+static CameraFaultModalActions drawCameraFaultModal(cv::Mat &ui,
+                                                    FrameMouse &fm,
+                                                    const MultiDeviceStreamingRecorder::CameraStreamFault &fault,
+                                                    bool restartEnabled,
+                                                    const std::string &detailLine) {
+    CameraFaultModalActions actions;
+    cv::Mat shade(ui.size(), ui.type(), cv::Scalar(0, 0, 0));
+    cv::addWeighted(shade, 0.64, ui, 0.36, 0.0, ui);
+
+    const int winW = ui.cols;
+    const int winH = ui.rows;
+    const int modalW = std::min(980, winW - 60);
+    const int modalH = 390;
+    const cv::Rect modal((winW - modalW) / 2, (winH - modalH) / 2, modalW, modalH);
+    cv::rectangle(ui, modal, cv::Scalar(24, 24, 30), cv::FILLED);
+    cv::rectangle(ui, modal, cv::Scalar(80, 80, 255), 3);
+
+    const std::string title = "Camera Stream Timeout";
+    int baseline = 0;
+    const auto titleSz = cv::getTextSize(title, cv::FONT_HERSHEY_DUPLEX, 1.22, 3, &baseline);
+    cv::putText(ui, title, cv::Point(modal.x + (modal.width - titleSz.width) / 2, modal.y + 58),
+                cv::FONT_HERSHEY_DUPLEX, 1.22, cv::Scalar(90, 90, 255), 3, cv::LINE_AA);
+
+    const int textLeft = modal.x + 34;
+    const int textWidth = modal.width - 68;
+    std::vector<std::string> lines;
+    auto appendWrapped = [&](const std::string &s, double scale, int thickness) {
+        auto wrapped = wrapTextToWidth(s, textWidth, cv::FONT_HERSHEY_DUPLEX, scale, thickness);
+        lines.insert(lines.end(), wrapped.begin(), wrapped.end());
+    };
+    appendWrapped(fault.message, 0.78, 2);
+    appendWrapped("Collection has been paused to prevent saving a broken capture.", 0.68, 1);
+    if(!detailLine.empty()) {
+        appendWrapped(detailLine, 0.62, 1);
+    }
+
+    int y = modal.y + 112;
+    for(size_t i = 0; i < lines.size() && i < 6; ++i) {
+        const cv::Scalar color = (i == 0) ? cv::Scalar(235, 235, 255) : cv::Scalar(215, 215, 215);
+        const double scale = (i == 0) ? 0.78 : 0.62;
+        const int thickness = (i == 0) ? 2 : 1;
+        cv::putText(ui, lines[i], cv::Point(textLeft, y),
+                    cv::FONT_HERSHEY_DUPLEX, scale, color, thickness, cv::LINE_AA);
+        y += (i == 0) ? 34 : 28;
+    }
+
+    cv::putText(ui, "Ctrl+1 exit collection    Ctrl+2 delete episode, restart cameras, and retry",
+                cv::Point(textLeft, modal.y + modal.height - 94),
+                cv::FONT_HERSHEY_DUPLEX, 0.58, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+
+    cv::Rect bExit(modal.x + 34, modal.y + modal.height - 64, (modal.width - 88) / 2, 48);
+    cv::Rect bRestart(modal.x + bExit.width + 54, modal.y + modal.height - 64, (modal.width - 88) / 2, 48);
+    actions.exitCollection = uiButtonEx(ui, bExit, "Exit Collection [Ctrl+1]", fm, true);
+    actions.restartCapture = uiButtonEx(ui, bRestart, "Delete + Restart [Ctrl+2]", fm, restartEnabled);
+    return actions;
+}
+
 }  // namespace
 
 int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
@@ -6195,6 +6420,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
+    std::optional<MultiDeviceStreamingRecorder::CameraStreamFault> activeCameraFault;
+    bool cameraFaultRecoveryShouldRecord = false;
+    bool cameraFaultDrainCompleteLogged = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     if(cfg.colorExposureMs > 0.0f) {
         std::ostringstream oss;
@@ -6244,6 +6472,56 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     auto enterDeleteConfirm = [&]() {
         captureState = CaptureState::DELETE_CONFIRM;
         capUi.msg.clear();
+    };
+
+    auto beginCurrentTaskRecording = [&](std::string *errorMessage) -> bool {
+        cfgUi.enforceRules();
+        if(capUi.currentTaskIdx < 0 || capUi.currentTaskIdx >= static_cast<int>(capUi.tasks.size())) {
+            if(errorMessage) {
+                *errorMessage = "No current task";
+            }
+            return false;
+        }
+
+        const fs::path root = fs::path(trimString(cfgUi.saveRoot));
+        const std::string subject = trimString(cfgUi.subjectId);
+        const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
+        const int episodeN = capUi.currentEpisode;
+        if(!recorder.start(cfgUi)) {
+            if(errorMessage) {
+                const std::string line = recorder.lastInfoLine();
+                *errorMessage = line.empty() ? "Failed to start cameras" : line;
+            }
+            return false;
+        }
+        if(!recorder.beginRecord(root, subject, taskName, episodeN)) {
+            if(errorMessage) {
+                const std::string line = recorder.lastInfoLine();
+                *errorMessage = line.empty() ? "Failed to start capture" : line;
+            }
+            return false;
+        }
+        return true;
+    };
+
+    auto pushRecordingStarted = [&]() {
+        if(capUi.currentTaskIdx < 0 || capUi.currentTaskIdx >= static_cast<int>(capUi.tasks.size())) {
+            return;
+        }
+        pushUiLog("Recording: " + capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name
+                  + " ep" + std::to_string(capUi.currentEpisode));
+        {
+            const std::string label = recorder.currentSessionLabel();
+            if(!label.empty()) {
+                pushUiLog("Session: " + label);
+            }
+        }
+        {
+            const std::string s = recorder.streamProfilesLine();
+            if(!s.empty()) {
+                pushUiLog(s);
+            }
+        }
     };
 
     bool running = true;
@@ -6490,12 +6768,40 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         else {
             collectionSetStage("ui_page_capture");
 
-            if(captureState == CaptureState::DRAINING && recorder.isDrainComplete()) {
+            if(!activeCameraFault.has_value()) {
+                auto fault = recorder.pollCameraStreamFault();
+                if(fault.has_value()) {
+                    activeCameraFault = fault;
+                    cameraFaultRecoveryShouldRecord = recorder.hasCurrentSession()
+                                                      || captureState == CaptureState::RECORDING
+                                                      || captureState == CaptureState::DRAINING
+                                                      || captureState == CaptureState::STOPPED_READY;
+                    cameraFaultDrainCompleteLogged = false;
+                    pendingResetAfterDrain = false;
+                    capUi.msg = "Camera stream timeout. Choose an action.";
+                    pushUiLog(fault->message);
+                    if(captureState == CaptureState::RECORDING) {
+                        recorder.stopRecording();
+                        captureState = recorder.isDrainComplete() ? CaptureState::STOPPED_READY : CaptureState::DRAINING;
+                        pushUiLog("Camera fault fuse tripped. Recording stopped.");
+                    }
+                }
+            }
+
+            const bool cameraFaultActive = activeCameraFault.has_value();
+            const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
+
+            if(!cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()) {
                 updateReadyState();
                 if(pendingResetAfterDrain) {
                     pushUiLog("Reset requested. Review delete confirmation.");
                     enterDeleteConfirm();
                 }
+            }
+            else if(cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()
+                    && !cameraFaultDrainCompleteLogged) {
+                pushUiLog("Faulted episode is ready to delete before restart.");
+                cameraFaultDrainCompleteLogged = true;
             }
 
             // --- 布局计算 ---
@@ -6610,6 +6916,13 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 sd = {"DELETE CONFIRM", cv::Scalar(255, 180, 80), cv::Scalar(80, 40, 20)};
                 break;
             }
+            if(cameraFaultActive && activeCameraFault.has_value()) {
+                sd = {"CAMERA ERROR", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
+                stateEmphasisLine = "cam" + activeCameraFault->camKey + " "
+                                    + dataTypeLabel(activeCameraFault->type) + " stalled";
+                stateFootnoteLine = cameraFaultRestartBlocked ? "waiting for current episode to finish saving"
+                                                              : "choose exit or delete + restart";
+            }
             cv::rectangle(ui, statusRect, sd.bgColor, cv::FILLED);
             cv::rectangle(ui, statusRect, sd.color, 2);
             {
@@ -6707,15 +7020,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
 
             // --- 状态机：允许操作判断 ---
-            const bool modalDelete = (captureState == CaptureState::DELETE_CONFIRM);
-            const bool allowStart  = !modalDelete && (captureState == CaptureState::IDLE) && (capUi.currentTaskIdx != -1);
-            const bool allowStop   = !modalDelete && (captureState == CaptureState::RECORDING);
-            const bool allowSave   = !modalDelete && (captureState == CaptureState::STOPPED_READY) && recorder.hasData();
-            const bool allowReset  = !modalDelete
+            const bool modalFault = cameraFaultActive;
+            const bool modalDelete = !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
+            const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE) && (capUi.currentTaskIdx != -1);
+            const bool allowStop   = !modalFault && !modalDelete && (captureState == CaptureState::RECORDING);
+            const bool allowSave   = !modalFault && !modalDelete && (captureState == CaptureState::STOPPED_READY) && recorder.hasData();
+            const bool allowReset  = !modalFault && !modalDelete
                                      && (captureState == CaptureState::RECORDING
                                          || captureState == CaptureState::STOPPED_READY
                                          || (captureState == CaptureState::DRAINING && !pendingResetAfterDrain));
-            const bool allowNav    = !modalDelete && (captureState == CaptureState::IDLE);
+            const bool allowNav    = !modalFault && !modalDelete && (captureState == CaptureState::IDLE);
 
             // --- 右侧按钮区 ---
             const int btnX = taskPanelX + 20;
@@ -6735,6 +7049,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             bool doBackCfg  = uiButtonEx(ui, bConfig,"Config",          fm, allowNav);
             bool doDeleteConfirm = false;
             bool doDeleteCancel  = false;
+            bool doFaultExit = false;
+            bool doFaultRestart = false;
 
             // --- Ctrl+1/2/3/4 快捷键 ---
             // 说明：当前环境里 Ctrl 按下会单独上报 0xE3/0xE4，数字键再单独上报 ASCII；
@@ -6752,7 +7068,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 const bool ctrlHeld     = g_ctrlShortcutListening || ctrlFromMask;
                 const int  baseKey      = key & 0xFFFF;
                 if(ctrlHeld) {
-                    if(modalDelete) {
+                    if(modalFault) {
+                        if(baseKey == '1') {
+                            doFaultExit = true;
+                        }
+                        else if(baseKey == '2') {
+                            doFaultRestart = !cameraFaultRestartBlocked;
+                        }
+                    }
+                    else if(modalDelete) {
                         if(baseKey == '1') {
                             doDeleteConfirm = true;
                         }
@@ -6830,7 +7154,87 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 doDeleteCancel  = doDeleteCancel  || uiButtonEx(ui, bDeleteCancel, "Cancel [Ctrl+4]", fm, true);
             }
 
+            if(modalFault && activeCameraFault.has_value()) {
+                const std::string detailLine = cameraFaultRestartBlocked
+                    ? "Waiting for current episode data to finish saving. Restart will be enabled after that."
+                    : "Restart will delete the current episode, restart all cameras, and retry this task.";
+                const auto actions = drawCameraFaultModal(ui, fm, *activeCameraFault,
+                                                          !cameraFaultRestartBlocked,
+                                                          detailLine);
+                doFaultExit = doFaultExit || actions.exitCollection;
+                doFaultRestart = doFaultRestart || actions.restartCapture;
+            }
+
             // --- 处理按钮动作 ---
+            if(doFaultExit) {
+                collectionSetStage("ui_camera_fault_exit");
+                recorder.stopIfRunning();
+                running = false;
+            }
+            if(doFaultRestart && running) {
+                collectionSetStage("ui_camera_fault_restart");
+                if(recorder.hasCurrentSession() && !recorder.isDrainComplete()) {
+                    capUi.msg = "Waiting for current episode to finish saving...";
+                    pushUiLog("Restart delayed: current episode is still saving.");
+                }
+                else {
+                    bool okToRestart = true;
+                    std::string error;
+                    const bool hadSession = recorder.hasCurrentSession();
+                    if(hadSession && !recorder.discardCurrentSession(&error)) {
+                        okToRestart = false;
+                        capUi.msg = "Delete failed";
+                        pushUiLog("Delete failed before camera restart: " + error);
+                    }
+
+                    if(okToRestart) {
+                        if(hadSession) {
+                            pushUiLog("Faulted episode deleted.");
+                        }
+                        recorder.stopIfRunning();
+                        latestFrameCache.clear();
+
+                        std::string startError;
+                        bool restarted = false;
+                        if(cameraFaultRecoveryShouldRecord) {
+                            restarted = beginCurrentTaskRecording(&startError);
+                        }
+                        else {
+                            restarted = recorder.start(cfgUi);
+                            if(!restarted) {
+                                startError = recorder.lastInfoLine();
+                                if(startError.empty()) {
+                                    startError = "Failed to restart cameras";
+                                }
+                            }
+                        }
+
+                        if(restarted) {
+                            activeCameraFault.reset();
+                            recorder.clearCameraStreamFault();
+                            cameraFaultRecoveryShouldRecord = false;
+                            cameraFaultDrainCompleteLogged = false;
+                            pendingResetAfterDrain = false;
+                            if(recorder.isRecording()) {
+                                captureState = CaptureState::RECORDING;
+                                capUi.msg.clear();
+                                pushUiLog("Cameras restarted. Retrying current task from the beginning.");
+                                pushRecordingStarted();
+                            }
+                            else {
+                                captureState = CaptureState::IDLE;
+                                capUi.msg = "Cameras restarted";
+                                pushUiLog("Cameras restarted.");
+                            }
+                        }
+                        else {
+                            recorder.stopIfRunning();
+                            capUi.msg = "Restart failed";
+                            pushUiLog("Restart failed: " + startError);
+                        }
+                    }
+                }
+            }
             if(doBackMenu) {
                 collectionSetStage("ui_capture_back_menu");
                 recorder.stopIfRunning();
