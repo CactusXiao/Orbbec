@@ -2441,6 +2441,7 @@ public:
     struct CameraStreamFault {
         std::string     sn;
         std::string     camKey;
+        std::string     displayName;
         CollectDataType type = CollectDataType::RGB;
         double          silentSeconds = 0.0;
         bool            everReceived = false;
@@ -2549,6 +2550,8 @@ public:
         recordInputClosing_.store(false);
         multiviewEosNotified_.store(false);
         passthroughRgbMjpg_.store(false);
+        activeFisheyeCameraCount_ = 0;
+        activeFisheyeCameraIds_.clear();
         resetStreamHealth();
     }
 
@@ -2681,6 +2684,7 @@ public:
             std::string err;
             auto snap = fisheyeRecorder_.snapshotLatest(&err);
             if(snap) {
+                noteFisheyeFrameSet(*snap);
                 for(size_t i = 0; i < snap->frames.size(); ++i) {
                     if(!snap->frames[i].bgr.empty()) {
                         out[fisheyePreviewLabel(i)] = snap->frames[i].bgr;
@@ -2693,11 +2697,6 @@ public:
 
     CameraStreamReadiness cameraStreamReadiness() const {
         CameraStreamReadiness readiness;
-        if(!multiviewEnabled_) {
-            readiness.allReady = true;
-            readiness.message = "Cameras ready";
-            return readiness;
-        }
         if(!capturing_.load()) {
             readiness.allReady = false;
             readiness.message = "Starting cameras...";
@@ -2714,12 +2713,12 @@ public:
                     readiness.readyStreams++;
                 }
                 else if(missing.size() < 3) {
-                    missing.push_back("cam" + state.camKey + " " + dataTypeLabel(state.type));
+                    missing.push_back(streamHealthDisplayName(state));
                 }
             }
         }
 
-        readiness.allReady = readiness.totalStreams > 0 && readiness.readyStreams == readiness.totalStreams;
+        readiness.allReady = readiness.totalStreams == 0 || readiness.readyStreams == readiness.totalStreams;
         std::ostringstream oss;
         if(readiness.allReady) {
             oss << "Cameras ready";
@@ -2741,7 +2740,7 @@ public:
     }
 
     std::optional<CameraStreamFault> pollCameraStreamFault() {
-        if(!capturing_.load() || !recording_.load() || !multiviewEnabled_) {
+        if(!capturing_.load() || !recording_.load()) {
             return std::nullopt;
         }
 
@@ -2769,14 +2768,14 @@ public:
                 CameraStreamFault fault;
                 fault.sn = state.sn;
                 fault.camKey = state.camKey;
+                fault.displayName = streamHealthDisplayName(state);
                 fault.type = state.type;
                 fault.silentSeconds = silentSeconds;
                 fault.everReceived = state.everReceived;
                 std::ostringstream oss;
                 oss.setf(std::ios::fixed);
-                oss << "Camera stream timeout: cam" << state.camKey
+                oss << "Camera stream timeout: " << fault.displayName
                     << " sn=" << state.sn
-                    << " " << dataTypeLabel(state.type)
                     << " no frame for " << std::setprecision(2) << silentSeconds << "s";
                 if(!state.everReceived) {
                     oss << " since stream start";
@@ -2902,6 +2901,7 @@ public:
         multiviewEnabled_ = ui.enableMultiview;
         fisheyeEnabled_   = ui.enableFisheyes;
         activeFisheyeCameraCount_ = 0;
+        activeFisheyeCameraIds_.clear();
 
         if(!multiviewEnabled_ && !fisheyeEnabled_) {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -2939,6 +2939,8 @@ public:
                 if(!fisheyeRecorder_.start(fisheyeCfg, &fisheyeError)) {
                     if(multiviewEnabled_) {
                         fisheyeEnabled_ = false;
+                        activeFisheyeCameraCount_ = 0;
+                        activeFisheyeCameraIds_.clear();
                         fisheyeStatusLine = "Fisheye unavailable, fallback to multiview only: " + fisheyeError;
                         std::cerr << "[collection] " << fisheyeStatusLine << std::endl;
                     }
@@ -2948,21 +2950,14 @@ public:
                         return false;
                     }
                 }
-                else if(!fisheyeRecorder_.waitUntilReady(std::chrono::seconds(2))) {
-                    fisheyeRecorder_.stop();
-                    if(multiviewEnabled_) {
-                        fisheyeEnabled_ = false;
-                        fisheyeStatusLine = "Fisheye start timed out, fallback to multiview only";
-                        std::cerr << "[collection] " << fisheyeStatusLine << std::endl;
-                    }
-                    else {
-                        std::lock_guard<std::mutex> lock(mtx_);
-                        captureInfoLine_ = "Fisheye start timed out";
-                        return false;
-                    }
-                }
                 else {
                     activeFisheyeCameraCount_ = fisheyeCfg.cameras.size();
+                    activeFisheyeCameraIds_.clear();
+                    activeFisheyeCameraIds_.reserve(fisheyeCfg.cameras.size());
+                    for(size_t i = 0; i < fisheyeCfg.cameras.size(); ++i) {
+                        const auto &camera = fisheyeCfg.cameras[i];
+                        activeFisheyeCameraIds_.push_back(camera.cameraId.empty() ? ("cam" + std::to_string(i)) : camera.cameraId);
+                    }
                 }
             }
         }
@@ -2971,7 +2966,7 @@ public:
             stopping_.store(false);
             capturing_.store(true);
             recording_.store(false);
-            resetStreamHealth();
+            initStreamHealthForActiveStreams();
             softwareTriggerDevices_.clear();
             useSoftwareTrigger_ = false;
             if(!fisheyeStatusLine.empty()) {
@@ -3450,6 +3445,8 @@ public:
     void stopIfRunning() {
         if(!capturing_.load()) {
             fisheyeRecorder_.stop();
+            activeFisheyeCameraCount_ = 0;
+            activeFisheyeCameraIds_.clear();
             return;
         }
         stopping_.store(true);
@@ -3486,6 +3483,8 @@ public:
         recording_.store(false);
         hasData_.store(false);
         passthroughRgbMjpg_.store(false);
+        activeFisheyeCameraCount_ = 0;
+        activeFisheyeCameraIds_.clear();
         resetStreamHealth();
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -3585,11 +3584,15 @@ public:
 
 private:
     struct StreamHealthState {
+        std::string healthKey;
         std::string sn;
         std::string camKey;
+        std::string displayName;
         CollectDataType type = CollectDataType::RGB;
         std::chrono::steady_clock::time_point startedSteady{};
         std::chrono::steady_clock::time_point lastFrameSteady{};
+        uint64_t lastFrameTimestampUs = 0;
+        bool requireTimestampAdvance = false;
         bool everReceived = false;
         bool faulted = false;
     };
@@ -4219,6 +4222,21 @@ private:
         return sn + ":" + dataTypeLabel(type);
     }
 
+    static std::string fisheyeStreamHealthKey(const std::string &cameraId) {
+        return "fisheye:" + cameraId + ":RGB";
+    }
+
+    static std::string fisheyeStreamDisplayName(const std::string &cameraId) {
+        return "fisheye " + cameraId + " RGB";
+    }
+
+    static std::string streamHealthDisplayName(const StreamHealthState &state) {
+        if(!state.displayName.empty()) {
+            return state.displayName;
+        }
+        return "cam" + state.camKey + " " + dataTypeLabel(state.type);
+    }
+
     void resetStreamHealth() {
         std::lock_guard<std::mutex> lock(streamHealthMtx_);
         streamHealth_.clear();
@@ -4230,15 +4248,17 @@ private:
         const auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            states.reserve(buffers_.size() * 2);
+            states.reserve(buffers_.size() * 2 + activeFisheyeCameraCount_);
             for(const auto &kv: buffers_) {
                 for(const auto t: { CollectDataType::RGB, CollectDataType::Depth }) {
                     if(kv.second.params.find(t) == kv.second.params.end()) {
                         continue;
                     }
                     StreamHealthState state;
+                    state.healthKey = streamHealthKey(kv.first, t);
                     state.sn = kv.first;
                     state.camKey = kv.second.camKey;
+                    state.displayName = "cam" + state.camKey + " " + dataTypeLabel(t);
                     state.type = t;
                     state.startedSteady = now;
                     state.lastFrameSteady = now;
@@ -4246,12 +4266,30 @@ private:
                 }
             }
         }
+        if(fisheyeEnabled_ && activeFisheyeCameraCount_ > 0) {
+            for(size_t i = 0; i < activeFisheyeCameraCount_; ++i) {
+                const std::string cameraId = (i < activeFisheyeCameraIds_.size() && !activeFisheyeCameraIds_[i].empty())
+                    ? activeFisheyeCameraIds_[i]
+                    : ("cam" + std::to_string(i));
+                StreamHealthState state;
+                state.healthKey = fisheyeStreamHealthKey(cameraId);
+                state.sn = cameraId;
+                state.camKey = cameraId;
+                state.displayName = fisheyeStreamDisplayName(cameraId);
+                state.type = CollectDataType::RGB;
+                state.startedSteady = now;
+                state.lastFrameSteady = now;
+                state.requireTimestampAdvance = true;
+                states.push_back(std::move(state));
+            }
+        }
 
         std::lock_guard<std::mutex> lock(streamHealthMtx_);
         streamHealth_.clear();
         activeCameraFault_.reset();
         for(auto &state: states) {
-            streamHealth_.emplace(streamHealthKey(state.sn, state.type), std::move(state));
+            const std::string key = state.healthKey;
+            streamHealth_.emplace(key, std::move(state));
         }
     }
 
@@ -4269,12 +4307,37 @@ private:
         it->second.everReceived = true;
     }
 
+    void noteFisheyeFrameSet(const FisheyeFrameSet &frameSet) {
+        if(frameSet.frames.empty()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        for(const auto &frame: frameSet.frames) {
+            if(frame.cameraId.empty() || frame.captureTimestampUs == 0) {
+                continue;
+            }
+            auto it = streamHealth_.find(fisheyeStreamHealthKey(frame.cameraId));
+            if(it == streamHealth_.end()) {
+                continue;
+            }
+            auto &state = it->second;
+            if(state.requireTimestampAdvance && frame.captureTimestampUs <= state.lastFrameTimestampUs) {
+                continue;
+            }
+            state.lastFrameTimestampUs = frame.captureTimestampUs;
+            state.lastFrameSteady = now;
+            state.everReceived = true;
+        }
+    }
+
     void markStreamHealthCaptureStarted(std::chrono::steady_clock::time_point startTime) {
         std::lock_guard<std::mutex> lock(streamHealthMtx_);
         activeCameraFault_.reset();
         for(auto &kv: streamHealth_) {
             kv.second.startedSteady = startTime;
             kv.second.lastFrameSteady = startTime;
+            kv.second.lastFrameTimestampUs = 0;
             kv.second.faulted = false;
         }
     }
@@ -5953,6 +6016,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 continue;
             }
+            noteFisheyeFrameSet(*sample);
             enqueueFisheyeFrameSet(std::move(*sample));
         }
     }
@@ -6158,6 +6222,7 @@ private:
     bool            multiviewEnabled_ = true;
     bool            fisheyeEnabled_ = false;
     size_t          activeFisheyeCameraCount_ = 0;
+    std::vector<std::string> activeFisheyeCameraIds_;
     FisheyeRecorder fisheyeRecorder_;
 
     mutable std::mutex mtx_;
@@ -6911,7 +6976,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     sd = {"WARMING UP", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
                     stateEmphasisLine = cameraReadiness.message;
-                    stateFootnoteLine = "Start is enabled after every active RGB/Depth stream has a frame";
+                    stateFootnoteLine = "Start is enabled after every active Orbbec RGB/Depth and fisheye RGB stream has a frame";
                 }
                 break;
             case CaptureState::RECORDING:
