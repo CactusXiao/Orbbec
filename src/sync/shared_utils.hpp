@@ -111,6 +111,13 @@ struct DepthPointCloudFiltersConfig {
     bool        deskCrop                   = false;
 };
 
+struct VoiceFeedbackConfig {
+    bool        enabled       = false;
+    std::string speakerDevice = "default";
+    std::string command;
+    std::unordered_map<std::string, std::string> messages;
+};
+
 struct AppConfig {
     fs::path                  outputDir;
     int                       durationSec   = 0;
@@ -131,6 +138,7 @@ struct AppConfig {
     int                       colorBrightness = -1;
     int                       colorCloudRgbFrameOffset = 0;
     SaveOptions               save;
+    VoiceFeedbackConfig       voiceFeedback;
     FisheyeModuleConfig       fisheye;
     DepthPointCloudFiltersConfig filters;
     std::vector<DeviceConfig> devices;

@@ -372,6 +372,39 @@ AppConfig loadConfig(const fs::path &configPath) {
         cfg.colorCloudRgbFrameOffset = std::max(-5, std::min(5, *v));
     }
 
+    if(auto *voiceObj = cJSON_GetObjectItemCaseSensitive(root, "voiceFeedback")) {
+        if(cJSON_IsObject(voiceObj)) {
+            if(auto v = getBool(voiceObj, "enabled")) {
+                cfg.voiceFeedback.enabled = *v;
+            }
+            if(auto v = getString(voiceObj, "speakerDevice")) {
+                cfg.voiceFeedback.speakerDevice = trimString(*v);
+            }
+            else if(auto v = getString(voiceObj, "device")) {
+                cfg.voiceFeedback.speakerDevice = trimString(*v);
+            }
+            else if(auto v = getString(voiceObj, "outputDevice")) {
+                cfg.voiceFeedback.speakerDevice = trimString(*v);
+            }
+            if(cfg.voiceFeedback.speakerDevice.empty()) {
+                cfg.voiceFeedback.speakerDevice = "default";
+            }
+            if(auto v = getString(voiceObj, "command")) {
+                cfg.voiceFeedback.command = trimString(*v);
+            }
+            if(auto *messagesObj = cJSON_GetObjectItemCaseSensitive(voiceObj, "messages")) {
+                if(cJSON_IsObject(messagesObj)) {
+                    cJSON *item = nullptr;
+                    cJSON_ArrayForEach(item, messagesObj) {
+                        if(item && item->string && cJSON_IsString(item) && item->valuestring) {
+                            cfg.voiceFeedback.messages[item->string] = item->valuestring;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if(auto *saveObj = cJSON_GetObjectItemCaseSensitive(root, "save")) {
         if(cJSON_IsObject(saveObj)) {
             if(auto v = getString(saveObj, "colorExt")) {

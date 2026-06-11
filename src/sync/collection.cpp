@@ -1124,6 +1124,127 @@ static std::string shellQuote(const std::string &s) {
     return out;
 }
 
+static void replaceAllInPlace(std::string &s, const std::string &needle, const std::string &replacement) {
+    if(needle.empty()) {
+        return;
+    }
+    size_t pos = 0;
+    while((pos = s.find(needle, pos)) != std::string::npos) {
+        s.replace(pos, needle.size(), replacement);
+        pos += replacement.size();
+    }
+}
+
+class VoiceAnnouncer {
+public:
+    explicit VoiceAnnouncer(VoiceFeedbackConfig cfg)
+        : cfg_(std::move(cfg)) {
+        if(cfg_.enabled) {
+            worker_ = std::thread([this]() { workerLoop(); });
+        }
+    }
+
+    ~VoiceAnnouncer() {
+        stop();
+    }
+
+    void say(const std::string &messageKey, const std::string &fallbackText) {
+        if(!cfg_.enabled) {
+            return;
+        }
+        std::string text = fallbackText;
+        auto it = cfg_.messages.find(messageKey);
+        if(it != cfg_.messages.end()) {
+            text = it->second;
+        }
+        text = trimString(std::move(text));
+        if(text.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            queue_.push_back(std::move(text));
+        }
+        cv_.notify_one();
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        if(worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+private:
+    std::string buildCommand(const std::string &text) const {
+        const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
+        const std::string qText = shellQuote(text);
+        const std::string qDevice = shellQuote(device);
+        if(!cfg_.command.empty()) {
+            std::string cmd = cfg_.command;
+            const bool hasTextPlaceholder = cmd.find("{text}") != std::string::npos;
+            replaceAllInPlace(cmd, "{text}", qText);
+            replaceAllInPlace(cmd, "{device}", qDevice);
+            if(!hasTextPlaceholder) {
+                cmd += " " + qText;
+            }
+            return cmd;
+        }
+
+#if defined(__APPLE__)
+        std::ostringstream cmd;
+        cmd << "if command -v say >/dev/null 2>&1; then say ";
+        if(!device.empty() && device != "default") {
+            cmd << "-a " << qDevice << " ";
+        }
+        cmd << qText << "; fi";
+        return cmd.str();
+#else
+        return "(if command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
+               "espeak --stdout " + qText + " | aplay -q -D " + qDevice + "; "
+               "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; "
+               "elif command -v spd-say >/dev/null 2>&1; then spd-say -- " + qText + "; fi)";
+#endif
+    }
+
+    void workerLoop() {
+        while(true) {
+            std::string text;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [&]() { return stopping_ || !queue_.empty(); });
+                if(stopping_ && queue_.empty()) {
+                    return;
+                }
+                text = std::move(queue_.front());
+                queue_.pop_front();
+            }
+
+            const std::string cmd = buildCommand(text);
+            if(cmd.empty()) {
+                continue;
+            }
+            const int rc = std::system(cmd.c_str());
+            if(rc != 0 && !warnedFailure_) {
+                warnedFailure_ = true;
+                std::cerr << "[collection][voice] playback command failed once. text=" << text << std::endl;
+            }
+        }
+    }
+
+    VoiceFeedbackConfig       cfg_;
+    std::mutex                mtx_;
+    std::condition_variable   cv_;
+    std::deque<std::string>   queue_;
+    std::thread               worker_;
+    bool                      stopping_ = false;
+    bool                      warnedFailure_ = false;
+};
+
 static std::string toLowerAscii(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -6548,12 +6669,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     CollectionConfigUi cfgUi;
     CollectionCaptureUi capUi;
     MultiDeviceStreamingRecorder recorder(cfg);
+    VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
     std::optional<MultiDeviceStreamingRecorder::CameraStreamFault> activeCameraFault;
     bool cameraFaultDrainCompleteLogged = false;
+    bool cameraReadyAnnounced = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     if(cfg.colorExposureMs > 0.0f) {
         std::ostringstream oss;
@@ -6574,6 +6697,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         while(uiLogs.size() > kMax) {
             uiLogs.pop_front();
         }
+    };
+
+    auto announce = [&](const std::string &messageKey, const std::string &fallbackText) {
+        voice.say(messageKey, fallbackText);
+    };
+
+    auto resetCameraReadyAnnouncement = [&]() {
+        cameraReadyAnnounced = false;
     };
 
     auto updateReadyState = [&]() {
@@ -6601,6 +6732,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     };
 
     auto enterDeleteConfirm = [&]() {
+        if(captureState != CaptureState::DELETE_CONFIRM) {
+            announce("reset_select", "reset select");
+        }
         captureState = CaptureState::DELETE_CONFIRM;
         capUi.msg.clear();
     };
@@ -6762,6 +6896,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect bEnter(340, 680, 260, 60);
             if(uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
+                announce("menu", "menu");
                 recorder.stopIfRunning();
                 running = false;
             }
@@ -6770,9 +6905,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 cfgUi.enforceRules();
                 if(!cfgUi.hasSelectedCaptureType()) {
                     cfgUi.error = "Select at least one capture type";
+                    announce("enter_failed", "enter failed");
                 }
                 else if(!cfgUi.hasRequiredFields()) {
                     cfgUi.error = "save_path and subject_id are required";
+                    announce("enter_failed", "enter failed");
                 }
                 else {
                     const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
@@ -6780,6 +6917,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     auto tasks = loadTaskJson(saveRoot / "task.json");
                     if(tasks.empty()) {
                         cfgUi.error = "task.json not found or empty at: " + saveRoot.string();
+                        announce("enter_failed", "enter failed");
                     }
                     else {
                         cfgUi.error.clear();
@@ -6802,6 +6940,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         page = CollectionPage::Capture;
                         const bool ok = recorder.start(cfgUi);
                         if(ok) {
+                            resetCameraReadyAnnouncement();
+                            announce("enter", "enter");
                             pushUiLog("Enter capture");
                             {
                                 const std::string s = recorder.streamProfilesLine();
@@ -6811,6 +6951,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                             }
                         }
                         else {
+                            announce("enter_failed", "enter failed");
                             pushUiLog("Enter capture failed");
                         }
                     }
@@ -6855,8 +6996,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     activeCameraFault = fault;
                     cameraFaultDrainCompleteLogged = false;
                     pendingResetAfterDrain = false;
+                    resetCameraReadyAnnouncement();
                     capUi.msg = "Camera stream timeout. Choose an action.";
                     pushUiLog(fault->message);
+                    announce("camera_fault", "camera error");
                     if(captureState == CaptureState::RECORDING) {
                         recorder.stopRecording();
                         captureState = recorder.isDrainComplete() ? CaptureState::STOPPED_READY : CaptureState::DRAINING;
@@ -6868,6 +7011,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const bool cameraFaultActive = activeCameraFault.has_value();
             const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
             const auto cameraReadiness = recorder.cameraStreamReadiness();
+            if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady) {
+                if(!cameraReadyAnnounced) {
+                    announce("ready", "ready");
+                    cameraReadyAnnounced = true;
+                }
+            }
+            else if(!cameraFaultActive && captureState == CaptureState::IDLE && !cameraReadiness.allReady) {
+                resetCameraReadyAnnouncement();
+            }
 
             if(!cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()) {
                 updateReadyState();
@@ -7259,6 +7411,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             // --- 处理按钮动作 ---
             if(doFaultExit) {
                 collectionSetStage("ui_camera_fault_exit");
+                announce("fault_exit", "exit");
                 if(recorder.isRecording()) {
                     recorder.stopRecording();
                 }
@@ -7294,6 +7447,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 if(recorder.hasCurrentSession() && !recorder.isDrainComplete()) {
                     capUi.msg = "Waiting for current episode to finish saving...";
                     pushUiLog("Restart delayed: current episode is still saving.");
+                    announce("fault_restart_wait", "waiting");
                 }
                 else {
                     bool okToRestart = true;
@@ -7303,6 +7457,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         okToRestart = false;
                         capUi.msg = "Delete failed";
                         pushUiLog("Delete failed before camera restart: " + error);
+                        announce("delete_failed", "delete failed");
                     }
 
                     if(okToRestart) {
@@ -7327,24 +7482,29 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                             cameraFaultDrainCompleteLogged = false;
                             pendingResetAfterDrain = false;
                             captureState = CaptureState::IDLE;
+                            resetCameraReadyAnnouncement();
                             capUi.msg = "Cameras restarted. Press Start to retry.";
                             pushUiLog("Cameras restarted. Ready to start current episode again.");
+                            announce("fault_restart", "restart");
                         }
                         else {
                             recorder.stopIfRunning();
                             capUi.msg = "Restart failed";
                             pushUiLog("Restart failed: " + startError);
+                            announce("fault_restart_failed", "restart failed");
                         }
                     }
                 }
             }
             if(doBackMenu) {
                 collectionSetStage("ui_capture_back_menu");
+                announce("menu", "menu");
                 recorder.stopIfRunning();
                 running = false;
             }
             if(doBackCfg) {
                 collectionSetStage("ui_capture_back_config");
+                announce("config", "config");
                 recorder.stopIfRunning();
                 page = CollectionPage::Config;
             }
@@ -7359,6 +7519,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 if(!ok) {
                     capUi.msg = "Failed to start capture";
                     pushUiLog("Start failed");
+                    announce("start_failed", "start failed");
                     {
                         const std::string line = recorder.lastInfoLine();
                         if(!line.empty()) {
@@ -7370,6 +7531,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     captureState = CaptureState::RECORDING;
                     pendingResetAfterDrain = false;
                     capUi.msg.clear();
+                    announce("start", "start");
                     pushUiLog("Recording: " + capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name
                               + " ep" + std::to_string(capUi.currentEpisode));
                     {
@@ -7389,6 +7551,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(doStop) {
                 collectionSetStage("ui_capture_stop");
                 recorder.stopRecording();
+                announce("stop", "stop");
                 if(recorder.isDrainComplete()) {
                     updateReadyState();
                 }
@@ -7400,6 +7563,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
             if(doReset) {
                 collectionSetStage("ui_capture_reset");
+                announce("reset", "reset");
                 if(captureState == CaptureState::RECORDING) {
                     recorder.stopRecording();
                     pendingResetAfterDrain = true;
@@ -7427,6 +7591,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 collectionSetStage("ui_capture_save");
                 const bool confirmed = recorder.confirmCurrentSession();
                 if(confirmed) {
+                    announce("confirm", "confirm");
                     const int idx = capUi.currentTaskIdx;
                     if(idx >= 0 && idx < static_cast<int>(capUi.progress.size())) {
                         capUi.progress[static_cast<size_t>(idx)].completed += 1;
@@ -7461,6 +7626,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     capUi.msg = "Confirm failed: session not ready";
                     pushUiLog("Confirm failed");
+                    announce("confirm_failed", "confirm failed");
                 }
             }
             if(doDeleteConfirm) {
@@ -7472,10 +7638,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     pendingResetAfterDrain = false;
                     capUi.msg = "Capture discarded";
                     pushUiLog("Reset OK. Current episode discarded.");
+                    announce("reset_confirm", "reset confirmed");
                 }
                 else {
                     capUi.msg = "Delete failed";
                     pushUiLog("Delete failed: " + error);
+                    announce("delete_failed", "delete failed");
                 }
             }
             if(doDeleteCancel) {
@@ -7484,6 +7652,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 pendingResetAfterDrain = false;
                 capUi.msg = "Delete canceled";
                 pushUiLog("Delete canceled");
+                announce("reset_cancel", "reset canceled");
             }
 
             // --- 超时自动停止 ---
