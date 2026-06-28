@@ -5545,6 +5545,40 @@ private:
         return findNearestEgoFrameIndex(session_.egoFrames, centerUs);
     }
 
+    bool pickNearestMappedEgoFrameLocked(uint64_t centerUs,
+                                         size_t &picked,
+                                         int &videoFrameIndex,
+                                         bool &hasPendingVideoCandidate) const {
+        picked = 0;
+        videoFrameIndex = -1;
+        hasPendingVideoCandidate = false;
+        if(session_.egoFrames.empty()) {
+            return false;
+        }
+        auto absDiff = [](uint64_t a, uint64_t b) {
+            return a > b ? (a - b) : (b - a);
+        };
+        uint64_t bestDiff = std::numeric_limits<uint64_t>::max();
+        for(size_t i = 0; i < session_.egoFrames.size(); ++i) {
+            const auto &frame = session_.egoFrames[i];
+            const uint64_t diff = absDiff(frame.refTimestampUs, centerUs);
+            if(diff > session_.maxAbsDiffUs) {
+                continue;
+            }
+            const int candidateVideoFrame = egoVideoFrameIndexForSourceFrameLocked(frame);
+            if(candidateVideoFrame < 0) {
+                hasPendingVideoCandidate = true;
+                continue;
+            }
+            if(diff < bestDiff || (diff == bestDiff && candidateVideoFrame < videoFrameIndex)) {
+                picked = i;
+                videoFrameIndex = candidateVideoFrame;
+                bestDiff = diff;
+            }
+        }
+        return videoFrameIndex >= 0;
+    }
+
     void pruneCommittedFramesLocked(uint64_t centerUs) {
         for(auto &kv: session_.streams) {
             for(auto &typeKv: kv.second) {
@@ -5760,24 +5794,15 @@ private:
         bool hasPickedEgo = false;
         int pickedEgoVideoFrameIndex = -1;
         if(session_.saveEgo) {
-            if(!session_.egoFrames.empty()) {
-                auto absDiff = [](uint64_t a, uint64_t b) {
-                    return a > b ? (a - b) : (b - a);
-                };
-                pickedEgoIdx = pickNearestEgoIndexLocked(centerUs);
-                if(pickedEgoIdx < session_.egoFrames.size()
-                   && absDiff(session_.egoFrames[pickedEgoIdx].refTimestampUs, centerUs) <= session_.maxAbsDiffUs) {
-                    const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
-                    pickedEgoVideoFrameIndex = egoVideoFrameIndexForSourceFrameLocked(egoFrame);
-                    if(pickedEgoVideoFrameIndex >= 0) {
-                        hasPickedEgo = true;
-                        tsMin = std::min(tsMin, egoFrame.refTimestampUs);
-                        tsMax = std::max(tsMax, egoFrame.refTimestampUs);
-                    }
-                    else if(!session_.egoEos && pickedEgoIdx + 1 >= session_.egoFrames.size()) {
-                        return false;
-                    }
-                }
+            bool hasPendingEgoVideoCandidate = false;
+            if(pickNearestMappedEgoFrameLocked(centerUs, pickedEgoIdx, pickedEgoVideoFrameIndex, hasPendingEgoVideoCandidate)) {
+                const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
+                hasPickedEgo = true;
+                tsMin = std::min(tsMin, egoFrame.refTimestampUs);
+                tsMax = std::max(tsMax, egoFrame.refTimestampUs);
+            }
+            else if(hasPendingEgoVideoCandidate && !session_.egoEos) {
+                return false;
             }
         }
 
