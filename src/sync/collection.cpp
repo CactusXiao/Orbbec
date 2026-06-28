@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <unordered_set>
 
 #if defined(__linux__)
 #include <execinfo.h>
@@ -2747,6 +2748,7 @@ public:
         oss.setf(std::ios::fixed);
         oss << "Time " << std::setprecision(2) << seconds << " s"
             << "   Frames " << session_.refFrameCount;
+        appendEgoAlignmentStats(oss, session_);
         return oss.str();
     }
 
@@ -2762,6 +2764,7 @@ public:
         oss << "Actual " << actualFrames
             << " / Total " << totalFrames
             << " / Dropped " << droppedFrames;
+        appendEgoAlignmentStats(oss, session_);
         return oss.str();
     }
 
@@ -4401,6 +4404,9 @@ private:
         uint64_t lastRefTs = 0;
         size_t fisheyeCapturedSets = 0;
         size_t egoCapturedFrames = 0;
+        std::unordered_set<int> egoAlignedSourceFrameIndices;
+        std::unordered_set<uint64_t> egoAlignedRefTimestamps;
+        size_t egoMissingAlignedRows = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -4821,10 +4827,29 @@ private:
         if(session.fisheyeCapturedSets > 0) {
             oss << "  FisheyeFrames=" << session.fisheyeCapturedSets;
         }
-        if(session.egoCapturedFrames > 0) {
+        if(session.saveEgo || session.egoCapturedFrames > 0) {
             oss << "  EgoFrames=" << session.egoCapturedFrames;
+            appendEgoAlignmentStats(oss, session);
         }
         return oss.str();
+    }
+
+    static size_t egoAlignedFrameCount(const SessionState &session) {
+        return session.egoAlignedSourceFrameIndices.size() + session.egoAlignedRefTimestamps.size();
+    }
+
+    static size_t egoUnalignedFrameCount(const SessionState &session) {
+        const size_t aligned = egoAlignedFrameCount(session);
+        return session.egoCapturedFrames > aligned ? (session.egoCapturedFrames - aligned) : 0;
+    }
+
+    static void appendEgoAlignmentStats(std::ostream &os, const SessionState &session) {
+        if(!session.saveEgo && session.egoCapturedFrames == 0) {
+            return;
+        }
+        os << "  EgoAligned=" << egoAlignedFrameCount(session)
+           << "  EgoUnaligned=" << egoUnalignedFrameCount(session)
+           << "  EgoNoAlignRows=" << session.egoMissingAlignedRows;
     }
 
     std::string buildCaptureInfoSnapshotLocked(int durMs) const {
@@ -4839,6 +4864,7 @@ private:
         std::ostringstream oss;
         oss.setf(std::ios::fixed);
         oss << "AlignedRef=" << session.alignedRef << " Full=" << session.fullAligned << " Missing=" << session.missingAligned;
+        appendEgoAlignmentStats(oss, session);
         if(session.minMissingMs > 0.0) {
             oss << " MinMissingInterval=" << std::setprecision(2) << session.minMissingMs << "ms";
         }
@@ -5607,13 +5633,27 @@ private:
         return frame.sourceFrameIndex >= 0 ? egoRecorder_.videoFrameIndexForSourceFrame(frame.sourceFrameIndex) : -1;
     }
 
-    void appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame *frame, int egoVideoFrameIndex) {
-        if(!session_.egoAlignedTimestampsOpen) {
-            return;
+    void noteEgoAlignedFrameLocked(const EgoFrame &frame) {
+        if(frame.sourceFrameIndex >= 0) {
+            session_.egoAlignedSourceFrameIndices.insert(frame.sourceFrameIndex);
         }
+        else if(frame.refTimestampUs > 0) {
+            session_.egoAlignedRefTimestamps.insert(frame.refTimestampUs);
+        }
+    }
+
+    void appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame *frame, int egoVideoFrameIndex) {
         if(!frame || egoVideoFrameIndex < 0) {
+            session_.egoMissingAlignedRows++;
+            if(!session_.egoAlignedTimestampsOpen) {
+                return;
+            }
             writeCsvRow(session_.egoAlignedTimestampsOfs,
                         { frameIndex, "", "", "", "", "", "", "" });
+            return;
+        }
+        noteEgoAlignedFrameLocked(*frame);
+        if(!session_.egoAlignedTimestampsOpen) {
             return;
         }
         writeCsvRow(session_.egoAlignedTimestampsOfs,
