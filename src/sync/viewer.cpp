@@ -1,9 +1,16 @@
 #include "viewer.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <list>
 #include <regex>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 
 #if defined(__has_include)
 #if __has_include(<opencv2/highgui/clipboard.hpp>)
@@ -1061,6 +1068,103 @@ static int countCsvDataRows(const fs::path &path) {
     return rows;
 }
 
+static std::vector<std::string> splitCsvSimple(const std::string &line) {
+    std::vector<std::string> out;
+    std::string current;
+    bool inQuotes = false;
+    for(size_t i = 0; i < line.size(); ++i) {
+        const char ch = line[i];
+        if(ch == '"') {
+            if(inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
+                current.push_back('"');
+                ++i;
+            }
+            else {
+                inQuotes = !inQuotes;
+            }
+            continue;
+        }
+        if(ch == ',' && !inQuotes) {
+            out.push_back(current);
+            current.clear();
+            continue;
+        }
+        if(ch != '\r' && ch != '\n') {
+            current.push_back(ch);
+        }
+    }
+    out.push_back(current);
+    return out;
+}
+
+static std::unordered_map<std::string, size_t> csvHeaderIndex(const std::vector<std::string> &header) {
+    std::unordered_map<std::string, size_t> out;
+    for(size_t i = 0; i < header.size(); ++i) {
+        out[header[i]] = i;
+    }
+    return out;
+}
+
+static std::string csvValue(const std::unordered_map<std::string, size_t> &index,
+                            const std::vector<std::string> &cols,
+                            const std::string &name) {
+    auto it = index.find(name);
+    if(it == index.end() || it->second >= cols.size()) {
+        return "";
+    }
+    return cols[it->second];
+}
+
+static bool csvBoolValue(const std::string &value) {
+    const std::string s = toLowerAscii(trimWhitespace(value));
+    return s == "1" || s == "true" || s == "yes" || s == "y";
+}
+
+static bool csvLooksBool(const std::string &value) {
+    const std::string s = toLowerAscii(trimWhitespace(value));
+    return s == "0" || s == "1" || s == "true" || s == "false" || s == "yes" || s == "no" || s == "y" || s == "n";
+}
+
+static int csvIntValue(const std::string &value, int fallback = -1) {
+    try {
+        size_t idx = 0;
+        const int v = std::stoi(trimWhitespace(value), &idx);
+        return idx == 0 ? fallback : v;
+    }
+    catch(...) {
+        try {
+            size_t idx = 0;
+            const double v = std::stod(trimWhitespace(value), &idx);
+            return idx == 0 ? fallback : static_cast<int>(std::llround(v));
+        }
+        catch(...) {
+            return fallback;
+        }
+    }
+}
+
+static uint64_t csvUint64Value(const std::string &value, uint64_t fallback = 0) {
+    try {
+        size_t idx = 0;
+        const uint64_t v = static_cast<uint64_t>(std::stoull(trimWhitespace(value), &idx));
+        return idx == 0 ? fallback : v;
+    }
+    catch(...) {
+        return fallback;
+    }
+}
+
+static double csvDoubleValue(const std::string &value, double fallback = std::numeric_limits<double>::quiet_NaN()) {
+    try {
+        size_t idx = 0;
+        const double v = std::stod(trimWhitespace(value), &idx);
+        return idx == 0 ? fallback : v;
+    }
+    catch(...) {
+        return fallback;
+    }
+}
+
 struct VideoStreamInfo {
     int width = 0;
     int height = 0;
@@ -1414,6 +1518,7 @@ enum class ViewerDataType {
 enum class ViewerSourceKind {
     Multiview,
     Fisheye,
+    Ego,
 };
 
 struct ViewerSource {
@@ -1432,6 +1537,51 @@ struct ViewerSource {
     bool             hasDepth = false;
     bool             hasIr = false;
     bool             visible = true;
+};
+
+struct EgoAlignedFrame {
+    bool valid = false;
+    int alignedFrameIndex = -1;
+    int egoFrameIndex = -1;
+    int egoSourceFrameIndex = -1;
+    uint64_t refTimestampUs = 0;
+};
+
+struct ViewerQuat {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+    double w = 1.0;
+};
+
+struct EgoGazeSample {
+    bool valid = false;
+    int frameIndex = -1;
+    int width = 0;
+    int height = 0;
+    int encoderWidth = 0;
+    int encoderHeight = 0;
+    bool gazeValid = false;
+    bool xrHeadValid = false;
+    std::string gazeSource;
+    std::string gazeStatus;
+    std::string gazeFailureReason;
+    cv::Vec3d gazeWorldDirection = cv::Vec3d(0.0, 0.0, 0.0);
+    cv::Vec3d eyeWorld = cv::Vec3d(0.0, 0.0, 0.0);
+    cv::Vec3d rgbWorldPos = cv::Vec3d(0.0, 0.0, 0.0);
+    ViewerQuat rgbWorldRot;
+    double fx = 0.0;
+    double fy = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
+};
+
+struct EgoGazeProjection {
+    bool projected = false;
+    bool inside = false;
+    cv::Point2f pixel;
+    cv::Vec3d directionCamera = cv::Vec3d(0.0, 0.0, 0.0);
+    std::string failureReason;
 };
 
 static std::string dataTypeToLabel(ViewerDataType t) {
@@ -1572,6 +1722,258 @@ static std::unordered_map<int, std::unordered_map<std::string, std::vector<cv::P
         }
     }
     cJSON_Delete(root);
+    return out;
+}
+
+static std::vector<EgoAlignedFrame> loadEgoAlignedFrames(const fs::path &path) {
+    std::vector<EgoAlignedFrame> out;
+    std::ifstream ifs(path);
+    if(!ifs.is_open()) {
+        return out;
+    }
+    std::string line;
+    if(!std::getline(ifs, line)) {
+        return out;
+    }
+    const auto header = splitCsvSimple(line);
+    const auto index = csvHeaderIndex(header);
+    int rowIndex = 0;
+    while(std::getline(ifs, line)) {
+        if(trimWhitespace(line).empty()) {
+            continue;
+        }
+        const auto cols = splitCsvSimple(line);
+        EgoAlignedFrame sample;
+        sample.alignedFrameIndex = csvIntValue(csvValue(index, cols, "frame_index"), rowIndex);
+        sample.egoFrameIndex = csvIntValue(csvValue(index, cols, "ego_frame_index"), -1);
+        sample.egoSourceFrameIndex = csvIntValue(csvValue(index, cols, "ego_source_frame_index"), sample.egoFrameIndex);
+        sample.refTimestampUs = csvUint64Value(csvValue(index, cols, "ego_ref_timestamp_us"));
+        sample.valid = sample.alignedFrameIndex >= 0 && sample.egoFrameIndex >= 0;
+        if(sample.valid) {
+            const size_t idx = static_cast<size_t>(sample.alignedFrameIndex);
+            if(out.size() <= idx) {
+                out.resize(idx + 1);
+            }
+            out[idx] = sample;
+        }
+        rowIndex++;
+    }
+    return out;
+}
+
+static void fixKnownEgoMetadataColumnShift(const std::vector<std::string> &header, std::vector<std::string> &cols) {
+    if(cols.size() != header.size() + 1) {
+        return;
+    }
+    const auto it = std::find(header.begin(), header.end(), "gaze_valid");
+    if(it == header.end()) {
+        return;
+    }
+    const size_t gazeValidIdx = static_cast<size_t>(std::distance(header.begin(), it));
+    if(gazeValidIdx + 1 >= cols.size()) {
+        return;
+    }
+    if(csvLooksBool(cols[gazeValidIdx]) && csvLooksBool(cols[gazeValidIdx + 1])) {
+        cols.erase(cols.begin() + static_cast<std::ptrdiff_t>(gazeValidIdx + 1));
+    }
+}
+
+static cv::Vec3d csvVec3Value(const std::unordered_map<std::string, size_t> &index,
+                              const std::vector<std::string> &cols,
+                              const std::string &prefix) {
+    return cv::Vec3d(csvDoubleValue(csvValue(index, cols, prefix + "_x")),
+                     csvDoubleValue(csvValue(index, cols, prefix + "_y")),
+                     csvDoubleValue(csvValue(index, cols, prefix + "_z")));
+}
+
+static ViewerQuat csvQuatValue(const std::unordered_map<std::string, size_t> &index,
+                               const std::vector<std::string> &cols,
+                               const std::string &prefix) {
+    ViewerQuat q;
+    q.x = csvDoubleValue(csvValue(index, cols, prefix + "_x"), 0.0);
+    q.y = csvDoubleValue(csvValue(index, cols, prefix + "_y"), 0.0);
+    q.z = csvDoubleValue(csvValue(index, cols, prefix + "_z"), 0.0);
+    q.w = csvDoubleValue(csvValue(index, cols, prefix + "_w"), 1.0);
+    return q;
+}
+
+static std::vector<EgoGazeSample> loadEgoGazeSamples(const fs::path &metadataPath) {
+    std::vector<EgoGazeSample> out;
+    std::ifstream ifs(metadataPath);
+    if(!ifs.is_open()) {
+        return out;
+    }
+    std::string line;
+    if(!std::getline(ifs, line)) {
+        return out;
+    }
+    const auto header = splitCsvSimple(line);
+    const auto index = csvHeaderIndex(header);
+    while(std::getline(ifs, line)) {
+        if(trimWhitespace(line).empty()) {
+            continue;
+        }
+        auto cols = splitCsvSimple(line);
+        fixKnownEgoMetadataColumnShift(header, cols);
+        EgoGazeSample sample;
+        sample.frameIndex = csvIntValue(csvValue(index, cols, "frame_index"), -1);
+        if(sample.frameIndex < 0) {
+            continue;
+        }
+        sample.width = csvIntValue(csvValue(index, cols, "width"), 0);
+        sample.height = csvIntValue(csvValue(index, cols, "height"), 0);
+        sample.encoderWidth = csvIntValue(csvValue(index, cols, "encoder_width"), 0);
+        sample.encoderHeight = csvIntValue(csvValue(index, cols, "encoder_height"), 0);
+        sample.gazeValid = csvBoolValue(csvValue(index, cols, "gaze_valid"));
+        sample.xrHeadValid = csvBoolValue(csvValue(index, cols, "xr_head_valid"));
+        sample.gazeSource = csvValue(index, cols, "gaze_source");
+        sample.gazeStatus = csvValue(index, cols, "gaze_status");
+        sample.gazeFailureReason = csvValue(index, cols, "gaze_failure_reason");
+        sample.gazeWorldDirection = csvVec3Value(index, cols, "gaze_world_direction");
+        sample.eyeWorld = csvVec3Value(index, cols, "eye_pose_position_unity");
+        sample.rgbWorldPos = csvVec3Value(index, cols, "rgb_pos");
+        sample.rgbWorldRot = csvQuatValue(index, cols, "rgb_rot");
+        sample.fx = csvDoubleValue(csvValue(index, cols, "fx"), 0.0);
+        sample.fy = csvDoubleValue(csvValue(index, cols, "fy"), 0.0);
+        sample.cx = csvDoubleValue(csvValue(index, cols, "cx"), 0.0);
+        sample.cy = csvDoubleValue(csvValue(index, cols, "cy"), 0.0);
+        sample.valid = true;
+        const size_t idx = static_cast<size_t>(sample.frameIndex);
+        if(out.size() <= idx) {
+            out.resize(idx + 1);
+        }
+        out[idx] = sample;
+    }
+    return out;
+}
+
+static bool finiteVec3(const cv::Vec3d &v) {
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+static cv::Vec3d normalizeVec3d(const cv::Vec3d &v) {
+    const double n = std::sqrt(v.dot(v));
+    if(!(n > 1e-12) || !std::isfinite(n)) {
+        return cv::Vec3d(0.0, 0.0, 0.0);
+    }
+    return v * (1.0 / n);
+}
+
+static ViewerQuat normalizeQuat(ViewerQuat q) {
+    const double n = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if(!(n > 1e-12) || !std::isfinite(n)) {
+        return ViewerQuat{};
+    }
+    q.x /= n;
+    q.y /= n;
+    q.z /= n;
+    q.w /= n;
+    return q;
+}
+
+static ViewerQuat conjugateQuat(const ViewerQuat &q) {
+    ViewerQuat out;
+    out.x = -q.x;
+    out.y = -q.y;
+    out.z = -q.z;
+    out.w = q.w;
+    return out;
+}
+
+static cv::Vec3d rotateVecByQuat(const ViewerQuat &qIn, const cv::Vec3d &v) {
+    const ViewerQuat q = normalizeQuat(qIn);
+    const cv::Vec3d qv(q.x, q.y, q.z);
+    const cv::Vec3d uv = qv.cross(v);
+    const cv::Vec3d uuv = qv.cross(uv);
+    return v + (uv * (2.0 * q.w)) + (uuv * 2.0);
+}
+
+static EgoGazeProjection projectEgoGazeToImage(const EgoGazeSample &sample,
+                                               const CameraStreamParams *params,
+                                               const cv::Size &imageSize) {
+    EgoGazeProjection out;
+    if(!sample.valid) {
+        out.failureReason = "no_metadata";
+        return out;
+    }
+    if(!sample.gazeValid) {
+        out.failureReason = sample.gazeFailureReason.empty() ? "gaze_invalid" : sample.gazeFailureReason;
+        return out;
+    }
+    if(!sample.xrHeadValid) {
+        out.failureReason = "xr_head_invalid";
+        return out;
+    }
+    if(imageSize.width <= 0 || imageSize.height <= 0 || !finiteVec3(sample.gazeWorldDirection)) {
+        out.failureReason = "invalid_input";
+        return out;
+    }
+
+    const double fx = params && params->intrinsic.fx > 0.0f ? params->intrinsic.fx : sample.fx;
+    const double fy = params && params->intrinsic.fy > 0.0f ? params->intrinsic.fy : sample.fy;
+    const double cx = params && params->intrinsic.fx > 0.0f ? params->intrinsic.cx : sample.cx;
+    const double cy = params && params->intrinsic.fy > 0.0f ? params->intrinsic.cy : sample.cy;
+    int sourceW = sample.width > 0 ? sample.width : (params ? params->width : 0);
+    int sourceH = sample.height > 0 ? sample.height : (params ? params->height : 0);
+    if(sourceW <= 0) {
+        sourceW = imageSize.width;
+    }
+    if(sourceH <= 0) {
+        sourceH = imageSize.height;
+    }
+    if(!(fx > 0.0) || !(fy > 0.0)) {
+        out.failureReason = "missing_intrinsics";
+        return out;
+    }
+
+    const cv::Vec3d gazeWorld = normalizeVec3d(sample.gazeWorldDirection);
+    if(gazeWorld.dot(gazeWorld) <= 1e-12) {
+        out.failureReason = "zero_gaze_direction";
+        return out;
+    }
+    const cv::Vec3d dir = normalizeVec3d(rotateVecByQuat(conjugateQuat(sample.rgbWorldRot), gazeWorld));
+    out.directionCamera = dir;
+    const double zCv = dir[2];
+    if(!(zCv > 1e-9)) {
+        out.failureReason = "behind_camera";
+        return out;
+    }
+
+    const double x = dir[0] / zCv;
+    const double y = -dir[1] / zCv;
+    const double r = std::sqrt(x * x + y * y);
+    double xd = 0.0;
+    double yd = 0.0;
+    if(r > 1e-12) {
+        const double k1 = params ? params->distortion.k1 : 0.0;
+        const double k2 = params ? params->distortion.k2 : 0.0;
+        const double k3 = params ? params->distortion.k3 : 0.0;
+        const double k4 = params ? params->distortion.k4 : 0.0;
+        const double theta = std::atan(r);
+        const double theta2 = theta * theta;
+        const double theta4 = theta2 * theta2;
+        const double theta6 = theta4 * theta2;
+        const double theta8 = theta4 * theta4;
+        const double thetaD = theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
+        const double scale = thetaD / r;
+        xd = x * scale;
+        yd = y * scale;
+    }
+    double px = fx * xd + cx;
+    double py = fy * yd + cy;
+    px *= static_cast<double>(imageSize.width) / static_cast<double>(std::max(1, sourceW));
+    py *= static_cast<double>(imageSize.height) / static_cast<double>(std::max(1, sourceH));
+
+    out.projected = std::isfinite(px) && std::isfinite(py);
+    if(!out.projected) {
+        out.failureReason = "non_finite_projection";
+        return out;
+    }
+    out.pixel = cv::Point2f(static_cast<float>(px), static_cast<float>(py));
+    out.inside = px >= 0.0 && py >= 0.0 && px < imageSize.width && py < imageSize.height;
+    if(!out.inside) {
+        out.failureReason = "outside_image";
+    }
     return out;
 }
 
@@ -2661,6 +3063,10 @@ private:
         return findByCamKeyVariants(taskCamParams_.rgb, cam);
     }
 
+    const CameraStreamParams *egoRgbParams() const {
+        return findByCamKeyVariants(egoCamParams_.rgb, "ego");
+    }
+
     const CameraStreamParams *depthParamsForCam(const std::string &cam) const {
         return findByCamKeyVariants(taskCamParams_.depth, cam);
     }
@@ -2670,6 +3076,13 @@ private:
             return p->storageEncoding;
         }
         return cfg_.save.rgbH265 ? "h265" : "image";
+    }
+
+    std::string egoRgbEncoding() const {
+        if(const auto *p = egoRgbParams(); p && !trimWhitespace(p->storageEncoding).empty()) {
+            return p->storageEncoding;
+        }
+        return "h265";
     }
 
     std::string depthEncodingForCam(const std::string &cam) const {
@@ -2695,6 +3108,53 @@ private:
     fs::path rgbVideoTimestampPathForCam(const std::string &cam, const fs::path &rgbDir) const {
         const auto *p = rgbParamsForCam(cam);
         return resolveStoragePath(rgbDir, p ? p->timestampFile : std::string(), h265OutputFileName(cfg_.save) + ".timestamps.csv");
+    }
+
+    fs::path egoRgbVideoPath(const fs::path &egoDir) const {
+        const auto *p = egoRgbParams();
+        return resolveStoragePath(egoDir, p ? p->storageFile : std::string(), "RGB/rgb.h265");
+    }
+
+    fs::path egoRgbVideoTimestampPath(const fs::path &egoDir) const {
+        const auto *p = egoRgbParams();
+        return resolveStoragePath(egoDir, p ? p->timestampFile : std::string(), "RGB/rgb.h265.timestamps.csv");
+    }
+
+    int egoVideoFrameIndexForAlignedFrame(int frameIdx) const {
+        if(!egoAlignedFrames_.empty()) {
+            if(frameIdx < 0 || static_cast<size_t>(frameIdx) >= egoAlignedFrames_.size()) {
+                return -1;
+            }
+            const auto &sample = egoAlignedFrames_[static_cast<size_t>(frameIdx)];
+            if(sample.valid && sample.egoFrameIndex >= 0) {
+                return sample.egoFrameIndex;
+            }
+            return -1;
+        }
+        return frameIdx;
+    }
+
+    int egoSourceFrameIndexForAlignedFrame(int frameIdx) const {
+        if(!egoAlignedFrames_.empty()) {
+            if(frameIdx < 0 || static_cast<size_t>(frameIdx) >= egoAlignedFrames_.size()) {
+                return -1;
+            }
+            const auto &sample = egoAlignedFrames_[static_cast<size_t>(frameIdx)];
+            if(sample.valid) {
+                return sample.egoSourceFrameIndex >= 0 ? sample.egoSourceFrameIndex : sample.egoFrameIndex;
+            }
+            return -1;
+        }
+        return frameIdx;
+    }
+
+    const EgoGazeSample *egoGazeForAlignedFrame(int frameIdx) const {
+        const int egoIdx = egoSourceFrameIndexForAlignedFrame(frameIdx);
+        if(egoIdx < 0 || static_cast<size_t>(egoIdx) >= egoGazeSamples_.size()) {
+            return nullptr;
+        }
+        const auto &sample = egoGazeSamples_[static_cast<size_t>(egoIdx)];
+        return sample.valid ? &sample : nullptr;
     }
 
     fs::path depthVideoPathForCam(const std::string &cam, const fs::path &depthDir) const {
@@ -3676,7 +4136,10 @@ private:
             cv::Mat img;
             if(dataType_ == ViewerDataType::RGB) {
                 img = loadRgbFrame(*source, currentFrame_);
-                if(source->kind == ViewerSourceKind::Multiview && showLabels_ && labelsAvailable_) {
+                if(source->kind == ViewerSourceKind::Ego) {
+                    drawEgoGazeOverlay(img, currentFrame_);
+                }
+                else if(source->kind == ViewerSourceKind::Multiview && showLabels_ && labelsAvailable_) {
                     drawLabelsOnRgb(img, source->camKey);
                 }
             }
@@ -3707,8 +4170,11 @@ private:
         labelsAvailable_ = false;
         showLabels_ = false;
         taskCamParams_ = CameraParamsBundle{};
+        egoCamParams_ = CameraParamsBundle{};
         extrinsics_ = {};
         labelsByFrame_.clear();
+        egoAlignedFrames_.clear();
+        egoGazeSamples_.clear();
         rgbCache_.clear();
         depthCache_.clear();
         irCache_.clear();
@@ -3762,6 +4228,12 @@ private:
         if(!taskCamParams_.hasColorCloudRgbFrameOffset) {
             taskCamParams_.colorCloudRgbFrameOffset = cfg_.colorCloudRgbFrameOffset;
         }
+        const fs::path egoDir = dataDir / "ego";
+        if(fs::exists(egoDir) && fs::is_directory(egoDir)) {
+            egoCamParams_ = loadCameraParams(egoDir / "camera_params.json");
+            egoAlignedFrames_ = loadEgoAlignedFrames(egoRgbVideoTimestampPath(egoDir));
+            egoGazeSamples_ = loadEgoGazeSamples(egoDir / "metadata.csv");
+        }
         for(const auto &e: fs::directory_iterator(dataDir)) {
             if(e.is_directory()) {
                 const std::string name = e.path().filename().string();
@@ -3790,6 +4262,26 @@ private:
                     source.hasIr = computeTotalFramesFromDir(source.irDir) > 0;
                     sources_.push_back(std::move(source));
                 }
+            }
+        }
+        if(fs::exists(egoDir) && fs::is_directory(egoDir)) {
+            ViewerSource source;
+            source.sourceId = "ego:ego";
+            source.displayName = "ego";
+            source.kind = ViewerSourceKind::Ego;
+            source.camKey = "ego";
+            source.rgbDir = egoDir / "RGB";
+            source.rgbEncoding = egoRgbEncoding();
+            source.rgbVideoPath = egoRgbVideoPath(egoDir);
+            if(encodingIsRgbH265(source.rgbEncoding)) {
+                source.hasRgb = countVideoTimestampRows(source.rgbVideoPath, egoRgbVideoTimestampPath(egoDir)) > 0
+                                || probeVideoStreamInfo(source.rgbVideoPath).frames > 0;
+            }
+            else {
+                source.hasRgb = computeTotalFramesFromDir(source.rgbDir) > 0;
+            }
+            if(source.hasRgb) {
+                sources_.push_back(std::move(source));
             }
         }
         std::sort(cameras_.begin(), cameras_.end());
@@ -3904,6 +4396,7 @@ private:
             }
         }
         int fisheyeRgbTotal = 0;
+        int egoRgbTotal = 0;
         for(const auto &source : sources_) {
             if(source.kind != ViewerSourceKind::Fisheye || !source.hasRgb) {
                 continue;
@@ -3923,6 +4416,28 @@ private:
                 fisheyeRgbTotal = (fisheyeRgbTotal == 0) ? nRgb : std::min(fisheyeRgbTotal, nRgb);
             }
         }
+        for(const auto &source : sources_) {
+            if(source.kind != ViewerSourceKind::Ego || !source.hasRgb) {
+                continue;
+            }
+            hasAnyRgb = true;
+            int nRgb = 0;
+            if(!egoAlignedFrames_.empty()) {
+                nRgb = static_cast<int>(egoAlignedFrames_.size());
+            }
+            else if(encodingIsRgbH265(source.rgbEncoding)) {
+                nRgb = countVideoTimestampRows(source.rgbVideoPath);
+                if(nRgb <= 0) {
+                    nRgb = probeVideoStreamInfo(source.rgbVideoPath).frames;
+                }
+            }
+            else {
+                nRgb = computeTotalFramesFromDir(source.rgbDir);
+            }
+            if(nRgb > 0) {
+                egoRgbTotal = (egoRgbTotal == 0) ? nRgb : std::min(egoRgbTotal, nRgb);
+            }
+        }
         totalFrames_ = 0;
         const int csvFrames = countCsvDataRows(dataDir / "timestamps.csv");
         if(csvFrames > 0) {
@@ -3933,6 +4448,9 @@ private:
         }
         else if(fisheyeRgbTotal > 0) {
             totalFrames_ = fisheyeRgbTotal;
+        }
+        else if(egoRgbTotal > 0) {
+            totalFrames_ = egoRgbTotal;
         }
         if(totalFrames_ > 0 && hasDepth && totalDepth > 0) {
             totalFrames_ = std::min(totalFrames_, totalDepth);
@@ -4017,6 +4535,9 @@ private:
     void prefetchRgbVideoRange(const ViewerSource &source, int startFrame, int ahead) {
         if(source.kind == ViewerSourceKind::Multiview) {
             prefetchRgbVideoRange(source.camKey, source.rgbDir, startFrame, ahead);
+            return;
+        }
+        if(source.kind == ViewerSourceKind::Ego) {
             return;
         }
         if(!encodingIsRgbH265(source.rgbEncoding)) {
@@ -4104,6 +4625,27 @@ private:
         auto preRgbSource = [&](const ViewerSource &source, int f) {
             if(source.kind == ViewerSourceKind::Multiview) {
                 preRgb(source.camKey, f);
+                return;
+            }
+            if(source.kind == ViewerSourceKind::Ego) {
+                const std::string key = makeCacheKey(0, source.sourceId, f);
+                rgbCache_.prefetch(key, [&]() {
+                    const int videoFrameIdx = egoVideoFrameIndexForAlignedFrame(f);
+                    if(videoFrameIdx < 0) {
+                        return cv::Mat();
+                    }
+                    if(encodingIsRgbH265(source.rgbEncoding)) {
+                        cv::Mat decoded = decodeVideoFrameRaw(source.rgbVideoPath, videoFrameIdx, 0, 0, "bgr24", CV_8UC3);
+                        if(!decoded.empty()) {
+                            return decoded;
+                        }
+                    }
+                    const fs::path p = findFrameFile(source.rgbDir, videoFrameIdx, { ".jpg", ".jpeg", ".png" });
+                    if(p.empty()) {
+                        return cv::Mat();
+                    }
+                    return cv::imread(p.string(), cv::IMREAD_COLOR);
+                });
                 return;
             }
             if(encodingIsRgbH265(source.rgbEncoding)) {
@@ -4253,19 +4795,105 @@ private:
         }
         const std::string key = makeCacheKey(0, source.sourceId, frameIdx);
         cv::Mat img = rgbCache_.getOrLoad(key, [&]() {
+            const int videoFrameIdx = source.kind == ViewerSourceKind::Ego ? egoVideoFrameIndexForAlignedFrame(frameIdx) : frameIdx;
+            if(videoFrameIdx < 0) {
+                return cv::Mat();
+            }
             if(encodingIsRgbH265(source.rgbEncoding)) {
-                cv::Mat decoded = decodeVideoFrameRaw(source.rgbVideoPath, frameIdx, 0, 0, "bgr24", CV_8UC3);
+                cv::Mat decoded = decodeVideoFrameRaw(source.rgbVideoPath, videoFrameIdx, 0, 0, "bgr24", CV_8UC3);
                 if(!decoded.empty()) {
                     return decoded;
                 }
             }
-            const fs::path p = findFrameFile(source.rgbDir, frameIdx, { ".jpg", ".jpeg", ".png" });
+            const fs::path p = findFrameFile(source.rgbDir, videoFrameIdx, { ".jpg", ".jpeg", ".png" });
             if(p.empty()) {
                 return cv::Mat();
             }
             return cv::imread(p.string(), cv::IMREAD_COLOR);
         });
         return img.clone();
+    }
+
+    void drawEgoGazeOverlay(cv::Mat &img, int alignedFrameIdx) const {
+        if(img.empty()) {
+            return;
+        }
+        const int egoFrameIdx = egoVideoFrameIndexForAlignedFrame(alignedFrameIdx);
+        const EgoGazeSample *sample = egoGazeForAlignedFrame(alignedFrameIdx);
+        EgoGazeProjection projection;
+        if(sample) {
+            projection = projectEgoGazeToImage(*sample, egoRgbParams(), img.size());
+        }
+        else {
+            projection.failureReason = "no_metadata";
+        }
+
+        const cv::Scalar okColor(80, 240, 120);
+        const cv::Scalar warnColor(0, 190, 255);
+        const cv::Scalar badColor(80, 80, 255);
+        const cv::Scalar color = projection.projected ? (projection.inside ? okColor : warnColor) : badColor;
+
+        if(projection.projected) {
+            const int x = std::max(0, std::min(img.cols - 1, static_cast<int>(std::lround(projection.pixel.x))));
+            const int y = std::max(0, std::min(img.rows - 1, static_cast<int>(std::lround(projection.pixel.y))));
+            const cv::Point p(x, y);
+            cv::circle(img, p, std::max(8, img.cols / 120), color, 2, cv::LINE_AA);
+            cv::line(img, cv::Point(std::max(0, x - 16), y), cv::Point(std::min(img.cols - 1, x + 16), y), color, 2, cv::LINE_AA);
+            cv::line(img, cv::Point(x, std::max(0, y - 16)), cv::Point(x, std::min(img.rows - 1, y + 16)), color, 2, cv::LINE_AA);
+            if(!projection.inside) {
+                const int textX = std::max(8, std::min(std::max(8, img.cols - 120), x + 12));
+                cv::putText(img, "outside", cv::Point(textX, std::max(24, y - 10)), cv::FONT_HERSHEY_DUPLEX, 0.7, color, 1, cv::LINE_AA);
+            }
+        }
+
+        std::vector<std::string> lines;
+        lines.push_back("ego frame " + std::to_string(egoFrameIdx));
+        if(sample) {
+            const std::string gazeState = sample->gazeValid ? "gaze valid" : "gaze invalid";
+            const std::string headState = sample->xrHeadValid ? "head valid" : "head invalid";
+            lines.push_back(gazeState + " / " + headState);
+            std::string src = !sample->gazeSource.empty() ? sample->gazeSource : sample->gazeStatus;
+            if(src.empty()) {
+                src = sample->gazeFailureReason;
+            }
+            if(!src.empty()) {
+                lines.push_back("source " + src);
+            }
+        }
+        else {
+            lines.push_back("metadata missing");
+        }
+        if(projection.projected) {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(1)
+                << "pixel " << projection.pixel.x << ", " << projection.pixel.y
+                << "  uv " << (projection.pixel.x / std::max(1, img.cols))
+                << ", " << (projection.pixel.y / std::max(1, img.rows));
+            lines.push_back(oss.str());
+        }
+        if(!projection.failureReason.empty() && !projection.inside) {
+            lines.push_back("status " + projection.failureReason);
+        }
+
+        const int margin = 14;
+        const int lineH = 24;
+        const int panelW = std::min(std::max(280, img.cols / 3), img.cols - margin * 2);
+        const int panelH = std::min(img.rows - margin * 2, 18 + static_cast<int>(lines.size()) * lineH);
+        if(panelW > 10 && panelH > 10) {
+            cv::Rect panel(margin, margin, panelW, panelH);
+            cv::Mat overlay = img.clone();
+            cv::rectangle(overlay, panel, cv::Scalar(0, 0, 0), cv::FILLED);
+            cv::addWeighted(overlay, 0.55, img, 0.45, 0.0, img);
+            cv::rectangle(img, panel, color, 2, cv::LINE_AA);
+            int y = panel.y + 24;
+            for(const auto &line : lines) {
+                cv::putText(img, line, cv::Point(panel.x + 10, y), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
+                y += lineH;
+                if(y > panel.y + panel.height - 6) {
+                    break;
+                }
+            }
+        }
     }
 
     cv::Mat loadDepthFrame(const std::string &cam, int frameIdx) {
@@ -4690,8 +5318,11 @@ private:
     cv::Rect mainRect_;
 
     CameraParamsBundle taskCamParams_;
+    CameraParamsBundle egoCamParams_;
     std::unordered_map<std::string, ExtrinsicCamToWorld> extrinsics_;
     std::unordered_map<int, std::unordered_map<std::string, std::vector<cv::Point2f>>> labelsByFrame_;
+    std::vector<EgoAlignedFrame> egoAlignedFrames_;
+    std::vector<EgoGazeSample> egoGazeSamples_;
     bool headCamPoseAvailable_ = false;
     std::string headPoseCamInput_;
     bool headPoseCamFieldActive_ = false;

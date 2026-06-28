@@ -62,6 +62,9 @@ public:
 
     bool popFrame(EgoFrame &out, std::chrono::milliseconds timeout);
     bool hasPendingFrames() const;
+    bool hasFramePayload(int sourceFrameIndex) const;
+    bool commitFrame(int sourceFrameIndex, std::string *errorMessage = nullptr);
+    void discardFramesBefore(int sourceFrameIndex);
 
 private:
     class Impl;

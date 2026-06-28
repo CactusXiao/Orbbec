@@ -4401,6 +4401,7 @@ private:
         uint64_t lastRefTs = 0;
         size_t fisheyeCapturedSets = 0;
         size_t egoCapturedFrames = 0;
+        size_t egoAlignedFrames = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -4752,6 +4753,7 @@ private:
             writeCsvRow(session.egoAlignedTimestampsOfs,
                         { "frame_index",
                           "ego_frame_index",
+                          "ego_source_frame_index",
                           "ego_ref_timestamp_us",
                           "ego_rgb_timestamp_us",
                           "pico_frame_timestamp_ns",
@@ -5559,6 +5561,9 @@ private:
         while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= centerUs) {
             session_.egoFrames.pop_front();
         }
+        if(session_.saveEgo && !session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
+            egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
+        }
     }
 
     void appendTimestampRowLocked(const std::vector<std::string> &row) {
@@ -5568,18 +5573,36 @@ private:
         writeCsvRow(session_.timestampsOfs, row);
     }
 
-    void appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame &frame) {
+    bool egoFrameHasPayloadLocked(const EgoFrame &frame) const {
+        return frame.sourceFrameIndex >= 0 && egoRecorder_.hasFramePayload(frame.sourceFrameIndex);
+    }
+
+    int appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame &frame) {
+        std::string error;
+        if(!egoRecorder_.commitFrame(frame.sourceFrameIndex, &error)) {
+            std::cerr << "[collection][ego] failed to commit aligned ego frame source_frame_index="
+                      << frame.sourceFrameIndex;
+            if(!error.empty()) {
+                std::cerr << " error=" << error;
+            }
+            std::cerr << std::endl;
+            return -1;
+        }
+
+        const int egoOutputFrameIndex = static_cast<int>(session_.egoAlignedFrames++);
         if(!session_.egoAlignedTimestampsOpen) {
-            return;
+            return egoOutputFrameIndex;
         }
         writeCsvRow(session_.egoAlignedTimestampsOfs,
                     { frameIndex,
+                      std::to_string(egoOutputFrameIndex),
                       std::to_string(frame.sourceFrameIndex),
                       std::to_string(frame.refTimestampUs),
                       std::to_string(frame.rgbTimestampUs),
                       std::to_string(frame.picoFrameTimestampNs),
                       std::to_string(frame.xrHeadTimestampUs),
                       std::to_string(frame.gazeTimestampUs) });
+        return egoOutputFrameIndex;
     }
 
     void buildCloudInputsLocked(const std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> &pickedIndices,
@@ -5758,10 +5781,15 @@ private:
                 pickedEgoIdx = pickNearestEgoIndexLocked(centerUs);
                 if(pickedEgoIdx < session_.egoFrames.size()
                    && absDiff(session_.egoFrames[pickedEgoIdx].refTimestampUs, centerUs) <= session_.maxAbsDiffUs) {
-                    hasPickedEgo = true;
                     const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
-                    tsMin = std::min(tsMin, egoFrame.refTimestampUs);
-                    tsMax = std::max(tsMax, egoFrame.refTimestampUs);
+                    if(egoFrameHasPayloadLocked(egoFrame)) {
+                        hasPickedEgo = true;
+                        tsMin = std::min(tsMin, egoFrame.refTimestampUs);
+                        tsMax = std::max(tsMax, egoFrame.refTimestampUs);
+                    }
+                    else {
+                        fullThis = false;
+                    }
                 }
                 else {
                     fullThis = false;
@@ -5771,7 +5799,7 @@ private:
 
         const size_t refIndex = session_.alignedRef;
         session_.alignedRef++;
-        if(!fullThis) {
+        auto dropCurrentSlot = [&]() {
             session_.missingAligned++;
             if(session_.prevMissingIndex != std::numeric_limits<size_t>::max()) {
                 const size_t d = refIndex - session_.prevMissingIndex;
@@ -5786,6 +5814,19 @@ private:
             itRefState->second.committed.pop_front();
             pruneCommittedFramesLocked(centerUs);
             return true;
+        };
+        if(!fullThis) {
+            return dropCurrentSlot();
+        }
+
+        const size_t outIdx = session_.nextFrameIndex;
+        const std::string frameIndex = formatFrameIndex(outIdx);
+        int egoOutputFrameIndex = -1;
+        if(session_.saveEgo && hasPickedEgo && pickedEgoIdx < session_.egoFrames.size()) {
+            egoOutputFrameIndex = appendEgoAlignedTimestampRowLocked(frameIndex, session_.egoFrames[pickedEgoIdx]);
+            if(egoOutputFrameIndex < 0) {
+                return dropCurrentSlot();
+            }
         }
 
         session_.fullAligned++;
@@ -5796,8 +5837,7 @@ private:
             }
         }
 
-        const size_t outIdx = session_.nextFrameIndex++;
-        const std::string frameIndex = formatFrameIndex(outIdx);
+        session_.nextFrameIndex++;
         session_.alignedCenters.push_back(centerUs);
         hasData_.store(true);
 
@@ -5949,12 +5989,11 @@ private:
         if(session_.saveEgo) {
             if(hasPickedEgo && pickedEgoIdx < session_.egoFrames.size()) {
                 const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
-                row.push_back(std::to_string(egoFrame.sourceFrameIndex));
+                row.push_back(std::to_string(egoOutputFrameIndex));
                 row.push_back(std::to_string(egoFrame.refTimestampUs));
                 allTsMin = std::min(allTsMin, egoFrame.refTimestampUs);
                 allTsMax = std::max(allTsMax, egoFrame.refTimestampUs);
                 allTsCount++;
-                appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
             }
             else {
                 row.emplace_back();
@@ -6045,16 +6084,38 @@ private:
             return true;
         }
         const auto &egoFrame = session_.egoFrames[egoIdx];
-        if(session_.hasLastEmittedEgoTs && session_.lastEmittedEgoTs == egoFrame.refTimestampUs) {
+        auto advanceEgoOnlyTarget = [&]() {
             session_.egoOnlyNextTargetUs += session_.stepUs;
+            int discardBeforeSourceFrame = -1;
+            if(egoIdx < session_.egoFrames.size()) {
+                discardBeforeSourceFrame = session_.egoFrames[egoIdx].sourceFrameIndex + 1;
+                session_.egoFrames.erase(session_.egoFrames.begin() + egoIdx);
+            }
             while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
                 session_.egoFrames.pop_front();
             }
+            if(!session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
+                egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
+            }
+            else if(discardBeforeSourceFrame > 0) {
+                egoRecorder_.discardFramesBefore(discardBeforeSourceFrame);
+            }
             return true;
+        };
+        if(session_.hasLastEmittedEgoTs && session_.lastEmittedEgoTs == egoFrame.refTimestampUs) {
+            return advanceEgoOnlyTarget();
+        }
+        if(!egoFrameHasPayloadLocked(egoFrame)) {
+            return advanceEgoOnlyTarget();
         }
 
-        const size_t outIdx = session_.nextFrameIndex++;
+        const size_t outIdx = session_.nextFrameIndex;
         const std::string frameIndex = formatFrameIndex(outIdx);
+        const int egoOutputFrameIndex = appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
+        if(egoOutputFrameIndex < 0) {
+            return advanceEgoOnlyTarget();
+        }
+        session_.nextFrameIndex++;
         session_.refFrameCount++;
         if(session_.firstRefTs == 0) {
             session_.firstRefTs = egoFrame.refTimestampUs;
@@ -6100,9 +6161,8 @@ private:
             }
         }
 
-        row.push_back(std::to_string(egoFrame.sourceFrameIndex));
+        row.push_back(std::to_string(egoOutputFrameIndex));
         row.push_back(std::to_string(egoFrame.refTimestampUs));
-        appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
         row.push_back("");
         double allModalMaxDiffMs = 0.0;
         if(rowTsCount > 1 && rowTsMax >= rowTsMin) {
@@ -6121,6 +6181,9 @@ private:
         session_.egoOnlyNextTargetUs += session_.stepUs;
         while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
             session_.egoFrames.pop_front();
+        }
+        if(!session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
+            egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
         }
         if(session_.saveFisheye) {
             while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= targetUs) {
