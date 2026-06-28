@@ -700,6 +700,7 @@ public:
                 }
                 return false;
             }
+            pendingTimestampFramesBySourceFrame_.clear();
             session_ = std::move(writer);
         }
 
@@ -901,7 +902,7 @@ private:
             return frame;
         }
 
-        void writeHevcSample(const std::string &headerJson, const std::vector<uint8_t> &payload) {
+        int writeHevcSample(const std::string &headerJson, const std::vector<uint8_t> &payload) {
             BufferedHevcSample sample;
             const auto frameIndex = jsonInt64Field(headerJson, "frame_index");
             if(frameIndex.has_value()) {
@@ -941,6 +942,7 @@ private:
                 lastError_ = "failed to write ego HEVC payload";
             }
             logHevcSampleEvent("hevc_sample", sample, offset, videoFrameIndex);
+            return videoFrameIndex >= 0 ? sample.frameIndex : -1;
         }
 
         int videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
@@ -1280,13 +1282,15 @@ private:
             const uint64_t seq = nextFrameSequence_++;
             auto frame = session_->writeTimestampRow(packet.payload, seq);
             if(frame.has_value()) {
-                pushFrame(*frame);
+                queueTimestampFrameWhenVideoReadyLocked(*frame);
             }
             break;
         }
-        case PKT_HEVC_SAMPLE:
-            session_->writeHevcSample(packet.headerJson, packet.payload);
+        case PKT_HEVC_SAMPLE: {
+            const int mappedSourceFrameIndex = session_->writeHevcSample(packet.headerJson, packet.payload);
+            releasePendingTimestampFrameLocked(mappedSourceFrameIndex);
             break;
+        }
         case PKT_SESSION_END:
             session_->markSessionEnd(packet.headerJson);
             closeSessionLocked("client_session_end");
@@ -1297,6 +1301,33 @@ private:
             std::cerr << "[ego] unknown packet type=" << static_cast<int>(packet.type) << std::endl;
             break;
         }
+    }
+
+    void queueTimestampFrameWhenVideoReadyLocked(const EgoFrame &frame) {
+        if(!session_ || frame.sourceFrameIndex < 0) {
+            return;
+        }
+        if(session_->videoFrameIndexForSourceFrame(frame.sourceFrameIndex) >= 0) {
+            pushFrame(frame);
+            return;
+        }
+        pendingTimestampFramesBySourceFrame_[frame.sourceFrameIndex] = frame;
+        while(pendingTimestampFramesBySourceFrame_.size() > std::max<size_t>(1, config_.maxBufferedFrames)) {
+            pendingTimestampFramesBySourceFrame_.erase(pendingTimestampFramesBySourceFrame_.begin());
+        }
+    }
+
+    void releasePendingTimestampFrameLocked(int sourceFrameIndex) {
+        if(sourceFrameIndex < 0 || !session_) {
+            return;
+        }
+        auto it = pendingTimestampFramesBySourceFrame_.find(sourceFrameIndex);
+        if(it == pendingTimestampFramesBySourceFrame_.end()) {
+            return;
+        }
+        EgoFrame frame = it->second;
+        pendingTimestampFramesBySourceFrame_.erase(it);
+        pushFrame(std::move(frame));
     }
 
     void pushFrame(EgoFrame frame) {
@@ -1316,6 +1347,7 @@ private:
         }
         session_->close(reason);
         session_.reset();
+        pendingTimestampFramesBySourceFrame_.clear();
         sessionCv_.notify_all();
     }
 
@@ -1339,6 +1371,7 @@ private:
     mutable std::mutex sessionMtx_;
     std::condition_variable sessionCv_;
     std::unique_ptr<SessionWriter> session_;
+    std::unordered_map<int, EgoFrame> pendingTimestampFramesBySourceFrame_;
 
     mutable std::mutex frameMtx_;
     std::condition_variable frameCv_;
