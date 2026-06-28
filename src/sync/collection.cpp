@@ -3667,7 +3667,10 @@ public:
         }
         if(egoEnabled_) {
             std::string egoError;
-            egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError);
+            if(!egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError)
+               && !egoError.empty()) {
+                std::cerr << "[collection] ego stop warning: " << egoError << std::endl;
+            }
         }
         if(egoRecordThread_.joinable()) {
             egoRecordThread_.join();
@@ -3717,7 +3720,10 @@ public:
         }
         if(egoEnabled_) {
             std::string egoError;
-            egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError);
+            if(!egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError)
+               && !egoError.empty()) {
+                std::cerr << "[collection] ego stop warning: " << egoError << std::endl;
+            }
         }
         if(egoRecordThread_.joinable()) {
             egoRecordThread_.join();

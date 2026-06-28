@@ -19,7 +19,7 @@ struct EgoModuleConfig {
     bool enabled = false;
     std::string host = "127.0.0.1";
     int port = 50051;
-    int stopTimeoutMs = 5000;
+    int stopTimeoutMs = 60000;
     size_t maxBufferedFrames = 8192;
     std::filesystem::path cameraParamsPath;
     std::string cameraId = "ego";

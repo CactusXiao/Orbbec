@@ -734,8 +734,13 @@ public:
                 return !session_;
             });
             if(session_) {
-                std::cerr << "[ego] warning: stop timed out, finalizing ego session locally" << std::endl;
+                if(errorMessage) {
+                    *errorMessage = "Timed out waiting for PICO ego SESSION_END after " + std::to_string(timeout.count()) + " ms";
+                }
+                std::cerr << "[ego] warning: " << (errorMessage ? *errorMessage : "stop timed out")
+                          << "; finalizing ego session locally" << std::endl;
                 closeSessionLocked("stop_timeout");
+                return false;
             }
         }
         return true;
