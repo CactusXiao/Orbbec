@@ -63,6 +63,11 @@ static void collectionInstallCrashHandlerOnce() {
 #endif
 }
 
+static uint64_t systemUnixUsNow() {
+    const auto now = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::system_clock::now());
+    return static_cast<uint64_t>(now.time_since_epoch().count());
+}
+
 struct CvMouseState {
     int  x          = 0;
     int  y          = 0;
@@ -6561,6 +6566,8 @@ private:
             return;
         }
         collectionSetStage("cb_enter");
+        const bool useSoftwareAlignmentTimestamp = cfg_.ego.alignmentTimestampMode == "software";
+        const uint64_t frameSetSystemTimestampUs = useSoftwareAlignmentTimestamp ? systemUnixUsNow() : 0;
 
         uint64_t cbCount = 0;
         {
@@ -6579,6 +6586,9 @@ private:
         auto getFrameTimestampUs = [&](const std::shared_ptr<ob::Frame> &frame, bool allowLocalTimestampFallback) -> uint64_t {
             if(!frame) {
                 return 0;
+            }
+            if(useSoftwareAlignmentTimestamp) {
+                return frameSetSystemTimestampUs;
             }
             uint64_t ts = 0;
             try {

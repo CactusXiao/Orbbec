@@ -168,6 +168,15 @@ static std::string normalizeDepthEncodingConfig(std::string s) {
     return "png";
 }
 
+static std::string normalizeEgoAlignmentTimestampMode(std::string s) {
+    s = normalizePresetKey(std::move(s));
+    if(s == "software" || s == "system" || s == "systemsoftware" || s == "softwaretimestamp"
+       || s == "host" || s == "hosttime" || s == "hosttimestamp") {
+        return "software";
+    }
+    return "hardware";
+}
+
 static std::string readFileAll(const fs::path &path) {
     std::ifstream file(path, std::ios::binary);
     if(!file.is_open()) {
@@ -512,6 +521,18 @@ AppConfig loadConfig(const fs::path &configPath) {
             }
             if(auto v = getInt(egoObj, "maxBufferedFrames")) {
                 cfg.ego.maxBufferedFrames = static_cast<size_t>(std::max(1, *v));
+            }
+            if(auto v = getString(egoObj, "alignmentTimestampMode")) {
+                cfg.ego.alignmentTimestampMode = normalizeEgoAlignmentTimestampMode(*v);
+            }
+            else if(auto v = getString(egoObj, "timestampAlignmentMode")) {
+                cfg.ego.alignmentTimestampMode = normalizeEgoAlignmentTimestampMode(*v);
+            }
+            else if(auto v = getString(egoObj, "globalAlignmentTimestampMode")) {
+                cfg.ego.alignmentTimestampMode = normalizeEgoAlignmentTimestampMode(*v);
+            }
+            else if(auto v = getString(egoObj, "alignTimestampMode")) {
+                cfg.ego.alignmentTimestampMode = normalizeEgoAlignmentTimestampMode(*v);
             }
             if(auto v = getDouble(egoObj, "timestampOffsetSec")) {
                 cfg.ego.timestampOffsetUs = secondsToUs(*v);

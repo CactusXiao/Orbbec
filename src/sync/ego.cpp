@@ -845,6 +845,7 @@ private:
             sessionJsonPath_ = egoDir_ / "session.json";
             networkLogPath_ = egoDir_ / "network_log.jsonl";
             cameraParamsSourcePath_ = config.cameraParamsPath;
+            alignmentTimestampMode_ = config.alignmentTimestampMode == "software" ? "software" : "hardware";
             configuredTimestampOffsetUs_ = config.timestampOffsetUs;
             autoTimestampOffset_ = config.autoTimestampOffset && configuredTimestampOffsetUs_ == 0;
             autoTimestampOffsetMinUs_ = std::max<int64_t>(0, config.autoTimestampOffsetMinUs);
@@ -952,6 +953,22 @@ private:
             return effectiveTimestampOffsetUs_;
         }
 
+        uint64_t timestampFromPicoHardwareClock(uint64_t picoFrameTimestampNs, uint64_t softwareRefTimestampUs) {
+            if(alignmentTimestampMode_ != "hardware" || picoFrameTimestampNs == 0) {
+                alignmentTimestampSource_ = "ref_timestamp_us";
+                return softwareRefTimestampUs;
+            }
+            if(firstPicoFrameTimestampNs_ == 0) {
+                firstPicoFrameTimestampNs_ = picoFrameTimestampNs;
+                firstPicoHardwareAnchorUnixUs_ = softwareRefTimestampUs;
+            }
+            const int64_t deltaUs = picoFrameTimestampNs >= firstPicoFrameTimestampNs_
+                ? static_cast<int64_t>((picoFrameTimestampNs - firstPicoFrameTimestampNs_) / 1000ULL)
+                : -static_cast<int64_t>((firstPicoFrameTimestampNs_ - picoFrameTimestampNs) / 1000ULL);
+            alignmentTimestampSource_ = "pico_frame_timestamp_ns_anchored_to_ref_timestamp_us";
+            return addSignedTimestampUs(firstPicoHardwareAnchorUnixUs_, deltaUs);
+        }
+
         std::optional<EgoFrame> writeTimestampRow(const std::vector<uint8_t> &payload, uint64_t sequence, uint64_t packetReceivedUnixUs) {
             timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
             timestampRows_++;
@@ -988,7 +1005,8 @@ private:
                 receiveTimestampOffsetCandidateUs_ = signedTimestampDiffUs(packetReceivedUnixUs, frame.rawRefTimestampUs);
             }
             frame.clockOffsetUs = timestampOffsetForRawRef(frame.rawRefTimestampUs);
-            frame.refTimestampUs = addSignedTimestampUs(frame.rawRefTimestampUs, frame.clockOffsetUs);
+            const uint64_t softwareRefTimestampUs = addSignedTimestampUs(frame.rawRefTimestampUs, frame.clockOffsetUs);
+            frame.refTimestampUs = timestampFromPicoHardwareClock(frame.picoFrameTimestampNs, softwareRefTimestampUs);
             return frame;
         }
 
@@ -1171,6 +1189,8 @@ private:
                 << "  \"close_reason\": " << jsonString(reason) << ",\n"
                 << "  \"client_summary\": " << (clientSummaryJson_.empty() ? "{}" : clientSummaryJson_) << ",\n"
                 << "  \"timestamp_standard\": \"unix_epoch_microseconds_utc\",\n"
+                << "  \"alignment_timestamp_mode\": " << jsonString(alignmentTimestampMode_) << ",\n"
+                << "  \"alignment_timestamp_source\": " << jsonString(alignmentTimestampSource_) << ",\n"
                 << "  \"timestamp_offset_source\": " << jsonString(timestampOffsetSource_) << ",\n"
                 << "  \"configured_timestamp_offset_us\": " << configuredTimestampOffsetUs_ << ",\n"
                 << "  \"auto_timestamp_offset_enabled\": " << (autoTimestampOffset_ ? "true" : "false") << ",\n"
@@ -1178,6 +1198,8 @@ private:
                 << "  \"auto_timestamp_offset_candidate_us\": " << autoTimestampOffsetCandidateUs_ << ",\n"
                 << "  \"effective_timestamp_offset_us\": " << effectiveTimestampOffsetUs_ << ",\n"
                 << "  \"first_raw_ref_timestamp_us\": " << firstRawRefTimestampUs_ << ",\n"
+                << "  \"first_pico_frame_timestamp_ns\": " << firstPicoFrameTimestampNs_ << ",\n"
+                << "  \"first_pico_hardware_anchor_unix_us\": " << firstPicoHardwareAnchorUnixUs_ << ",\n"
                 << "  \"first_timestamp_packet_received_unix_us\": " << firstTimestampPacketReceivedUnixUs_ << ",\n"
                 << "  \"receive_timestamp_offset_candidate_us\": " << receiveTimestampOffsetCandidateUs_ << ",\n"
                 << "  \"transport\": \"adb_reverse_tcp\",\n"
@@ -1219,6 +1241,8 @@ private:
         std::unordered_map<int, int> videoFrameBySourceFrame_;
         std::string lastError_;
         std::string clientSummaryJson_ = "{}";
+        std::string alignmentTimestampMode_ = "hardware";
+        std::string alignmentTimestampSource_ = "ref_timestamp_us";
         int64_t configuredTimestampOffsetUs_ = 0;
         bool autoTimestampOffset_ = true;
         int64_t autoTimestampOffsetMinUs_ = 1000000;
@@ -1226,6 +1250,8 @@ private:
         uint64_t firstRawRefTimestampUs_ = 0;
         int64_t autoTimestampOffsetCandidateUs_ = 0;
         int64_t effectiveTimestampOffsetUs_ = 0;
+        uint64_t firstPicoFrameTimestampNs_ = 0;
+        uint64_t firstPicoHardwareAnchorUnixUs_ = 0;
         uint64_t firstTimestampPacketReceivedUnixUs_ = 0;
         int64_t receiveTimestampOffsetCandidateUs_ = 0;
         std::string timestampOffsetSource_ = "none";
