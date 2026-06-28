@@ -6,6 +6,7 @@
 
 #include <opencv2/opencv.hpp>
 
+#include "ego.hpp"
 #include "fisheyes.hpp"
 #include "utils/cJSON.h"
 
@@ -139,6 +140,7 @@ struct AppConfig {
     int                       colorCloudRgbFrameOffset = 0;
     SaveOptions               save;
     VoiceFeedbackConfig       voiceFeedback;
+    EgoModuleConfig           ego;
     FisheyeModuleConfig       fisheye;
     DepthPointCloudFiltersConfig filters;
     std::vector<DeviceConfig> devices;

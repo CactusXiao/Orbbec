@@ -1,4 +1,5 @@
 #include "collection.hpp"
+#include "ego.hpp"
 #include "fisheyes.hpp"
 
 #include "utils/utils.hpp"
@@ -712,6 +713,7 @@ static std::string presetLabel(int w, int h, int fps) {
 struct CollectionConfigUi {
     bool enableMultiview = true;
     bool enableFisheyes  = false;
+    bool enableEgo       = false;
     bool enableRgb       = true;
     bool enableDepth     = true;
     bool enableIrRight   = false;
@@ -744,7 +746,7 @@ struct CollectionConfigUi {
     }
 
     bool hasSelectedCaptureType() const {
-        return enableMultiview || enableFisheyes;
+        return enableMultiview || enableFisheyes || enableEgo;
     }
 
     int widthInt() const { return std::max(1, parseIntOr(width, 1280)); }
@@ -1972,6 +1974,33 @@ static size_t findNearestFisheyeFrameSetIndex(const std::vector<FisheyeFrameSet>
     return bestIndex;
 }
 
+static size_t findNearestEgoFrameIndex(const std::deque<EgoFrame> &samples, uint64_t targetUs) {
+    if(samples.empty()) {
+        return 0;
+    }
+    auto absDiff = [](uint64_t a, uint64_t b) {
+        return a > b ? (a - b) : (b - a);
+    };
+    auto it = std::lower_bound(samples.begin(), samples.end(), targetUs, [](const EgoFrame &sample, uint64_t tsUs) {
+        return sample.refTimestampUs < tsUs;
+    });
+
+    size_t bestIndex = 0;
+    uint64_t bestDiff = std::numeric_limits<uint64_t>::max();
+    if(it != samples.end()) {
+        bestIndex = static_cast<size_t>(std::distance(samples.begin(), it));
+        bestDiff = absDiff(samples[bestIndex].refTimestampUs, targetUs);
+    }
+    if(it != samples.begin()) {
+        const size_t cand = static_cast<size_t>(std::distance(samples.begin(), it - 1));
+        const uint64_t diff = absDiff(samples[cand].refTimestampUs, targetUs);
+        if(diff <= bestDiff) {
+            bestIndex = cand;
+        }
+    }
+    return bestIndex;
+}
+
 static std::string fisheyeCameraDirName(size_t cameraIdx) {
     return std::to_string(cameraIdx);
 }
@@ -2648,6 +2677,7 @@ public:
             session_ = SessionState{};
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
+            coordEgoQueue_.clear();
             coordCv_.notify_all();
         }
         {
@@ -2673,6 +2703,7 @@ public:
         passthroughRgbMjpg_.store(false);
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
+        egoEnabled_ = false;
         resetStreamHealth();
     }
 
@@ -2749,11 +2780,11 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(coordMtx_);
-            if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty()) {
+            if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty()) {
                 if(any) {
                     oss << " ";
                 }
-                oss << "align=" << coordRecordQueue_.size() << "+" << coordFisheyeQueue_.size();
+                oss << "align=" << coordRecordQueue_.size() << "+" << coordFisheyeQueue_.size() << "+" << coordEgoQueue_.size();
                 any = true;
             }
         }
@@ -2823,6 +2854,7 @@ public:
             readiness.message = "Starting cameras...";
             return readiness;
         }
+        const_cast<MultiDeviceStreamingRecorder *>(this)->refreshEgoReadyHealth();
 
         std::vector<std::string> missing;
         {
@@ -3021,10 +3053,11 @@ public:
         colorBrightness_ = ui.brightnessInt();
         multiviewEnabled_ = ui.enableMultiview;
         fisheyeEnabled_   = ui.enableFisheyes;
+        egoEnabled_       = ui.enableEgo;
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
 
-        if(!multiviewEnabled_ && !fisheyeEnabled_) {
+        if(!multiviewEnabled_ && !fisheyeEnabled_ && !egoEnabled_) {
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "Select at least one capture type";
             return false;
@@ -3043,9 +3076,9 @@ public:
         if(fisheyeEnabled_) {
             const auto fisheyeDevices = listPreferredFisheyeDevices(preferredFisheyeCameraLabels());
             if(fisheyeDevices.empty()) {
-                if(multiviewEnabled_) {
+                if(multiviewEnabled_ || egoEnabled_) {
                     fisheyeEnabled_ = false;
-                    fisheyeStatusLine = "No fisheye detected, fallback to multiview only";
+                    fisheyeStatusLine = "No fisheye detected, continuing with other selected sources";
                     std::cerr << "[collection] " << fisheyeStatusLine << std::endl;
                 }
                 else {
@@ -3058,11 +3091,11 @@ public:
                 const auto fisheyeCfg = buildAutoFisheyeConfig(cfg_.save, ui.maxDurationInt(), fisheyeDevices);
                 std::string fisheyeError;
                 if(!fisheyeRecorder_.start(fisheyeCfg, &fisheyeError)) {
-                    if(multiviewEnabled_) {
+                    if(multiviewEnabled_ || egoEnabled_) {
                         fisheyeEnabled_ = false;
                         activeFisheyeCameraCount_ = 0;
                         activeFisheyeCameraIds_.clear();
-                        fisheyeStatusLine = "Fisheye unavailable, fallback to multiview only: " + fisheyeError;
+                        fisheyeStatusLine = "Fisheye unavailable, continuing with other selected sources: " + fisheyeError;
                         std::cerr << "[collection] " << fisheyeStatusLine << std::endl;
                     }
                     else {
@@ -3083,6 +3116,23 @@ public:
             }
         }
 
+        std::string egoStatusLine;
+        if(egoEnabled_) {
+            EgoModuleConfig egoCfg = cfg_.ego;
+            egoCfg.enabled = true;
+            if(egoCfg.maxBufferedFrames == 0) {
+                egoCfg.maxBufferedFrames = static_cast<size_t>(std::max(2048, ui.maxDurationInt() * std::max(1, ui.fpsInt()) * 2));
+            }
+            std::string egoError;
+            if(!egoRecorder_.start(egoCfg, &egoError)) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                captureInfoLine_ = "Ego server start failed: " + egoError;
+                return false;
+            }
+            egoStatusLine = "Ego server listening on " + egoCfg.host + ":" + std::to_string(egoCfg.port);
+            std::cerr << "[collection] " << egoStatusLine << std::endl;
+        }
+
         if(!multiviewEnabled_) {
             stopping_.store(false);
             capturing_.store(true);
@@ -3090,9 +3140,9 @@ public:
             initStreamHealthForActiveStreams();
             softwareTriggerDevices_.clear();
             useSoftwareTrigger_ = false;
-            if(!fisheyeStatusLine.empty()) {
+            if(!fisheyeStatusLine.empty() || !egoStatusLine.empty()) {
                 std::lock_guard<std::mutex> lock(mtx_);
-                captureInfoLine_ = fisheyeStatusLine;
+                captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine : egoStatusLine;
             }
             return true;
         }
@@ -3101,6 +3151,7 @@ public:
         auto deviceList = ctx_.queryDeviceList();
         if(!deviceList || deviceList->deviceCount() == 0) {
             fisheyeRecorder_.stop();
+            egoRecorder_.stop();
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "No device connected";
             std::cerr << "[collection] no device connected" << std::endl;
@@ -3111,6 +3162,7 @@ public:
         auto selected = selectDevicesWithPipeline(deviceList, cfg_);
         if(selected.empty()) {
             fisheyeRecorder_.stop();
+            egoRecorder_.stop();
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "No configured devices found";
             std::cerr << "[collection] no configured devices found" << std::endl;
@@ -3265,9 +3317,9 @@ public:
         capturing_.store(true);
         recording_.store(false);
         initStreamHealthForActiveStreams();
-        if(!fisheyeStatusLine.empty()) {
+        if(!fisheyeStatusLine.empty() || !egoStatusLine.empty()) {
             std::lock_guard<std::mutex> lock(mtx_);
-            captureInfoLine_ = fisheyeStatusLine;
+            captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine : egoStatusLine;
         }
 
         softwareTriggerDevices_.clear();
@@ -3364,6 +3416,7 @@ public:
         local.saveFisheye = fisheyeEnabled_ && activeFisheyeCameraCount_ > 0;
         local.fisheyeCameraCount = local.saveFisheye ? activeFisheyeCameraCount_ : 0;
         local.wroteFisheyeCameraParams.assign(local.fisheyeCameraCount, false);
+        local.saveEgo = egoEnabled_;
         if(local.saveCloud || local.saveColorCloud) {
             loadCamWorldPoses(cfg_.initExtrinsicPath, local.camToWorld);
         }
@@ -3415,6 +3468,9 @@ public:
                     fs::create_directories(local.dest / "fisheye" / fisheyeCameraDirName(i) / "RGB");
                 }
             }
+            if(local.saveEgo) {
+                fs::create_directories(local.dest / "ego" / "RGB");
+            }
 
             if(multiviewEnabled_) {
                 writeParamsJson(local.dest, local.buffers, typesSaving_, cfg_.colorCloudRgbFrameOffset, cfg_.save);
@@ -3436,6 +3492,9 @@ public:
             if(local.timestampsOfs.is_open()) {
                 local.timestampsOfs.close();
             }
+            if(local.egoAlignedTimestampsOfs.is_open()) {
+                local.egoAlignedTimestampsOfs.close();
+            }
             try {
                 fs::remove_all(local.dest);
             }
@@ -3445,13 +3504,71 @@ public:
             captureInfoLine_ = "Failed to open timestamps.csv.tmp in " + local.dest.string();
             return false;
         }
+        if(local.saveEgo) {
+            if(!egoRecorder_.isRunning() || !egoRecorder_.isConnected()) {
+                if(local.timestampsOfs.is_open()) {
+                    local.timestampsOfs.close();
+                }
+                if(local.egoAlignedTimestampsOfs.is_open()) {
+                    local.egoAlignedTimestampsOfs.close();
+                }
+                try {
+                    if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
+                        fs::remove(local.timestampsTmpPath);
+                    }
+                    if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
+                        fs::remove(local.egoAlignedTimestampsTmpPath);
+                    }
+                    fs::remove_all(local.dest);
+                }
+                catch(...) {
+                }
+                std::lock_guard<std::mutex> lock(mtx_);
+                captureInfoLine_ = "Ego client is not connected";
+                return false;
+            }
+            std::string egoError;
+            const std::string egoSessionName = subjectId + "_" + taskName + "_episode_" + std::to_string(episodeN);
+            if(!egoRecorder_.beginSession(local.dest, egoSessionName, &egoError)) {
+                if(local.timestampsOfs.is_open()) {
+                    local.timestampsOfs.close();
+                }
+                if(local.egoAlignedTimestampsOfs.is_open()) {
+                    local.egoAlignedTimestampsOfs.close();
+                }
+                try {
+                    if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
+                        fs::remove(local.timestampsTmpPath);
+                    }
+                    if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
+                        fs::remove(local.egoAlignedTimestampsTmpPath);
+                    }
+                    fs::remove_all(local.dest);
+                }
+                catch(...) {
+                }
+                std::lock_guard<std::mutex> lock(mtx_);
+                captureInfoLine_ = "Ego session start failed: " + egoError;
+                return false;
+            }
+        }
         if(fisheyeEnabled_ && !fisheyeRecorder_.isRunning()) {
+            if(local.saveEgo) {
+                std::string ignored;
+                egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &ignored);
+            }
             if(local.timestampsOfs.is_open()) {
                 local.timestampsOfs.close();
+            }
+            if(local.egoAlignedTimestampsOfs.is_open()) {
+                local.egoAlignedTimestampsOfs.close();
             }
             try {
                 if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
                     fs::remove(local.timestampsTmpPath);
+                }
+                if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
+                    fs::remove(local.egoAlignedTimestampsTmpPath);
                 }
                 fs::remove_all(local.dest);
             }
@@ -3497,6 +3614,9 @@ public:
             if(!fisheyeEnabled_) {
                 session_.fisheyeEos = true;
             }
+            if(!egoEnabled_) {
+                session_.egoEos = true;
+            }
             coordCv_.notify_all();
         }
         passthroughRgbMjpg_.store(session_.passthroughRgbMjpg);
@@ -3523,6 +3643,12 @@ public:
             }
             fisheyeRecordThread_ = std::thread([this]() { fisheyeRecordLoop(); });
         }
+        if(egoEnabled_) {
+            if(egoRecordThread_.joinable()) {
+                egoRecordThread_.join();
+            }
+            egoRecordThread_ = std::thread([this]() { egoRecordLoop(); });
+        }
         std::cerr << "[collection] record begin" << std::endl;
         return true;
     }
@@ -3535,6 +3661,13 @@ public:
         recording_.store(false);
         if(fisheyeRecordThread_.joinable()) {
             fisheyeRecordThread_.join();
+        }
+        if(egoEnabled_) {
+            std::string egoError;
+            egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError);
+        }
+        if(egoRecordThread_.joinable()) {
+            egoRecordThread_.join();
         }
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -3555,6 +3688,7 @@ public:
             notifyMultiviewEos();
         }
         notifyFisheyeEos();
+        notifyEgoEos();
         const std::string captureInfoSnapshot = buildCaptureInfoSnapshotLocked(durMs);
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -3566,8 +3700,10 @@ public:
     void stopIfRunning() {
         if(!capturing_.load()) {
             fisheyeRecorder_.stop();
+            egoRecorder_.stop();
             activeFisheyeCameraCount_ = 0;
             activeFisheyeCameraIds_.clear();
+            egoEnabled_ = false;
             return;
         }
         stopping_.store(true);
@@ -3576,7 +3712,15 @@ public:
         if(fisheyeRecordThread_.joinable()) {
             fisheyeRecordThread_.join();
         }
+        if(egoEnabled_) {
+            std::string egoError;
+            egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &egoError);
+        }
+        if(egoRecordThread_.joinable()) {
+            egoRecordThread_.join();
+        }
         notifyFisheyeEos();
+        notifyEgoEos();
         if(multiviewEnabled_) {
             waitRecordWorkerIdle();
             notifyMultiviewEos();
@@ -3600,12 +3744,14 @@ public:
             }
         }
         fisheyeRecorder_.stop();
+        egoRecorder_.stop();
         capturing_.store(false);
         recording_.store(false);
         hasData_.store(false);
         passthroughRgbMjpg_.store(false);
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
+        egoEnabled_ = false;
         resetStreamHealth();
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -3624,6 +3770,7 @@ public:
             session_ = SessionState{};
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
+            coordEgoQueue_.clear();
             coordCv_.notify_all();
         }
         std::cerr << "[collection] pipelines stopped" << std::endl;
@@ -3643,6 +3790,7 @@ public:
             session_ = SessionState{};
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
+            coordEgoQueue_.clear();
             coordCv_.notify_all();
         }
         hasData_.store(false);
@@ -3688,6 +3836,7 @@ public:
             session_ = SessionState{};
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
+            coordEgoQueue_.clear();
             coordCv_.notify_all();
         }
         {
@@ -4215,6 +4364,7 @@ private:
         bool needRgbForColorCloud = false;
         bool passthroughRgbMjpg = false;
         bool saveFisheye = false;
+        bool saveEgo = false;
         bool saveRgbTimesteps = false;
         bool saveDepthTimesteps = false;
         size_t fisheyeCameraCount = 0;
@@ -4222,8 +4372,10 @@ private:
         std::unordered_map<std::string, CamWorldPose> camToWorld;
         std::unordered_map<std::string, std::unordered_map<CollectDataType, StreamState>> streams;
         std::deque<FisheyeFrameSet> fisheyeSets;
+        std::deque<EgoFrame> egoFrames;
         bool multiviewEos = false;
         bool fisheyeEos = false;
+        bool egoEos = false;
         bool coordinatorDone = false;
         bool timestampsFinalized = false;
         bool imuWritten = false;
@@ -4231,15 +4383,24 @@ private:
         fs::path timestampsTmpPath;
         std::ofstream timestampsOfs;
         bool timestampsOpen = false;
+        fs::path egoAlignedTimestampsPath;
+        fs::path egoAlignedTimestampsTmpPath;
+        std::ofstream egoAlignedTimestampsOfs;
+        bool egoAlignedTimestampsOpen = false;
         uint64_t fisheyeOnlyNextTargetUs = 0;
         bool fisheyeOnlyTargetInit = false;
         uint64_t lastEmittedFisheyeTs = 0;
         bool hasLastEmittedFisheyeTs = false;
+        uint64_t egoOnlyNextTargetUs = 0;
+        bool egoOnlyTargetInit = false;
+        uint64_t lastEmittedEgoTs = 0;
+        bool hasLastEmittedEgoTs = false;
         size_t nextFrameIndex = 0;
         size_t refFrameCount = 0;
         uint64_t firstRefTs = 0;
         uint64_t lastRefTs = 0;
         size_t fisheyeCapturedSets = 0;
+        size_t egoCapturedFrames = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -4315,6 +4476,7 @@ private:
             }
         }
         session_.fisheyeSets.clear();
+        session_.egoFrames.clear();
     }
 
     static size_t softWriterThreadCount(const AppConfig &cfg) {
@@ -4349,6 +4511,14 @@ private:
 
     static std::string fisheyeStreamDisplayName(const std::string &cameraId) {
         return "fisheye " + cameraId + " RGB";
+    }
+
+    static std::string egoStreamHealthKey() {
+        return "ego:RGB";
+    }
+
+    static std::string egoStreamDisplayName() {
+        return "ego RGB";
     }
 
     static std::string streamHealthDisplayName(const StreamHealthState &state) {
@@ -4404,6 +4574,19 @@ private:
                 states.push_back(std::move(state));
             }
         }
+        if(egoEnabled_) {
+            StreamHealthState state;
+            state.healthKey = egoStreamHealthKey();
+            state.sn = "ego";
+            state.camKey = "ego";
+            state.displayName = egoStreamDisplayName();
+            state.type = CollectDataType::RGB;
+            state.startedSteady = now;
+            state.lastFrameSteady = now;
+            state.requireTimestampAdvance = true;
+            state.everReceived = egoRecorder_.isConnected();
+            states.push_back(std::move(state));
+        }
 
         std::lock_guard<std::mutex> lock(streamHealthMtx_);
         streamHealth_.clear();
@@ -4449,6 +4632,43 @@ private:
             state.lastFrameTimestampUs = frame.captureTimestampUs;
             state.lastFrameSteady = now;
             state.everReceived = true;
+        }
+    }
+
+    void noteEgoFrame(const EgoFrame &frame) {
+        if(frame.refTimestampUs == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        auto it = streamHealth_.find(egoStreamHealthKey());
+        if(it == streamHealth_.end()) {
+            return;
+        }
+        auto &state = it->second;
+        if(state.requireTimestampAdvance && frame.refTimestampUs <= state.lastFrameTimestampUs) {
+            return;
+        }
+        state.lastFrameTimestampUs = frame.refTimestampUs;
+        state.lastFrameSteady = now;
+        state.everReceived = true;
+    }
+
+    void refreshEgoReadyHealth() {
+        if(!egoEnabled_ || recording_.load()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const bool connected = egoRecorder_.isConnected();
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        auto it = streamHealth_.find(egoStreamHealthKey());
+        if(it == streamHealth_.end()) {
+            return;
+        }
+        it->second.lastFrameSteady = now;
+        it->second.everReceived = connected;
+        if(!connected) {
+            it->second.lastFrameTimestampUs = 0;
         }
     }
 
@@ -4513,9 +4733,31 @@ private:
         for(size_t cameraIdx = 0; cameraIdx < session.fisheyeCameraCount; ++cameraIdx) {
             header.push_back("fisheye" + std::to_string(cameraIdx) + "_timestamp_us");
         }
+        if(session.saveEgo) {
+            header.push_back("ego_frame_index");
+            header.push_back("ego_timestamp_us");
+        }
         header.push_back("rgbd_max_diff_ms");
         header.push_back("all_modalities_max_diff_ms");
         writeCsvRow(session.timestampsOfs, header);
+        if(session.saveEgo) {
+            session.egoAlignedTimestampsPath = session.dest / "ego" / "RGB" / "rgb.h265.timestamps.csv";
+            session.egoAlignedTimestampsTmpPath = session.egoAlignedTimestampsPath;
+            session.egoAlignedTimestampsTmpPath += ".tmp";
+            session.egoAlignedTimestampsOfs.open(session.egoAlignedTimestampsTmpPath, std::ios::out | std::ios::trunc);
+            if(!session.egoAlignedTimestampsOfs.is_open()) {
+                return false;
+            }
+            session.egoAlignedTimestampsOpen = true;
+            writeCsvRow(session.egoAlignedTimestampsOfs,
+                        { "frame_index",
+                          "ego_frame_index",
+                          "ego_ref_timestamp_us",
+                          "ego_rgb_timestamp_us",
+                          "pico_frame_timestamp_ns",
+                          "pico_xr_head_timestamp_us",
+                          "pico_gaze_timestamp_us" });
+        }
         return static_cast<bool>(session.timestampsOfs);
     }
 
@@ -4535,6 +4777,11 @@ private:
             session_.timestampsOfs.close();
         }
         session_.timestampsOpen = false;
+        if(session_.egoAlignedTimestampsOfs.is_open()) {
+            session_.egoAlignedTimestampsOfs.flush();
+            session_.egoAlignedTimestampsOfs.close();
+        }
+        session_.egoAlignedTimestampsOpen = false;
     }
 
     void finalizeSessionTimestampsLocked() {
@@ -4545,6 +4792,13 @@ private:
         if(!session_.timestampsTmpPath.empty()) {
             try {
                 fs::rename(session_.timestampsTmpPath, session_.timestampsPath);
+            }
+            catch(...) {
+            }
+        }
+        if(!session_.egoAlignedTimestampsTmpPath.empty()) {
+            try {
+                fs::rename(session_.egoAlignedTimestampsTmpPath, session_.egoAlignedTimestampsPath);
             }
             catch(...) {
             }
@@ -4565,6 +4819,9 @@ private:
         }
         if(session.fisheyeCapturedSets > 0) {
             oss << "  FisheyeFrames=" << session.fisheyeCapturedSets;
+        }
+        if(session.egoCapturedFrames > 0) {
+            oss << "  EgoFrames=" << session.egoCapturedFrames;
         }
         return oss.str();
     }
@@ -5167,6 +5424,17 @@ private:
         coordCv_.notify_one();
     }
 
+    void enqueueEgoFrame(EgoFrame &&sample) {
+        {
+            std::lock_guard<std::mutex> lock(coordMtx_);
+            if(!session_.active) {
+                return;
+            }
+            coordEgoQueue_.push_back(std::move(sample));
+        }
+        coordCv_.notify_one();
+    }
+
     void notifyMultiviewEos() {
         if(multiviewEosNotified_.exchange(true)) {
             return;
@@ -5190,6 +5458,15 @@ private:
             return;
         }
         session_.fisheyeEos = true;
+        coordCv_.notify_one();
+    }
+
+    void notifyEgoEos() {
+        std::lock_guard<std::mutex> lock(coordMtx_);
+        if(!session_.active) {
+            return;
+        }
+        session_.egoEos = true;
         coordCv_.notify_one();
     }
 
@@ -5245,6 +5522,14 @@ private:
                 return false;
             }
         }
+        if(session_.saveEgo) {
+            if(session_.egoFrames.empty()) {
+                return session_.egoEos;
+            }
+            if(!session_.egoEos && session_.egoFrames.back().refTimestampUs < centerUs) {
+                return false;
+            }
+        }
         return true;
     }
 
@@ -5253,6 +5538,10 @@ private:
             return 0;
         }
         return findNearestFisheyeFrameSetIndex(std::vector<FisheyeFrameSet>(session_.fisheyeSets.begin(), session_.fisheyeSets.end()), centerUs);
+    }
+
+    size_t pickNearestEgoIndexLocked(uint64_t centerUs) const {
+        return findNearestEgoFrameIndex(session_.egoFrames, centerUs);
     }
 
     void pruneCommittedFramesLocked(uint64_t centerUs) {
@@ -5267,6 +5556,9 @@ private:
         while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= centerUs) {
             session_.fisheyeSets.pop_front();
         }
+        while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= centerUs) {
+            session_.egoFrames.pop_front();
+        }
     }
 
     void appendTimestampRowLocked(const std::vector<std::string> &row) {
@@ -5274,6 +5566,20 @@ private:
             return;
         }
         writeCsvRow(session_.timestampsOfs, row);
+    }
+
+    void appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame &frame) {
+        if(!session_.egoAlignedTimestampsOpen) {
+            return;
+        }
+        writeCsvRow(session_.egoAlignedTimestampsOfs,
+                    { frameIndex,
+                      std::to_string(frame.sourceFrameIndex),
+                      std::to_string(frame.refTimestampUs),
+                      std::to_string(frame.rgbTimestampUs),
+                      std::to_string(frame.picoFrameTimestampNs),
+                      std::to_string(frame.xrHeadTimestampUs),
+                      std::to_string(frame.gazeTimestampUs) });
     }
 
     void buildCloudInputsLocked(const std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> &pickedIndices,
@@ -5439,6 +5745,29 @@ private:
                 fullThis = false;
             }
         }
+        size_t pickedEgoIdx = 0;
+        bool hasPickedEgo = false;
+        if(session_.saveEgo) {
+            if(session_.egoFrames.empty()) {
+                fullThis = false;
+            }
+            else {
+                auto absDiff = [](uint64_t a, uint64_t b) {
+                    return a > b ? (a - b) : (b - a);
+                };
+                pickedEgoIdx = pickNearestEgoIndexLocked(centerUs);
+                if(pickedEgoIdx < session_.egoFrames.size()
+                   && absDiff(session_.egoFrames[pickedEgoIdx].refTimestampUs, centerUs) <= session_.maxAbsDiffUs) {
+                    hasPickedEgo = true;
+                    const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
+                    tsMin = std::min(tsMin, egoFrame.refTimestampUs);
+                    tsMax = std::max(tsMax, egoFrame.refTimestampUs);
+                }
+                else {
+                    fullThis = false;
+                }
+            }
+        }
 
         const size_t refIndex = session_.alignedRef;
         session_.alignedRef++;
@@ -5473,7 +5802,7 @@ private:
         hasData_.store(true);
 
         std::vector<std::string> row;
-        row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount + 2);
+        row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount + (session_.saveEgo ? 2 : 0) + 2);
         row.push_back(frameIndex);
         row.push_back(std::to_string(centerUs));
         std::unordered_map<CollectDataType, uint64_t> rgbdTsMinByType;
@@ -5617,6 +5946,22 @@ private:
             }
         }
 
+        if(session_.saveEgo) {
+            if(hasPickedEgo && pickedEgoIdx < session_.egoFrames.size()) {
+                const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
+                row.push_back(std::to_string(egoFrame.sourceFrameIndex));
+                row.push_back(std::to_string(egoFrame.refTimestampUs));
+                allTsMin = std::min(allTsMin, egoFrame.refTimestampUs);
+                allTsMax = std::max(allTsMax, egoFrame.refTimestampUs);
+                allTsCount++;
+                appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
+            }
+            else {
+                row.emplace_back();
+                row.emplace_back();
+            }
+        }
+
         {
             double rgbdMaxDiffMs = 0.0;
             for(const auto &kv: rgbdTsCountByType) {
@@ -5668,6 +6013,120 @@ private:
 
         itRefState->second.committed.pop_front();
         pruneCommittedFramesLocked(centerUs);
+        return true;
+    }
+
+    bool tryFinalizeEgoOnlySlotLocked() {
+        if(!session_.saveEgo || session_.egoFrames.empty()) {
+            return false;
+        }
+        if(!session_.egoOnlyTargetInit) {
+            session_.egoOnlyNextTargetUs = session_.egoFrames.front().refTimestampUs;
+            session_.egoOnlyTargetInit = true;
+        }
+        const uint64_t targetUs = session_.egoOnlyNextTargetUs;
+        if(!session_.egoEos && session_.egoFrames.back().refTimestampUs < targetUs) {
+            return false;
+        }
+        if(session_.saveFisheye) {
+            if(session_.fisheyeSets.empty()) {
+                if(!session_.fisheyeEos) {
+                    return false;
+                }
+            }
+            else if(!session_.fisheyeEos && session_.fisheyeSets.back().representativeTimestampUs < targetUs) {
+                return false;
+            }
+        }
+
+        const size_t egoIdx = pickNearestEgoIndexLocked(targetUs);
+        if(egoIdx >= session_.egoFrames.size()) {
+            session_.egoOnlyNextTargetUs += session_.stepUs;
+            return true;
+        }
+        const auto &egoFrame = session_.egoFrames[egoIdx];
+        if(session_.hasLastEmittedEgoTs && session_.lastEmittedEgoTs == egoFrame.refTimestampUs) {
+            session_.egoOnlyNextTargetUs += session_.stepUs;
+            while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
+                session_.egoFrames.pop_front();
+            }
+            return true;
+        }
+
+        const size_t outIdx = session_.nextFrameIndex++;
+        const std::string frameIndex = formatFrameIndex(outIdx);
+        session_.refFrameCount++;
+        if(session_.firstRefTs == 0) {
+            session_.firstRefTs = egoFrame.refTimestampUs;
+        }
+        session_.lastRefTs = egoFrame.refTimestampUs;
+        std::vector<std::string> row;
+        row.reserve(2 + session_.fisheyeCameraCount + 4);
+        row.push_back(frameIndex);
+        row.push_back(std::to_string(egoFrame.refTimestampUs));
+
+        uint64_t rowTsMin = egoFrame.refTimestampUs;
+        uint64_t rowTsMax = egoFrame.refTimestampUs;
+        size_t rowTsCount = 1;
+
+        if(session_.saveFisheye) {
+            if(!session_.fisheyeSets.empty()) {
+                const size_t fisheyeIdx = pickNearestFisheyeIndexLocked(targetUs);
+                const auto &sample = session_.fisheyeSets[fisheyeIdx];
+                for(size_t cameraIdx = 0; cameraIdx < session_.fisheyeCameraCount; ++cameraIdx) {
+                    if(cameraIdx < sample.frames.size()) {
+                        const auto &frame = sample.frames[cameraIdx];
+                        row.push_back(std::to_string(frame.captureTimestampUs));
+                        rowTsMin = std::min(rowTsMin, frame.captureTimestampUs);
+                        rowTsMax = std::max(rowTsMax, frame.captureTimestampUs);
+                        rowTsCount++;
+                        cv::Mat frameImg = frame.bgr;
+                        enqueueFisheyeH265Frame(cameraIdx, frameIndex, frame.captureTimestampUs, std::move(frameImg));
+                        if(!session_.wroteFisheyeCameraParams[cameraIdx] && !frame.bgr.empty()) {
+                            const fs::path cameraDir = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx);
+                            writeFisheyeCameraParamsJson(cameraDir, cameraIdx, frame.bgr, cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_), cfg_.save);
+                            session_.wroteFisheyeCameraParams[cameraIdx] = true;
+                        }
+                    }
+                    else {
+                        row.emplace_back();
+                    }
+                }
+            }
+            else {
+                for(size_t cameraIdx = 0; cameraIdx < session_.fisheyeCameraCount; ++cameraIdx) {
+                    row.emplace_back();
+                }
+            }
+        }
+
+        row.push_back(std::to_string(egoFrame.sourceFrameIndex));
+        row.push_back(std::to_string(egoFrame.refTimestampUs));
+        appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
+        row.push_back("");
+        double allModalMaxDiffMs = 0.0;
+        if(rowTsCount > 1 && rowTsMax >= rowTsMin) {
+            allModalMaxDiffMs = static_cast<double>(rowTsMax - rowTsMin) / 1000.0;
+        }
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(3) << allModalMaxDiffMs;
+        row.push_back(oss.str());
+        appendTimestampRowLocked(row);
+        hasData_.store(true);
+        session_.hasLastEmittedEgoTs = true;
+        session_.lastEmittedEgoTs = egoFrame.refTimestampUs;
+        session_.alignedCenters.push_back(egoFrame.refTimestampUs);
+
+        session_.egoOnlyNextTargetUs += session_.stepUs;
+        while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
+            session_.egoFrames.pop_front();
+        }
+        if(session_.saveFisheye) {
+            while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= targetUs) {
+                session_.fisheyeSets.pop_front();
+            }
+        }
         return true;
     }
 
@@ -5831,7 +6290,7 @@ private:
         if(session_.coordinatorDone || !session_.active) {
             return false;
         }
-        if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty()) {
+        if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty()) {
             return false;
         }
         if(multiviewEnabled_) {
@@ -5842,13 +6301,26 @@ private:
             if(!session_.multiviewEos || !refEmpty || hasPendingBySeqLocked()) {
                 return false;
             }
+            if(session_.saveFisheye && !session_.fisheyeEos) {
+                return false;
+            }
+            if(session_.saveEgo && !session_.egoEos) {
+                return false;
+            }
         }
         else {
-            if(!session_.fisheyeEos) {
+            if(session_.saveFisheye && !session_.fisheyeEos) {
+                return false;
+            }
+            if(session_.saveEgo && !session_.egoEos) {
                 return false;
             }
             if(session_.fisheyeOnlyTargetInit && !session_.fisheyeSets.empty()
                && session_.fisheyeOnlyNextTargetUs <= session_.fisheyeSets.back().representativeTimestampUs) {
+                return false;
+            }
+            if(session_.egoOnlyTargetInit && !session_.egoFrames.empty()
+               && session_.egoOnlyNextTargetUs <= session_.egoFrames.back().refTimestampUs) {
                 return false;
             }
         }
@@ -5888,10 +6360,12 @@ private:
             std::unique_lock<std::mutex> lock(coordMtx_);
             coordCv_.wait(lock, [&]() {
                 return !coordRecordQueue_.empty() || !coordFisheyeQueue_.empty()
+                       || !coordEgoQueue_.empty()
                        || (session_.active && (session_.multiviewEos || session_.fisheyeEos))
+                       || (session_.active && session_.egoEos)
                        || stopping_.load();
             });
-            if(!session_.active && coordRecordQueue_.empty() && coordFisheyeQueue_.empty()) {
+            if(!session_.active && coordRecordQueue_.empty() && coordFisheyeQueue_.empty() && coordEgoQueue_.empty()) {
                 return;
             }
 
@@ -5906,6 +6380,12 @@ private:
                 session_.fisheyeCapturedSets++;
                 coordCv_.notify_all();
             }
+            while(!coordEgoQueue_.empty()) {
+                session_.egoFrames.push_back(std::move(coordEgoQueue_.front()));
+                coordEgoQueue_.pop_front();
+                session_.egoCapturedFrames++;
+                coordCv_.notify_all();
+            }
 
             bool progress = true;
             while(progress) {
@@ -5913,6 +6393,9 @@ private:
                 progress = flushEosSequenceGapsLocked() || progress;
                 if(multiviewEnabled_) {
                     progress = tryFinalizeOneMultiviewSlotLocked() || progress;
+                }
+                else if(session_.saveEgo) {
+                    progress = tryFinalizeEgoOnlySlotLocked() || progress;
                 }
                 else if(session_.saveFisheye) {
                     progress = tryFinalizeFisheyeOnlySlotLocked() || progress;
@@ -6142,6 +6625,20 @@ private:
         }
     }
 
+    void egoRecordLoop() {
+        while(!stopping_.load() && egoEnabled_) {
+            EgoFrame frame;
+            if(egoRecorder_.popFrame(frame, std::chrono::milliseconds(20))) {
+                noteEgoFrame(frame);
+                enqueueEgoFrame(std::move(frame));
+                continue;
+            }
+            if(!recording_.load() && !egoRecorder_.isSessionActive() && !egoRecorder_.hasPendingFrames()) {
+                break;
+            }
+        }
+    }
+
     static void writeParamsJson(const fs::path &dest,
                                 const std::unordered_map<std::string, DeviceBuffer> &buffers,
                                 const std::vector<CollectDataType> &typesSaving,
@@ -6303,6 +6800,7 @@ private:
     std::condition_variable coordCv_;
     std::deque<ProcessedRecord> coordRecordQueue_;
     std::deque<FisheyeFrameSet> coordFisheyeQueue_;
+    std::deque<EgoFrame> coordEgoQueue_;
     size_t coordQueueMax_ = 512;
     SessionState session_{};
     std::thread coordinatorThread_;
@@ -6329,6 +6827,7 @@ private:
     std::atomic_bool hasData_{ false };
     std::atomic_bool stopping_{ false };
     std::thread      fisheyeRecordThread_;
+    std::thread      egoRecordThread_;
 
     std::chrono::steady_clock::time_point captureStartSteady_{};
 
@@ -6345,6 +6844,8 @@ private:
     size_t          activeFisheyeCameraCount_ = 0;
     std::vector<std::string> activeFisheyeCameraIds_;
     FisheyeRecorder fisheyeRecorder_;
+    bool            egoEnabled_ = false;
+    EgoRecorder     egoRecorder_;
 
     mutable std::mutex mtx_;
     std::unordered_map<std::string, DeviceBuffer> buffers_;
@@ -6678,6 +7179,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     bool cameraFaultDrainCompleteLogged = false;
     bool cameraReadyAnnounced = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
+    cfgUi.enableEgo = cfg.ego.enabled;
     if(cfg.colorExposureMs > 0.0f) {
         std::ostringstream oss;
         oss << std::setprecision(4) << cfg.colorExposureMs;
@@ -6786,11 +7288,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::putText(ui, "Capture Types", cv::Point(left, top - 22), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
             cv::Rect type1(left, top, 220, 36);
             cv::Rect type2(left + 240, top, 220, 36);
+            cv::Rect type3(left + 480, top, 220, 36);
             if(uiCheckbox(ui, type1, cfgUi.enableMultiview, "multiview", fm)) {
                 cfgUi.enableMultiview = !cfgUi.enableMultiview;
             }
             if(uiCheckbox(ui, type2, cfgUi.enableFisheyes, "fisheyes", fm)) {
                 cfgUi.enableFisheyes = !cfgUi.enableFisheyes;
+            }
+            if(uiCheckbox(ui, type3, cfgUi.enableEgo, "ego", fm)) {
+                cfgUi.enableEgo = !cfgUi.enableEgo;
             }
             if(!cfgUi.hasSelectedCaptureType()) {
                 cv::putText(ui, "Select at least one capture type", cv::Point(left, top + rowH - 8), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(60, 60, 255), 1, cv::LINE_AA);
@@ -7128,7 +7634,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     sd = {"WARMING UP", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
                     stateEmphasisLine = cameraReadiness.message;
-                    stateFootnoteLine = "Start is enabled after every active Orbbec RGB/Depth and fisheye RGB stream has a frame";
+                    stateFootnoteLine = "Start is enabled after every active Orbbec RGB/Depth, fisheye RGB, and ego stream is ready";
                 }
                 break;
             case CaptureState::RECORDING:

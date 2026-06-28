@@ -90,6 +90,16 @@
             "02": 4
         }
     },
+    "ego": {
+        "_comment": "PICO ego streaming capture. Run adb reverse tcp:50051 tcp:50051 on Ubuntu, then launch the PICO app with EgoStreamingClientController. cameraParamsPath is the fixed calibrated ego parameter JSON copied into each episode.",
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 50051,
+        "stopTimeoutMs": 5000,
+        "maxBufferedFrames": 8192,
+        "cameraId": "ego",
+        "cameraParamsPath": "../../camera_info/ego_camera_params.json"
+    },
     "fisheye": {
         "_comment": "Fish-eye cameras bind to a physical device by uniqueId. If the configured node cannot stream, startup will probe sibling video-index nodes on the same camera. camera1 -> left hand, camera2 -> right hand.",
         "enabled": true,

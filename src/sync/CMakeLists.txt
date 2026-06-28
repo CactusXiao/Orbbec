@@ -15,6 +15,7 @@ find_package(PCL REQUIRED COMPONENTS common filters registration segmentation sa
 find_package(Threads REQUIRED)
 
 add_executable(${PROJECT_NAME}
+    ego.cpp
     fisheyes.cpp
     tactile.cpp
     sync.cpp

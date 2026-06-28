@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(orbbec 
+    src/sync/ego.cpp
     src/sync/fisheyes.cpp
     src/sync/tactile.cpp
     src/sync/sync.cpp

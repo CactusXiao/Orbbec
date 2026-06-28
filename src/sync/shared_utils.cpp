@@ -216,6 +216,14 @@ AppConfig loadConfig(const fs::path &configPath) {
     }
 
     AppConfig cfg;
+    const fs::path configBase = fs::absolute(configPath).parent_path();
+    auto resolveConfigRelativePath = [&](const std::string &value) {
+        fs::path p(value);
+        if(p.is_relative()) {
+            p = (configBase / p).lexically_normal();
+        }
+        return p;
+    };
 
     if(auto v = getString(root, "outputDir")) {
         cfg.outputDir = fs::path(*v);
@@ -240,11 +248,7 @@ AppConfig loadConfig(const fs::path &configPath) {
         cfg.viewerFps = *v;
     }
     if(auto v = getString(root, "init_extrinsic_path")) {
-        fs::path p = fs::path(*v);
-        if(p.is_relative()) {
-            const fs::path base = fs::absolute(configPath).parent_path();
-            p                  = (base / p).lexically_normal();
-        }
+        fs::path p = resolveConfigRelativePath(*v);
         cfg.initExtrinsicPath = p.string();
     }
     if(auto v = getDouble(root, "max_depth")) {
@@ -468,6 +472,54 @@ AppConfig loadConfig(const fs::path &configPath) {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    cfg.ego.cameraParamsPath = (configBase / "../../camera_info/ego_camera_params.json").lexically_normal();
+    if(auto *egoObj = cJSON_GetObjectItemCaseSensitive(root, "ego")) {
+        if(cJSON_IsObject(egoObj)) {
+            if(auto v = getBool(egoObj, "enabled")) {
+                cfg.ego.enabled = *v;
+            }
+            if(auto v = getString(egoObj, "host")) {
+                cfg.ego.host = trimString(*v);
+            }
+            else if(auto v = getString(egoObj, "bindHost")) {
+                cfg.ego.host = trimString(*v);
+            }
+            if(cfg.ego.host.empty()) {
+                cfg.ego.host = "127.0.0.1";
+            }
+            if(auto v = getInt(egoObj, "port")) {
+                cfg.ego.port = std::max(1, std::min(65535, *v));
+            }
+            if(auto v = getInt(egoObj, "stopTimeoutMs")) {
+                cfg.ego.stopTimeoutMs = std::max(100, *v);
+            }
+            else if(auto v = getDouble(egoObj, "stopTimeoutSec")) {
+                cfg.ego.stopTimeoutMs = std::max(100, static_cast<int>(*v * 1000.0 + 0.5));
+            }
+            if(auto v = getInt(egoObj, "maxBufferedFrames")) {
+                cfg.ego.maxBufferedFrames = static_cast<size_t>(std::max(1, *v));
+            }
+            if(auto v = getString(egoObj, "cameraId")) {
+                cfg.ego.cameraId = trimString(*v);
+            }
+            if(cfg.ego.cameraId.empty()) {
+                cfg.ego.cameraId = "ego";
+            }
+            if(auto v = getString(egoObj, "cameraParamsPath")) {
+                cfg.ego.cameraParamsPath = resolveConfigRelativePath(*v);
+            }
+            else if(auto v = getString(egoObj, "cameraParamsFile")) {
+                cfg.ego.cameraParamsPath = resolveConfigRelativePath(*v);
+            }
+            else if(auto v = getString(egoObj, "calibrationDir")) {
+                cfg.ego.cameraParamsPath = resolveConfigRelativePath(*v) / "camera_params.json";
+            }
+            else if(auto v = getString(egoObj, "cameraInfoDir")) {
+                cfg.ego.cameraParamsPath = resolveConfigRelativePath(*v) / "camera_params.json";
             }
         }
     }

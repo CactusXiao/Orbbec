@@ -1,0 +1,50 @@
+{
+  "ego": {
+    "sn": "pico_ego",
+    "RGB": {
+      "storageEncoding": "h265",
+      "storageFile": "RGB/rgb.h265",
+      "timestampFile": "RGB/rgb.h265.timestamps.csv",
+      "sourceTimestampFile": "timestamps.csv",
+      "metadataFile": "metadata.csv",
+      "cameraJsonFile": "camera.json",
+      "networkLogFile": "network_log.jsonl",
+      "width": 2328,
+      "height": 1748,
+      "fps": 30,
+      "format": 0,
+      "intrinsic": {
+        "fx": 871.3860632777656,
+        "fy": 871.3611894238346,
+        "cx": 1158.4533774472666,
+        "cy": 878.727692849812,
+        "width": 2328,
+        "height": 1748
+      },
+      "distortion": {
+        "k1": -0.1295521646698262,
+        "k2": 0.37644236481465476,
+        "k3": -0.4149826222386425,
+        "k4": 0.174528683614444,
+        "k5": 0,
+        "k6": 0,
+        "p1": 0,
+        "p2": 0,
+        "model": 0,
+        "modelName": "opencv_fisheye"
+      },
+      "undistort": {
+        "balance": 1.0,
+        "fovScale": 1.0,
+        "new_intrinsic": {
+          "fx": 446.5418914576467,
+          "fy": 446.5291448482502,
+          "cx": 1157.3499999309336,
+          "cy": 879.9224000499178,
+          "width": 2328,
+          "height": 1748
+        }
+      }
+    }
+  }
+}
