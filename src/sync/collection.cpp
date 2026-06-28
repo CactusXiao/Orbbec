@@ -3512,6 +3512,7 @@ public:
             captureInfoLine_ = "Failed to open timestamps.csv.tmp in " + local.dest.string();
             return false;
         }
+        std::string egoSessionName;
         if(local.saveEgo) {
             if(!egoRecorder_.isRunning() || !egoRecorder_.isConnected()) {
                 if(local.timestampsOfs.is_open()) {
@@ -3535,36 +3536,9 @@ public:
                 captureInfoLine_ = "Ego client is not connected";
                 return false;
             }
-            std::string egoError;
-            const std::string egoSessionName = subjectId + "_" + taskName + "_episode_" + std::to_string(episodeN);
-            if(!egoRecorder_.beginSession(local.dest, egoSessionName, &egoError)) {
-                if(local.timestampsOfs.is_open()) {
-                    local.timestampsOfs.close();
-                }
-                if(local.egoAlignedTimestampsOfs.is_open()) {
-                    local.egoAlignedTimestampsOfs.close();
-                }
-                try {
-                    if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
-                        fs::remove(local.timestampsTmpPath);
-                    }
-                    if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
-                        fs::remove(local.egoAlignedTimestampsTmpPath);
-                    }
-                    fs::remove_all(local.dest);
-                }
-                catch(...) {
-                }
-                std::lock_guard<std::mutex> lock(mtx_);
-                captureInfoLine_ = "Ego session start failed: " + egoError;
-                return false;
-            }
+            egoSessionName = subjectId + "_" + taskName + "_episode_" + std::to_string(episodeN);
         }
         if(fisheyeEnabled_ && !fisheyeRecorder_.isRunning()) {
-            if(local.saveEgo) {
-                std::string ignored;
-                egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::max(100, cfg_.ego.stopTimeoutMs)), &ignored);
-            }
             if(local.timestampsOfs.is_open()) {
                 local.timestampsOfs.close();
             }
@@ -3634,9 +3608,6 @@ public:
         recordInputClosing_.store(false);
         multiviewEosNotified_.store(!multiviewEnabled_);
         hasData_.store(false);
-        captureStartSteady_ = std::chrono::steady_clock::now();
-        markStreamHealthCaptureStarted(captureStartSteady_);
-        recording_.store(true);
 
         if(multiviewEnabled_) {
             clearRecordQueue();
@@ -3644,6 +3615,41 @@ public:
         }
         ensureWriteWorkersRunning();
         startCoordinatorThread();
+
+        if(session_.saveEgo) {
+            std::string egoError;
+            if(!egoRecorder_.beginSession(session_.dest, egoSessionName, &egoError)) {
+                stopH265Encoders();
+                stopDepthFfv1Encoders();
+                {
+                    std::lock_guard<std::mutex> lock(coordMtx_);
+                    closeSessionTimestampsLocked();
+                    session_ = SessionState{};
+                    coordRecordQueue_.clear();
+                    coordFisheyeQueue_.clear();
+                    coordEgoQueue_.clear();
+                    coordCv_.notify_all();
+                }
+                joinCoordinatorThreadIfPossible();
+                try {
+                    if(!egoSessionName.empty()) {
+                        fs::remove_all(saveRoot / subjectId / taskName / ("episode_" + std::to_string(episodeN)));
+                    }
+                }
+                catch(...) {
+                }
+                recordInputClosing_.store(false);
+                multiviewEosNotified_.store(false);
+                hasData_.store(false);
+                std::lock_guard<std::mutex> lock(mtx_);
+                captureInfoLine_ = "Ego session start failed: " + egoError;
+                return false;
+            }
+        }
+
+        captureStartSteady_ = std::chrono::steady_clock::now();
+        markStreamHealthCaptureStarted(captureStartSteady_);
+        recording_.store(true);
 
         if(fisheyeEnabled_) {
             if(fisheyeRecordThread_.joinable()) {
