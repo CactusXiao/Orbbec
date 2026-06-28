@@ -1749,7 +1749,7 @@ static std::vector<EgoAlignedFrame> loadEgoAlignedFrames(const fs::path &path) {
         sample.egoSourceFrameIndex = csvIntValue(csvValue(index, cols, "ego_source_frame_index"), sample.egoFrameIndex);
         sample.refTimestampUs = csvUint64Value(csvValue(index, cols, "ego_ref_timestamp_us"));
         sample.valid = sample.alignedFrameIndex >= 0 && sample.egoFrameIndex >= 0;
-        if(sample.valid) {
+        if(sample.alignedFrameIndex >= 0) {
             const size_t idx = static_cast<size_t>(sample.alignedFrameIndex);
             if(out.size() <= idx) {
                 out.resize(idx + 1);
@@ -3157,6 +3157,32 @@ private:
         return sample.valid ? &sample : nullptr;
     }
 
+    cv::Mat makeEgoNoAlignedFrameImage() const {
+        int w = 640;
+        int h = 480;
+        if(const auto *p = egoRgbParams()) {
+            if(p->width > 0) {
+                w = p->width;
+            }
+            if(p->height > 0) {
+                h = p->height;
+            }
+        }
+        cv::Mat img(std::max(120, h), std::max(240, w), CV_8UC3, cv::Scalar(18, 18, 18));
+        const std::string text = "noalignedframefromego";
+        int baseline = 0;
+        double scale = 0.9;
+        int thickness = 1;
+        cv::Size textSize = cv::getTextSize(text, cv::FONT_HERSHEY_DUPLEX, scale, thickness, &baseline);
+        while(textSize.width > img.cols - 32 && scale > 0.35) {
+            scale *= 0.9;
+            textSize = cv::getTextSize(text, cv::FONT_HERSHEY_DUPLEX, scale, thickness, &baseline);
+        }
+        const cv::Point org(std::max(12, (img.cols - textSize.width) / 2), std::max(40, (img.rows + textSize.height) / 2));
+        cv::putText(img, text, org, cv::FONT_HERSHEY_DUPLEX, scale, cv::Scalar(220, 220, 220), thickness, cv::LINE_AA);
+        return img;
+    }
+
     fs::path depthVideoPathForCam(const std::string &cam, const fs::path &depthDir) const {
         const auto *p = depthParamsForCam(cam);
         return resolveStoragePath(depthDir, p ? p->storageFile : std::string(), depthFfv1OutputFileName());
@@ -4137,7 +4163,12 @@ private:
             if(dataType_ == ViewerDataType::RGB) {
                 img = loadRgbFrame(*source, currentFrame_);
                 if(source->kind == ViewerSourceKind::Ego) {
-                    drawEgoGazeOverlay(img, currentFrame_);
+                    if(img.empty() && egoVideoFrameIndexForAlignedFrame(currentFrame_) < 0) {
+                        img = makeEgoNoAlignedFrameImage();
+                    }
+                    else {
+                        drawEgoGazeOverlay(img, currentFrame_);
+                    }
                 }
                 else if(source->kind == ViewerSourceKind::Multiview && showLabels_ && labelsAvailable_) {
                     drawLabelsOnRgb(img, source->camKey);

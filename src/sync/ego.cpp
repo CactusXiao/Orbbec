@@ -10,8 +10,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <map>
-#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -768,9 +766,7 @@ public:
         return !frameQueue_.empty();
     }
 
-    bool hasFramePayload(int sourceFrameIndex) const;
-    bool commitFrame(int sourceFrameIndex, std::string *errorMessage);
-    void discardFramesBefore(int sourceFrameIndex);
+    int videoFrameIndexForSourceFrame(int sourceFrameIndex) const;
 
 private:
     class SessionWriter {
@@ -913,113 +909,44 @@ private:
 
             hevcSamplesReceived_++;
             hevcBytesReceived_ += sample.payload.size();
-            logHevcSampleEvent("hevc_sample_received", sample, std::nullopt);
 
-            if(sample.codecConfig || sample.frameIndex < 0) {
-                if(wroteCodecConfig_ || hevcFramesCommitted_ > 0) {
-                    hevcSamplesDropped_++;
-                    hevcBytesDropped_ += sample.payload.size();
-                    logHevcSampleEvent("hevc_codec_config_late_dropped", sample, std::nullopt);
-                    return;
+            int videoFrameIndex = -1;
+            if(!sample.codecConfig && sample.frameIndex >= 0) {
+                auto it = videoFrameBySourceFrame_.find(sample.frameIndex);
+                if(it == videoFrameBySourceFrame_.end()) {
+                    videoFrameIndex = static_cast<int>(hevcVideoFrames_);
+                    videoFrameBySourceFrame_[sample.frameIndex] = videoFrameIndex;
+                    hevcVideoFrames_++;
                 }
-                codecConfigSamples_.push_back(std::move(sample));
-                return;
+                else {
+                    videoFrameIndex = it->second;
+                }
             }
 
-            if(committedHevcSourceFrames_.find(sample.frameIndex) != committedHevcSourceFrames_.end()) {
-                hevcSamplesDropped_++;
-                hevcBytesDropped_ += sample.payload.size();
-                logHevcSampleEvent("hevc_sample_duplicate_dropped", sample, std::nullopt);
-                return;
+            const auto pos = video_.tellp();
+            const uint64_t offset = pos == std::ofstream::pos_type(-1) ? videoBytes_ : static_cast<uint64_t>(pos);
+            if(!payload.empty()) {
+                video_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
             }
-            pendingHevcByFrame_[sample.frameIndex].push_back(std::move(sample));
+            if(video_) {
+                videoBytes_ += payload.size();
+                hevcSamplesWritten_++;
+            }
+            else {
+                lastError_ = "failed to write ego HEVC payload";
+            }
+            logHevcSampleEvent("hevc_sample", sample, offset, videoFrameIndex);
         }
 
-        bool hasHevcFrame(int sourceFrameIndex) const {
+        int videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
             if(sourceFrameIndex < 0) {
-                return false;
+                return -1;
             }
-            auto it = pendingHevcByFrame_.find(sourceFrameIndex);
-            return it != pendingHevcByFrame_.end() && !it->second.empty();
-        }
-
-        bool commitHevcFrame(int sourceFrameIndex, std::string *errorMessage) {
-            hevcFrameCommitRequests_++;
-            if(sourceFrameIndex < 0) {
-                if(errorMessage) {
-                    *errorMessage = "invalid ego source frame index";
-                }
-                return false;
+            auto it = videoFrameBySourceFrame_.find(sourceFrameIndex);
+            if(it == videoFrameBySourceFrame_.end()) {
+                return -1;
             }
-            if(committedHevcSourceFrames_.find(sourceFrameIndex) != committedHevcSourceFrames_.end()) {
-                if(errorMessage) {
-                    *errorMessage = "ego source frame already committed: " + std::to_string(sourceFrameIndex);
-                }
-                return false;
-            }
-            auto it = pendingHevcByFrame_.find(sourceFrameIndex);
-            if(it == pendingHevcByFrame_.end() || it->second.empty()) {
-                hevcFramesMissing_++;
-                if(errorMessage) {
-                    *errorMessage = "missing HEVC payload for ego source frame " + std::to_string(sourceFrameIndex);
-                }
-                logRaw("{\"event\":\"hevc_frame_missing\",\"server_unix_us\":" + std::to_string(unixUsNow())
-                       + ",\"source_frame_index\":" + std::to_string(sourceFrameIndex) + "}");
-                return false;
-            }
-
-            if(!wroteCodecConfig_) {
-                if(codecConfigSamples_.empty()) {
-                    logRaw("{\"event\":\"hevc_codec_config_missing_at_first_commit\",\"server_unix_us\":"
-                           + std::to_string(unixUsNow()) + "}");
-                }
-                for(const auto &sample: codecConfigSamples_) {
-                    if(!writeBufferedHevcSample(sample, "hevc_codec_config_committed", errorMessage)) {
-                        return false;
-                    }
-                }
-                codecConfigSamples_.clear();
-                wroteCodecConfig_ = true;
-            }
-
-            for(const auto &sample: it->second) {
-                if(!writeBufferedHevcSample(sample, "hevc_sample_committed", errorMessage)) {
-                    return false;
-                }
-            }
-            pendingHevcByFrame_.erase(it);
-            committedHevcSourceFrames_.insert(sourceFrameIndex);
-            hevcFramesCommitted_++;
-            logRaw("{\"event\":\"hevc_frame_committed\",\"server_unix_us\":" + std::to_string(unixUsNow())
-                   + ",\"source_frame_index\":" + std::to_string(sourceFrameIndex)
-                   + ",\"committed_frame_index\":" + std::to_string(hevcFramesCommitted_ - 1) + "}");
-            return true;
-        }
-
-        void discardHevcFramesBefore(int sourceFrameIndex) {
-            if(sourceFrameIndex <= 0 || pendingHevcByFrame_.empty()) {
-                return;
-            }
-            uint64_t droppedSamples = 0;
-            uint64_t droppedBytes = 0;
-            for(auto it = pendingHevcByFrame_.begin(); it != pendingHevcByFrame_.end();) {
-                if(it->first >= sourceFrameIndex) {
-                    break;
-                }
-                for(const auto &sample: it->second) {
-                    droppedSamples++;
-                    droppedBytes += sample.payload.size();
-                }
-                it = pendingHevcByFrame_.erase(it);
-            }
-            if(droppedSamples > 0) {
-                hevcSamplesDropped_ += droppedSamples;
-                hevcBytesDropped_ += droppedBytes;
-                logRaw("{\"event\":\"hevc_samples_discarded\",\"server_unix_us\":" + std::to_string(unixUsNow())
-                       + ",\"before_source_frame_index\":" + std::to_string(sourceFrameIndex)
-                       + ",\"samples\":" + std::to_string(droppedSamples)
-                       + ",\"bytes\":" + std::to_string(droppedBytes) + "}");
-            }
+            return it->second;
         }
 
         void markError(const std::string &message) {
@@ -1040,7 +967,6 @@ private:
             }
             closed_ = true;
             endedUnixUs_ = unixUsNow();
-            discardAllPendingHevcSamples("session_close");
             logRaw("{\"event\":\"session_close\",\"server_unix_us\":" + std::to_string(endedUnixUs_)
                    + ",\"reason\":" + jsonString(reason) + "}");
 
@@ -1101,73 +1027,22 @@ private:
 
         void logHevcSampleEvent(const std::string &event,
                                 const BufferedHevcSample &sample,
-                                std::optional<uint64_t> videoOffset) {
+                                uint64_t videoOffset,
+                                int videoFrameIndex) {
             std::ostringstream oss;
             oss << "{\"event\":" << jsonString(event)
                 << ",\"server_unix_us\":" << unixUsNow()
                 << ",\"source_frame_index\":" << sample.frameIndex
                 << ",\"is_codec_config\":" << (sample.codecConfig ? "true" : "false")
-                << ",\"payload_size\":" << sample.payload.size();
-            if(videoOffset.has_value()) {
-                oss << ",\"video_offset\":" << *videoOffset;
+                << ",\"payload_size\":" << sample.payload.size()
+                << ",\"video_offset\":" << videoOffset;
+            if(videoFrameIndex >= 0) {
+                oss << ",\"video_frame_index\":" << videoFrameIndex;
             }
             oss << ",\"header\":";
             appendHeaderJson(oss, sample.headerJson);
             oss << "}";
             logRaw(oss.str());
-        }
-
-        bool writeBufferedHevcSample(const BufferedHevcSample &sample,
-                                     const std::string &event,
-                                     std::string *errorMessage) {
-            if(!video_.is_open()) {
-                if(errorMessage) {
-                    *errorMessage = "ego video file is not open";
-                }
-                return false;
-            }
-            const auto pos = video_.tellp();
-            if(pos == std::ofstream::pos_type(-1)) {
-                if(errorMessage) {
-                    *errorMessage = "failed to query ego video offset";
-                }
-                return false;
-            }
-            const uint64_t offset = static_cast<uint64_t>(pos);
-            if(!sample.payload.empty()) {
-                video_.write(reinterpret_cast<const char *>(sample.payload.data()), static_cast<std::streamsize>(sample.payload.size()));
-                if(!video_) {
-                    if(errorMessage) {
-                        *errorMessage = "failed to write ego HEVC payload";
-                    }
-                    return false;
-                }
-            }
-            videoBytes_ += sample.payload.size();
-            hevcSamplesCommitted_++;
-            logHevcSampleEvent(event, sample, offset);
-            return true;
-        }
-
-        void discardAllPendingHevcSamples(const std::string &reason) {
-            uint64_t droppedSamples = 0;
-            uint64_t droppedBytes = 0;
-            for(const auto &kv: pendingHevcByFrame_) {
-                for(const auto &sample: kv.second) {
-                    droppedSamples++;
-                    droppedBytes += sample.payload.size();
-                }
-            }
-            pendingHevcByFrame_.clear();
-            codecConfigSamples_.clear();
-            if(droppedSamples > 0) {
-                hevcSamplesDropped_ += droppedSamples;
-                hevcBytesDropped_ += droppedBytes;
-                logRaw("{\"event\":\"hevc_pending_samples_discarded\",\"server_unix_us\":" + std::to_string(unixUsNow())
-                       + ",\"reason\":" + jsonString(reason)
-                       + ",\"samples\":" + std::to_string(droppedSamples)
-                       + ",\"bytes\":" + std::to_string(droppedBytes) + "}");
-            }
         }
 
         void writeSessionJson(const std::string &reason) {
@@ -1186,16 +1061,12 @@ private:
                 << "  \"camera_json\": " << jsonString(cameraPath_.string()) << ",\n"
                 << "  \"network_log_jsonl\": " << jsonString(networkLogPath_.string()) << ",\n"
                 << "  \"video_bytes\": " << videoBytes_ << ",\n"
-                << "  \"hevc_samples\": " << hevcSamplesCommitted_ << ",\n"
+                << "  \"hevc_samples\": " << hevcSamplesWritten_ << ",\n"
                 << "  \"hevc_samples_received\": " << hevcSamplesReceived_ << ",\n"
-                << "  \"hevc_samples_committed\": " << hevcSamplesCommitted_ << ",\n"
-                << "  \"hevc_samples_dropped\": " << hevcSamplesDropped_ << ",\n"
+                << "  \"hevc_samples_written\": " << hevcSamplesWritten_ << ",\n"
+                << "  \"hevc_video_frames\": " << hevcVideoFrames_ << ",\n"
                 << "  \"hevc_bytes_received\": " << hevcBytesReceived_ << ",\n"
-                << "  \"hevc_bytes_committed\": " << videoBytes_ << ",\n"
-                << "  \"hevc_bytes_dropped\": " << hevcBytesDropped_ << ",\n"
-                << "  \"hevc_frame_commit_requests\": " << hevcFrameCommitRequests_ << ",\n"
-                << "  \"hevc_frames_committed\": " << hevcFramesCommitted_ << ",\n"
-                << "  \"hevc_frames_missing\": " << hevcFramesMissing_ << ",\n"
+                << "  \"hevc_bytes_written\": " << videoBytes_ << ",\n"
                 << "  \"metadata_rows\": " << metadataRows_ << ",\n"
                 << "  \"timestamp_rows\": " << timestampRows_ << ",\n"
                 << "  \"camera_json_received\": " << (cameraJsonReceived_ ? "true" : "false") << ",\n"
@@ -1232,21 +1103,14 @@ private:
         uint64_t endedUnixUs_ = 0;
         uint64_t videoBytes_ = 0;
         uint64_t hevcSamplesReceived_ = 0;
-        uint64_t hevcSamplesCommitted_ = 0;
-        uint64_t hevcSamplesDropped_ = 0;
+        uint64_t hevcSamplesWritten_ = 0;
+        uint64_t hevcVideoFrames_ = 0;
         uint64_t hevcBytesReceived_ = 0;
-        uint64_t hevcBytesDropped_ = 0;
-        uint64_t hevcFrameCommitRequests_ = 0;
-        uint64_t hevcFramesCommitted_ = 0;
-        uint64_t hevcFramesMissing_ = 0;
         uint64_t metadataRows_ = 0;
         uint64_t timestampRows_ = 0;
         bool cameraJsonReceived_ = false;
         bool closed_ = false;
-        bool wroteCodecConfig_ = false;
-        std::vector<BufferedHevcSample> codecConfigSamples_;
-        std::map<int, std::vector<BufferedHevcSample>> pendingHevcByFrame_;
-        std::set<int> committedHevcSourceFrames_;
+        std::unordered_map<int, int> videoFrameBySourceFrame_;
         std::string lastError_;
         std::string clientSummaryJson_ = "{}";
     };
@@ -1477,27 +1341,12 @@ private:
     uint64_t nextFrameSequence_ = 0;
 };
 
-bool EgoRecorder::Impl::hasFramePayload(int sourceFrameIndex) const {
-    std::lock_guard<std::mutex> lock(sessionMtx_);
-    return session_ && session_->hasHevcFrame(sourceFrameIndex);
-}
-
-bool EgoRecorder::Impl::commitFrame(int sourceFrameIndex, std::string *errorMessage) {
+int EgoRecorder::Impl::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
     std::lock_guard<std::mutex> lock(sessionMtx_);
     if(!session_) {
-        if(errorMessage) {
-            *errorMessage = "No active ego session";
-        }
-        return false;
+        return -1;
     }
-    return session_->commitHevcFrame(sourceFrameIndex, errorMessage);
-}
-
-void EgoRecorder::Impl::discardFramesBefore(int sourceFrameIndex) {
-    std::lock_guard<std::mutex> lock(sessionMtx_);
-    if(session_) {
-        session_->discardHevcFramesBefore(sourceFrameIndex);
-    }
+    return session_->videoFrameIndexForSourceFrame(sourceFrameIndex);
 }
 
 EgoRecorder::EgoRecorder()
@@ -1560,16 +1409,8 @@ bool EgoRecorder::hasPendingFrames() const {
     return impl_->hasPendingFrames();
 }
 
-bool EgoRecorder::hasFramePayload(int sourceFrameIndex) const {
-    return impl_->hasFramePayload(sourceFrameIndex);
-}
-
-bool EgoRecorder::commitFrame(int sourceFrameIndex, std::string *errorMessage) {
-    return impl_->commitFrame(sourceFrameIndex, errorMessage);
-}
-
-void EgoRecorder::discardFramesBefore(int sourceFrameIndex) {
-    impl_->discardFramesBefore(sourceFrameIndex);
+int EgoRecorder::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
+    return impl_->videoFrameIndexForSourceFrame(sourceFrameIndex);
 }
 
 }  // namespace sync_app

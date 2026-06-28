@@ -4401,7 +4401,6 @@ private:
         uint64_t lastRefTs = 0;
         size_t fisheyeCapturedSets = 0;
         size_t egoCapturedFrames = 0;
-        size_t egoAlignedFrames = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -5561,9 +5560,6 @@ private:
         while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= centerUs) {
             session_.egoFrames.pop_front();
         }
-        if(session_.saveEgo && !session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
-            egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
-        }
     }
 
     void appendTimestampRowLocked(const std::vector<std::string> &row) {
@@ -5573,36 +5569,28 @@ private:
         writeCsvRow(session_.timestampsOfs, row);
     }
 
-    bool egoFrameHasPayloadLocked(const EgoFrame &frame) const {
-        return frame.sourceFrameIndex >= 0 && egoRecorder_.hasFramePayload(frame.sourceFrameIndex);
+    int egoVideoFrameIndexForSourceFrameLocked(const EgoFrame &frame) const {
+        return frame.sourceFrameIndex >= 0 ? egoRecorder_.videoFrameIndexForSourceFrame(frame.sourceFrameIndex) : -1;
     }
 
-    int appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame &frame) {
-        std::string error;
-        if(!egoRecorder_.commitFrame(frame.sourceFrameIndex, &error)) {
-            std::cerr << "[collection][ego] failed to commit aligned ego frame source_frame_index="
-                      << frame.sourceFrameIndex;
-            if(!error.empty()) {
-                std::cerr << " error=" << error;
-            }
-            std::cerr << std::endl;
-            return -1;
-        }
-
-        const int egoOutputFrameIndex = static_cast<int>(session_.egoAlignedFrames++);
+    void appendEgoAlignedTimestampRowLocked(const std::string &frameIndex, const EgoFrame *frame, int egoVideoFrameIndex) {
         if(!session_.egoAlignedTimestampsOpen) {
-            return egoOutputFrameIndex;
+            return;
+        }
+        if(!frame || egoVideoFrameIndex < 0) {
+            writeCsvRow(session_.egoAlignedTimestampsOfs,
+                        { frameIndex, "", "", "", "", "", "", "" });
+            return;
         }
         writeCsvRow(session_.egoAlignedTimestampsOfs,
                     { frameIndex,
-                      std::to_string(egoOutputFrameIndex),
-                      std::to_string(frame.sourceFrameIndex),
-                      std::to_string(frame.refTimestampUs),
-                      std::to_string(frame.rgbTimestampUs),
-                      std::to_string(frame.picoFrameTimestampNs),
-                      std::to_string(frame.xrHeadTimestampUs),
-                      std::to_string(frame.gazeTimestampUs) });
-        return egoOutputFrameIndex;
+                      std::to_string(egoVideoFrameIndex),
+                      std::to_string(frame->sourceFrameIndex),
+                      std::to_string(frame->refTimestampUs),
+                      std::to_string(frame->rgbTimestampUs),
+                      std::to_string(frame->picoFrameTimestampNs),
+                      std::to_string(frame->xrHeadTimestampUs),
+                      std::to_string(frame->gazeTimestampUs) });
     }
 
     void buildCloudInputsLocked(const std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> &pickedIndices,
@@ -5770,11 +5758,9 @@ private:
         }
         size_t pickedEgoIdx = 0;
         bool hasPickedEgo = false;
+        int pickedEgoVideoFrameIndex = -1;
         if(session_.saveEgo) {
-            if(session_.egoFrames.empty()) {
-                fullThis = false;
-            }
-            else {
+            if(!session_.egoFrames.empty()) {
                 auto absDiff = [](uint64_t a, uint64_t b) {
                     return a > b ? (a - b) : (b - a);
                 };
@@ -5782,17 +5768,15 @@ private:
                 if(pickedEgoIdx < session_.egoFrames.size()
                    && absDiff(session_.egoFrames[pickedEgoIdx].refTimestampUs, centerUs) <= session_.maxAbsDiffUs) {
                     const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
-                    if(egoFrameHasPayloadLocked(egoFrame)) {
+                    pickedEgoVideoFrameIndex = egoVideoFrameIndexForSourceFrameLocked(egoFrame);
+                    if(pickedEgoVideoFrameIndex >= 0) {
                         hasPickedEgo = true;
                         tsMin = std::min(tsMin, egoFrame.refTimestampUs);
                         tsMax = std::max(tsMax, egoFrame.refTimestampUs);
                     }
-                    else {
-                        fullThis = false;
+                    else if(!session_.egoEos && pickedEgoIdx + 1 >= session_.egoFrames.size()) {
+                        return false;
                     }
-                }
-                else {
-                    fullThis = false;
                 }
             }
         }
@@ -5821,13 +5805,6 @@ private:
 
         const size_t outIdx = session_.nextFrameIndex;
         const std::string frameIndex = formatFrameIndex(outIdx);
-        int egoOutputFrameIndex = -1;
-        if(session_.saveEgo && hasPickedEgo && pickedEgoIdx < session_.egoFrames.size()) {
-            egoOutputFrameIndex = appendEgoAlignedTimestampRowLocked(frameIndex, session_.egoFrames[pickedEgoIdx]);
-            if(egoOutputFrameIndex < 0) {
-                return dropCurrentSlot();
-            }
-        }
 
         session_.fullAligned++;
         if(tsMax >= tsMin) {
@@ -5989,15 +5966,17 @@ private:
         if(session_.saveEgo) {
             if(hasPickedEgo && pickedEgoIdx < session_.egoFrames.size()) {
                 const auto &egoFrame = session_.egoFrames[pickedEgoIdx];
-                row.push_back(std::to_string(egoOutputFrameIndex));
+                row.push_back(std::to_string(pickedEgoVideoFrameIndex));
                 row.push_back(std::to_string(egoFrame.refTimestampUs));
                 allTsMin = std::min(allTsMin, egoFrame.refTimestampUs);
                 allTsMax = std::max(allTsMax, egoFrame.refTimestampUs);
                 allTsCount++;
+                appendEgoAlignedTimestampRowLocked(frameIndex, &egoFrame, pickedEgoVideoFrameIndex);
             }
             else {
                 row.emplace_back();
                 row.emplace_back();
+                appendEgoAlignedTimestampRowLocked(frameIndex, nullptr, -1);
             }
         }
 
@@ -6086,35 +6065,28 @@ private:
         const auto &egoFrame = session_.egoFrames[egoIdx];
         auto advanceEgoOnlyTarget = [&]() {
             session_.egoOnlyNextTargetUs += session_.stepUs;
-            int discardBeforeSourceFrame = -1;
             if(egoIdx < session_.egoFrames.size()) {
-                discardBeforeSourceFrame = session_.egoFrames[egoIdx].sourceFrameIndex + 1;
                 session_.egoFrames.erase(session_.egoFrames.begin() + egoIdx);
             }
             while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
                 session_.egoFrames.pop_front();
-            }
-            if(!session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
-                egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
-            }
-            else if(discardBeforeSourceFrame > 0) {
-                egoRecorder_.discardFramesBefore(discardBeforeSourceFrame);
             }
             return true;
         };
         if(session_.hasLastEmittedEgoTs && session_.lastEmittedEgoTs == egoFrame.refTimestampUs) {
             return advanceEgoOnlyTarget();
         }
-        if(!egoFrameHasPayloadLocked(egoFrame)) {
+        const int egoVideoFrameIndex = egoVideoFrameIndexForSourceFrameLocked(egoFrame);
+        if(egoVideoFrameIndex < 0) {
+            if(!session_.egoEos && egoIdx + 1 >= session_.egoFrames.size()) {
+                return false;
+            }
             return advanceEgoOnlyTarget();
         }
 
         const size_t outIdx = session_.nextFrameIndex;
         const std::string frameIndex = formatFrameIndex(outIdx);
-        const int egoOutputFrameIndex = appendEgoAlignedTimestampRowLocked(frameIndex, egoFrame);
-        if(egoOutputFrameIndex < 0) {
-            return advanceEgoOnlyTarget();
-        }
+        appendEgoAlignedTimestampRowLocked(frameIndex, &egoFrame, egoVideoFrameIndex);
         session_.nextFrameIndex++;
         session_.refFrameCount++;
         if(session_.firstRefTs == 0) {
@@ -6161,7 +6133,7 @@ private:
             }
         }
 
-        row.push_back(std::to_string(egoOutputFrameIndex));
+        row.push_back(std::to_string(egoVideoFrameIndex));
         row.push_back(std::to_string(egoFrame.refTimestampUs));
         row.push_back("");
         double allModalMaxDiffMs = 0.0;
@@ -6181,9 +6153,6 @@ private:
         session_.egoOnlyNextTargetUs += session_.stepUs;
         while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= targetUs) {
             session_.egoFrames.pop_front();
-        }
-        if(!session_.egoFrames.empty() && session_.egoFrames.front().sourceFrameIndex >= 0) {
-            egoRecorder_.discardFramesBefore(session_.egoFrames.front().sourceFrameIndex);
         }
         if(session_.saveFisheye) {
             while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= targetUs) {
