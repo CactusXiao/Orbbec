@@ -708,6 +708,8 @@ struct CameraStreamParams {
     std::string timestampFile;
     std::string filePattern;
     OBCameraIntrinsic intrinsic{};
+    OBCameraIntrinsic undistortIntrinsic{};
+    bool hasUndistortIntrinsic = false;
     OBCameraDistortion distortion{};
 };
 
@@ -840,6 +842,7 @@ static bool parseStreamParams(cJSON *obj, CameraStreamParams &out) {
     };
     cJSON *intr = cJSON_GetObjectItemCaseSensitive(obj, "intrinsic");
     cJSON *dist = cJSON_GetObjectItemCaseSensitive(obj, "distortion");
+    cJSON *undistort = cJSON_GetObjectItemCaseSensitive(obj, "undistort");
     if(!getInt("width", out.width, false) || !getInt("height", out.height, false) || !getInt("fps", out.fps, false) || !getInt("format", out.format, false)) {
         return false;
     }
@@ -848,6 +851,9 @@ static bool parseStreamParams(cJSON *obj, CameraStreamParams &out) {
     getString("timestampFile", out.timestampFile);
     getString("filePattern", out.filePattern);
     parseIntrinsic(intr, out.intrinsic);
+    if(undistort && cJSON_IsObject(undistort)) {
+        out.hasUndistortIntrinsic = parseIntrinsic(cJSON_GetObjectItemCaseSensitive(undistort, "new_intrinsic"), out.undistortIntrinsic);
+    }
     parseDistortion(dist, out.distortion);
     if(out.width > 0 && out.height > 0) {
         if(out.intrinsic.width <= 0) {
@@ -855,6 +861,12 @@ static bool parseStreamParams(cJSON *obj, CameraStreamParams &out) {
         }
         if(out.intrinsic.height <= 0) {
             out.intrinsic.height = out.height;
+        }
+        if(out.hasUndistortIntrinsic && out.undistortIntrinsic.width <= 0) {
+            out.undistortIntrinsic.width = out.width;
+        }
+        if(out.hasUndistortIntrinsic && out.undistortIntrinsic.height <= 0) {
+            out.undistortIntrinsic.height = out.height;
         }
     }
     out.valid = out.intrinsic.fx > 0.0f && out.intrinsic.fy > 0.0f;
@@ -1568,6 +1580,8 @@ struct EgoGazeSample {
     std::string gazeFailureReason;
     cv::Vec3d gazeWorldDirection = cv::Vec3d(0.0, 0.0, 0.0);
     cv::Vec3d eyeWorld = cv::Vec3d(0.0, 0.0, 0.0);
+    cv::Vec3d xrHeadPos = cv::Vec3d(0.0, 0.0, 0.0);
+    ViewerQuat xrHeadRot;
     cv::Vec3d rgbWorldPos = cv::Vec3d(0.0, 0.0, 0.0);
     ViewerQuat rgbWorldRot;
     double fx = 0.0;
@@ -1582,6 +1596,12 @@ struct EgoGazeProjection {
     cv::Point2f pixel;
     cv::Vec3d directionCamera = cv::Vec3d(0.0, 0.0, 0.0);
     std::string failureReason;
+};
+
+struct EgoRgbLocalPose {
+    bool valid = false;
+    cv::Vec3d position = cv::Vec3d(0.0, 0.0, 0.0);
+    ViewerQuat rotation;
 };
 
 static std::string dataTypeToLabel(ViewerDataType t) {
@@ -1831,6 +1851,8 @@ static std::vector<EgoGazeSample> loadEgoGazeSamples(const fs::path &metadataPat
         sample.gazeFailureReason = csvValue(index, cols, "gaze_failure_reason");
         sample.gazeWorldDirection = csvVec3Value(index, cols, "gaze_world_direction");
         sample.eyeWorld = csvVec3Value(index, cols, "eye_pose_position_unity");
+        sample.xrHeadPos = csvVec3Value(index, cols, "xr_head_pos");
+        sample.xrHeadRot = csvQuatValue(index, cols, "xr_head_rot");
         sample.rgbWorldPos = csvVec3Value(index, cols, "rgb_pos");
         sample.rgbWorldRot = csvQuatValue(index, cols, "rgb_rot");
         sample.fx = csvDoubleValue(csvValue(index, cols, "fx"), 0.0);
@@ -1888,8 +1910,102 @@ static cv::Vec3d rotateVecByQuat(const ViewerQuat &qIn, const cv::Vec3d &v) {
     return v + (uv * (2.0 * q.w)) + (uuv * 2.0);
 }
 
+static bool finiteQuat(const ViewerQuat &q) {
+    return std::isfinite(q.x) && std::isfinite(q.y) && std::isfinite(q.z) && std::isfinite(q.w);
+}
+
+static ViewerQuat multiplyQuat(const ViewerQuat &aIn, const ViewerQuat &bIn) {
+    const ViewerQuat a = normalizeQuat(aIn);
+    const ViewerQuat b = normalizeQuat(bIn);
+    ViewerQuat out;
+    out.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    out.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    out.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    out.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    return normalizeQuat(out);
+}
+
+static EgoRgbLocalPose picoRightHandedPoseToUnity(const cv::Vec3d &positionRh, const ViewerQuat &rotationRh) {
+    EgoRgbLocalPose out;
+    out.valid = finiteVec3(positionRh) && finiteQuat(rotationRh);
+    out.position = cv::Vec3d(positionRh[0], positionRh[1], -positionRh[2]);
+    out.rotation.x = rotationRh.x;
+    out.rotation.y = rotationRh.y;
+    out.rotation.z = -rotationRh.z;
+    out.rotation.w = -rotationRh.w;
+    out.rotation = normalizeQuat(out.rotation);
+    return out;
+}
+
+static bool jsonDoubleValue(cJSON *obj, const char *key, double &out) {
+    cJSON *it = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if(!it || !cJSON_IsNumber(it)) {
+        return false;
+    }
+    out = it->valuedouble;
+    return true;
+}
+
+static EgoRgbLocalPose loadEgoRgbLocalPose(const fs::path &cameraJsonPath) {
+    EgoRgbLocalPose out;
+    const std::string content = readFileAllLocal(cameraJsonPath);
+    if(content.empty()) {
+        return out;
+    }
+    cJSON *root = cJSON_Parse(content.c_str());
+    if(!root || !cJSON_IsObject(root)) {
+        if(root) {
+            cJSON_Delete(root);
+        }
+        return out;
+    }
+    cJSON *ext = cJSON_GetObjectItemCaseSensitive(root, "extrinsics_head_to_rgb_camera");
+    if(!ext || !cJSON_IsObject(ext)) {
+        cJSON_Delete(root);
+        return out;
+    }
+    cv::Vec3d positionRh(0.0, 0.0, 0.0);
+    ViewerQuat rotationRh;
+    bool ok = jsonDoubleValue(ext, "x", positionRh[0])
+           && jsonDoubleValue(ext, "y", positionRh[1])
+           && jsonDoubleValue(ext, "z", positionRh[2])
+           && jsonDoubleValue(ext, "rx", rotationRh.x)
+           && jsonDoubleValue(ext, "ry", rotationRh.y)
+           && jsonDoubleValue(ext, "rz", rotationRh.z)
+           && jsonDoubleValue(ext, "rw", rotationRh.w);
+    cJSON_Delete(root);
+    if(!ok) {
+        return out;
+    }
+
+    const ViewerQuat rotateX180{ 1.0, 0.0, 0.0, 0.0 };
+    const ViewerQuat rgbRotationRh = multiplyQuat(rotationRh, rotateX180);
+    out = picoRightHandedPoseToUnity(positionRh, rgbRotationRh);
+    return out;
+}
+
+static void composePose(const cv::Vec3d &parentPos,
+                        const ViewerQuat &parentRot,
+                        const cv::Vec3d &localPos,
+                        const ViewerQuat &localRot,
+                        cv::Vec3d &worldPos,
+                        ViewerQuat &worldRot) {
+    worldPos = parentPos + rotateVecByQuat(parentRot, localPos);
+    worldRot = multiplyQuat(parentRot, localRot);
+}
+
+static cv::Rect egoFusedCenterCropRect(int sourceW, int sourceH) {
+    if(sourceW <= 0 || sourceH <= 0) {
+        return cv::Rect();
+    }
+    const int cropW = std::min(sourceW, 1280);
+    const int cropH = std::min(sourceH, 960);
+    return cv::Rect((sourceW - cropW) / 2, (sourceH - cropH) / 2, cropW, cropH);
+}
+
 static EgoGazeProjection projectEgoGazeToImage(const EgoGazeSample &sample,
                                                const CameraStreamParams *params,
+                                               const EgoRgbLocalPose &rgbLocalPose,
                                                const cv::Size &imageSize) {
     EgoGazeProjection out;
     if(!sample.valid) {
@@ -1900,79 +2016,91 @@ static EgoGazeProjection projectEgoGazeToImage(const EgoGazeSample &sample,
         out.failureReason = sample.gazeFailureReason.empty() ? "gaze_invalid" : sample.gazeFailureReason;
         return out;
     }
-    if(!sample.xrHeadValid) {
-        out.failureReason = "xr_head_invalid";
-        return out;
-    }
     if(imageSize.width <= 0 || imageSize.height <= 0 || !finiteVec3(sample.gazeWorldDirection)) {
         out.failureReason = "invalid_input";
         return out;
     }
-
-    const double fx = params && params->intrinsic.fx > 0.0f ? params->intrinsic.fx : sample.fx;
-    const double fy = params && params->intrinsic.fy > 0.0f ? params->intrinsic.fy : sample.fy;
-    const double cx = params && params->intrinsic.fx > 0.0f ? params->intrinsic.cx : sample.cx;
-    const double cy = params && params->intrinsic.fy > 0.0f ? params->intrinsic.cy : sample.cy;
-    int sourceW = sample.width > 0 ? sample.width : (params ? params->width : 0);
-    int sourceH = sample.height > 0 ? sample.height : (params ? params->height : 0);
-    if(sourceW <= 0) {
-        sourceW = imageSize.width;
-    }
-    if(sourceH <= 0) {
-        sourceH = imageSize.height;
-    }
-    if(!(fx > 0.0) || !(fy > 0.0)) {
-        out.failureReason = "missing_intrinsics";
+    if(!sample.xrHeadValid) {
+        out.failureReason = "xr_head_invalid";
         return out;
     }
-
     const cv::Vec3d gazeWorld = normalizeVec3d(sample.gazeWorldDirection);
     if(gazeWorld.dot(gazeWorld) <= 1e-12) {
         out.failureReason = "zero_gaze_direction";
         return out;
     }
-    const cv::Vec3d dir = normalizeVec3d(rotateVecByQuat(conjugateQuat(sample.rgbWorldRot), gazeWorld));
-    out.directionCamera = dir;
-    const double zCv = dir[2];
-    if(!(zCv > 1e-9)) {
+    if(!params || !params->hasUndistortIntrinsic || !(params->undistortIntrinsic.fx > 0.0f) || !(params->undistortIntrinsic.fy > 0.0f)) {
+        out.failureReason = "missing_undistort_intrinsics";
+        return out;
+    }
+    if(!rgbLocalPose.valid || !finiteVec3(rgbLocalPose.position) || !finiteQuat(rgbLocalPose.rotation)) {
+        out.failureReason = "missing_camera_json_extrinsic";
+        return out;
+    }
+    if(!finiteVec3(sample.xrHeadPos) || !finiteQuat(sample.xrHeadRot) || !finiteVec3(sample.eyeWorld)) {
+        out.failureReason = "non_finite_input_pose";
+        return out;
+    }
+
+    cv::Vec3d rgbWorldPos(0.0, 0.0, 0.0);
+    ViewerQuat rgbWorldRot;
+    composePose(sample.xrHeadPos, sample.xrHeadRot, rgbLocalPose.position, rgbLocalPose.rotation, rgbWorldPos, rgbWorldRot);
+
+    const ViewerQuat invRgbRot = conjugateQuat(rgbWorldRot);
+    const cv::Vec3d directionCamera = normalizeVec3d(rotateVecByQuat(invRgbRot, gazeWorld));
+    if(directionCamera.dot(directionCamera) <= 1e-12) {
+        out.failureReason = "zero_gaze_direction_camera";
+        return out;
+    }
+    const cv::Vec3d eyeOriginCamera = rotateVecByQuat(invRgbRot, sample.eyeWorld - rgbWorldPos);
+    const double depthM = 1.0;
+    if(std::abs(directionCamera[2]) <= 1e-9) {
+        out.failureReason = "parallel_to_depth_plane";
+        return out;
+    }
+    const double t = (depthM - eyeOriginCamera[2]) / directionCamera[2];
+    if(!(t > 0.0) || !std::isfinite(t)) {
+        out.failureReason = "intersection_behind_eye_ray";
+        return out;
+    }
+
+    const cv::Vec3d pointCamera = eyeOriginCamera + directionCamera * t;
+    if(!finiteVec3(pointCamera) || !(pointCamera[2] > 1e-9)) {
         out.failureReason = "behind_camera";
         return out;
     }
 
-    const double x = dir[0] / zCv;
-    const double y = -dir[1] / zCv;
-    const double r = std::sqrt(x * x + y * y);
-    double xd = 0.0;
-    double yd = 0.0;
-    if(r > 1e-12) {
-        const double k1 = params ? params->distortion.k1 : 0.0;
-        const double k2 = params ? params->distortion.k2 : 0.0;
-        const double k3 = params ? params->distortion.k3 : 0.0;
-        const double k4 = params ? params->distortion.k4 : 0.0;
-        const double theta = std::atan(r);
-        const double theta2 = theta * theta;
-        const double theta4 = theta2 * theta2;
-        const double theta6 = theta4 * theta2;
-        const double theta8 = theta4 * theta4;
-        const double thetaD = theta * (1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8);
-        const double scale = thetaD / r;
-        xd = x * scale;
-        yd = y * scale;
+    int sourceW = sample.width > 0 ? sample.width : params->width;
+    int sourceH = sample.height > 0 ? sample.height : params->height;
+    if(sourceW <= 0) {
+        sourceW = params->undistortIntrinsic.width > 0 ? params->undistortIntrinsic.width : imageSize.width;
     }
-    double px = fx * xd + cx;
-    double py = fy * yd + cy;
-    px *= static_cast<double>(imageSize.width) / static_cast<double>(std::max(1, sourceW));
-    py *= static_cast<double>(imageSize.height) / static_cast<double>(std::max(1, sourceH));
+    if(sourceH <= 0) {
+        sourceH = params->undistortIntrinsic.height > 0 ? params->undistortIntrinsic.height : imageSize.height;
+    }
+    const cv::Rect crop = egoFusedCenterCropRect(sourceW, sourceH);
+    if(crop.empty()) {
+        out.failureReason = "invalid_center_crop";
+        return out;
+    }
 
-    out.projected = std::isfinite(px) && std::isfinite(py);
-    if(!out.projected) {
+    const double pxFull = params->undistortIntrinsic.fx * (pointCamera[0] / pointCamera[2]) + params->undistortIntrinsic.cx;
+    const double pyFull = params->undistortIntrinsic.fy * (-pointCamera[1] / pointCamera[2]) + params->undistortIntrinsic.cy;
+    double px = pxFull - crop.x;
+    double py = pyFull - crop.y;
+    px *= static_cast<double>(imageSize.width) / static_cast<double>(std::max(1, crop.width));
+    py *= static_cast<double>(imageSize.height) / static_cast<double>(std::max(1, crop.height));
+    if(!std::isfinite(px) || !std::isfinite(py)) {
         out.failureReason = "non_finite_projection";
         return out;
     }
+
+    out.projected = true;
+    out.directionCamera = directionCamera;
     out.pixel = cv::Point2f(static_cast<float>(px), static_cast<float>(py));
     out.inside = px >= 0.0 && py >= 0.0 && px < imageSize.width && py < imageSize.height;
     if(!out.inside) {
-        out.failureReason = "outside_image";
+        out.failureReason = "outside_center_crop";
     }
     return out;
 }
@@ -4167,6 +4295,7 @@ private:
                         img = makeEgoNoAlignedFrameImage();
                     }
                     else {
+                        img = makeEgoFusedDisplayFrame(img);
                         drawEgoGazeOverlay(img, currentFrame_);
                     }
                 }
@@ -4202,6 +4331,10 @@ private:
         showLabels_ = false;
         taskCamParams_ = CameraParamsBundle{};
         egoCamParams_ = CameraParamsBundle{};
+        egoRgbLocalPose_ = EgoRgbLocalPose{};
+        egoUndistortMap1_.release();
+        egoUndistortMap2_.release();
+        egoUndistortMapSize_ = cv::Size();
         extrinsics_ = {};
         labelsByFrame_.clear();
         egoAlignedFrames_.clear();
@@ -4262,6 +4395,7 @@ private:
         const fs::path egoDir = dataDir / "ego";
         if(fs::exists(egoDir) && fs::is_directory(egoDir)) {
             egoCamParams_ = loadCameraParams(egoDir / "camera_params.json");
+            egoRgbLocalPose_ = loadEgoRgbLocalPose(egoDir / "camera.json");
             egoAlignedFrames_ = loadEgoAlignedFrames(egoRgbVideoTimestampPath(egoDir));
             egoGazeSamples_ = loadEgoGazeSamples(egoDir / "metadata.csv");
         }
@@ -4845,6 +4979,36 @@ private:
         return img.clone();
     }
 
+    cv::Mat makeEgoFusedDisplayFrame(const cv::Mat &raw) const {
+        if(raw.empty()) {
+            return raw;
+        }
+        const auto *p = egoRgbParams();
+        if(!p || !p->hasUndistortIntrinsic || !(p->intrinsic.fx > 0.0f) || !(p->intrinsic.fy > 0.0f)
+           || !(p->undistortIntrinsic.fx > 0.0f) || !(p->undistortIntrinsic.fy > 0.0f)) {
+            return raw.clone();
+        }
+        const cv::Size rawSize(raw.cols, raw.rows);
+        if(egoUndistortMapSize_ != rawSize || egoUndistortMap1_.empty() || egoUndistortMap2_.empty()) {
+            cv::Mat K = (cv::Mat_<double>(3, 3) << p->intrinsic.fx, 0.0, p->intrinsic.cx,
+                         0.0, p->intrinsic.fy, p->intrinsic.cy,
+                         0.0, 0.0, 1.0);
+            cv::Mat D = (cv::Mat_<double>(4, 1) << p->distortion.k1, p->distortion.k2, p->distortion.k3, p->distortion.k4);
+            cv::Mat newK = (cv::Mat_<double>(3, 3) << p->undistortIntrinsic.fx, 0.0, p->undistortIntrinsic.cx,
+                            0.0, p->undistortIntrinsic.fy, p->undistortIntrinsic.cy,
+                            0.0, 0.0, 1.0);
+            cv::fisheye::initUndistortRectifyMap(K, D, cv::Matx33d::eye(), newK, rawSize, CV_16SC2, egoUndistortMap1_, egoUndistortMap2_);
+            egoUndistortMapSize_ = rawSize;
+        }
+        cv::Mat undistorted;
+        cv::remap(raw, undistorted, egoUndistortMap1_, egoUndistortMap2_, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+        const cv::Rect crop = egoFusedCenterCropRect(undistorted.cols, undistorted.rows);
+        if(crop.empty()) {
+            return undistorted;
+        }
+        return undistorted(crop).clone();
+    }
+
     void drawEgoGazeOverlay(cv::Mat &img, int alignedFrameIdx) const {
         if(img.empty()) {
             return;
@@ -4853,7 +5017,7 @@ private:
         const EgoGazeSample *sample = egoGazeForAlignedFrame(alignedFrameIdx);
         EgoGazeProjection projection;
         if(sample) {
-            projection = projectEgoGazeToImage(*sample, egoRgbParams(), img.size());
+            projection = projectEgoGazeToImage(*sample, egoRgbParams(), egoRgbLocalPose_, img.size());
         }
         else {
             projection.failureReason = "no_metadata";
@@ -5350,6 +5514,10 @@ private:
 
     CameraParamsBundle taskCamParams_;
     CameraParamsBundle egoCamParams_;
+    EgoRgbLocalPose egoRgbLocalPose_;
+    mutable cv::Mat egoUndistortMap1_;
+    mutable cv::Mat egoUndistortMap2_;
+    mutable cv::Size egoUndistortMapSize_;
     std::unordered_map<std::string, ExtrinsicCamToWorld> extrinsics_;
     std::unordered_map<int, std::unordered_map<std::string, std::vector<cv::Point2f>>> labelsByFrame_;
     std::vector<EgoAlignedFrame> egoAlignedFrames_;
