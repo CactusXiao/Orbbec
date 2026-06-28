@@ -3044,6 +3044,7 @@ public:
         }
         collectionSetStage("start_enter");
         std::cerr << "[collection] start enter" << std::endl;
+        const bool egoWasRunning = egoRecorder_.isRunning();
         reset();
         clearStatus();
         {
@@ -3154,7 +3155,9 @@ public:
         auto deviceList = ctx_.queryDeviceList();
         if(!deviceList || deviceList->deviceCount() == 0) {
             fisheyeRecorder_.stop();
-            egoRecorder_.stop();
+            if(!egoWasRunning) {
+                egoRecorder_.stop();
+            }
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "No device connected";
             std::cerr << "[collection] no device connected" << std::endl;
@@ -3165,7 +3168,9 @@ public:
         auto selected = selectDevicesWithPipeline(deviceList, cfg_);
         if(selected.empty()) {
             fisheyeRecorder_.stop();
-            egoRecorder_.stop();
+            if(!egoWasRunning) {
+                egoRecorder_.stop();
+            }
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "No configured devices found";
             std::cerr << "[collection] no configured devices found" << std::endl;
@@ -3703,10 +3708,12 @@ public:
         std::cerr << "[collection] record stop" << std::endl;
     }
 
-    void stopIfRunning() {
+    void stopIfRunning(bool closeEgoTcp = true) {
         if(!capturing_.load()) {
             fisheyeRecorder_.stop();
-            egoRecorder_.stop();
+            if(closeEgoTcp) {
+                egoRecorder_.stop();
+            }
             activeFisheyeCameraCount_ = 0;
             activeFisheyeCameraIds_.clear();
             egoEnabled_ = false;
@@ -3753,7 +3760,9 @@ public:
             }
         }
         fisheyeRecorder_.stop();
-        egoRecorder_.stop();
+        if(closeEgoTcp) {
+            egoRecorder_.stop();
+        }
         capturing_.store(false);
         recording_.store(false);
         hasData_.store(false);
@@ -8076,7 +8085,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         if(hadSession) {
                             pushUiLog("Faulted episode deleted.");
                         }
-                        recorder.stopIfRunning();
+                        recorder.stopIfRunning(false);
                         latestFrameCache.clear();
 
                         std::string startError;
@@ -8100,7 +8109,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                             announce("fault_restart", "restart");
                         }
                         else {
-                            recorder.stopIfRunning();
+                            recorder.stopIfRunning(false);
                             capUi.msg = "Restart failed";
                             pushUiLog("Restart failed: " + startError);
                             announce("fault_restart_failed", "restart failed");
@@ -8117,7 +8126,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(doBackCfg) {
                 collectionSetStage("ui_capture_back_config");
                 announce("config", "config");
-                recorder.stopIfRunning();
+                recorder.stopIfRunning(false);
                 page = CollectionPage::Config;
             }
             if(doStart) {

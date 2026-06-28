@@ -132,6 +132,16 @@ bool writeTextFile(const std::filesystem::path &path, const std::string &content
     return static_cast<bool>(ofs);
 }
 
+std::string pathConfigKey(const std::filesystem::path &path) {
+    return path.lexically_normal().generic_string();
+}
+
+bool sameEgoServerConfig(const EgoModuleConfig &a, const EgoModuleConfig &b) {
+    return a.host == b.host
+           && a.port == b.port
+           && pathConfigKey(a.cameraParamsPath) == pathConfigKey(b.cameraParamsPath);
+}
+
 std::vector<std::string> splitCsvSimple(const std::string &line) {
     std::vector<std::string> out;
     std::string current;
@@ -525,6 +535,10 @@ public:
     }
 
     bool start(const EgoModuleConfig &config, std::string *errorMessage) {
+        if(running_.load() && sameEgoServerConfig(config_, config)) {
+            config_ = config;
+            return true;
+        }
         stop();
         config_ = config;
         if(config_.port <= 0 || config_.port > 65535) {
