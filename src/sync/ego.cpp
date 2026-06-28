@@ -970,13 +970,6 @@ private:
             return it->second;
         }
 
-        int sequentialVideoFrameIndexForTimestampSequence(uint64_t sequence) const {
-            if(sequence >= hevcVideoFrames_) {
-                return -1;
-            }
-            return static_cast<int>(sequence);
-        }
-
         void markError(const std::string &message) {
             lastError_ = message;
             logRaw("{\"event\":\"client_error\",\"server_unix_us\":" + std::to_string(unixUsNow())
@@ -1358,41 +1351,38 @@ private:
         if(!session_ || pendingTimestampFramesBySourceFrame_.empty()) {
             return;
         }
-        std::vector<EgoFrame> frames;
-        frames.reserve(pendingTimestampFramesBySourceFrame_.size());
-        for(auto &kv: pendingTimestampFramesBySourceFrame_) {
-            frames.push_back(std::move(kv.second));
-        }
-        pendingTimestampFramesBySourceFrame_.clear();
-        std::sort(frames.begin(), frames.end(), [](const EgoFrame &a, const EgoFrame &b) {
-            if(a.sequence != b.sequence) {
-                return a.sequence < b.sequence;
+        std::vector<int> readySourceFrames;
+        readySourceFrames.reserve(pendingTimestampFramesBySourceFrame_.size());
+        for(const auto &kv: pendingTimestampFramesBySourceFrame_) {
+            if(session_->videoFrameIndexForSourceFrame(kv.first) >= 0) {
+                readySourceFrames.push_back(kv.first);
             }
-            return a.sourceFrameIndex < b.sourceFrameIndex;
+        }
+        std::sort(readySourceFrames.begin(), readySourceFrames.end(), [&](int a, int b) {
+            const auto ita = pendingTimestampFramesBySourceFrame_.find(a);
+            const auto itb = pendingTimestampFramesBySourceFrame_.find(b);
+            if(ita != pendingTimestampFramesBySourceFrame_.end() && itb != pendingTimestampFramesBySourceFrame_.end()
+               && ita->second.sequence != itb->second.sequence) {
+                return ita->second.sequence < itb->second.sequence;
+            }
+            return a < b;
         });
 
         size_t released = 0;
-        size_t sequentialFallback = 0;
-        size_t withoutVideo = 0;
-        for(auto &frame: frames) {
-            int videoFrameIndex = session_->videoFrameIndexForSourceFrame(frame.sourceFrameIndex);
-            if(videoFrameIndex < 0) {
-                videoFrameIndex = session_->sequentialVideoFrameIndexForTimestampSequence(frame.sequence);
-                if(videoFrameIndex >= 0) {
-                    sequentialFallback++;
-                }
+        for(const int sourceFrameIndex: readySourceFrames) {
+            auto it = pendingTimestampFramesBySourceFrame_.find(sourceFrameIndex);
+            if(it == pendingTimestampFramesBySourceFrame_.end()) {
+                continue;
             }
-            frame.videoFrameIndex = videoFrameIndex;
-            if(videoFrameIndex < 0) {
-                withoutVideo++;
-            }
+            EgoFrame frame = std::move(it->second);
+            pendingTimestampFramesBySourceFrame_.erase(it);
+            frame.videoFrameIndex = session_->videoFrameIndexForSourceFrame(sourceFrameIndex);
             pushFrame(std::move(frame));
             released++;
         }
         std::cerr << "[ego] released pending timestamp frames on close reason=" << reason
                   << " released=" << released
-                  << " sequential_fallback=" << sequentialFallback
-                  << " without_video=" << withoutVideo << std::endl;
+                  << " still_waiting_for_hevc=" << pendingTimestampFramesBySourceFrame_.size() << std::endl;
     }
 
     void pushFrame(EgoFrame frame) {
