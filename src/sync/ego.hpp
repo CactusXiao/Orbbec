@@ -28,6 +28,7 @@ struct EgoModuleConfig {
 struct EgoFrame {
     uint64_t sequence = 0;
     int sourceFrameIndex = -1;
+    int videoFrameIndex = -1;
     uint64_t refTimestampUs = 0;
     uint64_t rgbTimestampUs = 0;
     uint64_t acquireStartTimestampUs = 0;

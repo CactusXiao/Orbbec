@@ -5636,6 +5636,9 @@ private:
     }
 
     int egoVideoFrameIndexForSourceFrameLocked(const EgoFrame &frame) const {
+        if(frame.videoFrameIndex >= 0) {
+            return frame.videoFrameIndex;
+        }
         return frame.sourceFrameIndex >= 0 ? egoRecorder_.videoFrameIndexForSourceFrame(frame.sourceFrameIndex) : -1;
     }
 

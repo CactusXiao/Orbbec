@@ -1303,15 +1303,17 @@ private:
         }
     }
 
-    void queueTimestampFrameWhenVideoReadyLocked(const EgoFrame &frame) {
+    void queueTimestampFrameWhenVideoReadyLocked(EgoFrame frame) {
         if(!session_ || frame.sourceFrameIndex < 0) {
             return;
         }
-        if(session_->videoFrameIndexForSourceFrame(frame.sourceFrameIndex) >= 0) {
-            pushFrame(frame);
+        const int videoFrameIndex = session_->videoFrameIndexForSourceFrame(frame.sourceFrameIndex);
+        if(videoFrameIndex >= 0) {
+            frame.videoFrameIndex = videoFrameIndex;
+            pushFrame(std::move(frame));
             return;
         }
-        pendingTimestampFramesBySourceFrame_[frame.sourceFrameIndex] = frame;
+        pendingTimestampFramesBySourceFrame_[frame.sourceFrameIndex] = std::move(frame);
         while(pendingTimestampFramesBySourceFrame_.size() > std::max<size_t>(1, config_.maxBufferedFrames)) {
             pendingTimestampFramesBySourceFrame_.erase(pendingTimestampFramesBySourceFrame_.begin());
         }
@@ -1327,6 +1329,7 @@ private:
         }
         EgoFrame frame = it->second;
         pendingTimestampFramesBySourceFrame_.erase(it);
+        frame.videoFrameIndex = session_->videoFrameIndexForSourceFrame(sourceFrameIndex);
         pushFrame(std::move(frame));
     }
 
