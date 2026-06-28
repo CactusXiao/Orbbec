@@ -4419,11 +4419,9 @@ private:
         uint64_t lastRefTs = 0;
         size_t fisheyeCapturedSets = 0;
         size_t egoCapturedFrames = 0;
-        uint64_t lastEgoFrameTimestampUs = 0;
         std::unordered_set<int> egoAlignedSourceFrameIndices;
         std::unordered_set<uint64_t> egoAlignedRefTimestamps;
         size_t egoMissingAlignedRows = 0;
-        size_t egoTailDroppedRows = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -4732,10 +4730,6 @@ private:
         return value + delta;
     }
 
-    static bool timestampPastWindow(uint64_t value, uint64_t center, uint64_t windowUs) {
-        return value > center && (value - center) > windowUs;
-    }
-
     bool openSessionTimestamps(SessionState &session) {
         session.timestampsPath = session.dest / "timestamps.csv";
         session.timestampsTmpPath = session.timestampsPath;
@@ -4877,8 +4871,7 @@ private:
         }
         os << "  EgoAligned=" << egoAlignedFrameCount(session)
            << "  EgoUnaligned=" << egoUnalignedFrameCount(session)
-           << "  EgoNoAlignRows=" << session.egoMissingAlignedRows
-           << "  EgoTailDropped=" << session.egoTailDroppedRows;
+           << "  EgoNoAlignRows=" << session.egoMissingAlignedRows;
     }
 
     std::string buildCaptureInfoSnapshotLocked(int durMs) const {
@@ -5866,7 +5859,6 @@ private:
         }
         size_t pickedEgoIdx = 0;
         bool hasPickedEgo = false;
-        bool dropDueToEgoTail = false;
         int pickedEgoVideoFrameIndex = -1;
         if(session_.saveEgo) {
             bool hasPendingEgoVideoCandidate = false;
@@ -5878,10 +5870,6 @@ private:
             }
             else if(hasPendingEgoVideoCandidate && !session_.egoEos) {
                 return false;
-            }
-            else if(session_.egoEos && session_.lastEgoFrameTimestampUs > 0
-                    && timestampPastWindow(centerUs, session_.lastEgoFrameTimestampUs, session_.maxAbsDiffUs)) {
-                dropDueToEgoTail = true;
             }
         }
 
@@ -5903,10 +5891,6 @@ private:
             pruneCommittedFramesLocked(centerUs);
             return true;
         };
-        if(dropDueToEgoTail) {
-            session_.egoTailDroppedRows++;
-            return dropCurrentSlot();
-        }
         if(!fullThis) {
             return dropCurrentSlot();
         }
@@ -6521,12 +6505,8 @@ private:
                 coordCv_.notify_all();
             }
             while(!coordEgoQueue_.empty()) {
-                EgoFrame egoFrame = std::move(coordEgoQueue_.front());
+                session_.egoFrames.push_back(std::move(coordEgoQueue_.front()));
                 coordEgoQueue_.pop_front();
-                if(egoFrame.refTimestampUs > session_.lastEgoFrameTimestampUs) {
-                    session_.lastEgoFrameTimestampUs = egoFrame.refTimestampUs;
-                }
-                session_.egoFrames.push_back(std::move(egoFrame));
                 session_.egoCapturedFrames++;
                 coordCv_.notify_all();
             }

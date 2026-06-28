@@ -970,6 +970,13 @@ private:
             return it->second;
         }
 
+        int sequentialVideoFrameIndexForTimestampSequence(uint64_t sequence) const {
+            if(sequence >= hevcVideoFrames_) {
+                return -1;
+            }
+            return static_cast<int>(sequence);
+        }
+
         void markError(const std::string &message) {
             lastError_ = message;
             logRaw("{\"event\":\"client_error\",\"server_unix_us\":" + std::to_string(unixUsNow())
@@ -1347,6 +1354,47 @@ private:
         pushFrame(std::move(frame));
     }
 
+    void releasePendingTimestampFramesOnCloseLocked(const std::string &reason) {
+        if(!session_ || pendingTimestampFramesBySourceFrame_.empty()) {
+            return;
+        }
+        std::vector<EgoFrame> frames;
+        frames.reserve(pendingTimestampFramesBySourceFrame_.size());
+        for(auto &kv: pendingTimestampFramesBySourceFrame_) {
+            frames.push_back(std::move(kv.second));
+        }
+        pendingTimestampFramesBySourceFrame_.clear();
+        std::sort(frames.begin(), frames.end(), [](const EgoFrame &a, const EgoFrame &b) {
+            if(a.sequence != b.sequence) {
+                return a.sequence < b.sequence;
+            }
+            return a.sourceFrameIndex < b.sourceFrameIndex;
+        });
+
+        size_t released = 0;
+        size_t sequentialFallback = 0;
+        size_t withoutVideo = 0;
+        for(auto &frame: frames) {
+            int videoFrameIndex = session_->videoFrameIndexForSourceFrame(frame.sourceFrameIndex);
+            if(videoFrameIndex < 0) {
+                videoFrameIndex = session_->sequentialVideoFrameIndexForTimestampSequence(frame.sequence);
+                if(videoFrameIndex >= 0) {
+                    sequentialFallback++;
+                }
+            }
+            frame.videoFrameIndex = videoFrameIndex;
+            if(videoFrameIndex < 0) {
+                withoutVideo++;
+            }
+            pushFrame(std::move(frame));
+            released++;
+        }
+        std::cerr << "[ego] released pending timestamp frames on close reason=" << reason
+                  << " released=" << released
+                  << " sequential_fallback=" << sequentialFallback
+                  << " without_video=" << withoutVideo << std::endl;
+    }
+
     void pushFrame(EgoFrame frame) {
         {
             std::lock_guard<std::mutex> lock(frameMtx_);
@@ -1362,6 +1410,7 @@ private:
         if(!session_) {
             return;
         }
+        releasePendingTimestampFramesOnCloseLocked(reason);
         session_->close(reason);
         session_.reset();
         pendingTimestampFramesBySourceFrame_.clear();
