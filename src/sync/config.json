@@ -97,11 +97,6 @@
         "port": 50051,
         "stopTimeoutMs": 60000,
         "maxBufferedFrames": 8192,
-        "_timestamp_comment": "alignmentTimestampMode affects only ego-to-global matching; Orbbec multi-camera global alignment always keeps SDK/global hardware timestamps. hardware uses ego pico_frame_timestamp_ns anchored to corrected ref_timestamp_us; software uses corrected PICO ref_timestamp_us. timestampOffsetMs is added to raw PICO ref_timestamp_us before ego matching. autoTimestampOffset estimates only obvious host/PICO clock offsets larger than autoTimestampOffsetMinMs from session start; it does not modify raw ego/timestamps.csv.",
-        "alignmentTimestampMode": "hardware",
-        "timestampOffsetMs": 0,
-        "autoTimestampOffset": true,
-        "autoTimestampOffsetMinMs": 1000,
         "cameraId": "ego",
         "cameraParamsPath": "../../camera_info/ego_camera_params.json"
     },
