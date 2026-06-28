@@ -23,6 +23,9 @@ struct EgoModuleConfig {
     size_t maxBufferedFrames = 8192;
     std::filesystem::path cameraParamsPath;
     std::string cameraId = "ego";
+    int64_t timestampOffsetUs = 0;
+    bool autoTimestampOffset = true;
+    int64_t autoTimestampOffsetMinUs = 1000000;
 };
 
 struct EgoFrame {
@@ -30,6 +33,8 @@ struct EgoFrame {
     int sourceFrameIndex = -1;
     int videoFrameIndex = -1;
     uint64_t refTimestampUs = 0;
+    uint64_t rawRefTimestampUs = 0;
+    int64_t clockOffsetUs = 0;
     uint64_t rgbTimestampUs = 0;
     uint64_t acquireStartTimestampUs = 0;
     uint64_t acquireEndTimestampUs = 0;

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 
@@ -48,11 +49,38 @@ struct Packet {
     uint8_t type = 0;
     std::string headerJson;
     std::vector<uint8_t> payload;
+    uint64_t receivedUnixUs = 0;
 };
 
 uint64_t unixUsNow() {
     const auto now = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::system_clock::now());
     return static_cast<uint64_t>(now.time_since_epoch().count());
+}
+
+int64_t signedTimestampDiffUs(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a) - static_cast<int64_t>(b);
+}
+
+uint64_t absSignedUs(int64_t value) {
+    if(value >= 0) {
+        return static_cast<uint64_t>(value);
+    }
+    if(value == std::numeric_limits<int64_t>::min()) {
+        return static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) + 1ULL;
+    }
+    return static_cast<uint64_t>(-value);
+}
+
+uint64_t addSignedTimestampUs(uint64_t value, int64_t delta) {
+    if(delta >= 0) {
+        const uint64_t add = static_cast<uint64_t>(delta);
+        if(std::numeric_limits<uint64_t>::max() - value < add) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return value + add;
+    }
+    const uint64_t sub = absSignedUs(delta);
+    return value > sub ? value - sub : 0;
 }
 
 std::string sanitizeSessionName(std::string value) {
@@ -817,6 +845,11 @@ private:
             sessionJsonPath_ = egoDir_ / "session.json";
             networkLogPath_ = egoDir_ / "network_log.jsonl";
             cameraParamsSourcePath_ = config.cameraParamsPath;
+            configuredTimestampOffsetUs_ = config.timestampOffsetUs;
+            autoTimestampOffset_ = config.autoTimestampOffset && configuredTimestampOffsetUs_ == 0;
+            autoTimestampOffsetMinUs_ = std::max<int64_t>(0, config.autoTimestampOffsetMinUs);
+            effectiveTimestampOffsetUs_ = configuredTimestampOffsetUs_;
+            timestampOffsetSource_ = configuredTimestampOffsetUs_ == 0 ? "none" : "manual";
             metadataTmpPath_ = metadataPath_;
             metadataTmpPath_ += ".tmp";
             timestampsTmpPath_ = timestampsPath_;
@@ -885,7 +918,41 @@ private:
             logEventWithBytes("timestamp_header", payload.size());
         }
 
-        std::optional<EgoFrame> writeTimestampRow(const std::vector<uint8_t> &payload, uint64_t sequence) {
+        int64_t timestampOffsetForRawRef(uint64_t rawRefTimestampUs) {
+            if(configuredTimestampOffsetUs_ != 0) {
+                return configuredTimestampOffsetUs_;
+            }
+            if(!autoTimestampOffset_) {
+                return 0;
+            }
+            if(!autoTimestampOffsetDecided_ && rawRefTimestampUs > 0 && startedUnixUs_ > 0) {
+                firstRawRefTimestampUs_ = rawRefTimestampUs;
+                const int64_t candidate = signedTimestampDiffUs(startedUnixUs_, rawRefTimestampUs);
+                autoTimestampOffsetCandidateUs_ = candidate;
+                if(absSignedUs(candidate) >= static_cast<uint64_t>(autoTimestampOffsetMinUs_)) {
+                    effectiveTimestampOffsetUs_ = candidate;
+                    timestampOffsetSource_ = "session_start_auto";
+                    std::cerr << "[ego] auto timestamp offset enabled offset_us=" << effectiveTimestampOffsetUs_
+                              << " first_raw_ref_us=" << firstRawRefTimestampUs_
+                              << " server_session_start_us=" << startedUnixUs_ << std::endl;
+                    logRaw("{\"event\":\"auto_timestamp_offset_enabled\",\"server_unix_us\":" + std::to_string(unixUsNow())
+                           + ",\"offset_us\":" + std::to_string(effectiveTimestampOffsetUs_)
+                           + ",\"first_raw_ref_timestamp_us\":" + std::to_string(firstRawRefTimestampUs_)
+                           + ",\"server_session_start_us\":" + std::to_string(startedUnixUs_) + "}");
+                }
+                else {
+                    effectiveTimestampOffsetUs_ = 0;
+                    timestampOffsetSource_ = "none";
+                    logRaw("{\"event\":\"auto_timestamp_offset_skipped\",\"server_unix_us\":" + std::to_string(unixUsNow())
+                           + ",\"candidate_offset_us\":" + std::to_string(candidate)
+                           + ",\"threshold_us\":" + std::to_string(autoTimestampOffsetMinUs_) + "}");
+                }
+                autoTimestampOffsetDecided_ = true;
+            }
+            return effectiveTimestampOffsetUs_;
+        }
+
+        std::optional<EgoFrame> writeTimestampRow(const std::vector<uint8_t> &payload, uint64_t sequence, uint64_t packetReceivedUnixUs) {
             timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
             timestampRows_++;
             const std::string line(reinterpret_cast<const char *>(payload.data()), payload.size());
@@ -900,19 +967,28 @@ private:
             EgoFrame frame;
             frame.sequence = sequence;
             frame.sourceFrameIndex = parseIntOr(col("frame_index"), -1);
-            frame.refTimestampUs = parseUint64Or(col("ref_timestamp_us"));
+            frame.rawRefTimestampUs = parseUint64Or(col("ref_timestamp_us"));
             frame.rgbTimestampUs = parseUint64Or(col("pico_rgb_timestamp_us"));
             frame.acquireStartTimestampUs = parseUint64Or(col("pico_rgb_acquire_start_timestamp_us"));
             frame.acquireEndTimestampUs = parseUint64Or(col("pico_rgb_acquire_end_timestamp_us"));
             frame.picoFrameTimestampNs = parseUint64Or(col("pico_frame_timestamp_ns"));
             frame.xrHeadTimestampUs = parseUint64Or(col("pico_xr_head_timestamp_us"));
             frame.gazeTimestampUs = parseUint64Or(col("pico_gaze_timestamp_us"));
-            if(frame.refTimestampUs == 0) {
-                frame.refTimestampUs = frame.rgbTimestampUs;
+            if(frame.rawRefTimestampUs == 0) {
+                frame.rawRefTimestampUs = frame.rgbTimestampUs;
             }
-            if(frame.refTimestampUs == 0) {
+            if(frame.rawRefTimestampUs == 0) {
                 return std::nullopt;
             }
+            if(firstRawRefTimestampUs_ == 0) {
+                firstRawRefTimestampUs_ = frame.rawRefTimestampUs;
+            }
+            if(firstTimestampPacketReceivedUnixUs_ == 0 && packetReceivedUnixUs > 0) {
+                firstTimestampPacketReceivedUnixUs_ = packetReceivedUnixUs;
+                receiveTimestampOffsetCandidateUs_ = signedTimestampDiffUs(packetReceivedUnixUs, frame.rawRefTimestampUs);
+            }
+            frame.clockOffsetUs = timestampOffsetForRawRef(frame.rawRefTimestampUs);
+            frame.refTimestampUs = addSignedTimestampUs(frame.rawRefTimestampUs, frame.clockOffsetUs);
             return frame;
         }
 
@@ -1095,6 +1171,15 @@ private:
                 << "  \"close_reason\": " << jsonString(reason) << ",\n"
                 << "  \"client_summary\": " << (clientSummaryJson_.empty() ? "{}" : clientSummaryJson_) << ",\n"
                 << "  \"timestamp_standard\": \"unix_epoch_microseconds_utc\",\n"
+                << "  \"timestamp_offset_source\": " << jsonString(timestampOffsetSource_) << ",\n"
+                << "  \"configured_timestamp_offset_us\": " << configuredTimestampOffsetUs_ << ",\n"
+                << "  \"auto_timestamp_offset_enabled\": " << (autoTimestampOffset_ ? "true" : "false") << ",\n"
+                << "  \"auto_timestamp_offset_min_us\": " << autoTimestampOffsetMinUs_ << ",\n"
+                << "  \"auto_timestamp_offset_candidate_us\": " << autoTimestampOffsetCandidateUs_ << ",\n"
+                << "  \"effective_timestamp_offset_us\": " << effectiveTimestampOffsetUs_ << ",\n"
+                << "  \"first_raw_ref_timestamp_us\": " << firstRawRefTimestampUs_ << ",\n"
+                << "  \"first_timestamp_packet_received_unix_us\": " << firstTimestampPacketReceivedUnixUs_ << ",\n"
+                << "  \"receive_timestamp_offset_candidate_us\": " << receiveTimestampOffsetCandidateUs_ << ",\n"
                 << "  \"transport\": \"adb_reverse_tcp\",\n"
                 << "  \"camera_params_json\": \"camera_params.json\",\n"
                 << "  \"camera_params_source_json\": " << jsonString(cameraParamsSourcePath_.generic_string()) << "\n"
@@ -1134,6 +1219,16 @@ private:
         std::unordered_map<int, int> videoFrameBySourceFrame_;
         std::string lastError_;
         std::string clientSummaryJson_ = "{}";
+        int64_t configuredTimestampOffsetUs_ = 0;
+        bool autoTimestampOffset_ = true;
+        int64_t autoTimestampOffsetMinUs_ = 1000000;
+        bool autoTimestampOffsetDecided_ = false;
+        uint64_t firstRawRefTimestampUs_ = 0;
+        int64_t autoTimestampOffsetCandidateUs_ = 0;
+        int64_t effectiveTimestampOffsetUs_ = 0;
+        uint64_t firstTimestampPacketReceivedUnixUs_ = 0;
+        int64_t receiveTimestampOffsetCandidateUs_ = 0;
+        std::string timestampOffsetSource_ = "none";
     };
 
     bool sendPacket(uint8_t type,
@@ -1235,6 +1330,7 @@ private:
                 }
                 break;
             }
+            packet.receivedUnixUs = unixUsNow();
             handlePacket(packet);
         }
 
@@ -1294,7 +1390,7 @@ private:
             break;
         case PKT_TIMESTAMP_ROW: {
             const uint64_t seq = nextFrameSequence_++;
-            auto frame = session_->writeTimestampRow(packet.payload, seq);
+            auto frame = session_->writeTimestampRow(packet.payload, seq, packet.receivedUnixUs);
             if(frame.has_value()) {
                 queueTimestampFrameWhenVideoReadyLocked(*frame);
             }

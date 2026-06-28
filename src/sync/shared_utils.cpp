@@ -1,5 +1,7 @@
 #include "shared_utils.hpp"
 
+#include <cmath>
+
 namespace sync_app {
 
 std::string streamTypeToString(StreamType t) {
@@ -198,6 +200,14 @@ static std::optional<double> getDouble(cJSON *obj, const char *key) {
         return item->valuedouble;
     }
     return std::nullopt;
+}
+
+static int64_t secondsToUs(double seconds) {
+    return static_cast<int64_t>(std::llround(seconds * 1000000.0));
+}
+
+static int64_t millisecondsToUs(double milliseconds) {
+    return static_cast<int64_t>(std::llround(milliseconds * 1000.0));
 }
 
 static std::optional<bool> getBool(cJSON *obj, const char *key) {
@@ -502,6 +512,30 @@ AppConfig loadConfig(const fs::path &configPath) {
             }
             if(auto v = getInt(egoObj, "maxBufferedFrames")) {
                 cfg.ego.maxBufferedFrames = static_cast<size_t>(std::max(1, *v));
+            }
+            if(auto v = getDouble(egoObj, "timestampOffsetSec")) {
+                cfg.ego.timestampOffsetUs = secondsToUs(*v);
+            }
+            if(auto v = getDouble(egoObj, "timestampOffsetMs")) {
+                cfg.ego.timestampOffsetUs = millisecondsToUs(*v);
+            }
+            if(auto v = getDouble(egoObj, "timestampOffsetUs")) {
+                cfg.ego.timestampOffsetUs = static_cast<int64_t>(std::llround(*v));
+            }
+            if(auto v = getBool(egoObj, "autoTimestampOffset")) {
+                cfg.ego.autoTimestampOffset = *v;
+            }
+            else if(auto v = getBool(egoObj, "autoClockOffset")) {
+                cfg.ego.autoTimestampOffset = *v;
+            }
+            if(auto v = getDouble(egoObj, "autoTimestampOffsetMinSec")) {
+                cfg.ego.autoTimestampOffsetMinUs = std::max<int64_t>(0, secondsToUs(*v));
+            }
+            if(auto v = getDouble(egoObj, "autoTimestampOffsetMinMs")) {
+                cfg.ego.autoTimestampOffsetMinUs = std::max<int64_t>(0, millisecondsToUs(*v));
+            }
+            if(auto v = getDouble(egoObj, "autoTimestampOffsetMinUs")) {
+                cfg.ego.autoTimestampOffsetMinUs = std::max<int64_t>(0, static_cast<int64_t>(std::llround(*v)));
             }
             if(auto v = getString(egoObj, "cameraId")) {
                 cfg.ego.cameraId = trimString(*v);

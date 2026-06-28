@@ -4788,6 +4788,8 @@ private:
                           "ego_frame_index",
                           "ego_source_frame_index",
                           "ego_ref_timestamp_us",
+                          "ego_raw_ref_timestamp_us",
+                          "ego_clock_offset_us",
                           "ego_rgb_timestamp_us",
                           "pico_frame_timestamp_ns",
                           "pico_xr_head_timestamp_us",
@@ -5682,7 +5684,7 @@ private:
                 return;
             }
             writeCsvRow(session_.egoAlignedTimestampsOfs,
-                        { frameIndex, "", "", "", "", "", "", "" });
+                        { frameIndex, "", "", "", "", "", "", "", "", "" });
             return;
         }
         noteEgoAlignedFrameLocked(*frame);
@@ -5694,6 +5696,8 @@ private:
                       std::to_string(egoVideoFrameIndex),
                       std::to_string(frame->sourceFrameIndex),
                       std::to_string(frame->refTimestampUs),
+                      std::to_string(frame->rawRefTimestampUs),
+                      std::to_string(frame->clockOffsetUs),
                       std::to_string(frame->rgbTimestampUs),
                       std::to_string(frame->picoFrameTimestampNs),
                       std::to_string(frame->xrHeadTimestampUs),
