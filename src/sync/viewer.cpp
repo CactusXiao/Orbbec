@@ -1,8 +1,10 @@
 #include "viewer.hpp"
 
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -10,6 +12,7 @@
 #include <regex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__has_include)
@@ -2194,11 +2197,13 @@ public:
         : capacity_(std::max<size_t>(1, capacity)) {}
 
     void clear() {
+        std::lock_guard<std::mutex> lock(mtx_);
         map_.clear();
         lru_.clear();
     }
 
     bool tryGet(const std::string &key, cv::Mat &out) {
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it == map_.end()) {
             return false;
@@ -2221,9 +2226,12 @@ public:
 
     template <class Loader>
     void prefetch(const std::string &key, Loader loader) {
-        auto it = map_.find(key);
-        if(it != map_.end()) {
-            return;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            auto it = map_.find(key);
+            if(it != map_.end()) {
+                return;
+            }
         }
         cv::Mat v = loader();
         if(v.empty()) {
@@ -2236,6 +2244,7 @@ public:
         if(v.empty()) {
             return;
         }
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it != map_.end()) {
             it->second->second = v;
@@ -2254,6 +2263,7 @@ public:
 
 private:
     size_t capacity_;
+    mutable std::mutex mtx_;
     std::list<std::pair<std::string, cv::Mat>> lru_;
     std::unordered_map<std::string, std::list<std::pair<std::string, cv::Mat>>::iterator> map_;
 };
@@ -2393,11 +2403,13 @@ public:
         : capacity_(std::max<size_t>(1, capacity)) {}
 
     void clear() {
+        std::lock_guard<std::mutex> lock(mtx_);
         map_.clear();
         lru_.clear();
     }
 
     bool tryGet(const std::string &key, CloudPointVecPtr &out) {
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it == map_.end()) {
             return false;
@@ -2420,9 +2432,12 @@ public:
 
     template <class Loader>
     void prefetch(const std::string &key, Loader loader) {
-        auto it = map_.find(key);
-        if(it != map_.end()) {
-            return;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            auto it = map_.find(key);
+            if(it != map_.end()) {
+                return;
+            }
         }
         CloudPointVecPtr v = loader();
         if(!v) {
@@ -2436,6 +2451,7 @@ private:
         if(!v) {
             return;
         }
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it != map_.end()) {
             it->second->second = v;
@@ -2453,6 +2469,7 @@ private:
     }
 
     size_t capacity_;
+    mutable std::mutex mtx_;
     std::list<std::pair<std::string, CloudPointVecPtr>> lru_;
     std::unordered_map<std::string, std::list<std::pair<std::string, CloudPointVecPtr>>::iterator> map_;
 };
@@ -2463,11 +2480,13 @@ public:
         : capacity_(std::max<size_t>(1, capacity)) {}
 
     void clear() {
+        std::lock_guard<std::mutex> lock(mtx_);
         map_.clear();
         lru_.clear();
     }
 
     bool tryGet(const std::string &key, JointWorldVecPtr &out) {
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it == map_.end()) {
             return false;
@@ -2490,9 +2509,12 @@ public:
 
     template <class Loader>
     void prefetch(const std::string &key, Loader loader) {
-        auto it = map_.find(key);
-        if(it != map_.end()) {
-            return;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            auto it = map_.find(key);
+            if(it != map_.end()) {
+                return;
+            }
         }
         JointWorldVecPtr v = loader();
         if(!v) {
@@ -2506,6 +2528,7 @@ private:
         if(!v) {
             return;
         }
+        std::lock_guard<std::mutex> lock(mtx_);
         auto it = map_.find(key);
         if(it != map_.end()) {
             it->second->second = v;
@@ -2523,6 +2546,7 @@ private:
     }
 
     size_t capacity_;
+    mutable std::mutex mtx_;
     std::list<std::pair<std::string, JointWorldVecPtr>> lru_;
     std::unordered_map<std::string, std::list<std::pair<std::string, JointWorldVecPtr>>::iterator> map_;
 };
@@ -2758,6 +2782,22 @@ static cv::Vec3f medoidPoint(const std::vector<cv::Vec3f> &pts) {
     return pts[bestIdx];
 }
 
+enum class ViewerVideoCacheKind { RGB, Depth };
+
+struct ViewerVideoDecodeJob {
+    ViewerVideoCacheKind kind = ViewerVideoCacheKind::RGB;
+    fs::path path;
+    int firstFrameIdx = -1;
+    int frameCount = 0;
+    int width = 0;
+    int height = 0;
+    std::string pixFmt;
+    int cvType = CV_8UC3;
+    std::vector<std::string> cacheKeys;
+    std::string jobKey;
+    int generation = 0;
+};
+
 class DatasetViewer {
 public:
     explicit DatasetViewer(AppConfig cfg, const std::atomic_bool *cancel)
@@ -2765,6 +2805,7 @@ public:
 
     ~DatasetViewer() {
         stopPreloadWorker();
+        stopVideoPrefetchWorkers();
     }
 
     int run() {
@@ -2795,6 +2836,7 @@ public:
         cv::setMouseCallback(winName_, mouseCallbackMain, &mainMouseCtx_);
         pcMouseCtx_.view = &pcView_;
         pcMouseCtx_.allow = &pcAllowMouse_;
+        startVideoPrefetchWorkers();
 
         bool running = true;
         while(running) {
@@ -3164,6 +3206,142 @@ private:
             preloadThread_.join();
         }
         preloadStop_.store(false);
+    }
+
+    int videoPrefetchWorkerCount() const {
+        const unsigned int hc = std::thread::hardware_concurrency();
+        if(hc == 0) {
+            return 4;
+        }
+        return std::max(2, std::min(8, static_cast<int>(hc)));
+    }
+
+    void startVideoPrefetchWorkers() {
+        std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+        if(!videoPrefetchWorkers_.empty()) {
+            return;
+        }
+        videoPrefetchStop_ = false;
+        const int workerCount = videoPrefetchWorkerCount();
+        videoPrefetchWorkers_.reserve(static_cast<size_t>(workerCount));
+        for(int i = 0; i < workerCount; ++i) {
+            videoPrefetchWorkers_.emplace_back([this]() {
+                videoPrefetchWorkerLoop();
+            });
+        }
+    }
+
+    void stopVideoPrefetchWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+            videoPrefetchStop_ = true;
+            videoPrefetchQueue_.clear();
+            videoPrefetchInflight_.clear();
+            videoPrefetchInflightFrames_.clear();
+            ++videoPrefetchGeneration_;
+        }
+        videoPrefetchCv_.notify_all();
+        for(auto &worker : videoPrefetchWorkers_) {
+            if(worker.joinable()) {
+                worker.join();
+            }
+        }
+        videoPrefetchWorkers_.clear();
+        {
+            std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+            videoPrefetchStop_ = false;
+        }
+    }
+
+    void resetVideoPrefetchQueue() {
+        {
+            std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+            videoPrefetchQueue_.clear();
+            videoPrefetchInflight_.clear();
+            videoPrefetchInflightFrames_.clear();
+            ++videoPrefetchGeneration_;
+        }
+        videoPrefetchCv_.notify_all();
+    }
+
+    bool videoFrameDecodeQueued(const std::string &cacheKey) const {
+        std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+        return videoPrefetchInflightFrames_.find(cacheKey) != videoPrefetchInflightFrames_.end();
+    }
+
+    void videoPrefetchWorkerLoop() {
+        while(true) {
+            ViewerVideoDecodeJob job;
+            {
+                std::unique_lock<std::mutex> lock(videoPrefetchMtx_);
+                videoPrefetchCv_.wait(lock, [&]() {
+                    return videoPrefetchStop_ || !videoPrefetchQueue_.empty();
+                });
+                if(videoPrefetchStop_ && videoPrefetchQueue_.empty()) {
+                    return;
+                }
+                job = std::move(videoPrefetchQueue_.front());
+                videoPrefetchQueue_.pop_front();
+            }
+
+            std::vector<cv::Mat> frames = decodeVideoFrameRangeRaw(job.path, job.firstFrameIdx, job.frameCount, job.width, job.height, job.pixFmt, job.cvType);
+
+            bool accept = false;
+            {
+                std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+                accept = !videoPrefetchStop_ && job.generation == videoPrefetchGeneration_;
+                videoPrefetchInflight_.erase(job.jobKey);
+                for(const auto &key : job.cacheKeys) {
+                    videoPrefetchInflightFrames_.erase(key);
+                }
+            }
+            if(!accept || frames.empty()) {
+                continue;
+            }
+
+            const size_t n = std::min(frames.size(), job.cacheKeys.size());
+            for(size_t i = 0; i < n; ++i) {
+                if(job.kind == ViewerVideoCacheKind::RGB) {
+                    rgbCache_.put(job.cacheKeys[i], frames[i]);
+                }
+                else {
+                    depthCache_.put(job.cacheKeys[i], frames[i]);
+                }
+            }
+        }
+    }
+
+    void enqueueVideoDecodeJob(ViewerVideoDecodeJob job) {
+        if(job.path.empty() || job.firstFrameIdx < 0 || job.frameCount <= 0 || job.cacheKeys.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(videoPrefetchMtx_);
+        job.generation = videoPrefetchGeneration_;
+        if(job.jobKey.empty()) {
+            job.jobKey = job.path.string() + "|" + std::to_string(job.firstFrameIdx) + "|" + std::to_string(job.frameCount) + "|" + job.pixFmt;
+        }
+        if(videoPrefetchInflight_.find(job.jobKey) != videoPrefetchInflight_.end()) {
+            return;
+        }
+        for(const auto &key : job.cacheKeys) {
+            if(videoPrefetchInflightFrames_.find(key) != videoPrefetchInflightFrames_.end()) {
+                return;
+            }
+        }
+        constexpr size_t maxQueuedJobs = 256;
+        while(videoPrefetchQueue_.size() >= maxQueuedJobs) {
+            for(const auto &key : videoPrefetchQueue_.front().cacheKeys) {
+                videoPrefetchInflightFrames_.erase(key);
+            }
+            videoPrefetchInflight_.erase(videoPrefetchQueue_.front().jobKey);
+            videoPrefetchQueue_.pop_front();
+        }
+        videoPrefetchInflight_.insert(job.jobKey);
+        for(const auto &key : job.cacheKeys) {
+            videoPrefetchInflightFrames_.insert(key);
+        }
+        videoPrefetchQueue_.push_back(std::move(job));
+        videoPrefetchCv_.notify_one();
     }
 
     void clearPreloaded() {
@@ -4319,6 +4497,7 @@ private:
     }
 
     void clearTaskState() {
+        resetVideoPrefetchQueue();
         invalidatePointCloudPreload();
         sources_.clear();
         cameras_.clear();
@@ -4672,29 +4851,52 @@ private:
         if(!encodingIsRgbH265(rgbEncodingForCam(cam))) {
             return;
         }
-        int firstMissing = -1;
+        const auto *p = rgbParamsForCam(cam);
+        const int width = p ? p->width : 0;
+        const int height = p ? p->height : 0;
+        const fs::path videoPath = rgbVideoPathForCam(cam, rgbDir);
+        constexpr int chunkSize = 24;
+        int chunkStart = -1;
+        std::vector<std::string> keys;
+        auto flushChunk = [&]() {
+            if(chunkStart < 0 || keys.empty()) {
+                return;
+            }
+            ViewerVideoDecodeJob job;
+            job.kind = ViewerVideoCacheKind::RGB;
+            job.path = videoPath;
+            job.firstFrameIdx = chunkStart;
+            job.frameCount = static_cast<int>(keys.size());
+            job.width = width;
+            job.height = height;
+            job.pixFmt = "bgr24";
+            job.cvType = CV_8UC3;
+            job.cacheKeys = keys;
+            job.jobKey = "rgb|" + cam + "|" + videoPath.string() + "|" + std::to_string(chunkStart) + "|" + std::to_string(job.frameCount);
+            enqueueVideoDecodeJob(std::move(job));
+            chunkStart = -1;
+            keys.clear();
+        };
         for(int i = 0; i <= ahead; ++i) {
             const int f = startFrame + i;
             if(f < 0 || f >= totalFrames_) {
                 break;
             }
+            const std::string key = makeCacheKey(0, cam, f);
             cv::Mat cached;
-            if(!rgbCache_.tryGet(makeCacheKey(0, cam, f), cached)) {
-                firstMissing = f;
-                break;
+            if(rgbCache_.tryGet(key, cached) || videoFrameDecodeQueued(key)) {
+                flushChunk();
+                continue;
+            }
+            if(chunkStart < 0) {
+                chunkStart = f;
+            }
+            keys.push_back(key);
+            if(static_cast<int>(keys.size()) >= chunkSize) {
+                flushChunk();
             }
         }
-        if(firstMissing < 0) {
-            return;
-        }
-        const auto *p = rgbParamsForCam(cam);
-        const int width = p ? p->width : 0;
-        const int height = p ? p->height : 0;
-        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
-        const auto frames = decodeVideoFrameRangeRaw(rgbVideoPathForCam(cam, rgbDir), firstMissing, count, width, height, "bgr24", CV_8UC3);
-        for(size_t i = 0; i < frames.size(); ++i) {
-            rgbCache_.put(makeCacheKey(0, cam, firstMissing + static_cast<int>(i)), frames[i]);
-        }
+        flushChunk();
     }
 
     void prefetchRgbVideoRange(const ViewerSource &source, int startFrame, int ahead) {
@@ -4703,67 +4905,175 @@ private:
             return;
         }
         if(source.kind == ViewerSourceKind::Ego) {
+            prefetchEgoVideoRange(source, startFrame, ahead);
             return;
         }
         if(!encodingIsRgbH265(source.rgbEncoding)) {
             return;
         }
-        int firstMissing = -1;
+        constexpr int chunkSize = 24;
+        int chunkStart = -1;
+        std::vector<std::string> keys;
+        auto flushChunk = [&]() {
+            if(chunkStart < 0 || keys.empty()) {
+                return;
+            }
+            ViewerVideoDecodeJob job;
+            job.kind = ViewerVideoCacheKind::RGB;
+            job.path = source.rgbVideoPath;
+            job.firstFrameIdx = chunkStart;
+            job.frameCount = static_cast<int>(keys.size());
+            job.pixFmt = "bgr24";
+            job.cvType = CV_8UC3;
+            job.cacheKeys = keys;
+            job.jobKey = "rgbsrc|" + source.sourceId + "|" + source.rgbVideoPath.string() + "|" + std::to_string(chunkStart) + "|" + std::to_string(job.frameCount);
+            enqueueVideoDecodeJob(std::move(job));
+            chunkStart = -1;
+            keys.clear();
+        };
         for(int i = 0; i <= ahead; ++i) {
             const int f = startFrame + i;
             if(f < 0 || f >= totalFrames_) {
                 break;
             }
+            const std::string key = makeCacheKey(0, source.sourceId, f);
             cv::Mat cached;
-            if(!rgbCache_.tryGet(makeCacheKey(0, source.sourceId, f), cached)) {
-                firstMissing = f;
-                break;
+            if(rgbCache_.tryGet(key, cached) || videoFrameDecodeQueued(key)) {
+                flushChunk();
+                continue;
+            }
+            if(chunkStart < 0) {
+                chunkStart = f;
+            }
+            keys.push_back(key);
+            if(static_cast<int>(keys.size()) >= chunkSize) {
+                flushChunk();
             }
         }
-        if(firstMissing < 0) {
+        flushChunk();
+    }
+
+    void prefetchEgoVideoRange(const ViewerSource &source, int startFrame, int ahead) {
+        if(!encodingIsRgbH265(source.rgbEncoding)) {
             return;
         }
-        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
-        const auto frames = decodeVideoFrameRangeRaw(source.rgbVideoPath, firstMissing, count, 0, 0, "bgr24", CV_8UC3);
-        for(size_t i = 0; i < frames.size(); ++i) {
-            rgbCache_.put(makeCacheKey(0, source.sourceId, firstMissing + static_cast<int>(i)), frames[i]);
+        const auto *p = egoRgbParams();
+        const int width = p ? p->width : 0;
+        const int height = p ? p->height : 0;
+        constexpr int chunkSize = 24;
+        int chunkStartVideo = -1;
+        int prevVideo = -1;
+        std::vector<std::string> keys;
+        auto flushChunk = [&]() {
+            if(chunkStartVideo < 0 || keys.empty()) {
+                return;
+            }
+            ViewerVideoDecodeJob job;
+            job.kind = ViewerVideoCacheKind::RGB;
+            job.path = source.rgbVideoPath;
+            job.firstFrameIdx = chunkStartVideo;
+            job.frameCount = static_cast<int>(keys.size());
+            job.width = width;
+            job.height = height;
+            job.pixFmt = "bgr24";
+            job.cvType = CV_8UC3;
+            job.cacheKeys = keys;
+            job.jobKey = "ego|" + source.sourceId + "|" + source.rgbVideoPath.string() + "|" + std::to_string(chunkStartVideo) + "|" + std::to_string(job.frameCount);
+            enqueueVideoDecodeJob(std::move(job));
+            chunkStartVideo = -1;
+            prevVideo = -1;
+            keys.clear();
+        };
+        for(int i = 0; i <= ahead; ++i) {
+            const int f = startFrame + i;
+            if(f < 0 || f >= totalFrames_) {
+                break;
+            }
+            const int videoFrameIdx = egoVideoFrameIndexForAlignedFrame(f);
+            if(videoFrameIdx < 0) {
+                flushChunk();
+                continue;
+            }
+            const std::string key = makeCacheKey(0, source.sourceId, f);
+            cv::Mat cached;
+            if(rgbCache_.tryGet(key, cached) || videoFrameDecodeQueued(key)) {
+                flushChunk();
+                continue;
+            }
+            if(chunkStartVideo < 0) {
+                chunkStartVideo = videoFrameIdx;
+            }
+            else if(videoFrameIdx != prevVideo + 1) {
+                flushChunk();
+                chunkStartVideo = videoFrameIdx;
+            }
+            keys.push_back(key);
+            prevVideo = videoFrameIdx;
+            if(static_cast<int>(keys.size()) >= chunkSize) {
+                flushChunk();
+            }
         }
+        flushChunk();
     }
 
     void prefetchDepthVideoRange(const std::string &cam, const fs::path &depthDir, int startFrame, int ahead) {
         if(!encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
             return;
         }
-        int firstMissing = -1;
+        const auto *p = depthParamsForCam(cam);
+        const int width = p ? p->width : 0;
+        const int height = p ? p->height : 0;
+        const fs::path videoPath = depthVideoPathForCam(cam, depthDir);
+        constexpr int chunkSize = 24;
+        int chunkStart = -1;
+        std::vector<std::string> keys;
+        auto flushChunk = [&]() {
+            if(chunkStart < 0 || keys.empty()) {
+                return;
+            }
+            ViewerVideoDecodeJob job;
+            job.kind = ViewerVideoCacheKind::Depth;
+            job.path = videoPath;
+            job.firstFrameIdx = chunkStart;
+            job.frameCount = static_cast<int>(keys.size());
+            job.width = width;
+            job.height = height;
+            job.pixFmt = "gray16le";
+            job.cvType = CV_16UC1;
+            job.cacheKeys = keys;
+            job.jobKey = "depth|" + cam + "|" + videoPath.string() + "|" + std::to_string(chunkStart) + "|" + std::to_string(job.frameCount);
+            enqueueVideoDecodeJob(std::move(job));
+            chunkStart = -1;
+            keys.clear();
+        };
         for(int i = 0; i <= ahead; ++i) {
             const int f = startFrame + i;
             if(f < 0 || f >= totalFrames_) {
                 break;
             }
+            const std::string key = makeCacheKey(1, cam, f);
             cv::Mat cached;
-            if(!depthCache_.tryGet(makeCacheKey(1, cam, f), cached)) {
-                firstMissing = f;
-                break;
+            if(depthCache_.tryGet(key, cached) || videoFrameDecodeQueued(key)) {
+                flushChunk();
+                continue;
+            }
+            if(chunkStart < 0) {
+                chunkStart = f;
+            }
+            keys.push_back(key);
+            if(static_cast<int>(keys.size()) >= chunkSize) {
+                flushChunk();
             }
         }
-        if(firstMissing < 0) {
-            return;
-        }
-        const auto *p = depthParamsForCam(cam);
-        const int width = p ? p->width : 0;
-        const int height = p ? p->height : 0;
-        const int count = std::min(8, std::max(1, totalFrames_ - firstMissing));
-        const auto frames = decodeVideoFrameRangeRaw(depthVideoPathForCam(cam, depthDir), firstMissing, count, width, height, "gray16le", CV_16UC1);
-        for(size_t i = 0; i < frames.size(); ++i) {
-            depthCache_.put(makeCacheKey(1, cam, firstMissing + static_cast<int>(i)), frames[i]);
-        }
+        flushChunk();
     }
 
     void prefetchAroundCurrent() {
         if(totalFrames_ <= 0 || selectedSubject_.empty() || selectedTask_.empty() || selectedDataDir().empty()) {
             return;
         }
-        const int ahead = playing_ ? 20 : 6;
+        const int ahead = playing_ ? 24 : 8;
+        const int videoAhead = playing_ ? 96 : 36;
         auto wrap = [&](int f) {
             int v = f;
             while(v < 0) {
@@ -4778,7 +5088,7 @@ private:
         auto preRgb = [&](const std::string &cam, int f) {
             if(encodingIsRgbH265(rgbEncodingForCam(cam))) {
                 if(f == currentFrame_) {
-                    prefetchRgbVideoRange(cam, selectedDataDir() / cam / "RGB", f, ahead);
+                    prefetchRgbVideoRange(cam, selectedDataDir() / cam / "RGB", f, videoAhead);
                 }
                 return;
             }
@@ -4793,17 +5103,17 @@ private:
                 return;
             }
             if(source.kind == ViewerSourceKind::Ego) {
+                if(encodingIsRgbH265(source.rgbEncoding)) {
+                    if(f == currentFrame_) {
+                        prefetchEgoVideoRange(source, f, videoAhead);
+                    }
+                    return;
+                }
                 const std::string key = makeCacheKey(0, source.sourceId, f);
                 rgbCache_.prefetch(key, [&]() {
                     const int videoFrameIdx = egoVideoFrameIndexForAlignedFrame(f);
                     if(videoFrameIdx < 0) {
                         return cv::Mat();
-                    }
-                    if(encodingIsRgbH265(source.rgbEncoding)) {
-                        cv::Mat decoded = decodeVideoFrameRaw(source.rgbVideoPath, videoFrameIdx, 0, 0, "bgr24", CV_8UC3);
-                        if(!decoded.empty()) {
-                            return decoded;
-                        }
                     }
                     const fs::path p = findFrameFile(source.rgbDir, videoFrameIdx, { ".jpg", ".jpeg", ".png" });
                     if(p.empty()) {
@@ -4815,7 +5125,7 @@ private:
             }
             if(encodingIsRgbH265(source.rgbEncoding)) {
                 if(f == currentFrame_) {
-                    prefetchRgbVideoRange(source, f, ahead);
+                    prefetchRgbVideoRange(source, f, videoAhead);
                 }
                 return;
             }
@@ -4831,7 +5141,7 @@ private:
         auto preDepth = [&](const std::string &cam, int f) {
             if(encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
                 if(f == currentFrame_) {
-                    prefetchDepthVideoRange(cam, selectedDataDir() / cam / "Depth", f, ahead);
+                    prefetchDepthVideoRange(cam, selectedDataDir() / cam / "Depth", f, videoAhead);
                 }
                 return;
             }
@@ -5556,6 +5866,15 @@ private:
     int preloadStartFrame_ = 0;
     int preloadSpan_ = 0;
     std::chrono::steady_clock::time_point preloadLastRestart_{};
+
+    mutable std::mutex videoPrefetchMtx_;
+    std::condition_variable videoPrefetchCv_;
+    bool videoPrefetchStop_ = false;
+    int videoPrefetchGeneration_ = 0;
+    std::deque<ViewerVideoDecodeJob> videoPrefetchQueue_;
+    std::unordered_set<std::string> videoPrefetchInflight_;
+    std::unordered_set<std::string> videoPrefetchInflightFrames_;
+    std::vector<std::thread> videoPrefetchWorkers_;
 };
 
 int run_viewer(const AppConfig &cfg, const std::atomic_bool *cancel) {
