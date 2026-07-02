@@ -3424,7 +3424,8 @@ public:
         local.fisheyeCameraCount = local.saveFisheye ? activeFisheyeCameraCount_ : 0;
         local.wroteFisheyeCameraParams.assign(local.fisheyeCameraCount, false);
         local.saveEgo = egoEnabled_;
-        local.egoSoftAlignEnabled = local.saveEgo && multiviewEnabled_ && !local.refSn.empty();
+        local.egoSoftAlignEnabled = cfg_.ego.softAlignToOrbbecFirstFrame
+                                     && local.saveEgo && multiviewEnabled_ && !local.refSn.empty();
         if(local.saveCloud || local.saveColorCloud) {
             loadCamWorldPoses(cfg_.initExtrinsicPath, local.camToWorld);
         }
@@ -4483,6 +4484,10 @@ private:
         return frame.rawRefTimestampUs != 0 ? frame.rawRefTimestampUs : frame.refTimestampUs;
     }
 
+    static uint64_t egoBaseRefTimestamp(const EgoFrame &frame) {
+        return frame.refTimestampUs != 0 ? frame.refTimestampUs : egoRawRefTimestamp(frame);
+    }
+
     bool ensureEgoSoftAlignReadyLocked() {
         if(!session_.egoSoftAlignEnabled) {
             return true;
@@ -4493,27 +4498,28 @@ private:
         if(session_.firstRefTs == 0 || session_.egoPendingSoftAlignFrames.empty()) {
             return false;
         }
-        const uint64_t firstRaw = egoRawRefTimestamp(session_.egoPendingSoftAlignFrames.front());
-        if(firstRaw == 0) {
+        const uint64_t firstBase = egoBaseRefTimestamp(session_.egoPendingSoftAlignFrames.front());
+        if(firstBase == 0) {
             return false;
         }
         session_.egoSoftAlignGlobalFirstRefUs = session_.firstRefTs;
-        session_.egoSoftAlignPicoFirstRawUs = firstRaw;
+        session_.egoSoftAlignPicoFirstRawUs = firstBase;
         session_.egoSoftAlignOffsetUs = signedDiffUs(session_.egoSoftAlignGlobalFirstRefUs, session_.egoSoftAlignPicoFirstRawUs);
         session_.egoSoftAlignReady = true;
         std::cerr << "[collection][ego] soft timestamp alignment ready"
                   << " orbbec_first_us=" << session_.egoSoftAlignGlobalFirstRefUs
-                  << " pico_first_raw_us=" << session_.egoSoftAlignPicoFirstRawUs
+                  << " ego_first_base_us=" << session_.egoSoftAlignPicoFirstRawUs
                   << " offset_us=" << session_.egoSoftAlignOffsetUs << std::endl;
         return true;
     }
 
     void validateAndApplyEgoSoftAlignmentLocked(EgoFrame &frame) {
         const uint64_t raw = egoRawRefTimestamp(frame);
+        const uint64_t base = egoBaseRefTimestamp(frame);
         frame.rawRefTimestampUs = raw;
         frame.rawDeltaUs = 0;
         frame.timestampValidation = "ok";
-        if(raw == 0) {
+        if(raw == 0 || base == 0) {
             frame.timestampValidation = "missing_raw_timestamp";
             return;
         }
@@ -4537,12 +4543,14 @@ private:
 
         if(session_.egoSoftAlignEnabled) {
             frame.softAlignOffsetUs = session_.egoSoftAlignOffsetUs;
-            frame.refTimestampUs = addSignedUs(raw, session_.egoSoftAlignOffsetUs);
+            frame.refTimestampUs = addSignedUs(base, session_.egoSoftAlignOffsetUs);
         }
         else {
             frame.softAlignOffsetUs = 0;
-            frame.refTimestampUs = raw;
-            frame.timestampValidation = frame.timestampValidation == "ok" ? "raw_no_global_anchor" : frame.timestampValidation;
+            frame.refTimestampUs = base;
+            if(frame.timestampValidation == "ok") {
+                frame.timestampValidation = frame.timeCalibrationStatus == "ok" ? "time_calibrated" : "raw_no_soft_align";
+            }
         }
     }
 
@@ -4927,6 +4935,8 @@ private:
                           "ego_source_frame_index",
                           "ego_ref_timestamp_us",
                           "ego_raw_ref_timestamp_us",
+                          "ego_time_calibration_offset_us",
+                          "ego_time_calibration_status",
                           "ego_soft_align_offset_us",
                           "ego_timestamp_validation",
                           "ego_rgb_timestamp_us",
@@ -4978,6 +4988,8 @@ private:
                       "ego_source_frame_index",
                       "ego_ref_timestamp_us",
                       "ego_raw_ref_timestamp_us",
+                      "ego_time_calibration_offset_us",
+                      "ego_time_calibration_status",
                       "ego_soft_align_offset_us",
                       "ego_timestamp_validation",
                       "ego_raw_delta_us",
@@ -4991,6 +5003,8 @@ private:
                           std::to_string(frame.sourceFrameIndex),
                           std::to_string(frame.refTimestampUs),
                           std::to_string(frame.rawRefTimestampUs),
+                          std::to_string(frame.timeCalibrationOffsetUs),
+                          frame.timeCalibrationStatus,
                           std::to_string(frame.softAlignOffsetUs),
                           frame.timestampValidation,
                           std::to_string(frame.rawDeltaUs),
@@ -5849,7 +5863,7 @@ private:
                 return;
             }
             writeCsvRow(session_.egoAlignedTimestampsOfs,
-                        { frameIndex, "", "", "", "", "", "", "", "", "", "" });
+                        { frameIndex, "", "", "", "", "", "", "", "", "", "", "", "" });
             return;
         }
         noteEgoAlignedFrameLocked(*frame);
@@ -5862,6 +5876,8 @@ private:
                       std::to_string(frame->sourceFrameIndex),
                       std::to_string(frame->refTimestampUs),
                       std::to_string(frame->rawRefTimestampUs),
+                      std::to_string(frame->timeCalibrationOffsetUs),
+                      frame->timeCalibrationStatus,
                       std::to_string(frame->softAlignOffsetUs),
                       frame->timestampValidation,
                       std::to_string(frame->rgbTimestampUs),

@@ -91,10 +91,14 @@
         }
     },
     "ego": {
-        "_comment": "PICO ego streaming capture. Run adb reverse tcp:50051 tcp:50051 on Ubuntu, then launch the PICO app with EgoStreamingClientController. cameraParamsPath is the fixed calibrated ego parameter JSON copied into each episode.",
+        "_comment": "PICO ego streaming capture. Run adb reverse tcp:50051 tcp:50051 on Ubuntu, then launch the PICO app with EgoStreamingClientController. timeCalibrate estimates Pico-to-host clock offset before START. softAlignToOrbbecFirstFrame is the older Orbbec-first-frame alignment and is off by default. cameraParamsPath is the fixed calibrated ego parameter JSON copied into each episode.",
         "enabled": true,
         "host": "127.0.0.1",
         "port": 50051,
+        "timeCalibrate": true,
+        "timeCalibrateSampleCount": 20,
+        "timeCalibrateTimeoutMs": 1000,
+        "softAlignToOrbbecFirstFrame": false,
         "stopTimeoutMs": 60000,
         "maxBufferedFrames": 8192,
         "cameraId": "ego",

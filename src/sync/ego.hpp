@@ -19,6 +19,10 @@ struct EgoModuleConfig {
     bool enabled = false;
     std::string host = "127.0.0.1";
     int port = 50051;
+    bool timeCalibrate = true;
+    int timeCalibrateSampleCount = 20;
+    int timeCalibrateTimeoutMs = 1000;
+    bool softAlignToOrbbecFirstFrame = false;
     int stopTimeoutMs = 60000;
     size_t maxBufferedFrames = 8192;
     std::filesystem::path cameraParamsPath;
@@ -31,6 +35,8 @@ struct EgoFrame {
     int videoFrameIndex = -1;
     uint64_t refTimestampUs = 0;
     uint64_t rawRefTimestampUs = 0;
+    int64_t timeCalibrationOffsetUs = 0;
+    std::string timeCalibrationStatus = "disabled";
     int64_t softAlignOffsetUs = 0;
     uint64_t rawDeltaUs = 0;
     std::string timestampValidation = "raw";

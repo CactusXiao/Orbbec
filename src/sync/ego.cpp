@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 
@@ -42,6 +43,8 @@ enum PacketType : uint8_t {
     PKT_ERROR = 9,
     PKT_METADATA_HEADER = 10,
     PKT_TIMESTAMP_HEADER = 11,
+    PKT_TIME_SYNC_REQUEST = 12,
+    PKT_TIME_SYNC_RESPONSE = 13,
 };
 
 struct Packet {
@@ -50,9 +53,58 @@ struct Packet {
     std::vector<uint8_t> payload;
 };
 
+struct TimeSyncResponse {
+    std::string calibrationId;
+    int seq = -1;
+    int64_t serverSendUnixUs = 0;
+    int64_t clientRecvUnixUs = 0;
+    int64_t clientSendUnixUs = 0;
+    int64_t serverRecvUnixUs = 0;
+};
+
+struct TimeCalibrationSample {
+    int seq = -1;
+    int64_t serverSendUnixUs = 0;
+    int64_t clientRecvUnixUs = 0;
+    int64_t clientSendUnixUs = 0;
+    int64_t serverRecvUnixUs = 0;
+    int64_t rttUs = 0;
+    int64_t clientProcessingUs = 0;
+    int64_t picoToHostOffsetUs = 0;
+};
+
+struct TimeCalibrationResult {
+    std::string calibrationId;
+    uint64_t createdUnixUs = 0;
+    std::string reason;
+    std::string method = "ntp_best_half_median_offset_v1";
+    int sampleCount = 0;
+    int responseCount = 0;
+    int acceptedCount = 0;
+    int bestSampleCount = 0;
+    int64_t picoToHostOffsetUs = 0;
+    int64_t hostToPicoOffsetUs = 0;
+    int64_t minRttUs = 0;
+    int64_t medianRttUs = 0;
+    int64_t maxRttUs = 0;
+    std::vector<TimeCalibrationSample> samples;
+};
+
 uint64_t unixUsNow() {
     const auto now = std::chrono::time_point_cast<std::chrono::microseconds>(std::chrono::system_clock::now());
     return static_cast<uint64_t>(now.time_since_epoch().count());
+}
+
+uint64_t addSignedUs(uint64_t value, int64_t delta) {
+    if(delta >= 0) {
+        const auto udelta = static_cast<uint64_t>(delta);
+        if(value > std::numeric_limits<uint64_t>::max() - udelta) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        return value + udelta;
+    }
+    const auto magnitude = static_cast<uint64_t>(-(delta + 1)) + 1;
+    return value > magnitude ? value - magnitude : 0;
 }
 
 std::string sanitizeSessionName(std::string value) {
@@ -236,6 +288,195 @@ std::optional<bool> jsonBoolField(const std::string &json, const char *key) {
     return out;
 }
 
+bool getJsonInt64(cJSON *root, const char *key, int64_t &out) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if(!item) {
+        return false;
+    }
+    if(cJSON_IsNumber(item)) {
+        out = static_cast<int64_t>(item->valuedouble);
+        return true;
+    }
+    if(cJSON_IsString(item) && item->valuestring) {
+        try {
+            size_t idx = 0;
+            const auto value = std::stoll(item->valuestring, &idx);
+            if(idx > 0) {
+                out = value;
+                return true;
+            }
+        }
+        catch(...) {
+        }
+    }
+    return false;
+}
+
+std::optional<std::string> getJsonString(cJSON *root, const char *key) {
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if(item && cJSON_IsString(item) && item->valuestring) {
+        return std::string(item->valuestring);
+    }
+    return std::nullopt;
+}
+
+bool parseTimeSyncResponseJson(const std::string &json, TimeSyncResponse &out) {
+    cJSON *root = cJSON_Parse(json.c_str());
+    if(!root) {
+        return false;
+    }
+    const auto calibrationId = getJsonString(root, "calibration_id");
+    int64_t seq = -1;
+    bool ok = calibrationId.has_value()
+              && getJsonInt64(root, "seq", seq)
+              && getJsonInt64(root, "server_send_unix_us", out.serverSendUnixUs)
+              && getJsonInt64(root, "client_recv_unix_us", out.clientRecvUnixUs)
+              && getJsonInt64(root, "client_send_unix_us", out.clientSendUnixUs);
+    if(ok) {
+        out.calibrationId = *calibrationId;
+        out.seq = static_cast<int>(seq);
+    }
+    cJSON_Delete(root);
+    return ok && !out.calibrationId.empty() && out.seq >= 0;
+}
+
+int64_t medianInt64(std::vector<int64_t> values) {
+    if(values.empty()) {
+        return 0;
+    }
+    std::sort(values.begin(), values.end());
+    const size_t mid = values.size() / 2;
+    if(values.size() % 2 == 1) {
+        return values[mid];
+    }
+    return (values[mid - 1] + values[mid]) / 2;
+}
+
+bool buildTimeCalibrationResult(const std::string &calibrationId,
+                                int sampleCount,
+                                const std::vector<TimeSyncResponse> &responses,
+                                const std::string &reason,
+                                TimeCalibrationResult &out,
+                                std::string *errorMessage) {
+    std::vector<TimeCalibrationSample> validSamples;
+    validSamples.reserve(responses.size());
+    for(const auto &response: responses) {
+        const int64_t rttUs = (response.serverRecvUnixUs - response.serverSendUnixUs)
+                              - (response.clientSendUnixUs - response.clientRecvUnixUs);
+        const int64_t clientProcessingUs = response.clientSendUnixUs - response.clientRecvUnixUs;
+        if(rttUs < 0 || clientProcessingUs < 0) {
+            continue;
+        }
+        TimeCalibrationSample sample;
+        sample.seq = response.seq;
+        sample.serverSendUnixUs = response.serverSendUnixUs;
+        sample.clientRecvUnixUs = response.clientRecvUnixUs;
+        sample.clientSendUnixUs = response.clientSendUnixUs;
+        sample.serverRecvUnixUs = response.serverRecvUnixUs;
+        sample.rttUs = rttUs;
+        sample.clientProcessingUs = clientProcessingUs;
+        sample.picoToHostOffsetUs = ((response.serverSendUnixUs + response.serverRecvUnixUs)
+                                     - (response.clientRecvUnixUs + response.clientSendUnixUs))
+                                    / 2;
+        validSamples.push_back(sample);
+    }
+
+    if(validSamples.empty()) {
+        if(errorMessage) {
+            *errorMessage = "timecalibrate failed: no valid time sync responses";
+        }
+        return false;
+    }
+
+    std::vector<TimeCalibrationSample> samplesByRtt = validSamples;
+    std::sort(samplesByRtt.begin(), samplesByRtt.end(), [](const auto &a, const auto &b) {
+        if(a.rttUs != b.rttUs) {
+            return a.rttUs < b.rttUs;
+        }
+        return a.seq < b.seq;
+    });
+    const int bestSampleCount = std::max<int>(1, static_cast<int>((samplesByRtt.size() + 1) / 2));
+    std::vector<int64_t> rtts;
+    std::vector<int64_t> bestOffsets;
+    rtts.reserve(validSamples.size());
+    bestOffsets.reserve(static_cast<size_t>(bestSampleCount));
+    for(const auto &sample: validSamples) {
+        rtts.push_back(sample.rttUs);
+    }
+    for(int i = 0; i < bestSampleCount; ++i) {
+        bestOffsets.push_back(samplesByRtt[static_cast<size_t>(i)].picoToHostOffsetUs);
+    }
+
+    out = TimeCalibrationResult{};
+    out.calibrationId = calibrationId;
+    out.createdUnixUs = unixUsNow();
+    out.reason = reason;
+    out.sampleCount = sampleCount;
+    out.responseCount = static_cast<int>(responses.size());
+    out.acceptedCount = static_cast<int>(validSamples.size());
+    out.bestSampleCount = bestSampleCount;
+    out.picoToHostOffsetUs = medianInt64(bestOffsets);
+    out.hostToPicoOffsetUs = -out.picoToHostOffsetUs;
+    out.minRttUs = *std::min_element(rtts.begin(), rtts.end());
+    out.medianRttUs = medianInt64(rtts);
+    out.maxRttUs = *std::max_element(rtts.begin(), rtts.end());
+    out.samples = std::move(validSamples);
+    return true;
+}
+
+std::string timeCalibrationToJson(const TimeCalibrationResult &calibration, int indent = 0) {
+    const std::string pad(static_cast<size_t>(std::max(0, indent)), ' ');
+    const std::string pad2 = pad + "  ";
+    const std::string pad4 = pad + "    ";
+    std::ostringstream oss;
+    oss << pad << "{\n"
+        << pad2 << "\"calibration_id\": " << jsonString(calibration.calibrationId) << ",\n"
+        << pad2 << "\"created_unix_us\": " << calibration.createdUnixUs << ",\n"
+        << pad2 << "\"reason\": " << jsonString(calibration.reason) << ",\n"
+        << pad2 << "\"method\": " << jsonString(calibration.method) << ",\n"
+        << pad2 << "\"sample_count\": " << calibration.sampleCount << ",\n"
+        << pad2 << "\"response_count\": " << calibration.responseCount << ",\n"
+        << pad2 << "\"accepted_count\": " << calibration.acceptedCount << ",\n"
+        << pad2 << "\"best_sample_count\": " << calibration.bestSampleCount << ",\n"
+        << pad2 << "\"pico_to_host_offset_us\": " << calibration.picoToHostOffsetUs << ",\n"
+        << pad2 << "\"host_to_pico_offset_us\": " << calibration.hostToPicoOffsetUs << ",\n"
+        << pad2 << "\"min_rtt_us\": " << calibration.minRttUs << ",\n"
+        << pad2 << "\"median_rtt_us\": " << calibration.medianRttUs << ",\n"
+        << pad2 << "\"max_rtt_us\": " << calibration.maxRttUs << ",\n"
+        << pad2 << "\"formula\": \"host_unix_us = pico_unix_us + pico_to_host_offset_us\",\n"
+        << pad2 << "\"samples\": [";
+    for(size_t i = 0; i < calibration.samples.size(); ++i) {
+        const auto &sample = calibration.samples[i];
+        oss << (i == 0 ? "\n" : ",\n")
+            << pad4 << "{"
+            << "\"seq\": " << sample.seq
+            << ", \"server_send_unix_us\": " << sample.serverSendUnixUs
+            << ", \"client_recv_unix_us\": " << sample.clientRecvUnixUs
+            << ", \"client_send_unix_us\": " << sample.clientSendUnixUs
+            << ", \"server_recv_unix_us\": " << sample.serverRecvUnixUs
+            << ", \"rtt_us\": " << sample.rttUs
+            << ", \"client_processing_us\": " << sample.clientProcessingUs
+            << ", \"pico_to_host_offset_us\": " << sample.picoToHostOffsetUs
+            << "}";
+    }
+    if(!calibration.samples.empty()) {
+        oss << "\n" << pad2;
+    }
+    oss << "]\n" << pad << "}";
+    return oss.str();
+}
+
+std::string timeCalibrationSummary(const TimeCalibrationResult &calibration) {
+    std::ostringstream oss;
+    oss << "timecalibrate ok samples=" << calibration.sampleCount
+        << " accepted=" << calibration.acceptedCount
+        << " pico_to_host_offset_us=" << calibration.picoToHostOffsetUs
+        << " min_rtt_us=" << calibration.minRttUs
+        << " median_rtt_us=" << calibration.medianRttUs
+        << " max_rtt_us=" << calibration.maxRttUs;
+    return oss.str();
+}
+
 std::string packetTypeName(uint8_t type) {
     switch(type) {
     case PKT_HELLO:
@@ -260,6 +501,10 @@ std::string packetTypeName(uint8_t type) {
         return "METADATA_HEADER";
     case PKT_TIMESTAMP_HEADER:
         return "TIMESTAMP_HEADER";
+    case PKT_TIME_SYNC_REQUEST:
+        return "TIME_SYNC_REQUEST";
+    case PKT_TIME_SYNC_RESPONSE:
+        return "TIME_SYNC_RESPONSE";
     default:
         return std::to_string(static_cast<int>(type));
     }
@@ -629,6 +874,7 @@ public:
             helloReceived_ = false;
         }
         readyCv_.notify_all();
+        timeSyncCv_.notify_all();
         sessionCv_.notify_all();
         frameCv_.notify_all();
         std::thread acceptThread;
@@ -695,8 +941,27 @@ public:
         }
 
         const std::string safeName = sanitizeSessionName(sessionName);
+        {
+            std::lock_guard<std::mutex> lock(sessionMtx_);
+            if(session_) {
+                if(errorMessage) {
+                    *errorMessage = "Ego session is already active";
+                }
+                return false;
+            }
+        }
+
+        std::optional<TimeCalibrationResult> timeCalibration;
+        if(config_.timeCalibrate) {
+            TimeCalibrationResult calibration;
+            if(!performTimeCalibration(calibration, errorMessage)) {
+                return false;
+            }
+            timeCalibration = std::move(calibration);
+        }
+
         auto writer = std::make_unique<SessionWriter>();
-        if(!writer->open(episodeDir, safeName, config_, errorMessage)) {
+        if(!writer->open(episodeDir, safeName, config_, timeCalibration ? &(*timeCalibration) : nullptr, errorMessage)) {
             return false;
         }
 
@@ -806,6 +1071,7 @@ private:
         bool open(const std::filesystem::path &episodeDir,
                   const std::string &sessionName,
                   const EgoModuleConfig &config,
+                  const TimeCalibrationResult *timeCalibration,
                   std::string *errorMessage) {
             sessionName_ = sessionName;
             egoDir_ = episodeDir / "ego";
@@ -816,7 +1082,20 @@ private:
             cameraPath_ = egoDir_ / "camera.json";
             sessionJsonPath_ = egoDir_ / "session.json";
             networkLogPath_ = egoDir_ / "network_log.jsonl";
+            timeCalibrationPath_ = egoDir_ / "time_calibration.json";
             cameraParamsSourcePath_ = config.cameraParamsPath;
+            timeCalibrateEnabled_ = config.timeCalibrate;
+            softAlignToOrbbecFirstFrame_ = config.softAlignToOrbbecFirstFrame;
+            if(timeCalibration) {
+                timeCalibration_ = *timeCalibration;
+                timeCalibrationOffsetUs_ = timeCalibration->picoToHostOffsetUs;
+                timeCalibrationStatus_ = "ok";
+            }
+            else {
+                timeCalibration_.reset();
+                timeCalibrationOffsetUs_ = 0;
+                timeCalibrationStatus_ = config.timeCalibrate ? "missing" : "disabled";
+            }
             metadataTmpPath_ = metadataPath_;
             metadataTmpPath_ += ".tmp";
             timestampsTmpPath_ = timestampsPath_;
@@ -848,6 +1127,7 @@ private:
             }
             startedUnixUs_ = unixUsNow();
             logRaw("{\"event\":\"session_open\",\"server_unix_us\":" + std::to_string(startedUnixUs_) + "}");
+            writeTimeCalibrationSnapshot();
             return true;
         }
 
@@ -913,7 +1193,11 @@ private:
             if(frame.rawRefTimestampUs == 0) {
                 return std::nullopt;
             }
-            frame.refTimestampUs = frame.rawRefTimestampUs;
+            frame.timeCalibrationOffsetUs = timeCalibrationOffsetUs_;
+            frame.timeCalibrationStatus = timeCalibrationStatus_;
+            frame.refTimestampUs = timeCalibrationStatus_ == "ok"
+                ? addSignedUs(frame.rawRefTimestampUs, timeCalibrationOffsetUs_)
+                : frame.rawRefTimestampUs;
             return frame;
         }
 
@@ -1030,6 +1314,18 @@ private:
             }
         }
 
+        void writeTimeCalibrationSnapshot() {
+            if(!timeCalibration_) {
+                return;
+            }
+            const std::string json = timeCalibrationToJson(*timeCalibration_);
+            (void)writeTextFile(timeCalibrationPath_, json + "\n");
+            logRaw("{\"event\":\"time_calibration_snapshot\",\"server_unix_us\":" + std::to_string(unixUsNow())
+                   + ",\"pico_to_host_offset_us\":" + std::to_string(timeCalibration_->picoToHostOffsetUs)
+                   + ",\"accepted_count\":" + std::to_string(timeCalibration_->acceptedCount)
+                   + ",\"median_rtt_us\":" + std::to_string(timeCalibration_->medianRttUs) + "}");
+        }
+
         void appendHeaderJson(std::ostringstream &oss, const std::string &headerJson) {
             if(cJSON *root = cJSON_Parse(headerJson.c_str())) {
                 char *printed = cJSON_PrintUnformatted(root);
@@ -1082,6 +1378,10 @@ private:
                 << "  \"timestamps_csv\": " << jsonString(timestampsPath_.string()) << ",\n"
                 << "  \"camera_json\": " << jsonString(cameraPath_.string()) << ",\n"
                 << "  \"network_log_jsonl\": " << jsonString(networkLogPath_.string()) << ",\n"
+                << "  \"time_calibration_json\": " << (timeCalibration_ ? jsonString(timeCalibrationPath_.string()) : jsonString("")) << ",\n"
+                << "  \"time_calibrate_enabled\": " << (timeCalibrateEnabled_ ? "true" : "false") << ",\n"
+                << "  \"time_calibration_status\": " << jsonString(timeCalibrationStatus_) << ",\n"
+                << "  \"pico_to_host_offset_us\": " << timeCalibrationOffsetUs_ << ",\n"
                 << "  \"video_bytes\": " << videoBytes_ << ",\n"
                 << "  \"hevc_samples\": " << hevcSamplesWritten_ << ",\n"
                 << "  \"hevc_samples_received\": " << hevcSamplesReceived_ << ",\n"
@@ -1098,7 +1398,8 @@ private:
                 << "  \"timestamp_standard\": \"unix_epoch_microseconds_utc\",\n"
                 << "  \"transport\": \"adb_reverse_tcp\",\n"
                 << "  \"camera_params_json\": \"camera_params.json\",\n"
-                << "  \"camera_params_source_json\": " << jsonString(cameraParamsSourcePath_.generic_string()) << "\n"
+                << "  \"camera_params_source_json\": " << jsonString(cameraParamsSourcePath_.generic_string()) << ",\n"
+                << "  \"soft_align_to_orbbec_first_frame\": " << (softAlignToOrbbecFirstFrame_ ? "true" : "false") << "\n"
                 << "}\n";
             (void)writeTextFile(sessionJsonPath_, oss.str());
         }
@@ -1112,6 +1413,7 @@ private:
         std::filesystem::path cameraPath_;
         std::filesystem::path sessionJsonPath_;
         std::filesystem::path networkLogPath_;
+        std::filesystem::path timeCalibrationPath_;
         std::filesystem::path cameraParamsSourcePath_;
         std::filesystem::path metadataTmpPath_;
         std::filesystem::path timestampsTmpPath_;
@@ -1132,10 +1434,117 @@ private:
         uint64_t timestampRows_ = 0;
         bool cameraJsonReceived_ = false;
         bool closed_ = false;
+        bool timeCalibrateEnabled_ = false;
+        bool softAlignToOrbbecFirstFrame_ = false;
+        int64_t timeCalibrationOffsetUs_ = 0;
+        std::string timeCalibrationStatus_ = "disabled";
+        std::optional<TimeCalibrationResult> timeCalibration_;
         std::unordered_map<int, int> videoFrameBySourceFrame_;
         std::string lastError_;
         std::string clientSummaryJson_ = "{}";
     };
+
+    std::string makeTimeCalibrationId() {
+        std::lock_guard<std::mutex> lock(timeSyncMtx_);
+        std::ostringstream oss;
+        oss << unixUsNow() << "_" << std::hex << reinterpret_cast<uintptr_t>(this)
+            << "_" << std::dec << (++timeSyncSerial_);
+        return oss.str();
+    }
+
+    bool performTimeCalibration(TimeCalibrationResult &out, std::string *errorMessage) {
+        const int sampleCount = std::max(1, std::min(200, config_.timeCalibrateSampleCount));
+        const auto timeout = std::chrono::milliseconds(std::max(100, config_.timeCalibrateTimeoutMs));
+        if(!isConnected()) {
+            if(errorMessage) {
+                *errorMessage = "timecalibrate failed: no PICO client connected";
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(sessionMtx_);
+            if(session_) {
+                if(errorMessage) {
+                    *errorMessage = "timecalibrate failed: stop the active ego session first";
+                }
+                return false;
+            }
+        }
+
+        const std::string calibrationId = makeTimeCalibrationId();
+        {
+            std::lock_guard<std::mutex> lock(timeSyncMtx_);
+            timeSyncCalibrationId_ = calibrationId;
+            timeSyncResponses_.clear();
+        }
+
+        auto clearCalibration = [&]() {
+            std::lock_guard<std::mutex> lock(timeSyncMtx_);
+            if(timeSyncCalibrationId_ == calibrationId) {
+                timeSyncCalibrationId_.clear();
+                timeSyncResponses_.clear();
+            }
+        };
+
+        std::vector<TimeSyncResponse> responses;
+        responses.reserve(static_cast<size_t>(sampleCount));
+        for(int seq = 0; seq < sampleCount; ++seq) {
+            const uint64_t serverSendUnixUs = unixUsNow();
+            std::ostringstream header;
+            header << "{\"calibration_id\":" << jsonString(calibrationId)
+                   << ",\"seq\":" << seq
+                   << ",\"server_send_unix_us\":" << serverSendUnixUs << "}";
+            if(!sendPacket(PKT_TIME_SYNC_REQUEST, header.str(), {}, errorMessage)) {
+                clearCalibration();
+                return false;
+            }
+
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
+            std::unique_lock<std::mutex> lock(timeSyncMtx_);
+            while(timeSyncResponses_.find(seq) == timeSyncResponses_.end()) {
+                if(stopRequested_.load() || !isConnected()) {
+                    lock.unlock();
+                    clearCalibration();
+                    if(errorMessage) {
+                        *errorMessage = "timecalibrate failed: PICO client disconnected";
+                    }
+                    return false;
+                }
+                if(timeSyncCv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                    if(timeSyncResponses_.find(seq) == timeSyncResponses_.end()) {
+                        lock.unlock();
+                        clearCalibration();
+                        if(errorMessage) {
+                            *errorMessage = "timecalibrate failed: timeout waiting for seq=" + std::to_string(seq);
+                        }
+                        return false;
+                    }
+                }
+            }
+            responses.push_back(timeSyncResponses_.at(seq));
+        }
+        clearCalibration();
+
+        if(!buildTimeCalibrationResult(calibrationId, sampleCount, responses, "auto_start", out, errorMessage)) {
+            return false;
+        }
+        std::cerr << "[ego] " << timeCalibrationSummary(out) << std::endl;
+        return true;
+    }
+
+    void handleTimeSyncResponse(const std::string &headerJson) {
+        TimeSyncResponse response;
+        if(!parseTimeSyncResponseJson(headerJson, response)) {
+            return;
+        }
+        response.serverRecvUnixUs = static_cast<int64_t>(unixUsNow());
+        std::lock_guard<std::mutex> lock(timeSyncMtx_);
+        if(response.calibrationId != timeSyncCalibrationId_) {
+            return;
+        }
+        timeSyncResponses_[response.seq] = response;
+        timeSyncCv_.notify_all();
+    }
 
     bool sendPacket(uint8_t type,
                     const std::string &headerJson,
@@ -1248,6 +1657,7 @@ private:
             }
         }
         readyCv_.notify_all();
+        timeSyncCv_.notify_all();
     }
 
     void handlePacket(const Packet &packet) {
@@ -1269,6 +1679,11 @@ private:
                 session_->markError(message);
             }
             std::cerr << "[ego] client ERROR " << message << std::endl;
+            return;
+        }
+
+        if(packet.type == PKT_TIME_SYNC_RESPONSE) {
+            handleTimeSyncResponse(packet.headerJson);
             return;
         }
 
@@ -1421,6 +1836,12 @@ private:
     std::string lastHelloJson_;
 
     std::mutex sendMtx_;
+    std::mutex timeSyncMtx_;
+    std::condition_variable timeSyncCv_;
+    std::string timeSyncCalibrationId_;
+    std::unordered_map<int, TimeSyncResponse> timeSyncResponses_;
+    uint64_t timeSyncSerial_ = 0;
+
     std::mutex threadMtx_;
     std::thread acceptThread_;
     std::thread readerThread_;

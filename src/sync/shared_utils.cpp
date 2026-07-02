@@ -494,6 +494,39 @@ AppConfig loadConfig(const fs::path &configPath) {
             if(auto v = getInt(egoObj, "port")) {
                 cfg.ego.port = std::max(1, std::min(65535, *v));
             }
+            if(auto v = getBool(egoObj, "timeCalibrate")) {
+                cfg.ego.timeCalibrate = *v;
+            }
+            else if(auto v = getBool(egoObj, "timecalibrate")) {
+                cfg.ego.timeCalibrate = *v;
+            }
+            else if(auto v = getBool(egoObj, "timeSync")) {
+                cfg.ego.timeCalibrate = *v;
+            }
+            if(auto v = getInt(egoObj, "timeCalibrateSampleCount")) {
+                cfg.ego.timeCalibrateSampleCount = std::max(1, std::min(200, *v));
+            }
+            else if(auto v = getInt(egoObj, "timeSyncSampleCount")) {
+                cfg.ego.timeCalibrateSampleCount = std::max(1, std::min(200, *v));
+            }
+            if(auto v = getInt(egoObj, "timeCalibrateTimeoutMs")) {
+                cfg.ego.timeCalibrateTimeoutMs = std::max(100, *v);
+            }
+            else if(auto v = getDouble(egoObj, "timeCalibrateTimeoutSec")) {
+                cfg.ego.timeCalibrateTimeoutMs = std::max(100, static_cast<int>(*v * 1000.0 + 0.5));
+            }
+            else if(auto v = getInt(egoObj, "timeSyncTimeoutMs")) {
+                cfg.ego.timeCalibrateTimeoutMs = std::max(100, *v);
+            }
+            if(auto v = getBool(egoObj, "softAlignToOrbbecFirstFrame")) {
+                cfg.ego.softAlignToOrbbecFirstFrame = *v;
+            }
+            else if(auto v = getBool(egoObj, "softAlignOrbbecFirstFrame")) {
+                cfg.ego.softAlignToOrbbecFirstFrame = *v;
+            }
+            else if(auto v = getBool(egoObj, "softAlignFirstFrame")) {
+                cfg.ego.softAlignToOrbbecFirstFrame = *v;
+            }
             if(auto v = getInt(egoObj, "stopTimeoutMs")) {
                 cfg.ego.stopTimeoutMs = std::max(100, *v);
             }
