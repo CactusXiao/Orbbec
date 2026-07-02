@@ -900,19 +900,20 @@ private:
             EgoFrame frame;
             frame.sequence = sequence;
             frame.sourceFrameIndex = parseIntOr(col("frame_index"), -1);
-            frame.refTimestampUs = parseUint64Or(col("ref_timestamp_us"));
+            frame.rawRefTimestampUs = parseUint64Or(col("ref_timestamp_us"));
             frame.rgbTimestampUs = parseUint64Or(col("pico_rgb_timestamp_us"));
             frame.acquireStartTimestampUs = parseUint64Or(col("pico_rgb_acquire_start_timestamp_us"));
             frame.acquireEndTimestampUs = parseUint64Or(col("pico_rgb_acquire_end_timestamp_us"));
             frame.picoFrameTimestampNs = parseUint64Or(col("pico_frame_timestamp_ns"));
             frame.xrHeadTimestampUs = parseUint64Or(col("pico_xr_head_timestamp_us"));
             frame.gazeTimestampUs = parseUint64Or(col("pico_gaze_timestamp_us"));
-            if(frame.refTimestampUs == 0) {
-                frame.refTimestampUs = frame.rgbTimestampUs;
+            if(frame.rawRefTimestampUs == 0) {
+                frame.rawRefTimestampUs = frame.rgbTimestampUs;
             }
-            if(frame.refTimestampUs == 0) {
+            if(frame.rawRefTimestampUs == 0) {
                 return std::nullopt;
             }
+            frame.refTimestampUs = frame.rawRefTimestampUs;
             return frame;
         }
 

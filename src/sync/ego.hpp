@@ -30,6 +30,10 @@ struct EgoFrame {
     int sourceFrameIndex = -1;
     int videoFrameIndex = -1;
     uint64_t refTimestampUs = 0;
+    uint64_t rawRefTimestampUs = 0;
+    int64_t softAlignOffsetUs = 0;
+    uint64_t rawDeltaUs = 0;
+    std::string timestampValidation = "raw";
     uint64_t rgbTimestampUs = 0;
     uint64_t acquireStartTimestampUs = 0;
     uint64_t acquireEndTimestampUs = 0;

@@ -4,6 +4,7 @@
 
 #include "utils/utils.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <condition_variable>
@@ -3425,6 +3426,7 @@ public:
         local.fisheyeCameraCount = local.saveFisheye ? activeFisheyeCameraCount_ : 0;
         local.wroteFisheyeCameraParams.assign(local.fisheyeCameraCount, false);
         local.saveEgo = egoEnabled_;
+        local.egoSoftAlignEnabled = local.saveEgo && multiviewEnabled_ && !local.refSn.empty();
         if(local.saveCloud || local.saveColorCloud) {
             loadCamWorldPoses(cfg_.initExtrinsicPath, local.camToWorld);
         }
@@ -4411,6 +4413,8 @@ private:
         fs::path egoAlignedTimestampsTmpPath;
         std::ofstream egoAlignedTimestampsOfs;
         bool egoAlignedTimestampsOpen = false;
+        fs::path egoAllTimestampsPath;
+        fs::path egoAllTimestampsTmpPath;
         uint64_t fisheyeOnlyNextTargetUs = 0;
         bool fisheyeOnlyTargetInit = false;
         uint64_t lastEmittedFisheyeTs = 0;
@@ -4428,6 +4432,17 @@ private:
         std::unordered_set<int> egoAlignedSourceFrameIndices;
         std::unordered_set<uint64_t> egoAlignedRefTimestamps;
         size_t egoMissingAlignedRows = 0;
+        std::deque<EgoFrame> egoPendingSoftAlignFrames;
+        std::vector<EgoFrame> egoAllFrames;
+        bool egoSoftAlignEnabled = false;
+        bool egoSoftAlignReady = false;
+        uint64_t egoSoftAlignGlobalFirstRefUs = 0;
+        uint64_t egoSoftAlignPicoFirstRawUs = 0;
+        int64_t egoSoftAlignOffsetUs = 0;
+        bool egoSoftAlignHasLastRaw = false;
+        uint64_t egoSoftAlignLastRawUs = 0;
+        size_t egoTimestampNonMonotonic = 0;
+        size_t egoTimestampLargeGap = 0;
         size_t alignedRef = 0;
         size_t fullAligned = 0;
         size_t missingAligned = 0;
@@ -4464,6 +4479,119 @@ private:
             }
             state.nextSeq++;
         }
+    }
+
+    static uint64_t egoRawRefTimestamp(const EgoFrame &frame) {
+        return frame.rawRefTimestampUs != 0 ? frame.rawRefTimestampUs : frame.refTimestampUs;
+    }
+
+    bool ensureEgoSoftAlignReadyLocked() {
+        if(!session_.egoSoftAlignEnabled) {
+            return true;
+        }
+        if(session_.egoSoftAlignReady) {
+            return true;
+        }
+        if(session_.firstRefTs == 0 || session_.egoPendingSoftAlignFrames.empty()) {
+            return false;
+        }
+        const uint64_t firstRaw = egoRawRefTimestamp(session_.egoPendingSoftAlignFrames.front());
+        if(firstRaw == 0) {
+            return false;
+        }
+        session_.egoSoftAlignGlobalFirstRefUs = session_.firstRefTs;
+        session_.egoSoftAlignPicoFirstRawUs = firstRaw;
+        session_.egoSoftAlignOffsetUs = signedDiffUs(session_.egoSoftAlignGlobalFirstRefUs, session_.egoSoftAlignPicoFirstRawUs);
+        session_.egoSoftAlignReady = true;
+        std::cerr << "[collection][ego] soft timestamp alignment ready"
+                  << " orbbec_first_us=" << session_.egoSoftAlignGlobalFirstRefUs
+                  << " pico_first_raw_us=" << session_.egoSoftAlignPicoFirstRawUs
+                  << " offset_us=" << session_.egoSoftAlignOffsetUs << std::endl;
+        return true;
+    }
+
+    void validateAndApplyEgoSoftAlignmentLocked(EgoFrame &frame) {
+        const uint64_t raw = egoRawRefTimestamp(frame);
+        frame.rawRefTimestampUs = raw;
+        frame.rawDeltaUs = 0;
+        frame.timestampValidation = "ok";
+        if(raw == 0) {
+            frame.timestampValidation = "missing_raw_timestamp";
+            return;
+        }
+
+        if(session_.egoSoftAlignHasLastRaw) {
+            if(raw <= session_.egoSoftAlignLastRawUs) {
+                session_.egoTimestampNonMonotonic++;
+                frame.timestampValidation = "non_monotonic";
+            }
+            else {
+                frame.rawDeltaUs = raw - session_.egoSoftAlignLastRawUs;
+                const uint64_t largeGapUs = std::max<uint64_t>(session_.stepUs * 3, session_.stepUs + session_.maxAbsDiffUs * 2);
+                if(largeGapUs > 0 && frame.rawDeltaUs > largeGapUs) {
+                    session_.egoTimestampLargeGap++;
+                    frame.timestampValidation = "large_gap";
+                }
+            }
+        }
+        session_.egoSoftAlignLastRawUs = raw;
+        session_.egoSoftAlignHasLastRaw = true;
+
+        if(session_.egoSoftAlignEnabled) {
+            frame.softAlignOffsetUs = session_.egoSoftAlignOffsetUs;
+            frame.refTimestampUs = addSignedUs(raw, session_.egoSoftAlignOffsetUs);
+        }
+        else {
+            frame.softAlignOffsetUs = 0;
+            frame.refTimestampUs = raw;
+            frame.timestampValidation = frame.timestampValidation == "ok" ? "raw_no_global_anchor" : frame.timestampValidation;
+        }
+    }
+
+    void commitEgoFrameLocked(EgoFrame &&frame) {
+        validateAndApplyEgoSoftAlignmentLocked(frame);
+        session_.egoAllFrames.push_back(frame);
+        auto insertPos = std::upper_bound(session_.egoFrames.begin(),
+                                          session_.egoFrames.end(),
+                                          frame.refTimestampUs,
+                                          [](uint64_t tsUs, const EgoFrame &sample) {
+                                              return tsUs < sample.refTimestampUs;
+                                          });
+        session_.egoFrames.insert(insertPos, std::move(frame));
+        session_.egoCapturedFrames++;
+    }
+
+    void flushPendingEgoSoftAlignLocked() {
+        if(session_.egoPendingSoftAlignFrames.empty()) {
+            return;
+        }
+        if(!ensureEgoSoftAlignReadyLocked()) {
+            return;
+        }
+        while(!session_.egoPendingSoftAlignFrames.empty()) {
+            commitEgoFrameLocked(std::move(session_.egoPendingSoftAlignFrames.front()));
+            session_.egoPendingSoftAlignFrames.pop_front();
+        }
+    }
+
+    void flushPendingEgoWithoutGlobalAnchorLocked() {
+        if(session_.egoPendingSoftAlignFrames.empty()) {
+            return;
+        }
+        session_.egoSoftAlignEnabled = false;
+        while(!session_.egoPendingSoftAlignFrames.empty()) {
+            commitEgoFrameLocked(std::move(session_.egoPendingSoftAlignFrames.front()));
+            session_.egoPendingSoftAlignFrames.pop_front();
+        }
+    }
+
+    void acceptEgoFrameLocked(EgoFrame &&frame) {
+        if(session_.egoSoftAlignEnabled && !session_.egoSoftAlignReady) {
+            session_.egoPendingSoftAlignFrames.push_back(std::move(frame));
+            flushPendingEgoSoftAlignLocked();
+            return;
+        }
+        commitEgoFrameLocked(std::move(frame));
     }
 
     bool flushEosSequenceGapsLocked() {
@@ -4736,6 +4864,18 @@ private:
         return value + delta;
     }
 
+    static int64_t signedDiffUs(uint64_t a, uint64_t b) {
+        return static_cast<int64_t>(a) - static_cast<int64_t>(b);
+    }
+
+    static uint64_t addSignedUs(uint64_t value, int64_t delta) {
+        if(delta >= 0) {
+            return saturatingAddUs(value, static_cast<uint64_t>(delta));
+        }
+        const uint64_t sub = static_cast<uint64_t>(-(delta + 1)) + 1ULL;
+        return value > sub ? value - sub : 0;
+    }
+
     bool openSessionTimestamps(SessionState &session) {
         session.timestampsPath = session.dest / "timestamps.csv";
         session.timestampsTmpPath = session.timestampsPath;
@@ -4788,10 +4928,16 @@ private:
                           "ego_frame_index",
                           "ego_source_frame_index",
                           "ego_ref_timestamp_us",
+                          "ego_raw_ref_timestamp_us",
+                          "ego_soft_align_offset_us",
+                          "ego_timestamp_validation",
                           "ego_rgb_timestamp_us",
                           "pico_frame_timestamp_ns",
                           "pico_xr_head_timestamp_us",
                           "pico_gaze_timestamp_us" });
+            session.egoAllTimestampsPath = session.dest / "ego" / "RGB" / "rgb.h265.all_timestamps.csv";
+            session.egoAllTimestampsTmpPath = session.egoAllTimestampsPath;
+            session.egoAllTimestampsTmpPath += ".tmp";
         }
         return static_cast<bool>(session.timestampsOfs);
     }
@@ -4819,10 +4965,56 @@ private:
         session_.egoAlignedTimestampsOpen = false;
     }
 
+    void writeEgoAllTimestampsLocked() {
+        if(!session_.saveEgo || session_.egoAllTimestampsTmpPath.empty()) {
+            return;
+        }
+        std::ofstream ofs(session_.egoAllTimestampsTmpPath, std::ios::out | std::ios::trunc);
+        if(!ofs.is_open()) {
+            std::cerr << "[collection][ego] warning: failed to write all ego timestamps path="
+                      << session_.egoAllTimestampsTmpPath << std::endl;
+            return;
+        }
+        writeCsvRow(ofs,
+                    { "ego_frame_index",
+                      "ego_source_frame_index",
+                      "ego_ref_timestamp_us",
+                      "ego_raw_ref_timestamp_us",
+                      "ego_soft_align_offset_us",
+                      "ego_timestamp_validation",
+                      "ego_raw_delta_us",
+                      "ego_rgb_timestamp_us",
+                      "pico_frame_timestamp_ns",
+                      "pico_xr_head_timestamp_us",
+                      "pico_gaze_timestamp_us" });
+        for(const auto &frame: session_.egoAllFrames) {
+            writeCsvRow(ofs,
+                        { std::to_string(frame.videoFrameIndex),
+                          std::to_string(frame.sourceFrameIndex),
+                          std::to_string(frame.refTimestampUs),
+                          std::to_string(frame.rawRefTimestampUs),
+                          std::to_string(frame.softAlignOffsetUs),
+                          frame.timestampValidation,
+                          std::to_string(frame.rawDeltaUs),
+                          std::to_string(frame.rgbTimestampUs),
+                          std::to_string(frame.picoFrameTimestampNs),
+                          std::to_string(frame.xrHeadTimestampUs),
+                          std::to_string(frame.gazeTimestampUs) });
+        }
+        ofs.flush();
+        ofs.close();
+        try {
+            fs::rename(session_.egoAllTimestampsTmpPath, session_.egoAllTimestampsPath);
+        }
+        catch(...) {
+        }
+    }
+
     void finalizeSessionTimestampsLocked() {
         if(session_.timestampsFinalized) {
             return;
         }
+        writeEgoAllTimestampsLocked();
         closeSessionTimestampsLocked();
         if(!session_.timestampsTmpPath.empty()) {
             try {
@@ -4878,6 +5070,13 @@ private:
         os << "  EgoAligned=" << egoAlignedFrameCount(session)
            << "  EgoUnaligned=" << egoUnalignedFrameCount(session)
            << "  EgoNoAlignRows=" << session.egoMissingAlignedRows;
+        if(session.egoSoftAlignEnabled || session.egoSoftAlignReady) {
+            os << "  EgoSoftOffsetUs=" << session.egoSoftAlignOffsetUs;
+        }
+        if(session.egoTimestampNonMonotonic > 0 || session.egoTimestampLargeGap > 0) {
+            os << "  EgoTsNonMono=" << session.egoTimestampNonMonotonic
+               << "  EgoTsLargeGap=" << session.egoTimestampLargeGap;
+        }
     }
 
     std::string buildCaptureInfoSnapshotLocked(int durMs) const {
@@ -5682,7 +5881,7 @@ private:
                 return;
             }
             writeCsvRow(session_.egoAlignedTimestampsOfs,
-                        { frameIndex, "", "", "", "", "", "", "" });
+                        { frameIndex, "", "", "", "", "", "", "", "", "", "" });
             return;
         }
         noteEgoAlignedFrameLocked(*frame);
@@ -5694,6 +5893,9 @@ private:
                       std::to_string(egoVideoFrameIndex),
                       std::to_string(frame->sourceFrameIndex),
                       std::to_string(frame->refTimestampUs),
+                      std::to_string(frame->rawRefTimestampUs),
+                      std::to_string(frame->softAlignOffsetUs),
+                      frame->timestampValidation,
                       std::to_string(frame->rgbTimestampUs),
                       std::to_string(frame->picoFrameTimestampNs),
                       std::to_string(frame->xrHeadTimestampUs),
@@ -6423,6 +6625,15 @@ private:
         if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty()) {
             return false;
         }
+        if(!session_.egoPendingSoftAlignFrames.empty()) {
+            flushPendingEgoSoftAlignLocked();
+            if(!session_.egoPendingSoftAlignFrames.empty() && session_.egoEos && session_.multiviewEos && session_.firstRefTs == 0) {
+                flushPendingEgoWithoutGlobalAnchorLocked();
+            }
+            if(!session_.egoPendingSoftAlignFrames.empty()) {
+                return false;
+            }
+        }
         if(multiviewEnabled_) {
             auto itRefStreams = session_.streams.find(session_.refSn);
             const bool refEmpty = (itRefStreams == session_.streams.end())
@@ -6504,6 +6715,7 @@ private:
                 coordRecordQueue_.pop_front();
                 coordCv_.notify_all();
             }
+            flushPendingEgoSoftAlignLocked();
             while(!coordFisheyeQueue_.empty()) {
                 session_.fisheyeSets.push_back(std::move(coordFisheyeQueue_.front()));
                 coordFisheyeQueue_.pop_front();
@@ -6511,11 +6723,11 @@ private:
                 coordCv_.notify_all();
             }
             while(!coordEgoQueue_.empty()) {
-                session_.egoFrames.push_back(std::move(coordEgoQueue_.front()));
+                acceptEgoFrameLocked(std::move(coordEgoQueue_.front()));
                 coordEgoQueue_.pop_front();
-                session_.egoCapturedFrames++;
                 coordCv_.notify_all();
             }
+            flushPendingEgoSoftAlignLocked();
 
             bool progress = true;
             while(progress) {
