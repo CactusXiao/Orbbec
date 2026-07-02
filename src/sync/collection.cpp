@@ -2749,7 +2749,6 @@ public:
         oss.setf(std::ios::fixed);
         oss << "Time " << std::setprecision(2) << seconds << " s"
             << "   Frames " << session_.refFrameCount;
-        appendEgoAlignmentStats(oss, session_);
         return oss.str();
     }
 
@@ -2765,7 +2764,6 @@ public:
         oss << "Actual " << actualFrames
             << " / Total " << totalFrames
             << " / Dropped " << droppedFrames;
-        appendEgoAlignmentStats(oss, session_);
         return oss.str();
     }
 
@@ -5047,36 +5045,7 @@ private:
         if(session.fisheyeCapturedSets > 0) {
             oss << "  FisheyeFrames=" << session.fisheyeCapturedSets;
         }
-        if(session.saveEgo || session.egoCapturedFrames > 0) {
-            oss << "  EgoFrames=" << session.egoCapturedFrames;
-            appendEgoAlignmentStats(oss, session);
-        }
         return oss.str();
-    }
-
-    static size_t egoAlignedFrameCount(const SessionState &session) {
-        return session.egoAlignedSourceFrameIndices.size() + session.egoAlignedRefTimestamps.size();
-    }
-
-    static size_t egoUnalignedFrameCount(const SessionState &session) {
-        const size_t aligned = egoAlignedFrameCount(session);
-        return session.egoCapturedFrames > aligned ? (session.egoCapturedFrames - aligned) : 0;
-    }
-
-    static void appendEgoAlignmentStats(std::ostream &os, const SessionState &session) {
-        if(!session.saveEgo && session.egoCapturedFrames == 0) {
-            return;
-        }
-        os << "  EgoAligned=" << egoAlignedFrameCount(session)
-           << "  EgoUnaligned=" << egoUnalignedFrameCount(session)
-           << "  EgoNoAlignRows=" << session.egoMissingAlignedRows;
-        if(session.egoSoftAlignEnabled || session.egoSoftAlignReady) {
-            os << "  EgoSoftOffsetUs=" << session.egoSoftAlignOffsetUs;
-        }
-        if(session.egoTimestampNonMonotonic > 0 || session.egoTimestampLargeGap > 0) {
-            os << "  EgoTsNonMono=" << session.egoTimestampNonMonotonic
-               << "  EgoTsLargeGap=" << session.egoTimestampLargeGap;
-        }
     }
 
     std::string buildCaptureInfoSnapshotLocked(int durMs) const {
@@ -5091,7 +5060,6 @@ private:
         std::ostringstream oss;
         oss.setf(std::ios::fixed);
         oss << "AlignedRef=" << session.alignedRef << " Full=" << session.fullAligned << " Missing=" << session.missingAligned;
-        appendEgoAlignmentStats(oss, session);
         if(session.minMissingMs > 0.0) {
             oss << " MinMissingInterval=" << std::setprecision(2) << session.minMissingMs << "ms";
         }
