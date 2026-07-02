@@ -6183,6 +6183,18 @@ private:
                     }
                 }
                 else if(t == CollectDataType::Depth) {
+                    const auto itRgbParam = buf.params.find(CollectDataType::RGB);
+                    const int rgbW = (itRgbParam != buf.params.end() && itRgbParam->second.valid) ? itRgbParam->second.width : 0;
+                    const int rgbH = (itRgbParam != buf.params.end() && itRgbParam->second.valid) ? itRgbParam->second.height : 0;
+                    const auto rgbDepthParam = buf.rgbDepthParam;
+                    const bool rgbDepthParamValid = buf.rgbDepthParamValid;
+                    const float valueScale = packet.valueScale;
+                    auto makeDepthForReconstruction = [&rgbDepthParam, rgbDepthParamValid, rgbW, rgbH, valueScale](const cv::Mat &frame) {
+                        if(rgbDepthParamValid && rgbW > 0 && rgbH > 0 && valueScale > 0.0f) {
+                            return alignDepthToRgb(frame, valueScale, rgbDepthParam, rgbW, rgbH);
+                        }
+                        return frame;
+                    };
                     if(cfg_.save.saveRaw) {
                         const fs::path rawOutPath = session_.dest / buf.camKey / depthRawDirName() / (frameIndex + ".raw");
                         cv::Mat rawFrame = packet.frame;
@@ -6191,7 +6203,7 @@ private:
                         } });
                     }
                     if(depthOutputIsFfv1Mkv(cfg_.save)) {
-                        cv::Mat frame = packet.frame;
+                        cv::Mat frame = makeDepthForReconstruction(packet.frame);
                         if(enqueueDepthFfv1Frame(sn, frameIndex, packet.tsUs, std::move(frame))) {
                             continue;
                         }
@@ -6201,7 +6213,10 @@ private:
                     const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png");
                     cv::Mat frame = packet.frame;
                     const SaveOptions saveOptions = cfg_.save;
-                    enqueueWriteTask(WriteTask{ [frame = std::move(frame), outPath, saveOptions]() mutable {
+                    enqueueWriteTask(WriteTask{ [frame = std::move(frame), outPath, saveOptions, rgbW, rgbH, rgbDepthParam, rgbDepthParamValid, valueScale]() mutable {
+                        if(rgbDepthParamValid && rgbW > 0 && rgbH > 0 && valueScale > 0.0f) {
+                            frame = alignDepthToRgb(frame, valueScale, rgbDepthParam, rgbW, rgbH);
+                        }
                         saveRawMatToPng(frame, outPath, saveOptions.pngCompression);
                     } });
                 }
