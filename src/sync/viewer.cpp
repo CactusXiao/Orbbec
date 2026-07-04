@@ -11,6 +11,7 @@
 #include <list>
 #include <regex>
 #include <sstream>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2912,6 +2913,7 @@ public:
 
     ~DatasetViewer() {
         stopPrepareWorker();
+        cleanupActiveDecodedPicRoot();
         stopPreloadWorker();
         stopVideoPrefetchWorkers();
     }
@@ -3025,6 +3027,16 @@ private:
     fs::path decodedPicRoot() const {
         const fs::path dir = selectedDataDir();
         return dir.empty() ? fs::path() : (dir / "decoded_pic");
+    }
+
+    static void removeDecodedPicDirIfSafe(const fs::path &dir) {
+        if(dir.empty() || dir.filename() != "decoded_pic") {
+            return;
+        }
+        std::error_code ec;
+        if(fs::exists(dir, ec) && fs::is_directory(dir, ec)) {
+            fs::remove_all(dir, ec);
+        }
     }
 
     fs::path decodedRgbDirForCam(const std::string &cam) const {
@@ -4718,6 +4730,7 @@ private:
 
     void clearTaskState() {
         stopPrepareWorker();
+        cleanupActiveDecodedPicRoot();
         setPrepareStatus(false, false, false, 0, 0, "");
         resetVideoPrefetchQueue();
         invalidatePointCloudPreload();
@@ -4757,6 +4770,12 @@ private:
             headCamPoseFrameCache_.clear();
         }
         pcView_.resetView();
+    }
+
+    void cleanupActiveDecodedPicRoot() {
+        const fs::path dir = activeDecodedPicRoot_;
+        activeDecodedPicRoot_.clear();
+        removeDecodedPicDirIfSafe(dir);
     }
 
     void setPrepareStatus(bool running, bool done, bool failed, int completed, int total, const std::string &message) {
@@ -4991,6 +5010,7 @@ private:
             depthCache_.clear();
         }
         else {
+            removeDecodedPicDirIfSafe(dataDir / "decoded_pic");
             setPrepareStatus(false, false, true, completed, totalTasks, "prepare failed; using original files");
         }
     }
@@ -5004,6 +5024,7 @@ private:
         prepareStop_.store(false);
         setPrepareStatus(true, false, false, 0, 1, "prepare decoded_pic");
         std::vector<ViewerSource> sourcesSnapshot = sources_;
+        activeDecodedPicRoot_ = dataDir / "decoded_pic";
         prepareThread_ = std::thread([this, dataDir, sourcesSnapshot = std::move(sourcesSnapshot)]() mutable {
             prepareEpisodeDecodedPics(dataDir, std::move(sourcesSnapshot));
         });
@@ -6339,6 +6360,7 @@ private:
     std::thread prepareThread_;
     mutable std::mutex prepareMtx_;
     ViewerPrepareStatus prepareStatus_;
+    fs::path activeDecodedPicRoot_;
 
     std::atomic_bool preloadStop_{ false };
     std::thread preloadThread_;
