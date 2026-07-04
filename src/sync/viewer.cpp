@@ -1320,6 +1320,104 @@ static std::vector<cv::Mat> decodeVideoFrameRangeRaw(const fs::path &path, int f
     return out;
 }
 
+static std::string frameFileName(int frameIdx, const std::string &ext) {
+    std::ostringstream oss;
+    oss << std::setw(5) << std::setfill('0') << frameIdx << ext;
+    return oss.str();
+}
+
+static int countPreparedFrames(const fs::path &dir, const std::vector<std::string> &extensions) {
+    if(!fs::exists(dir) || !fs::is_directory(dir)) {
+        return 0;
+    }
+    int maxIdx = -1;
+    for(const auto &e : fs::directory_iterator(dir)) {
+        if(!e.is_regular_file()) {
+            continue;
+        }
+        const std::string stem = e.path().stem().string();
+        if(stem.size() != 5 || !std::all_of(stem.begin(), stem.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            continue;
+        }
+        const std::string ext = toLowerAscii(e.path().extension().string());
+        if(std::find(extensions.begin(), extensions.end(), ext) == extensions.end()) {
+            continue;
+        }
+        try {
+            maxIdx = std::max(maxIdx, std::stoi(stem));
+        }
+        catch(...) {
+        }
+    }
+    return maxIdx >= 0 ? maxIdx + 1 : 0;
+}
+
+static bool runCommandQuiet(const std::string &cmd) {
+    const int rc = std::system(cmd.c_str());
+    return rc == 0;
+}
+
+static bool decodeVideoToImageDir(const fs::path &videoPath,
+                                  const fs::path &outDir,
+                                  int frameCount,
+                                  bool depth16,
+                                  const std::atomic_bool *stop) {
+    if(videoPath.empty() || !fs::exists(videoPath) || !fs::is_regular_file(videoPath)) {
+        return false;
+    }
+    if(stop && stop->load()) {
+        return false;
+    }
+    fs::create_directories(outDir);
+    const std::string ext = depth16 ? ".png" : ".jpg";
+    const fs::path pattern = outDir / ("%05d" + ext);
+    std::ostringstream cmd;
+    cmd << "ffmpeg -hide_banner -v error -threads 0 -y"
+        << " -i " << shellQuote(videoPath.string());
+    if(frameCount > 0) {
+        cmd << " -frames:v " << frameCount;
+    }
+    if(depth16) {
+        cmd << " -pix_fmt gray16be";
+    }
+    else {
+        cmd << " -q:v 2";
+    }
+    cmd << " -start_number 0 " << shellQuote(pattern.string());
+    if(runCommandQuiet(cmd.str())) {
+        const int decoded = countPreparedFrames(outDir, { ext });
+        if(decoded > 0 && (frameCount <= 0 || decoded >= frameCount)) {
+            return true;
+        }
+    }
+
+    const VideoStreamInfo info = probeVideoStreamInfo(videoPath);
+    const int n = frameCount > 0 ? frameCount : info.frames;
+    if(n <= 0) {
+        return false;
+    }
+    const int width = info.width;
+    const int height = info.height;
+    for(int f = 0; f < n; ++f) {
+        if(stop && stop->load()) {
+            return false;
+        }
+        cv::Mat frame = depth16 ? decodeVideoFrameRaw(videoPath, f, width, height, "gray16le", CV_16UC1)
+                                : decodeVideoFrameRaw(videoPath, f, width, height, "bgr24", CV_8UC3);
+        if(frame.empty()) {
+            continue;
+        }
+        const fs::path outPath = outDir / frameFileName(f, ext);
+        if(depth16) {
+            cv::imwrite(outPath.string(), frame, { cv::IMWRITE_PNG_COMPRESSION, 1 });
+        }
+        else {
+            cv::imwrite(outPath.string(), frame, { cv::IMWRITE_JPEG_QUALITY, 95 });
+        }
+    }
+    return countPreparedFrames(outDir, { ext }) > 0;
+}
+
 static fs::path findFrameFile(const fs::path &dir, int frameIdx, const std::vector<std::string> &extensions) {
     std::ostringstream oss;
     oss << std::setw(5) << std::setfill('0') << frameIdx;
@@ -2798,12 +2896,22 @@ struct ViewerVideoDecodeJob {
     int generation = 0;
 };
 
+struct ViewerPrepareStatus {
+    bool running = false;
+    bool done = false;
+    bool failed = false;
+    int completed = 0;
+    int total = 0;
+    std::string message;
+};
+
 class DatasetViewer {
 public:
     explicit DatasetViewer(AppConfig cfg, const std::atomic_bool *cancel)
         : cfg_(std::move(cfg)), cancel_(cancel) {}
 
     ~DatasetViewer() {
+        stopPrepareWorker();
         stopPreloadWorker();
         stopVideoPrefetchWorkers();
     }
@@ -2912,6 +3020,63 @@ private:
             return taskDir;
         }
         return taskDir / selectedEpisode_;
+    }
+
+    fs::path decodedPicRoot() const {
+        const fs::path dir = selectedDataDir();
+        return dir.empty() ? fs::path() : (dir / "decoded_pic");
+    }
+
+    fs::path decodedRgbDirForCam(const std::string &cam) const {
+        return decodedPicRoot() / cam / "RGB";
+    }
+
+    fs::path decodedDepthDirForCam(const std::string &cam) const {
+        return decodedPicRoot() / cam / "Depth";
+    }
+
+    fs::path decodedRgbDirForSource(const ViewerSource &source) const {
+        if(source.kind == ViewerSourceKind::Multiview) {
+            return decodedRgbDirForCam(source.camKey);
+        }
+        if(source.kind == ViewerSourceKind::Fisheye) {
+            return decodedPicRoot() / "fisheye" / source.camKey / "RGB";
+        }
+        if(source.kind == ViewerSourceKind::Ego) {
+            return decodedPicRoot() / "ego" / "RGB";
+        }
+        return {};
+    }
+
+    fs::path decodedEgoRawRgbDir() const {
+        return decodedPicRoot() / "ego" / "RGB_raw";
+    }
+
+    static fs::path decodedFramePath(const fs::path &dir, int frameIdx, const std::string &ext) {
+        if(dir.empty() || frameIdx < 0) {
+            return {};
+        }
+        return dir / frameFileName(frameIdx, ext);
+    }
+
+    fs::path decodedRgbFramePathForCam(const std::string &cam, int frameIdx) const {
+        return decodedFramePath(decodedRgbDirForCam(cam), frameIdx, ".jpg");
+    }
+
+    fs::path decodedDepthFramePathForCam(const std::string &cam, int frameIdx) const {
+        return decodedFramePath(decodedDepthDirForCam(cam), frameIdx, ".png");
+    }
+
+    fs::path decodedRgbFramePathForSource(const ViewerSource &source, int frameIdx) const {
+        return decodedFramePath(decodedRgbDirForSource(source), frameIdx, ".jpg");
+    }
+
+    bool decodedFrameExists(const fs::path &p) const {
+        return !p.empty() && fs::exists(p) && fs::is_regular_file(p);
+    }
+
+    bool decodedEgoDisplayFrameExists(int frameIdx) const {
+        return decodedFrameExists(decodedFramePath(decodedPicRoot() / "ego" / "RGB", frameIdx, ".jpg"));
     }
 
     bool selectedTaskHasEpisodes() const {
@@ -3523,6 +3688,13 @@ private:
     }
 
     cv::Mat loadRgbFrameNoCache(const std::string &cam, int frameIdx) const {
+        const fs::path decoded = decodedRgbFramePathForCam(cam, frameIdx);
+        if(decodedFrameExists(decoded)) {
+            cv::Mat img = cv::imread(decoded.string(), cv::IMREAD_COLOR);
+            if(!img.empty()) {
+                return img;
+            }
+        }
         const fs::path dir = selectedDataDir() / cam / "RGB";
         if(encodingIsRgbH265(rgbEncodingForCam(cam))) {
             const auto *p = rgbParamsForCam(cam);
@@ -3545,6 +3717,13 @@ private:
     }
 
     cv::Mat loadDepthFrameNoCache(const std::string &cam, int frameIdx) const {
+        const fs::path decoded = decodedDepthFramePathForCam(cam, frameIdx);
+        if(decodedFrameExists(decoded)) {
+            cv::Mat m = cv::imread(decoded.string(), cv::IMREAD_UNCHANGED);
+            if(!m.empty() && m.type() == CV_16UC1) {
+                return m;
+            }
+        }
         const fs::path dir = selectedDataDir() / cam / "Depth";
         if(encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
             const auto *p = depthParamsForCam(cam);
@@ -4421,6 +4600,51 @@ private:
             return;
         }
 
+        const ViewerPrepareStatus prepare = prepareStatusSnapshot();
+        auto drawPrepareWarning = [&]() {
+            if(!prepare.failed) {
+                return;
+            }
+            std::string msg = prepare.message.empty() ? "prepare failed; using original files" : prepare.message;
+            if(msg.size() > 90) {
+                msg.resize(87);
+                msg += "...";
+            }
+            const cv::Point origin(mainRect_.x + 14, mainRect_.y + 26);
+            const cv::Rect panel(origin.x - 8, origin.y - 22, std::min(mainRect_.width - 12, 760), 34);
+            if(panel.width > 80) {
+                cv::rectangle(ui, panel, cv::Scalar(20, 20, 20), cv::FILLED);
+                cv::rectangle(ui, panel, cv::Scalar(70, 70, 180), 1);
+            }
+            cv::putText(ui, msg, origin, cv::FONT_HERSHEY_DUPLEX, 0.58, cv::Scalar(220, 220, 255), 1, cv::LINE_AA);
+        };
+        if(prepare.running) {
+            playing_ = false;
+            const int total = std::max(1, prepare.total);
+            const double ratio = std::max(0.0, std::min(1.0, static_cast<double>(prepare.completed) / static_cast<double>(total)));
+            const std::string title = "Preparing episode decoded_pic";
+            const std::string detail = prepare.message.empty() ? "decoding videos to disk" : prepare.message;
+            cv::putText(ui, title, cv::Point(mainRect_.x + 24, mainRect_.y + 48), cv::FONT_HERSHEY_DUPLEX, 0.9, cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
+            cv::putText(ui, detail, cv::Point(mainRect_.x + 24, mainRect_.y + 84), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            const cv::Rect bar(mainRect_.x + 24, mainRect_.y + 112, std::min(620, mainRect_.width - 48), 20);
+            if(bar.width > 40) {
+                cv::rectangle(ui, bar, cv::Scalar(40, 40, 40), cv::FILLED);
+                cv::rectangle(ui, bar, cv::Scalar(120, 120, 120), 1);
+                cv::Rect fill = bar;
+                fill.width = std::max(1, static_cast<int>(static_cast<double>(bar.width) * ratio));
+                cv::rectangle(ui, fill, cv::Scalar(70, 170, 240), cv::FILLED);
+            }
+            cv::putText(ui,
+                        std::to_string(prepare.completed) + "/" + std::to_string(total),
+                        cv::Point(mainRect_.x + 24, mainRect_.y + 160),
+                        cv::FONT_HERSHEY_DUPLEX,
+                        0.62,
+                        cv::Scalar(220, 220, 220),
+                        1,
+                        cv::LINE_AA);
+            return;
+        }
+
         if(playing_) {
             const auto now = std::chrono::steady_clock::now();
             const int fps = std::max(1, cfg_.viewerFps > 0 ? cfg_.viewerFps : 30);
@@ -4447,6 +4671,7 @@ private:
                 drawPointCloud(ui);
             }
             drawPointCloudOverlays(ui);
+            drawPrepareWarning();
             return;
         }
         pcAllowMouse_ = false;
@@ -4462,10 +4687,11 @@ private:
             if(dataType_ == ViewerDataType::RGB) {
                 img = loadRgbFrame(*source, currentFrame_);
                 if(source->kind == ViewerSourceKind::Ego) {
+                    const bool preparedEgoFrame = decodedEgoDisplayFrameExists(currentFrame_);
                     if(img.empty() && egoVideoFrameIndexForAlignedFrame(currentFrame_) < 0) {
                         img = makeEgoNoAlignedFrameImage();
                     }
-                    else {
+                    else if(!preparedEgoFrame) {
                         img = makeEgoFusedDisplayFrame(img);
                         drawEgoGazeOverlay(img, currentFrame_);
                     }
@@ -4487,9 +4713,12 @@ private:
             frames.emplace_back(source->displayName, img);
         }
         drawGridImages(ui, mainRect_, frames);
+        drawPrepareWarning();
     }
 
     void clearTaskState() {
+        stopPrepareWorker();
+        setPrepareStatus(false, false, false, 0, 0, "");
         resetVideoPrefetchQueue();
         invalidatePointCloudPreload();
         sources_.clear();
@@ -4528,6 +4757,256 @@ private:
             headCamPoseFrameCache_.clear();
         }
         pcView_.resetView();
+    }
+
+    void setPrepareStatus(bool running, bool done, bool failed, int completed, int total, const std::string &message) {
+        std::lock_guard<std::mutex> lock(prepareMtx_);
+        prepareStatus_.running = running;
+        prepareStatus_.done = done;
+        prepareStatus_.failed = failed;
+        prepareStatus_.completed = completed;
+        prepareStatus_.total = total;
+        prepareStatus_.message = message;
+    }
+
+    ViewerPrepareStatus prepareStatusSnapshot() const {
+        std::lock_guard<std::mutex> lock(prepareMtx_);
+        return prepareStatus_;
+    }
+
+    void stopPrepareWorker() {
+        prepareStop_.store(true);
+        if(prepareThread_.joinable()) {
+            prepareThread_.join();
+        }
+        prepareStop_.store(false);
+        std::lock_guard<std::mutex> lock(prepareMtx_);
+        if(prepareStatus_.running) {
+            prepareStatus_.running = false;
+            prepareStatus_.failed = true;
+            prepareStatus_.message = "prepare canceled";
+        }
+    }
+
+    void notePrepareProgress(int completed, int total, const std::string &message) {
+        std::lock_guard<std::mutex> lock(prepareMtx_);
+        prepareStatus_.running = true;
+        prepareStatus_.completed = completed;
+        prepareStatus_.total = total;
+        prepareStatus_.message = message;
+    }
+
+    int frameCountForSource(const ViewerSource &source) const {
+        if(source.kind == ViewerSourceKind::Multiview) {
+            return rgbFrameCountForCam(source.camKey, source.rgbDir);
+        }
+        if(source.kind == ViewerSourceKind::Ego) {
+            if(!egoAlignedFrames_.empty()) {
+                return static_cast<int>(egoAlignedFrames_.size());
+            }
+            if(encodingIsRgbH265(source.rgbEncoding)) {
+                const int sidecar = countVideoTimestampRows(source.rgbVideoPath, egoRgbVideoTimestampPath(selectedDataDir() / "ego"));
+                if(sidecar > 0) {
+                    return sidecar;
+                }
+                return probeVideoStreamInfo(source.rgbVideoPath).frames;
+            }
+            return computeTotalFramesFromDir(source.rgbDir);
+        }
+        if(encodingIsRgbH265(source.rgbEncoding)) {
+            const int sidecar = countVideoTimestampRows(source.rgbVideoPath);
+            if(sidecar > 0) {
+                return sidecar;
+            }
+            return probeVideoStreamInfo(source.rgbVideoPath).frames;
+        }
+        return computeTotalFramesFromDir(source.rgbDir);
+    }
+
+    bool prepareEgoDisplayFrames(const ViewerSource &source, const fs::path &dataDir, const fs::path &outRoot, int &completed, int totalTasks) {
+        const fs::path egoOut = outRoot / "ego" / "RGB";
+        fs::create_directories(egoOut);
+        int displayFrames = 0;
+        if(!egoAlignedFrames_.empty()) {
+            displayFrames = static_cast<int>(egoAlignedFrames_.size());
+        }
+        else if(encodingIsRgbH265(source.rgbEncoding)) {
+            const fs::path egoDir = dataDir / "ego";
+            displayFrames = countVideoTimestampRows(source.rgbVideoPath, egoRgbVideoTimestampPath(egoDir));
+            if(displayFrames <= 0) {
+                displayFrames = probeVideoStreamInfo(source.rgbVideoPath).frames;
+            }
+        }
+        else {
+            displayFrames = computeTotalFramesFromDir(source.rgbDir);
+        }
+        if(displayFrames <= 0) {
+            return true;
+        }
+
+        fs::path rawDir;
+        if(encodingIsRgbH265(source.rgbEncoding)) {
+            rawDir = outRoot / "ego" / "RGB_raw";
+            int rawFrames = 0;
+            if(!egoAlignedFrames_.empty()) {
+                for(const auto &f : egoAlignedFrames_) {
+                    if(f.valid && f.egoFrameIndex >= 0) {
+                        rawFrames = std::max(rawFrames, f.egoFrameIndex + 1);
+                    }
+                }
+            }
+            if(rawFrames <= 0) {
+                rawFrames = probeVideoStreamInfo(source.rgbVideoPath).frames;
+            }
+            if(rawFrames <= 0) {
+                rawFrames = displayFrames;
+            }
+            notePrepareProgress(completed, totalTasks, "decoding ego RGB");
+            if(!decodeVideoToImageDir(source.rgbVideoPath, rawDir, rawFrames, false, &prepareStop_)) {
+                return false;
+            }
+        }
+
+        for(int f = 0; f < displayFrames; ++f) {
+            if(prepareStop_.load()) {
+                return false;
+            }
+            const int videoFrameIdx = source.kind == ViewerSourceKind::Ego ? egoVideoFrameIndexForAlignedFrame(f) : f;
+            cv::Mat raw;
+            if(videoFrameIdx >= 0) {
+                fs::path rawPath;
+                if(encodingIsRgbH265(source.rgbEncoding)) {
+                    rawPath = decodedFramePath(rawDir, videoFrameIdx, ".jpg");
+                }
+                else {
+                    rawPath = findFrameFile(source.rgbDir, videoFrameIdx, { ".jpg", ".jpeg", ".png" });
+                }
+                if(!rawPath.empty()) {
+                    raw = cv::imread(rawPath.string(), cv::IMREAD_COLOR);
+                }
+            }
+            if(raw.empty()) {
+                raw = makeEgoNoAlignedFrameImage();
+            }
+            else {
+                raw = makeEgoFusedDisplayFrame(raw);
+                drawEgoGazeOverlay(raw, f);
+            }
+            cv::imwrite((egoOut / frameFileName(f, ".jpg")).string(), raw, { cv::IMWRITE_JPEG_QUALITY, 95 });
+            if(f % 10 == 0 || f + 1 == displayFrames) {
+                notePrepareProgress(completed, totalTasks, "rendering ego gaze " + std::to_string(f + 1) + "/" + std::to_string(displayFrames));
+            }
+        }
+        completed++;
+        notePrepareProgress(completed, totalTasks, "ego gaze ready");
+        return true;
+    }
+
+    void prepareEpisodeDecodedPics(const fs::path &dataDir, std::vector<ViewerSource> sourcesSnapshot) {
+        bool failed = false;
+        int completed = 0;
+        int totalTasks = 0;
+        try {
+            for(const auto &source : sourcesSnapshot) {
+                if(source.kind == ViewerSourceKind::Ego && source.hasRgb) {
+                    totalTasks++;
+                    continue;
+                }
+                if(source.hasRgb && encodingIsRgbH265(source.rgbEncoding)) {
+                    totalTasks++;
+                }
+                if(source.kind == ViewerSourceKind::Multiview && source.hasDepth && encodingIsDepthFfv1Mkv(source.depthEncoding)) {
+                    totalTasks++;
+                }
+            }
+            totalTasks = std::max(1, totalTasks);
+            setPrepareStatus(true, false, false, 0, totalTasks, "prepare decoded_pic");
+
+            const fs::path outRoot = dataDir / "decoded_pic";
+            fs::remove_all(outRoot);
+            fs::create_directories(outRoot);
+
+            auto decodedRgbDirForPreparedSource = [&](const ViewerSource &source) {
+                if(source.kind == ViewerSourceKind::Multiview) {
+                    return outRoot / source.camKey / "RGB";
+                }
+                if(source.kind == ViewerSourceKind::Fisheye) {
+                    return outRoot / "fisheye" / source.camKey / "RGB";
+                }
+                return outRoot / "ego" / "RGB";
+            };
+
+            for(const auto &source : sourcesSnapshot) {
+                if(prepareStop_.load()) {
+                    failed = true;
+                    break;
+                }
+                if(source.kind == ViewerSourceKind::Ego && source.hasRgb) {
+                    if(!prepareEgoDisplayFrames(source, dataDir, outRoot, completed, totalTasks)) {
+                        failed = true;
+                        break;
+                    }
+                    continue;
+                }
+                if(source.hasRgb && encodingIsRgbH265(source.rgbEncoding)) {
+                    const fs::path outDir = decodedRgbDirForPreparedSource(source);
+                    const int n = frameCountForSource(source);
+                    notePrepareProgress(completed, totalTasks, "decoding " + source.displayName + " RGB");
+                    if(!decodeVideoToImageDir(source.rgbVideoPath, outDir, n, false, &prepareStop_)) {
+                        failed = true;
+                        break;
+                    }
+                    completed++;
+                    notePrepareProgress(completed, totalTasks, source.displayName + " RGB ready");
+                }
+                if(source.kind == ViewerSourceKind::Multiview && source.hasDepth && encodingIsDepthFfv1Mkv(source.depthEncoding)) {
+                    const fs::path outDir = outRoot / source.camKey / "Depth";
+                    const int n = depthFrameCountForCam(source.camKey, source.depthDir);
+                    notePrepareProgress(completed, totalTasks, "decoding " + source.displayName + " depth");
+                    if(!decodeVideoToImageDir(source.depthVideoPath, outDir, n, true, &prepareStop_)) {
+                        failed = true;
+                        break;
+                    }
+                    completed++;
+                    notePrepareProgress(completed, totalTasks, source.displayName + " depth ready");
+                }
+            }
+        }
+        catch(const std::exception &e) {
+            failed = true;
+            setPrepareStatus(false, false, true, completed, totalTasks, std::string("prepare failed: ") + e.what());
+        }
+        catch(...) {
+            failed = true;
+            setPrepareStatus(false, false, true, completed, totalTasks, "prepare failed");
+        }
+
+        if(prepareStop_.load()) {
+            setPrepareStatus(false, false, true, completed, totalTasks, "prepare canceled");
+        }
+        else if(!failed) {
+            setPrepareStatus(false, true, false, totalTasks, totalTasks, "prepare complete");
+            resetVideoPrefetchQueue();
+            rgbCache_.clear();
+            depthCache_.clear();
+        }
+        else {
+            setPrepareStatus(false, false, true, completed, totalTasks, "prepare failed; using original files");
+        }
+    }
+
+    void startPrepareForSelectedDataDir() {
+        stopPrepareWorker();
+        const fs::path dataDir = selectedDataDir();
+        if(dataDir.empty() || !fs::exists(dataDir) || !fs::is_directory(dataDir) || totalFrames_ <= 0) {
+            return;
+        }
+        prepareStop_.store(false);
+        setPrepareStatus(true, false, false, 0, 1, "prepare decoded_pic");
+        std::vector<ViewerSource> sourcesSnapshot = sources_;
+        prepareThread_ = std::thread([this, dataDir, sourcesSnapshot = std::move(sourcesSnapshot)]() mutable {
+            prepareEpisodeDecodedPics(dataDir, std::move(sourcesSnapshot));
+        });
     }
 
     static std::string makeCacheKey(int typeId, const std::string &cam, int frameIdx) {
@@ -4821,6 +5300,7 @@ private:
         dataType_ = availableTypes_.front();
         dropdownOpen_ = false;
         statusLine_.clear();
+        startPrepareForSelectedDataDir();
     }
 
     void seekFrames(int delta) {
@@ -4840,6 +5320,9 @@ private:
 
     void prefetchRgbVideoRange(const std::string &cam, const fs::path &rgbDir, int startFrame, int ahead) {
         if(!encodingIsRgbH265(rgbEncodingForCam(cam))) {
+            return;
+        }
+        if(decodedFrameExists(decodedRgbFramePathForCam(cam, startFrame))) {
             return;
         }
         const auto *p = rgbParamsForCam(cam);
@@ -4902,6 +5385,9 @@ private:
         if(!encodingIsRgbH265(source.rgbEncoding)) {
             return;
         }
+        if(decodedFrameExists(decodedRgbFramePathForSource(source, startFrame))) {
+            return;
+        }
         constexpr int chunkSize = 24;
         int chunkStart = -1;
         std::vector<std::string> keys;
@@ -4946,6 +5432,9 @@ private:
 
     void prefetchEgoVideoRange(const ViewerSource &source, int startFrame, int ahead) {
         if(!encodingIsRgbH265(source.rgbEncoding)) {
+            return;
+        }
+        if(decodedFrameExists(decodedRgbFramePathForSource(source, startFrame))) {
             return;
         }
         const auto *p = egoRgbParams();
@@ -5009,6 +5498,9 @@ private:
 
     void prefetchDepthVideoRange(const std::string &cam, const fs::path &depthDir, int startFrame, int ahead) {
         if(!encodingIsDepthFfv1Mkv(depthEncodingForCam(cam))) {
+            return;
+        }
+        if(decodedFrameExists(decodedDepthFramePathForCam(cam, startFrame))) {
             return;
         }
         const auto *p = depthParamsForCam(cam);
@@ -5261,6 +5753,13 @@ private:
         }
         const std::string key = makeCacheKey(0, source.sourceId, frameIdx);
         cv::Mat img = rgbCache_.getOrLoad(key, [&]() {
+            const fs::path decoded = decodedRgbFramePathForSource(source, frameIdx);
+            if(decodedFrameExists(decoded)) {
+                cv::Mat prepared = cv::imread(decoded.string(), cv::IMREAD_COLOR);
+                if(!prepared.empty()) {
+                    return prepared;
+                }
+            }
             const int videoFrameIdx = source.kind == ViewerSourceKind::Ego ? egoVideoFrameIndexForAlignedFrame(frameIdx) : frameIdx;
             if(videoFrameIdx < 0) {
                 return cv::Mat();
@@ -5835,6 +6334,11 @@ private:
     mutable CloudLruCache fusedColorCloudFrameCache_{ 180 };
     mutable JointLruCache jointWorldCache_{ 180 };
     std::unordered_map<std::string, AlignMapCache> alignCache_;
+
+    std::atomic_bool prepareStop_{ false };
+    std::thread prepareThread_;
+    mutable std::mutex prepareMtx_;
+    ViewerPrepareStatus prepareStatus_;
 
     std::atomic_bool preloadStop_{ false };
     std::thread preloadThread_;
