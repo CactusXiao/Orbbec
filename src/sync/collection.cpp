@@ -5490,8 +5490,7 @@ private:
         if(cfg_.depthAlignWorkers > 0) {
             return static_cast<size_t>(cfg_.depthAlignWorkers);
         }
-        const size_t cams = std::max<size_t>(1, session.deviceSns.size());
-        return std::max<size_t>(1, std::min<size_t>(3, cams));
+        return softWriterThreadCount(cfg_);
     }
 
     size_t configuredDepthAlignQueueCapacity(const SessionState &session) const {

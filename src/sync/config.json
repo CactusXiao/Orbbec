@@ -42,7 +42,7 @@
     "recordQueueCapacity": 1024,
     "coordQueueCapacity": 512,
     "writeQueueCapacity": 1024,
-    "depthAlignWorkers": 2,
+    "depthAlignWorkers": 0,
     "depthAlignQueueCapacity": 90,
     "cameraStreamTimeoutSec": 2.0,
     "voiceFeedback": {
