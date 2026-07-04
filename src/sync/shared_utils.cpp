@@ -315,6 +315,12 @@ AppConfig loadConfig(const fs::path &configPath) {
 
     if(auto *calibObj = cJSON_GetObjectItemCaseSensitive(root, "calibration")) {
         if(cJSON_IsObject(calibObj)) {
+            if(auto v = getInt(calibObj, "samplesPerPair")) {
+                cfg.calibration.samplesPerPair = std::max(3, *v);
+            }
+            else if(auto v = getInt(calibObj, "samples_per_pair")) {
+                cfg.calibration.samplesPerPair = std::max(3, *v);
+            }
             if(auto *cbObj = cJSON_GetObjectItemCaseSensitive(calibObj, "chessboard")) {
                 if(cJSON_IsObject(cbObj)) {
                     if(auto v = getInt(cbObj, "cols")) {
@@ -327,6 +333,12 @@ AppConfig loadConfig(const fs::path &configPath) {
                         if(*v > 0.0) {
                             cfg.calibration.chessboard.squareSize = static_cast<float>(*v);
                         }
+                    }
+                    if(auto v = getInt(cbObj, "samplesPerPair")) {
+                        cfg.calibration.samplesPerPair = std::max(3, *v);
+                    }
+                    else if(auto v = getInt(cbObj, "samples_per_pair")) {
+                        cfg.calibration.samplesPerPair = std::max(3, *v);
                     }
                 }
             }

@@ -57,8 +57,12 @@ public:
             ctx_.enableDeviceClockSync(60000);
         }
 
-        cbRows_ = std::to_string(std::max(3, cfg_.calibration.chessboard.rows));
-        cbCols_ = std::to_string(std::max(3, cfg_.calibration.chessboard.cols));
+        cfg_.calibration.chessboard.rows = kFixedChessboardRows;
+        cfg_.calibration.chessboard.cols = kFixedChessboardCols;
+        cfg_.calibration.samplesPerPair = std::max(3, cfg_.calibration.samplesPerPair);
+        cbRows_ = std::to_string(kFixedChessboardRows);
+        cbCols_ = std::to_string(kFixedChessboardCols);
+        sampleTarget_ = std::to_string(cfg_.calibration.samplesPerPair);
         icpIter_ = "300";
         icpStop_ = "0.005";
         icpStopRot_ = "0.005";
@@ -67,7 +71,8 @@ public:
             oss << std::setprecision(2) << std::fixed << (cfg_.maxDepth > 0.0f ? cfg_.maxDepth : 6.0f);
             icpMaxDepth_ = oss.str();
         }
-        pushLog("calibration ui ready");
+        pushLog("auto chessboard calibration ui ready");
+        pushLog("fixed board: 11x8, fixed cameras: 00 01 02 03 04 05");
 
         const std::string win = "Calibration";
         cv::namedWindow(win, cv::WINDOW_NORMAL);
@@ -96,6 +101,13 @@ public:
     }
 
 private:
+    static constexpr int kFixedChessboardCols = 11;
+    static constexpr int kFixedChessboardRows = 8;
+
+    static std::vector<std::string> fixedCalibrationCameraIds() {
+        return { "00", "01", "02", "03", "04", "05" };
+    }
+
     struct DeviceRuntimeLite {
         DeviceConfig cfg;
         std::shared_ptr<ob::Device> dev;
@@ -518,6 +530,47 @@ private:
         return findByIndex(idx) != nullptr;
     }
 
+    void forceFixedChessboardConfig() {
+        cfg_.calibration.chessboard.cols = kFixedChessboardCols;
+        cfg_.calibration.chessboard.rows = kFixedChessboardRows;
+        cbCols_ = std::to_string(kFixedChessboardCols);
+        cbRows_ = std::to_string(kFixedChessboardRows);
+    }
+
+    int sampleTargetCount() const {
+        return parseIntBound(sampleTarget_, cfg_.calibration.samplesPerPair, 3, 999);
+    }
+
+    std::vector<std::string> missingFixedCalibrationCameras() const {
+        std::vector<std::string> missing;
+        for(const auto &idx: fixedCalibrationCameraIds()) {
+            if(!hasIndex(idx)) {
+                missing.push_back(idx);
+            }
+        }
+        return missing;
+    }
+
+    static std::string joinStrings(const std::vector<std::string> &items, const std::string &sep) {
+        std::ostringstream oss;
+        for(size_t i = 0; i < items.size(); i++) {
+            if(i > 0) {
+                oss << sep;
+            }
+            oss << items[i];
+        }
+        return oss.str();
+    }
+
+    std::vector<std::pair<std::string, std::string>> fixedCalibrationPairPlan() const {
+        std::vector<std::pair<std::string, std::string>> plan;
+        const auto ids = fixedCalibrationCameraIds();
+        for(size_t i = 1; i < ids.size(); i++) {
+            plan.emplace_back(ids[i - 1], ids[i]);
+        }
+        return plan;
+    }
+
     static cv::Mat toCameraMatrix(const OBCameraIntrinsic &in) {
         cv::Mat K = cv::Mat::eye(3, 3, CV_64F);
         K.at<double>(0, 0) = static_cast<double>(in.fx);
@@ -887,8 +940,8 @@ private:
         if(s.img1.empty() || s.img2.empty()) {
             return false;
         }
-        const int rows = parseIntBound(cbRows_, cfg_.calibration.chessboard.rows, 3, 64);
-        const int cols = parseIntBound(cbCols_, cfg_.calibration.chessboard.cols, 3, 64);
+        const int rows = kFixedChessboardRows;
+        const int cols = kFixedChessboardCols;
         const cv::Size pat(cols, rows);
         cv::Mat g1, g2;
         cv::cvtColor(s.img1, g1, cv::COLOR_BGR2GRAY);
@@ -910,8 +963,8 @@ private:
     }
 
     bool computePairExtrinsic(PairData &pd, cv::Matx33d &R12, cv::Vec3d &t12, double &rms) {
-        const int rows = parseIntBound(cbRows_, cfg_.calibration.chessboard.rows, 3, 64);
-        const int cols = parseIntBound(cbCols_, cfg_.calibration.chessboard.cols, 3, 64);
+        const int rows = kFixedChessboardRows;
+        const int cols = kFixedChessboardCols;
         cfg_.calibration.chessboard.rows = rows;
         cfg_.calibration.chessboard.cols = cols;
         const cv::Size pat(cols, rows);
@@ -1130,7 +1183,7 @@ private:
     }
 
     bool calcOverallAndSave() {
-        const std::string root = hasIndex("00") ? "00" : devices_.front().cfg.index;
+        const std::string root = "00";
         std::unordered_map<std::string, EdgeExtrinsic> worldToCam;
         std::unordered_set<std::string> vis;
         std::deque<std::string> q;
@@ -1164,8 +1217,8 @@ private:
                 q.push_back(to);
             }
         }
-        for(const auto &d: devices_) {
-            if(worldToCam.find(d.cfg.index) == worldToCam.end()) {
+        for(const auto &idx: fixedCalibrationCameraIds()) {
+            if(worldToCam.find(idx) == worldToCam.end()) {
                 return false;
             }
         }
@@ -1637,33 +1690,33 @@ private:
     }
 
     void drawChessboardPanel(cv::Mat &ui, FrameMouse &fm, int key, bool &running, const cv::Rect &left, const cv::Rect &mid, const cv::Rect &right) {
-        cv::Rect f1(left.x + 12, left.y + 72, (left.width - 36) / 2, 34);
-        cv::Rect f2(f1.x + f1.width + 12, f1.y, (left.width - 36) / 2, 34);
-        cv::Rect f3(left.x + 12, f1.y + 56, (left.width - 36) / 2, 34);
-        cv::Rect f4(f3.x + f3.width + 12, f3.y, (left.width - 36) / 2, 34);
-        if(uiField(ui, f1, "first camera", camFirst_, activeField_, "camFirst", fm)) {
-            activeField_ = "camFirst";
-        }
-        if(uiField(ui, f2, "second camera", camSecond_, activeField_, "camSecond", fm)) {
-            activeField_ = "camSecond";
-        }
-        if(uiField(ui, f3, "board cols", cbCols_, activeField_, "cbCols", fm)) {
-            activeField_ = "cbCols";
-        }
-        if(uiField(ui, f4, "board rows", cbRows_, activeField_, "cbRows", fm)) {
-            activeField_ = "cbRows";
+        forceFixedChessboardConfig();
+        cv::putText(ui, "Auto Chessboard", cv::Point(left.x + 12, left.y + 78), cv::FONT_HERSHEY_DUPLEX, 0.66, cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
+        cv::putText(ui, "cameras: 00 01 02 03 04 05", cv::Point(left.x + 12, left.y + 106), cv::FONT_HERSHEY_DUPLEX, 0.47, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, "board: 11 x 8", cv::Point(left.x + 12, left.y + 130), cv::FONT_HERSHEY_DUPLEX, 0.47, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+
+        cv::Rect f1(left.x + 12, left.y + 164, left.width - 24, 34);
+        if(uiField(ui, f1, "valid samples per pair", sampleTarget_, activeField_, "sampleTarget", fm)) {
+            activeField_ = "sampleTarget";
         }
         if(!activeField_.empty() && key > 0) {
-            if(activeField_ == "camFirst") handleText(camFirst_, key, 8);
-            else if(activeField_ == "camSecond") handleText(camSecond_, key, 8);
-            else if(activeField_ == "cbCols") handleText(cbCols_, key, 4);
-            else if(activeField_ == "cbRows") handleText(cbRows_, key, 4);
+            if(activeField_ == "sampleTarget") {
+                handleText(sampleTarget_, key, 4);
+            }
         }
 
-        const std::string pk = pairKey(trimString(camFirst_), trimString(camSecond_));
+        int target = sampleTargetCount();
+        std::string pk = activePairKey_;
+        if(pk.empty() && !autoPairPlan_.empty()) {
+            const size_t displayIdx = std::min(autoPairIndex_, autoPairPlan_.size() - 1);
+            pk = pairKey(autoPairPlan_[displayIdx].first, autoPairPlan_[displayIdx].second);
+        }
+        if(pk.empty()) {
+            pk = "00->01";
+        }
         int valid = 0;
         double rms = -1.0;
-        int calibratedCount = 0;
+        const int calibratedCount = fixedCalibratedPairCount();
         cv::Mat det1, det2;
         {
             std::lock_guard<std::mutex> lock(pairMtx_);
@@ -1674,13 +1727,15 @@ private:
                 det1 = it->second.latestDet1;
                 det2 = it->second.latestDet2;
             }
-            for(const auto &kv: pairStore_) {
-                if(kv.second.calibrated) {
-                    calibratedCount++;
-                }
-            }
         }
-        cv::putText(ui, "valid image pairs: " + std::to_string(valid), cv::Point(left.x + 12, f4.y + 56), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+
+        const cv::Scalar statusColor = autoError_ ? cv::Scalar(80, 80, 255)
+                                      : calibrationComplete_ ? cv::Scalar(100, 230, 120)
+                                      : autoRunning_ ? cv::Scalar(80, 210, 240)
+                                                     : cv::Scalar(220, 220, 220);
+        cv::putText(ui, "status: " + autoStatus_, cv::Point(left.x + 12, f1.y + 62), cv::FONT_HERSHEY_DUPLEX, 0.47, statusColor, 1, cv::LINE_AA);
+        cv::putText(ui, "current pair: " + pk, cv::Point(left.x + 12, f1.y + 88), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, "valid image pairs: " + std::to_string(valid) + "/" + std::to_string(target), cv::Point(left.x + 12, f1.y + 114), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         {
             std::ostringstream oss;
             oss.setf(std::ios::fixed);
@@ -1691,68 +1746,91 @@ private:
             else {
                 oss << "-";
             }
-            cv::putText(ui, "stereo rms (px): " + oss.str(), cv::Point(left.x + 12, f4.y + 82), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            cv::putText(ui, "stereo rms (px): " + oss.str(), cv::Point(left.x + 12, f1.y + 140), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         }
-        cv::putText(ui, "calibrated camera pairs: " + std::to_string(calibratedCount), cv::Point(left.x + 12, f4.y + 108), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, "calibrated pairs: " + std::to_string(calibratedCount) + "/5", cv::Point(left.x + 12, f1.y + 166), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, std::string("graph connected: ") + (fixedCalibrationGraphConnected() ? "yes" : "no"), cv::Point(left.x + 12, f1.y + 192), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
 
-        cv::Rect logBox(left.x + 10, f4.y + 132, left.width - 20, 330);
+        cv::Rect logBox(left.x + 10, f1.y + 214, left.width - 20, 330);
         drawLogBox(ui, logBox, fm);
 
-        const int by = left.y + left.height - 190;
+        const int by = left.y + left.height - 154;
         cv::Rect b1(left.x + 10, by, left.width - 20, 30);
         cv::Rect b2(left.x + 10, by + 34, left.width - 20, 30);
         cv::Rect b3(left.x + 10, by + 68, left.width - 20, 30);
         cv::Rect b4(left.x + 10, by + 102, left.width - 20, 30);
-        cv::Rect b5(left.x + 10, by + 136, left.width - 20, 30);
-        if(uiButton(ui, b1, "start", fm)) onStartChessboard();
-        if(uiButton(ui, b2, "pause", fm)) onPauseChessboard();
-        if(uiButton(ui, b3, "calculate camera pair", fm)) onCalcPair();
-        if(uiButton(ui, b4, "calculate overall extrinsic", fm)) onCalcOverall();
-        if(uiButton(ui, b5, "back to menu", fm)) {
-            clearAllState();
+        if(calibrationComplete_) {
+            if(uiButton(ui, b1, "restart calibration", fm)) onRestartAutoCalibration();
+            if(uiButton(ui, b2, "exit calibration", fm)) {
+                stopActivePair();
+                running = false;
+            }
+        }
+        else {
+            if(uiButton(ui, b1, autoRunning_ ? "running" : "start auto", fm) && !autoRunning_) onStartAutoCalibration();
+            if(uiButton(ui, b2, "pause", fm)) onPauseChessboard();
+            if(uiButton(ui, b3, "restart calibration", fm)) onRestartAutoCalibration();
+            if(uiButton(ui, b4, "exit calibration", fm)) {
+                stopActivePair();
+                running = false;
+            }
+        }
+        if(fm.clicked && !left.contains(cv::Point(fm.clickX, fm.clickY))) {
+            activeField_.clear();
+        }
+        if(key == 27) {
             running = false;
         }
 
+        updateAutoCalibration();
         updateStreaming();
+        updateAutoCalibration();
+
         drawRgbGrid(ui, mid, latestRgbFramesForGrid(), activePair_.colorW, activePair_.colorH, std::max(activePair_.colorFps1, activePair_.colorFps2));
         std::vector<std::pair<std::string, cv::Mat>> detections;
+        std::string detA = activeCam1_;
+        std::string detB = activeCam2_;
+        auto pos = pk.find("->");
+        if(pos != std::string::npos) {
+            if(detA.empty()) {
+                detA = pk.substr(0, pos);
+            }
+            if(detB.empty()) {
+                detB = pk.substr(pos + 2);
+            }
+        }
         if(!det1.empty()) {
-            detections.emplace_back(activeCam1_.empty() ? "cam1" : activeCam1_, det1);
+            detections.emplace_back(detA.empty() ? "cam1" : detA, det1);
         }
         if(!det2.empty()) {
-            detections.emplace_back(activeCam2_.empty() ? "cam2" : activeCam2_, det2);
+            detections.emplace_back(detB.empty() ? "cam2" : detB, det2);
         }
         drawRgbGrid(ui, right, detections, activePair_.colorW, activePair_.colorH, std::max(activePair_.colorFps1, activePair_.colorFps2));
     }
 
-    void onStartChessboard() {
-        const std::string a = trimString(camFirst_);
-        const std::string b = trimString(camSecond_);
-        const int rows = parseIntBound(cbRows_, cfg_.calibration.chessboard.rows, 3, 64);
-        const int cols = parseIntBound(cbCols_, cfg_.calibration.chessboard.cols, 3, 64);
+    bool startChessboardPair(const std::string &a, const std::string &b) {
+        forceFixedChessboardConfig();
         if(a.empty() || b.empty()) {
             pushLog("start failed: camera index empty");
-            return;
+            return false;
         }
         if(a == b) {
             pushLog("start failed: two cameras are same");
-            return;
+            return false;
         }
         if(!hasIndex(a) || !hasIndex(b)) {
             pushLog("start failed: camera not found");
-            return;
+            return false;
         }
-        cfg_.calibration.chessboard.rows = rows;
-        cfg_.calibration.chessboard.cols = cols;
         const auto *d1 = findByIndex(a);
         const auto *d2 = findByIndex(b);
         if(!d1 || !d2) {
             pushLog("start failed: internal index mismatch");
-            return;
+            return false;
         }
         if(!startPair(*d1, *d2)) {
             pushLog("start failed: pipeline start error");
-            return;
+            return false;
         }
         activePairKey_ = pairKey(a, b);
         {
@@ -1770,16 +1848,27 @@ private:
         pushLog("start streaming pair " + activePairKey_);
         pushLog("rgb profile cam " + a + ": " + std::to_string(activePair_.colorW) + "x" + std::to_string(activePair_.colorH) + "@" + std::to_string(activePair_.colorFps1));
         pushLog("rgb profile cam " + b + ": " + std::to_string(activePair_.colorW) + "x" + std::to_string(activePair_.colorH) + "@" + std::to_string(activePair_.colorFps2));
+        return true;
+    }
+
+    void onStartChessboard() {
+        autoRunning_ = false;
+        calibrationComplete_ = false;
+        autoError_ = false;
+        autoStatus_ = "manual pair streaming";
+        const std::string a = trimString(camFirst_);
+        const std::string b = trimString(camSecond_);
+        startChessboardPair(a, b);
     }
 
     void onPauseChessboard() {
+        autoRunning_ = false;
+        autoStatus_ = calibrationComplete_ ? "calibration complete" : "paused";
         stopActivePair();
         pushLog("stream paused");
     }
 
-    void onCalcPair() {
-        const std::string a = trimString(camFirst_);
-        const std::string b = trimString(camSecond_);
+    bool calculateChessboardPair(const std::string &a, const std::string &b) {
         const std::string pk = pairKey(a, b);
         PairData snap;
         {
@@ -1787,7 +1876,7 @@ private:
             auto it = pairStore_.find(pk);
             if(it == pairStore_.end() || it->second.samples.size() < 3) {
                 pushLog("calculate pair failed: need >=3 valid samples");
-                return;
+                return false;
             }
             snap = it->second;
         }
@@ -1796,7 +1885,7 @@ private:
         double rms = -1.0;
         if(!computePairExtrinsic(snap, R12, t12, rms)) {
             pushLog("calculate pair failed");
-            return;
+            return false;
         }
         EdgeExtrinsic e12;
         e12.valid = true;
@@ -1816,7 +1905,18 @@ private:
                 it->second.rmsPx = rms;
             }
         }
-        pushLog("pair calibrated " + pk);
+        {
+            std::ostringstream oss;
+            oss << "pair calibrated " << pk << ", stereo rms=" << std::fixed << std::setprecision(4) << rms << " px";
+            pushLog(oss.str());
+        }
+        return true;
+    }
+
+    void onCalcPair() {
+        const std::string a = trimString(camFirst_);
+        const std::string b = trimString(camSecond_);
+        calculateChessboardPair(a, b);
     }
 
     void onCalcOverall() {
@@ -1830,6 +1930,189 @@ private:
         else {
             pushLog("calculate overall failed: graph disconnected or file write failed");
         }
+    }
+
+    int validCountForPair(const std::string &pk) {
+        std::lock_guard<std::mutex> lock(pairMtx_);
+        auto it = pairStore_.find(pk);
+        return it == pairStore_.end() ? 0 : it->second.validCount;
+    }
+
+    bool pairIsCalibrated(const std::string &pk) {
+        std::lock_guard<std::mutex> lock(pairMtx_);
+        auto it = pairStore_.find(pk);
+        return it != pairStore_.end() && it->second.calibrated;
+    }
+
+    int fixedCalibratedPairCount() {
+        int n = 0;
+        for(const auto &p: autoPairPlan_.empty() ? fixedCalibrationPairPlan() : autoPairPlan_) {
+            if(pairIsCalibrated(pairKey(p.first, p.second))) {
+                n++;
+            }
+        }
+        return n;
+    }
+
+    bool fixedCalibrationGraphConnected() {
+        const auto ids = fixedCalibrationCameraIds();
+        std::unordered_set<std::string> required(ids.begin(), ids.end());
+        std::unordered_set<std::string> vis;
+        std::deque<std::string> q;
+        q.push_back("00");
+        vis.insert("00");
+        while(!q.empty()) {
+            const std::string u = q.front();
+            q.pop_front();
+            for(const auto &kv: edges_) {
+                const auto pos = kv.first.find("->");
+                if(pos == std::string::npos || !kv.second.valid) {
+                    continue;
+                }
+                const std::string from = kv.first.substr(0, pos);
+                const std::string to = kv.first.substr(pos + 2);
+                if(from != u || !required.count(to) || vis.count(to)) {
+                    continue;
+                }
+                vis.insert(to);
+                q.push_back(to);
+            }
+        }
+        return vis.size() == required.size();
+    }
+
+    bool prepareAutoCalibrationPlan() {
+        const auto missing = missingFixedCalibrationCameras();
+        if(!missing.empty()) {
+            autoRunning_ = false;
+            autoError_ = true;
+            autoStatus_ = "missing cameras: " + joinStrings(missing, " ");
+            pushLog("auto start failed: missing fixed cameras " + joinStrings(missing, " "));
+            return false;
+        }
+        autoPairPlan_ = fixedCalibrationPairPlan();
+        autoPairIndex_ = 0;
+        std::vector<std::string> labels;
+        for(const auto &p: autoPairPlan_) {
+            labels.push_back(pairKey(p.first, p.second));
+        }
+        pushLog("auto pair plan: " + joinStrings(labels, ", "));
+        return true;
+    }
+
+    bool startCurrentAutoPair() {
+        if(autoPairIndex_ >= autoPairPlan_.size()) {
+            return false;
+        }
+        const auto &p = autoPairPlan_[autoPairIndex_];
+        camFirst_ = p.first;
+        camSecond_ = p.second;
+        autoStatus_ = "sampling " + pairKey(p.first, p.second);
+        return startChessboardPair(p.first, p.second);
+    }
+
+    void finishAutoCalibration() {
+        stopActivePair();
+        autoStatus_ = "saving overall extrinsic";
+        if(!fixedCalibrationGraphConnected()) {
+            autoRunning_ = false;
+            autoError_ = true;
+            autoStatus_ = "graph disconnected";
+            pushLog("auto overall failed: fixed camera graph disconnected");
+            return;
+        }
+        if(calcOverallAndSave()) {
+            autoRunning_ = false;
+            calibrationComplete_ = true;
+            autoError_ = false;
+            autoStatus_ = "calibration complete";
+            pushLog("calibration complete; overall extrinsic saved to " + cfg_.initExtrinsicPath);
+        }
+        else {
+            autoRunning_ = false;
+            autoError_ = true;
+            autoStatus_ = "overall save failed";
+            pushLog("auto overall failed: file write failed");
+        }
+    }
+
+    void updateAutoCalibration() {
+        if(!autoRunning_ || autoError_ || calibrationComplete_) {
+            return;
+        }
+        forceFixedChessboardConfig();
+        cfg_.calibration.samplesPerPair = sampleTargetCount();
+        sampleTarget_ = std::to_string(cfg_.calibration.samplesPerPair);
+        if(autoPairPlan_.empty() && !prepareAutoCalibrationPlan()) {
+            return;
+        }
+        while(autoPairIndex_ < autoPairPlan_.size()) {
+            const auto &p = autoPairPlan_[autoPairIndex_];
+            const std::string pk = pairKey(p.first, p.second);
+            if(pairIsCalibrated(pk)) {
+                autoPairIndex_++;
+                continue;
+            }
+            const int valid = validCountForPair(pk);
+            const int target = sampleTargetCount();
+            if(valid >= target) {
+                if(pairStreaming_) {
+                    pushLog("sample target reached: " + pk + " count=" + std::to_string(valid));
+                    stopActivePair();
+                }
+                autoStatus_ = "calculating " + pk;
+                if(!calculateChessboardPair(p.first, p.second)) {
+                    autoRunning_ = false;
+                    autoError_ = true;
+                    autoStatus_ = "pair calculation failed: " + pk;
+                    return;
+                }
+                autoPairIndex_++;
+                continue;
+            }
+            if(!pairStreaming_ || activePairKey_ != pk) {
+                if(pairStreaming_) {
+                    stopActivePair();
+                }
+                if(!startCurrentAutoPair()) {
+                    autoRunning_ = false;
+                    autoError_ = true;
+                    autoStatus_ = "stream start failed: " + pk;
+                }
+            }
+            else {
+                autoStatus_ = "sampling " + pk + " " + std::to_string(valid) + "/" + std::to_string(target);
+            }
+            return;
+        }
+        finishAutoCalibration();
+    }
+
+    void onStartAutoCalibration() {
+        if(calibrationComplete_) {
+            pushLog("calibration already complete; restart to run again");
+            return;
+        }
+        forceFixedChessboardConfig();
+        cfg_.calibration.samplesPerPair = sampleTargetCount();
+        sampleTarget_ = std::to_string(cfg_.calibration.samplesPerPair);
+        autoError_ = false;
+        if(autoPairPlan_.empty() && !prepareAutoCalibrationPlan()) {
+            return;
+        }
+        autoRunning_ = true;
+        updateAutoCalibration();
+    }
+
+    void onRestartAutoCalibration() {
+        clearAllState();
+        autoPairPlan_.clear();
+        autoPairIndex_ = 0;
+        calibrationComplete_ = false;
+        autoError_ = false;
+        autoRunning_ = false;
+        autoStatus_ = "ready";
+        onStartAutoCalibration();
     }
 
     void updateStreaming() {
@@ -2023,6 +2306,12 @@ private:
         edges_.clear();
         rgbToDepthByCam_.clear();
         depthToRgbByCam_.clear();
+        autoRunning_ = false;
+        autoError_ = false;
+        calibrationComplete_ = false;
+        autoStatus_ = "ready";
+        autoPairPlan_.clear();
+        autoPairIndex_ = 0;
         live1_.release();
         live2_.release();
         icpWork_.clear();
@@ -2050,6 +2339,7 @@ private:
     std::string camSecond_;
     std::string cbCols_;
     std::string cbRows_;
+    std::string sampleTarget_;
     std::string icpIter_;
     std::string icpStop_;
     std::string icpStopRot_;
@@ -2071,6 +2361,13 @@ private:
     std::unordered_map<std::string, EdgeExtrinsic> edges_;
     std::unordered_map<std::string, EdgeExtrinsic> rgbToDepthByCam_;
     std::unordered_map<std::string, EdgeExtrinsic> depthToRgbByCam_;
+
+    bool autoRunning_ = false;
+    bool autoError_ = false;
+    bool calibrationComplete_ = false;
+    std::string autoStatus_ = "ready";
+    std::vector<std::pair<std::string, std::string>> autoPairPlan_;
+    size_t autoPairIndex_ = 0;
 
     std::atomic_bool sampleStop_{ false };
     std::thread sampleThread_;

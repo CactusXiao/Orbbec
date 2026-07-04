@@ -94,6 +94,7 @@ struct ChessboardConfig {
 
 struct CalibrationConfig {
     ChessboardConfig chessboard;
+    int              samplesPerPair = 20;
 };
 
 struct DepthPointCloudFiltersConfig {

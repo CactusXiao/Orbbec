@@ -23,6 +23,7 @@
         "desk_crop": true
     },
     "calibration": {
+        "samplesPerPair": 20,
         "chessboard": {
             "rows": 8,
             "cols": 11,
