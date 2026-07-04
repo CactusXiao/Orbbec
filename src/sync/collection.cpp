@@ -2499,16 +2499,19 @@ static bool writeTextFile(const fs::path &p, const std::string &content) {
     return true;
 }
 
-static cv::Mat alignDepthToRgb(const cv::Mat &depth16,
+static void alignDepthToRgbInto(const cv::Mat &depth16,
                                 float valueScaleMm,
                                 const OBCameraParam &rgbDepthParam,
-                                int rgbW, int rgbH) {
-    cv::Mat aligned(rgbH, rgbW, CV_16UC1, cv::Scalar(0));
+                                int rgbW, int rgbH,
+                                cv::Mat &aligned,
+                                cv::Mat &zBuf) {
+    aligned.create(rgbH, rgbW, CV_16UC1);
+    aligned.setTo(cv::Scalar(0));
     if(depth16.empty() || depth16.type() != CV_16UC1 || !(valueScaleMm > 0.0f)) {
-        return aligned;
+        return;
     }
     if(rgbDepthParam.depthIntrinsic.fx <= 0.0f || rgbDepthParam.rgbIntrinsic.fx <= 0.0f) {
-        return aligned;
+        return;
     }
 
     const int   dW   = depth16.cols;
@@ -2519,7 +2522,8 @@ static cv::Mat alignDepthToRgb(const cv::Mat &depth16,
     const float cy_d = rgbDepthParam.depthIntrinsic.cy;
     const float *R   = rgbDepthParam.transform.rot;
     const float *t   = rgbDepthParam.transform.trans;
-    cv::Mat      zBuf(rgbH, rgbW, CV_32FC1, cv::Scalar(std::numeric_limits<float>::infinity()));
+    zBuf.create(rgbH, rgbW, CV_32FC1);
+    zBuf.setTo(cv::Scalar(std::numeric_limits<float>::infinity()));
 
     for(int v = 0; v < dH; ++v) {
         const uint16_t *row = depth16.ptr<uint16_t>(v);
@@ -2576,14 +2580,23 @@ static cv::Mat alignDepthToRgb(const cv::Mat &depth16,
                 continue;
             }
 
-            float &bestZ = zBuf.at<float>(v_rgb, u_rgb);
+            float &bestZ = zBuf.ptr<float>(v_rgb)[u_rgb];
             if(Zr >= bestZ) {
                 continue;
             }
             bestZ = Zr;
-            aligned.at<uint16_t>(v_rgb, u_rgb) = static_cast<uint16_t>(zRatio + 0.5f);
+            aligned.ptr<uint16_t>(v_rgb)[u_rgb] = static_cast<uint16_t>(zRatio + 0.5f);
         }
     }
+}
+
+static cv::Mat alignDepthToRgb(const cv::Mat &depth16,
+                                float valueScaleMm,
+                                const OBCameraParam &rgbDepthParam,
+                                int rgbW, int rgbH) {
+    cv::Mat aligned;
+    cv::Mat zBuf;
+    alignDepthToRgbInto(depth16, valueScaleMm, rgbDepthParam, rgbW, rgbH, aligned, zBuf);
 
     return aligned;
 }
@@ -2610,9 +2623,9 @@ public:
     explicit MultiDeviceStreamingRecorder(AppConfig baseCfg)
         : cfg_(std::move(baseCfg)) {
         const size_t baseQueue = cfg_.queueCapacity > 0 ? static_cast<size_t>(cfg_.queueCapacity) : 1024;
-        recordQueueMax_ = std::max<size_t>(16384, baseQueue * 16);
-        coordQueueMax_ = std::max<size_t>(8192, baseQueue * 8);
-        writeQueueMax_ = std::max<size_t>(16384, baseQueue * 16);
+        recordQueueMax_ = cfg_.recordQueueCapacity > 0 ? static_cast<size_t>(cfg_.recordQueueCapacity) : std::max<size_t>(16384, baseQueue * 16);
+        coordQueueMax_ = cfg_.coordQueueCapacity > 0 ? static_cast<size_t>(cfg_.coordQueueCapacity) : std::max<size_t>(8192, baseQueue * 8);
+        writeQueueMax_ = cfg_.writeQueueCapacity > 0 ? static_cast<size_t>(cfg_.writeQueueCapacity) : std::max<size_t>(16384, baseQueue * 16);
     }
 
     bool isCapturing() const { return capturing_.load(); }
@@ -2630,7 +2643,8 @@ public:
             return true;
         }
         return session_.coordinatorDone && queuedWriteCount_.load() == 0 && writeInFlight_.load() == 0
-               && !h265EncodingActive_.load() && !depthFfv1EncodingActive_.load();
+               && queuedDepthAlignCount_.load() == 0 && depthAlignInFlight_.load() == 0
+               && !depthAlignActive_.load() && !h265EncodingActive_.load() && !depthFfv1EncodingActive_.load();
     }
 
     std::string currentSessionLabel() const {
@@ -2795,6 +2809,13 @@ public:
                 oss << " ";
             }
             oss << "write=" << queuedWriteCount_.load() << "+" << writeInFlight_.load();
+            any = true;
+        }
+        if(queuedDepthAlignCount_.load() > 0 || depthAlignInFlight_.load() > 0) {
+            if(any) {
+                oss << " ";
+            }
+            oss << "depthAlign=" << queuedDepthAlignCount_.load() << "+" << depthAlignInFlight_.load();
             any = true;
         }
         return any ? oss.str() : "";
@@ -3605,6 +3626,7 @@ public:
         passthroughRgbMjpg_.store(session_.passthroughRgbMjpg);
         startH265Encoders(session_);
         startDepthFfv1Encoders(session_);
+        startDepthAlignWorkers(session_);
 
         recordInputClosing_.store(false);
         multiviewEosNotified_.store(!multiviewEnabled_);
@@ -3620,6 +3642,7 @@ public:
         if(session_.saveEgo) {
             std::string egoError;
             if(!egoRecorder_.beginSession(session_.dest, egoSessionName, &egoError)) {
+                stopDepthAlignWorkers();
                 stopH265Encoders();
                 stopDepthFfv1Encoders();
                 {
@@ -3727,6 +3750,9 @@ public:
             return;
         }
         stopping_.store(true);
+        recordCv_.notify_all();
+        coordCv_.notify_all();
+        depthAlignCv_.notify_all();
         recording_.store(false);
         recordInputClosing_.store(true);
         if(fisheyeRecordThread_.joinable()) {
@@ -3943,6 +3969,22 @@ private:
         uint64_t tsUs = 0;
     };
 
+    struct DepthAlignTask {
+        std::string sn;
+        std::string camKey;
+        std::string frameIndex;
+        uint64_t tsUs = 0;
+        cv::Mat frame;
+        fs::path outPath;
+        SaveOptions saveOptions;
+        OBCameraParam rgbDepthParam{};
+        bool rgbDepthParamValid = false;
+        int rgbW = 0;
+        int rgbH = 0;
+        float valueScale = 0.0f;
+        bool useFfv1 = false;
+    };
+
     class H265Encoder {
     public:
         H265Encoder(fs::path outputPath, int width, int height, int fps, int threads, OBFormat inputFormat, SaveOptions options, size_t queueMax)
@@ -3953,7 +3995,7 @@ private:
               threads_(std::max(0, threads)),
               inputFormat_(h265RawInputFormatForColorProfile(inputFormat)),
               options_(std::move(options)),
-              queueMax_(std::max<size_t>(64, queueMax)) {}
+              queueMax_(std::max<size_t>(1, queueMax)) {}
 
         ~H265Encoder() {
             stop();
@@ -4204,7 +4246,7 @@ private:
               width_(width),
               height_(height),
               fps_(std::max(1, fps)),
-              queueMax_(std::max<size_t>(64, queueMax)) {}
+              queueMax_(std::max<size_t>(1, queueMax)) {}
 
         ~DepthFfv1Encoder() {
             stop();
@@ -5262,8 +5304,11 @@ private:
 
     void enqueueRecordTask(RecordTask &&task) {
         {
-            std::lock_guard<std::mutex> lock(recordMtx_);
-            if(recordStop_.load()) {
+            std::unique_lock<std::mutex> lock(recordMtx_);
+            recordCv_.wait(lock, [&]() {
+                return recordStop_.load() || stopping_.load() || recordQueue_.size() < recordQueueMax_;
+            });
+            if(recordStop_.load() || stopping_.load()) {
                 return;
             }
             recordQueue_.push_back(std::move(task));
@@ -5438,6 +5483,155 @@ private:
         }
     }
 
+    size_t configuredDepthAlignWorkerCount(const SessionState &session) const {
+        if(!session.saveDepthTimesteps) {
+            return 0;
+        }
+        if(cfg_.depthAlignWorkers > 0) {
+            return static_cast<size_t>(cfg_.depthAlignWorkers);
+        }
+        const size_t cams = std::max<size_t>(1, session.deviceSns.size());
+        return std::max<size_t>(1, std::min<size_t>(3, cams));
+    }
+
+    size_t configuredDepthAlignQueueCapacity(const SessionState &session) const {
+        if(cfg_.depthAlignQueueCapacity > 0) {
+            return static_cast<size_t>(cfg_.depthAlignQueueCapacity);
+        }
+        const size_t cams = std::max<size_t>(1, session.deviceSns.size());
+        int fps = cfg_.collectFps > 0 ? cfg_.collectFps : uiFpsFallback_;
+        if(fps <= 0) {
+            fps = 30;
+        }
+        return std::max<size_t>(16, cams * static_cast<size_t>(fps));
+    }
+
+    void startDepthAlignWorkers(const SessionState &session) {
+        stopDepthAlignWorkers();
+        const size_t workerN = configuredDepthAlignWorkerCount(session);
+        if(workerN == 0) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(depthAlignMtx_);
+            depthAlignStop_.store(false);
+            depthAlignQueue_.clear();
+            depthAlignQueueMax_ = configuredDepthAlignQueueCapacity(session);
+            queuedDepthAlignCount_.store(0);
+            depthAlignInFlight_.store(0);
+        }
+        depthAlignWorkers_.reserve(workerN);
+        for(size_t i = 0; i < workerN; ++i) {
+            depthAlignWorkers_.emplace_back([this]() { depthAlignWorkerLoop(); });
+        }
+        depthAlignActive_.store(true);
+        std::cerr << "[collection][depth_align] start workers=" << workerN
+                  << " queueCapacity=" << depthAlignQueueMax_ << std::endl;
+    }
+
+    void waitDepthAlignQueueIdle() {
+        std::unique_lock<std::mutex> lock(depthAlignMtx_);
+        depthAlignDrainCv_.wait(lock, [&]() {
+            return depthAlignQueue_.empty() && depthAlignInFlight_.load() == 0;
+        });
+    }
+
+    void stopDepthAlignWorkers() {
+        {
+            std::lock_guard<std::mutex> lock(depthAlignMtx_);
+            depthAlignStop_.store(true);
+            depthAlignCv_.notify_all();
+            depthAlignDrainCv_.notify_all();
+        }
+        for(auto &worker: depthAlignWorkers_) {
+            if(worker.joinable()) {
+                worker.join();
+            }
+        }
+        depthAlignWorkers_.clear();
+        {
+            std::lock_guard<std::mutex> lock(depthAlignMtx_);
+            depthAlignQueue_.clear();
+            queuedDepthAlignCount_.store(0);
+            depthAlignInFlight_.store(0);
+        }
+        depthAlignActive_.store(false);
+    }
+
+    void enqueueDepthAlignTask(DepthAlignTask &&task) {
+        if(task.frame.empty()) {
+            return;
+        }
+        {
+            std::unique_lock<std::mutex> lock(depthAlignMtx_);
+            depthAlignCv_.wait(lock, [&]() {
+                return depthAlignStop_.load() || depthAlignQueue_.size() < depthAlignQueueMax_;
+            });
+            if(depthAlignStop_.load()) {
+                return;
+            }
+            depthAlignQueue_.push_back(std::move(task));
+            queuedDepthAlignCount_.fetch_add(1);
+        }
+        depthAlignCv_.notify_one();
+    }
+
+    void processDepthAlignTask(DepthAlignTask &task, cv::Mat &aligned, cv::Mat &zBuf) {
+        cv::Mat output = task.frame;
+        if(task.rgbDepthParamValid && task.rgbW > 0 && task.rgbH > 0 && task.valueScale > 0.0f) {
+            alignDepthToRgbInto(task.frame, task.valueScale, task.rgbDepthParam, task.rgbW, task.rgbH, aligned, zBuf);
+            output = aligned;
+        }
+
+        if(task.useFfv1) {
+            cv::Mat frameForEncoder = output.clone();
+            if(enqueueDepthFfv1Frame(task.sn, task.frameIndex, task.tsUs, std::move(frameForEncoder))) {
+                return;
+            }
+            std::cerr << "[collection][depth_ffv1] warning: encoder unavailable, fallback PNG frame="
+                      << task.frameIndex << " cam=" << task.camKey << std::endl;
+        }
+
+        saveRawMatToPng(output, task.outPath, task.saveOptions.pngCompression);
+    }
+
+    void depthAlignWorkerLoop() {
+        cv::Mat aligned;
+        cv::Mat zBuf;
+        while(true) {
+            DepthAlignTask task;
+            {
+                std::unique_lock<std::mutex> lock(depthAlignMtx_);
+                depthAlignCv_.wait(lock, [&]() {
+                    return depthAlignStop_.load() || !depthAlignQueue_.empty();
+                });
+                if(depthAlignQueue_.empty() && depthAlignStop_.load()) {
+                    break;
+                }
+                if(depthAlignQueue_.empty()) {
+                    continue;
+                }
+                task = std::move(depthAlignQueue_.front());
+                depthAlignQueue_.pop_front();
+                queuedDepthAlignCount_.fetch_sub(1);
+                depthAlignInFlight_.fetch_add(1);
+                depthAlignCv_.notify_all();
+            }
+            try {
+                processDepthAlignTask(task, aligned, zBuf);
+            }
+            catch(...) {
+            }
+            depthAlignInFlight_.fetch_sub(1);
+            {
+                std::lock_guard<std::mutex> lock(depthAlignMtx_);
+                if(depthAlignQueue_.empty() && depthAlignInFlight_.load() == 0) {
+                    depthAlignDrainCv_.notify_all();
+                }
+            }
+        }
+    }
+
     int h265ThreadsForCamera(const std::string &sn, const std::string &camKey) const {
         auto it = cfg_.save.h265ThreadsByCamera.find(sn);
         if(it != cfg_.save.h265ThreadsByCamera.end()) {
@@ -5457,7 +5651,7 @@ private:
         }
 
         std::lock_guard<std::mutex> lock(h265Mtx_);
-        const size_t queueMax = std::max<size_t>(256, writeQueueMax_ / 2);
+        const size_t queueMax = static_cast<size_t>(std::max(1, cfg_.save.h265QueueCapacity));
         for(const auto &sn: session.deviceSns) {
             const auto itBuf = session.buffers.find(sn);
             if(itBuf == session.buffers.end()) {
@@ -5539,7 +5733,7 @@ private:
                 const std::string cameraKey = "fisheye_" + std::to_string(cameraIdx);
                 const fs::path outPath = session_.dest / "fisheye" / fisheyeCameraDirName(cameraIdx) / "RGB" / h265OutputFileName(cfg_.save);
                 const int fps = cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_);
-                const size_t queueMax = std::max<size_t>(256, writeQueueMax_ / 2);
+                const size_t queueMax = static_cast<size_t>(std::max(1, cfg_.save.h265QueueCapacity));
                 auto newEncoder = std::make_unique<H265Encoder>(
                     outPath,
                     frame.cols,
@@ -5567,7 +5761,7 @@ private:
         }
 
         std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
-        const size_t queueMax = std::max<size_t>(256, writeQueueMax_ / 2);
+        const size_t queueMax = static_cast<size_t>(std::max(1, cfg_.save.depthFfv1QueueCapacity));
         for(const auto &sn: session.deviceSns) {
             const auto itBuf = session.buffers.find(sn);
             if(itBuf == session.buffers.end()) {
@@ -5578,12 +5772,20 @@ private:
                || itParams->second.width <= 0 || itParams->second.height <= 0) {
                 continue;
             }
+            int outputW = itParams->second.width;
+            int outputH = itParams->second.height;
+            const auto itRgbParams = itBuf->second.params.find(CollectDataType::RGB);
+            if(itRgbParams != itBuf->second.params.end() && itRgbParams->second.valid
+               && itRgbParams->second.width > 0 && itRgbParams->second.height > 0) {
+                outputW = itRgbParams->second.width;
+                outputH = itRgbParams->second.height;
+            }
             const std::string &camKey = itBuf->second.camKey;
             const fs::path outPath = session.dest / camKey / dataTypeLabel(CollectDataType::Depth) / depthFfv1OutputFileName();
             auto encoder = std::make_unique<DepthFfv1Encoder>(
                 outPath,
-                itParams->second.width,
-                itParams->second.height,
+                outputW,
+                outputH,
                 itParams->second.fps > 0 ? itParams->second.fps : (cfg_.collectFps > 0 ? cfg_.collectFps : std::max(1, uiFpsFallback_)),
                 queueMax);
             encoder->start();
@@ -5627,6 +5829,8 @@ private:
         }
         coordinatorThread_ = std::thread([this]() {
             coordinatorLoop();
+            waitDepthAlignQueueIdle();
+            stopDepthAlignWorkers();
             stopH265Encoders();
             stopDepthFfv1Encoders();
         });
@@ -5638,10 +5842,17 @@ private:
         }
     }
 
+    size_t coordQueuedCountLocked() const {
+        return coordRecordQueue_.size() + coordFisheyeQueue_.size() + coordEgoQueue_.size();
+    }
+
     void enqueueProcessedRecord(ProcessedRecord &&item) {
         {
-            std::lock_guard<std::mutex> lock(coordMtx_);
-            if(!session_.active) {
+            std::unique_lock<std::mutex> lock(coordMtx_);
+            coordCv_.wait(lock, [&]() {
+                return !session_.active || stopping_.load() || coordQueuedCountLocked() < coordQueueMax_;
+            });
+            if(!session_.active || stopping_.load()) {
                 return;
             }
             coordRecordQueue_.push_back(std::move(item));
@@ -5651,8 +5862,11 @@ private:
 
     void enqueueFisheyeFrameSet(FisheyeFrameSet &&sample) {
         {
-            std::lock_guard<std::mutex> lock(coordMtx_);
-            if(!session_.active) {
+            std::unique_lock<std::mutex> lock(coordMtx_);
+            coordCv_.wait(lock, [&]() {
+                return !session_.active || stopping_.load() || coordQueuedCountLocked() < coordQueueMax_;
+            });
+            if(!session_.active || stopping_.load()) {
                 return;
             }
             coordFisheyeQueue_.push_back(std::move(sample));
@@ -5662,8 +5876,11 @@ private:
 
     void enqueueEgoFrame(EgoFrame &&sample) {
         {
-            std::lock_guard<std::mutex> lock(coordMtx_);
-            if(!session_.active) {
+            std::unique_lock<std::mutex> lock(coordMtx_);
+            coordCv_.wait(lock, [&]() {
+                return !session_.active || stopping_.load() || coordQueuedCountLocked() < coordQueueMax_;
+            });
+            if(!session_.active || stopping_.load()) {
                 return;
             }
             coordEgoQueue_.push_back(std::move(sample));
@@ -5969,7 +6186,7 @@ private:
         }
     }
 
-    bool tryFinalizeOneMultiviewSlotLocked() {
+    bool tryFinalizeOneMultiviewSlotLocked(std::vector<DepthAlignTask> &depthAlignTasks) {
         if(session_.refSn.empty()) {
             return false;
         }
@@ -6189,12 +6406,6 @@ private:
                     const auto rgbDepthParam = buf.rgbDepthParam;
                     const bool rgbDepthParamValid = buf.rgbDepthParamValid;
                     const float valueScale = packet.valueScale;
-                    auto makeDepthForReconstruction = [&rgbDepthParam, rgbDepthParamValid, rgbW, rgbH, valueScale](const cv::Mat &frame) {
-                        if(rgbDepthParamValid && rgbW > 0 && rgbH > 0 && valueScale > 0.0f) {
-                            return alignDepthToRgb(frame, valueScale, rgbDepthParam, rgbW, rgbH);
-                        }
-                        return frame;
-                    };
                     if(cfg_.save.saveRaw) {
                         const fs::path rawOutPath = session_.dest / buf.camKey / depthRawDirName() / (frameIndex + ".raw");
                         cv::Mat rawFrame = packet.frame;
@@ -6202,23 +6413,21 @@ private:
                             saveMatToRawFile(rawFrame, rawOutPath);
                         } });
                     }
-                    if(depthOutputIsFfv1Mkv(cfg_.save)) {
-                        cv::Mat frame = makeDepthForReconstruction(packet.frame);
-                        if(enqueueDepthFfv1Frame(sn, frameIndex, packet.tsUs, std::move(frame))) {
-                            continue;
-                        }
-                        std::cerr << "[collection][depth_ffv1] warning: encoder unavailable, fallback PNG frame="
-                                  << frameIndex << " cam=" << buf.camKey << std::endl;
-                    }
-                    const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png");
-                    cv::Mat frame = packet.frame;
-                    const SaveOptions saveOptions = cfg_.save;
-                    enqueueWriteTask(WriteTask{ [frame = std::move(frame), outPath, saveOptions, rgbW, rgbH, rgbDepthParam, rgbDepthParamValid, valueScale]() mutable {
-                        if(rgbDepthParamValid && rgbW > 0 && rgbH > 0 && valueScale > 0.0f) {
-                            frame = alignDepthToRgb(frame, valueScale, rgbDepthParam, rgbW, rgbH);
-                        }
-                        saveRawMatToPng(frame, outPath, saveOptions.pngCompression);
-                    } });
+                    depthAlignTasks.push_back(DepthAlignTask{
+                        sn,
+                        buf.camKey,
+                        frameIndex,
+                        packet.tsUs,
+                        packet.frame,
+                        session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png"),
+                        cfg_.save,
+                        rgbDepthParam,
+                        rgbDepthParamValid,
+                        rgbW,
+                        rgbH,
+                        valueScale,
+                        depthOutputIsFfv1Mkv(cfg_.save)
+                    });
                 }
                 else {
                     const fs::path outPath = session_.dest / buf.camKey / dataTypeLabel(t) / (frameIndex + ".png");
@@ -6731,9 +6940,10 @@ private:
             bool progress = true;
             while(progress) {
                 progress = false;
+                std::vector<DepthAlignTask> deferredDepthAlignTasks;
                 progress = flushEosSequenceGapsLocked() || progress;
                 if(multiviewEnabled_) {
-                    progress = tryFinalizeOneMultiviewSlotLocked() || progress;
+                    progress = tryFinalizeOneMultiviewSlotLocked(deferredDepthAlignTasks) || progress;
                 }
                 else if(session_.saveEgo) {
                     progress = tryFinalizeEgoOnlySlotLocked() || progress;
@@ -6742,7 +6952,16 @@ private:
                     progress = tryFinalizeFisheyeOnlySlotLocked() || progress;
                 }
                 progress = tryCompleteSessionLocked() || progress;
-                if(session_.coordinatorDone) {
+                const bool coordinatorDone = session_.coordinatorDone;
+                if(!deferredDepthAlignTasks.empty()) {
+                    lock.unlock();
+                    for(auto &task: deferredDepthAlignTasks) {
+                        enqueueDepthAlignTask(std::move(task));
+                    }
+                    deferredDepthAlignTasks.clear();
+                    lock.lock();
+                }
+                if(coordinatorDone || session_.coordinatorDone) {
                     return;
                 }
             }
@@ -7154,6 +7373,17 @@ private:
     std::atomic_bool writeStop_{ false };
     std::atomic<size_t> queuedWriteCount_{ 0 };
     std::atomic<int>    writeInFlight_{ 0 };
+
+    std::mutex depthAlignMtx_;
+    std::condition_variable depthAlignCv_;
+    std::condition_variable depthAlignDrainCv_;
+    std::deque<DepthAlignTask> depthAlignQueue_;
+    size_t depthAlignQueueMax_ = 90;
+    std::vector<std::thread> depthAlignWorkers_;
+    std::atomic_bool depthAlignStop_{ false };
+    std::atomic_bool depthAlignActive_{ false };
+    std::atomic<size_t> queuedDepthAlignCount_{ 0 };
+    std::atomic<int> depthAlignInFlight_{ 0 };
 
     std::mutex h265Mtx_;
     std::unordered_map<std::string, std::unique_ptr<H265Encoder>> h265Encoders_;

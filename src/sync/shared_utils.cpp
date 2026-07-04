@@ -342,6 +342,21 @@ AppConfig loadConfig(const fs::path &configPath) {
     if(auto v = getInt(root, "writerThreads")) {
         cfg.writerThreads = *v;
     }
+    if(auto v = getInt(root, "recordQueueCapacity")) {
+        cfg.recordQueueCapacity = std::max(0, *v);
+    }
+    if(auto v = getInt(root, "coordQueueCapacity")) {
+        cfg.coordQueueCapacity = std::max(0, *v);
+    }
+    if(auto v = getInt(root, "writeQueueCapacity")) {
+        cfg.writeQueueCapacity = std::max(0, *v);
+    }
+    if(auto v = getInt(root, "depthAlignWorkers")) {
+        cfg.depthAlignWorkers = std::max(0, *v);
+    }
+    if(auto v = getInt(root, "depthAlignQueueCapacity")) {
+        cfg.depthAlignQueueCapacity = std::max(0, *v);
+    }
     if(auto v = getDouble(root, "cameraStreamTimeoutSec")) {
         if(*v > 0.0) {
             cfg.cameraStreamTimeoutSec = *v;
@@ -462,6 +477,12 @@ AppConfig loadConfig(const fs::path &configPath) {
             }
             if(auto v = getInt(saveObj, "h265Threads")) {
                 cfg.save.h265Threads = std::max(0, *v);
+            }
+            if(auto v = getInt(saveObj, "h265QueueCapacity")) {
+                cfg.save.h265QueueCapacity = std::max(1, *v);
+            }
+            if(auto v = getInt(saveObj, "depthFfv1QueueCapacity")) {
+                cfg.save.depthFfv1QueueCapacity = std::max(1, *v);
             }
             if(auto *threadsObj = cJSON_GetObjectItemCaseSensitive(saveObj, "h265ThreadsByCamera")) {
                 if(cJSON_IsObject(threadsObj)) {

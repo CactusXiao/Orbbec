@@ -81,6 +81,8 @@ struct SaveOptions {
     std::string h265Preset     = "medium";
     int         h265Crf        = 23;
     int         h265Threads    = 0;
+    int         h265QueueCapacity = 90;
+    int         depthFfv1QueueCapacity = 90;
     std::unordered_map<std::string, int> h265ThreadsByCamera;
 };
 
@@ -134,6 +136,11 @@ struct AppConfig {
     bool                      enableSync     = true;
     int                       queueCapacity  = 512;
     int                       writerThreads  = 0;
+    int                       recordQueueCapacity = 0;
+    int                       coordQueueCapacity = 0;
+    int                       writeQueueCapacity = 0;
+    int                       depthAlignWorkers = 0;
+    int                       depthAlignQueueCapacity = 0;
     double                    cameraStreamTimeoutSec = 2.0;
     float                     colorExposureMs = 0.0f;
     int                       colorBrightness = -1;
