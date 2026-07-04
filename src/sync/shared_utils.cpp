@@ -345,6 +345,105 @@ AppConfig loadConfig(const fs::path &configPath) {
         }
     }
 
+    cfg.extrinsicHealth.scriptPath = (configBase / "extrinsic_health_check.py").lexically_normal();
+    if(auto *healthObj = cJSON_GetObjectItemCaseSensitive(root, "extrinsicHealthCheck")) {
+        if(cJSON_IsObject(healthObj)) {
+            if(auto v = getBool(healthObj, "enabled")) {
+                cfg.extrinsicHealth.enabled = *v;
+            }
+            if(auto v = getString(healthObj, "pythonExecutable")) {
+                cfg.extrinsicHealth.pythonExecutable = trimString(*v);
+            }
+            else if(auto v = getString(healthObj, "python")) {
+                cfg.extrinsicHealth.pythonExecutable = trimString(*v);
+            }
+            if(cfg.extrinsicHealth.pythonExecutable.empty()) {
+                cfg.extrinsicHealth.pythonExecutable = "python3";
+            }
+            if(auto v = getString(healthObj, "scriptPath")) {
+                cfg.extrinsicHealth.scriptPath = resolveConfigRelativePath(*v);
+            }
+            else if(auto v = getString(healthObj, "script")) {
+                cfg.extrinsicHealth.scriptPath = resolveConfigRelativePath(*v);
+            }
+            if(auto v = getString(healthObj, "tagFamily")) {
+                cfg.extrinsicHealth.tagFamily = trimString(*v);
+            }
+            if(auto v = getDouble(healthObj, "tagSizeM")) {
+                cfg.extrinsicHealth.tagSizeM = std::max(0.001, *v);
+            }
+            if(auto v = getInt(healthObj, "sampleCount")) {
+                cfg.extrinsicHealth.sampleCount = std::max(1, std::min(30, *v));
+            }
+            if(auto v = getInt(healthObj, "sampleIntervalMs")) {
+                cfg.extrinsicHealth.sampleIntervalMs = std::max(0, std::min(5000, *v));
+            }
+            if(auto v = getInt(healthObj, "maxSnapshotAgeMs")) {
+                cfg.extrinsicHealth.maxSnapshotAgeMs = std::max(100, *v);
+            }
+            if(auto v = getInt(healthObj, "jpegQuality")) {
+                cfg.extrinsicHealth.jpegQuality = std::max(1, std::min(100, *v));
+            }
+            if(auto v = getBool(healthObj, "keepDebugSnapshots")) {
+                cfg.extrinsicHealth.keepDebugSnapshots = *v;
+            }
+            if(auto v = getBool(healthObj, "blockOnInconclusive")) {
+                cfg.extrinsicHealth.blockOnInconclusive = *v;
+            }
+            if(auto v = getBool(healthObj, "blockOnWarn")) {
+                cfg.extrinsicHealth.blockOnWarn = *v;
+            }
+            if(auto v = getBool(healthObj, "requireAllCameras")) {
+                cfg.extrinsicHealth.requireAllCameras = *v;
+            }
+            if(auto v = getInt(healthObj, "minSharedCamerasPerTag")) {
+                cfg.extrinsicHealth.minSharedCamerasPerTag = std::max(2, *v);
+            }
+            if(auto v = getInt(healthObj, "minTagInlierObservations")) {
+                cfg.extrinsicHealth.minTagInlierObservations = std::max(2, *v);
+            }
+            if(auto v = getInt(healthObj, "minCheckedCameras")) {
+                cfg.extrinsicHealth.minCheckedCameras = std::max(2, *v);
+            }
+            if(auto v = getInt(healthObj, "minTagsPerCamera")) {
+                cfg.extrinsicHealth.minTagsPerCamera = std::max(1, *v);
+            }
+            if(auto v = getInt(healthObj, "minPassingSnapshots")) {
+                cfg.extrinsicHealth.minPassingSnapshots = std::max(1, *v);
+            }
+            if(auto v = getInt(healthObj, "minFailingSnapshots")) {
+                cfg.extrinsicHealth.minFailingSnapshots = std::max(1, *v);
+            }
+            if(auto v = getDouble(healthObj, "singleTagReprojLimitPx")) {
+                cfg.extrinsicHealth.singleTagReprojLimitPx = std::max(0.1, *v);
+            }
+            if(auto v = getDouble(healthObj, "fusionTransThreshM")) {
+                cfg.extrinsicHealth.fusionTransThreshM = std::max(0.001, *v);
+            }
+            if(auto v = getDouble(healthObj, "fusionRotThreshDeg")) {
+                cfg.extrinsicHealth.fusionRotThreshDeg = std::max(0.1, *v);
+            }
+            if(auto v = getDouble(healthObj, "warnTransThreshM")) {
+                cfg.extrinsicHealth.warnTransThreshM = std::max(0.0, *v);
+            }
+            if(auto v = getDouble(healthObj, "warnRotThreshDeg")) {
+                cfg.extrinsicHealth.warnRotThreshDeg = std::max(0.0, *v);
+            }
+            if(auto v = getDouble(healthObj, "warnReprojThreshPx")) {
+                cfg.extrinsicHealth.warnReprojThreshPx = std::max(0.0, *v);
+            }
+            if(auto v = getDouble(healthObj, "failTransThreshM")) {
+                cfg.extrinsicHealth.failTransThreshM = std::max(0.0, *v);
+            }
+            if(auto v = getDouble(healthObj, "failRotThreshDeg")) {
+                cfg.extrinsicHealth.failRotThreshDeg = std::max(0.0, *v);
+            }
+            if(auto v = getDouble(healthObj, "failReprojThreshPx")) {
+                cfg.extrinsicHealth.failReprojThreshPx = std::max(0.0, *v);
+            }
+        }
+    }
+
     if(auto v = getBool(root, "enableSync")) {
         cfg.enableSync = *v;
     }

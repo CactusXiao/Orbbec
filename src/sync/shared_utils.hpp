@@ -97,6 +97,37 @@ struct CalibrationConfig {
     int              samplesPerPair = 20;
 };
 
+struct ExtrinsicHealthConfig {
+    bool enabled = false;
+    std::string pythonExecutable = "python3";
+    fs::path scriptPath;
+    std::string tagFamily = "tag36h11";
+    double tagSizeM = 0.096;
+    int sampleCount = 5;
+    int sampleIntervalMs = 200;
+    int maxSnapshotAgeMs = 1000;
+    int jpegQuality = 90;
+    bool keepDebugSnapshots = false;
+    bool blockOnInconclusive = true;
+    bool blockOnWarn = false;
+    bool requireAllCameras = true;
+    int minSharedCamerasPerTag = 2;
+    int minTagInlierObservations = 2;
+    int minCheckedCameras = 3;
+    int minTagsPerCamera = 2;
+    int minPassingSnapshots = 3;
+    int minFailingSnapshots = 2;
+    double singleTagReprojLimitPx = 4.0;
+    double fusionTransThreshM = 0.08;
+    double fusionRotThreshDeg = 8.0;
+    double warnTransThreshM = 0.015;
+    double warnRotThreshDeg = 1.0;
+    double warnReprojThreshPx = 5.0;
+    double failTransThreshM = 0.025;
+    double failRotThreshDeg = 2.0;
+    double failReprojThreshPx = 8.0;
+};
+
 struct DepthPointCloudFiltersConfig {
     std::string preset;
     int         pointCloudDecimationFactor = 0;
@@ -134,6 +165,7 @@ struct AppConfig {
     bool                      differentColor = false;
     bool                      colorfulCloudPoints = false;
     CalibrationConfig         calibration;
+    ExtrinsicHealthConfig     extrinsicHealth;
     bool                      enableSync     = true;
     int                       queueCapacity  = 512;
     int                       writerThreads  = 0;

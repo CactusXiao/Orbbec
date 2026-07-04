@@ -71,6 +71,7 @@ endif()
 
 install(FILES
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/config.json
+    ${CMAKE_CURRENT_LIST_DIR}/src/sync/extrinsic_health_check.py
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/hand_joint_gt_worker.py
     DESTINATION bin
 )

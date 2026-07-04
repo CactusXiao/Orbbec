@@ -16,9 +16,13 @@
 #include <memory>
 #include <unordered_set>
 
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
 #if defined(__linux__)
 #include <execinfo.h>
-#include <unistd.h>
 #endif
 
 #if defined(__has_include)
@@ -842,6 +846,7 @@ struct DeviceBuffer {
 
     cv::Mat   latestRgb;
     uint64_t  latestRgbTsUs = 0;
+    std::chrono::steady_clock::time_point latestRgbSteady{};
 
     OBCameraParam rgbDepthParam{};
     bool          rgbDepthParamValid = false;
@@ -1126,6 +1131,53 @@ static std::string shellQuote(const std::string &s) {
     }
     out += "'";
     return out;
+}
+
+static int runCommandCapture(const std::string &command, std::string &output) {
+    output.clear();
+    FILE *pipe = popen(command.c_str(), "r");
+    if(!pipe) {
+        return -1;
+    }
+    char buf[512];
+    while(true) {
+        const size_t n = fread(buf, 1, sizeof(buf), pipe);
+        if(n > 0) {
+            output.append(buf, n);
+        }
+        if(n < sizeof(buf)) {
+            break;
+        }
+    }
+    const int status = pclose(pipe);
+#if defined(__unix__) || defined(__APPLE__)
+    if(status == -1) {
+        return -1;
+    }
+    if(WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+#endif
+    return status == 0 ? 0 : -1;
+}
+
+static std::string sanitizePathComponent(std::string value) {
+    value = trimString(std::move(value));
+    if(value.empty()) {
+        return "item";
+    }
+    std::string out;
+    out.reserve(value.size());
+    for(char ch: value) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if(std::isalnum(c) || ch == '-' || ch == '_' || ch == '.') {
+            out.push_back(ch);
+        }
+        else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? "item" : out;
 }
 
 static void replaceAllInPlace(std::string &s, const std::string &needle, const std::string &replacement) {
@@ -2701,6 +2753,7 @@ public:
             for(auto &kv: buffers_) {
                 kv.second.latestRgb.release();
                 kv.second.latestRgbTsUs = 0;
+                kv.second.latestRgbSteady = {};
                 kv.second.accelSamples.clear();
                 kv.second.gyroSamples.clear();
             }
@@ -2969,6 +3022,191 @@ public:
             captureInfoLine_ = faultToLog->message;
         }
         return faultToLog;
+    }
+
+    bool runExtrinsicHealthCheckBeforeStart(const fs::path &saveRoot,
+                                            const std::string &subjectId,
+                                            const std::string &taskName,
+                                            int episodeN,
+                                            std::string *statusLine = nullptr) {
+        const auto &health = cfg_.extrinsicHealth;
+        if(!health.enabled) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check disabled";
+            }
+            return true;
+        }
+        if(!multiviewEnabled_) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check skipped: multiview disabled";
+            }
+            return true;
+        }
+        if(!capturing_.load()) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check failed: cameras are not running";
+            }
+            return false;
+        }
+        if(cfg_.initExtrinsicPath.empty()) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check failed: init_extrinsic_path is empty";
+            }
+            return false;
+        }
+        if(health.scriptPath.empty() || !fs::exists(health.scriptPath)) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check failed: script not found at " + health.scriptPath.string();
+            }
+            return false;
+        }
+
+        const auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
+        const auto nowMs = now.time_since_epoch().count();
+        const fs::path debugRoot = saveRoot / subjectId / ".extrinsic_health";
+        const fs::path checkDir = debugRoot / (sanitizePathComponent(taskName)
+                                                + "_episode_" + std::to_string(episodeN)
+                                                + "_" + std::to_string(nowMs));
+        try {
+            fs::create_directories(checkDir);
+        }
+        catch(const std::exception &ex) {
+            if(statusLine) {
+                *statusLine = "Extrinsic check failed: cannot create debug directory: " + std::string(ex.what());
+            }
+            return false;
+        }
+
+        std::unordered_map<std::string, DeviceBuffer> paramsBuffers;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            for(const auto &kv: buffers_) {
+                const auto itRgb = kv.second.params.find(CollectDataType::RGB);
+                if(itRgb == kv.second.params.end() || !itRgb->second.valid) {
+                    continue;
+                }
+                DeviceBuffer buf;
+                buf.camKey = kv.second.camKey;
+                buf.params[CollectDataType::RGB] = itRgb->second;
+                paramsBuffers.emplace(kv.first, std::move(buf));
+            }
+        }
+        if(paramsBuffers.size() < static_cast<size_t>(std::max(2, health.minCheckedCameras))) {
+            if(!health.keepDebugSnapshots) {
+                try { fs::remove_all(checkDir); } catch(...) {}
+            }
+            if(statusLine) {
+                *statusLine = "Extrinsic check inconclusive: not enough RGB camera parameters";
+            }
+            return !health.blockOnInconclusive;
+        }
+        writeParamsJson(checkDir, paramsBuffers, { CollectDataType::RGB }, cfg_.colorCloudRgbFrameOffset, cfg_.save);
+        writeExtrinsicsJson(checkDir);
+        writeExtrinsicHealthConfigJson(checkDir / "health_config.json");
+
+        cJSON *manifest = cJSON_CreateObject();
+        cJSON_AddStringToObject(manifest, "camera_params_json", "camera_params.json");
+        cJSON_AddStringToObject(manifest, "extrinsics_json", "extrinsics.json");
+        cJSON *samples = cJSON_CreateArray();
+        const int sampleCount = std::max(1, health.sampleCount);
+        for(int sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx) {
+            if(sampleIdx > 0 && health.sampleIntervalMs > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(health.sampleIntervalMs));
+            }
+            auto frames = latestExtrinsicHealthFrames();
+            const std::string sampleName = "sample_" + formatFrameIndex(static_cast<size_t>(sampleIdx));
+            const fs::path sampleDir = checkDir / sampleName;
+            try {
+                fs::create_directories(sampleDir);
+            }
+            catch(...) {
+            }
+
+            cJSON *sampleObj = cJSON_CreateObject();
+            cJSON_AddNumberToObject(sampleObj, "index", sampleIdx);
+            cJSON *cameras = cJSON_CreateArray();
+            for(const auto &frame: frames) {
+                if(frame.bgr.empty() || frame.ageMs > static_cast<double>(health.maxSnapshotAgeMs)) {
+                    continue;
+                }
+                const std::string fileName = frame.camKey + ".jpg";
+                const fs::path outPath = sampleDir / fileName;
+                std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, std::max(1, std::min(100, health.jpegQuality)) };
+                if(!cv::imwrite(outPath.string(), frame.bgr, params)) {
+                    continue;
+                }
+                cJSON *camObj = cJSON_CreateObject();
+                cJSON_AddStringToObject(camObj, "id", frame.camKey.c_str());
+                cJSON_AddStringToObject(camObj, "sn", frame.sn.c_str());
+                cJSON_AddStringToObject(camObj, "image", (sampleName + "/" + fileName).c_str());
+                cJSON_AddNumberToObject(camObj, "timestamp_us", static_cast<double>(frame.tsUs));
+                cJSON_AddNumberToObject(camObj, "age_ms", frame.ageMs);
+                cJSON_AddItemToArray(cameras, camObj);
+            }
+            cJSON_AddItemToObject(sampleObj, "cameras", cameras);
+            cJSON_AddItemToArray(samples, sampleObj);
+        }
+        cJSON_AddItemToObject(manifest, "samples", samples);
+        char *manifestText = cJSON_Print(manifest);
+        if(manifestText) {
+            writeTextFile(checkDir / "manifest.json", manifestText);
+            cJSON_free(manifestText);
+        }
+        cJSON_Delete(manifest);
+
+        const fs::path resultJson = checkDir / "result.json";
+        const std::string command = shellQuote(health.pythonExecutable)
+                                  + " " + shellQuote(health.scriptPath.string())
+                                  + " --snapshot-dir " + shellQuote(checkDir.string())
+                                  + " --config-json " + shellQuote((checkDir / "health_config.json").string())
+                                  + " --result-json " + shellQuote(resultJson.string())
+                                  + " 2>&1";
+        std::string output;
+        const int exitCode = runCommandCapture(command, output);
+        std::string resultStatus;
+        std::string resultSummary;
+        readExtrinsicHealthResult(resultJson, resultStatus, resultSummary);
+        if(resultSummary.empty()) {
+            resultSummary = trimString(output);
+        }
+        if(resultSummary.empty()) {
+            resultSummary = "exit_code=" + std::to_string(exitCode);
+        }
+
+        bool ok = false;
+        if(resultStatus == "pass") {
+            ok = true;
+        }
+        else if(resultStatus == "warn") {
+            ok = !health.blockOnWarn;
+        }
+        else if(resultStatus == "inconclusive") {
+            ok = !health.blockOnInconclusive;
+        }
+        else {
+            ok = false;
+        }
+
+        if(statusLine) {
+            *statusLine = "Extrinsic check " + resultSummary;
+            if(health.keepDebugSnapshots || !ok) {
+                *statusLine += " debug=" + checkDir.string();
+            }
+        }
+        std::cerr << "[collection][extrinsic_check] status=" << (resultStatus.empty() ? "(missing)" : resultStatus)
+                  << " ok=" << (ok ? 1 : 0)
+                  << " exit=" << exitCode
+                  << " dir=" << checkDir
+                  << " summary=" << resultSummary << std::endl;
+
+        if(ok && !health.keepDebugSnapshots) {
+            try {
+                fs::remove_all(checkDir);
+            }
+            catch(...) {
+            }
+        }
+        return ok;
     }
 
     void clearCameraStreamFault() {
@@ -3926,6 +4164,14 @@ private:
         DetachedVideoFrame detached;
     };
 
+    struct ExtrinsicHealthFrame {
+        std::string sn;
+        std::string camKey;
+        cv::Mat bgr;
+        uint64_t tsUs = 0;
+        double ageMs = 0.0;
+    };
+
     struct ProcessedRecord {
         std::string sn;
         CollectDataType type = CollectDataType::RGB;
@@ -3956,6 +4202,88 @@ private:
     struct WriteTask {
         std::function<void()> fn;
     };
+
+    std::vector<ExtrinsicHealthFrame> latestExtrinsicHealthFrames() {
+        std::vector<ExtrinsicHealthFrame> out;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(mtx_);
+        out.reserve(buffers_.size());
+        for(const auto &kv: buffers_) {
+            const auto &buf = kv.second;
+            if(buf.latestRgb.empty() || buf.latestRgbSteady.time_since_epoch().count() == 0) {
+                continue;
+            }
+            if(buf.params.find(CollectDataType::RGB) == buf.params.end()) {
+                continue;
+            }
+            ExtrinsicHealthFrame frame;
+            frame.sn = kv.first;
+            frame.camKey = buf.camKey;
+            frame.bgr = buf.latestRgb.clone();
+            frame.tsUs = buf.latestRgbTsUs;
+            frame.ageMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - buf.latestRgbSteady).count();
+            out.push_back(std::move(frame));
+        }
+        std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
+            return a.camKey < b.camKey;
+        });
+        return out;
+    }
+
+    void writeExtrinsicHealthConfigJson(const fs::path &path) const {
+        const auto &h = cfg_.extrinsicHealth;
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "tagFamily", h.tagFamily.c_str());
+        cJSON_AddNumberToObject(root, "tagSizeM", h.tagSizeM);
+        cJSON_AddBoolToObject(root, "requireAllCameras", h.requireAllCameras);
+        cJSON_AddNumberToObject(root, "minSharedCamerasPerTag", h.minSharedCamerasPerTag);
+        cJSON_AddNumberToObject(root, "minTagInlierObservations", h.minTagInlierObservations);
+        cJSON_AddNumberToObject(root, "minCheckedCameras", h.minCheckedCameras);
+        cJSON_AddNumberToObject(root, "minTagsPerCamera", h.minTagsPerCamera);
+        cJSON_AddNumberToObject(root, "minPassingSnapshots", std::min(std::max(1, h.minPassingSnapshots), std::max(1, h.sampleCount)));
+        cJSON_AddNumberToObject(root, "minFailingSnapshots", std::min(std::max(1, h.minFailingSnapshots), std::max(1, h.sampleCount)));
+        cJSON_AddNumberToObject(root, "singleTagReprojLimitPx", h.singleTagReprojLimitPx);
+        cJSON_AddNumberToObject(root, "fusionTransThreshM", h.fusionTransThreshM);
+        cJSON_AddNumberToObject(root, "fusionRotThreshDeg", h.fusionRotThreshDeg);
+        cJSON_AddNumberToObject(root, "warnTransThreshM", h.warnTransThreshM);
+        cJSON_AddNumberToObject(root, "warnRotThreshDeg", h.warnRotThreshDeg);
+        cJSON_AddNumberToObject(root, "warnReprojThreshPx", h.warnReprojThreshPx);
+        cJSON_AddNumberToObject(root, "failTransThreshM", h.failTransThreshM);
+        cJSON_AddNumberToObject(root, "failRotThreshDeg", h.failRotThreshDeg);
+        cJSON_AddNumberToObject(root, "failReprojThreshPx", h.failReprojThreshPx);
+        char *printed = cJSON_Print(root);
+        if(printed) {
+            writeTextFile(path, printed);
+            cJSON_free(printed);
+        }
+        cJSON_Delete(root);
+    }
+
+    static bool readExtrinsicHealthResult(const fs::path &path, std::string &status, std::string &summary) {
+        status.clear();
+        summary.clear();
+        std::string content;
+        if(!readTextFile(path, content)) {
+            return false;
+        }
+        cJSON *root = cJSON_Parse(content.c_str());
+        if(!root || !cJSON_IsObject(root)) {
+            if(root) {
+                cJSON_Delete(root);
+            }
+            return false;
+        }
+        cJSON *statusObj = cJSON_GetObjectItemCaseSensitive(root, "status");
+        if(statusObj && cJSON_IsString(statusObj) && statusObj->valuestring) {
+            status = statusObj->valuestring;
+        }
+        cJSON *summaryObj = cJSON_GetObjectItemCaseSensitive(root, "summary_line");
+        if(summaryObj && cJSON_IsString(summaryObj) && summaryObj->valuestring) {
+            summary = summaryObj->valuestring;
+        }
+        cJSON_Delete(root);
+        return !status.empty();
+    }
 
     struct H265FrameItem {
         cv::Mat frame;
@@ -7078,6 +7406,7 @@ private:
                         if(it != buffers_.end()) {
                             it->second.latestRgb = std::move(previewBgr);
                             it->second.latestRgbTsUs = ts;
+                            it->second.latestRgbSteady = std::chrono::steady_clock::now();
                         }
                     }
                 }
@@ -7748,6 +8077,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     std::optional<MultiDeviceStreamingRecorder::CameraStreamFault> activeCameraFault;
     bool cameraFaultDrainCompleteLogged = false;
     bool cameraReadyAnnounced = false;
+    bool extrinsicReadyChecked = false;
+    bool extrinsicReadyPassed = false;
+    std::string extrinsicReadyMessage;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
     if(cfg.colorExposureMs > 0.0f) {
@@ -7777,6 +8109,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
     auto resetCameraReadyAnnouncement = [&]() {
         cameraReadyAnnounced = false;
+        extrinsicReadyChecked = false;
+        extrinsicReadyPassed = false;
+        extrinsicReadyMessage.clear();
     };
 
     auto updateReadyState = [&]() {
@@ -8087,8 +8422,30 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const bool cameraFaultActive = activeCameraFault.has_value();
             const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
             const auto cameraReadiness = recorder.cameraStreamReadiness();
+            if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
+               && capUi.currentTaskIdx != -1 && !extrinsicReadyChecked) {
+                collectionSetStage("ui_extrinsic_ready_check");
+                capUi.msg = "Checking camera extrinsics...";
+                pushUiLog("Checking camera extrinsics before READY...");
+
+                const fs::path root = fs::path(trimString(cfgUi.saveRoot));
+                const std::string subject = trimString(cfgUi.subjectId);
+                const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
+                const int episodeN = capUi.currentEpisode;
+                std::string checkLine;
+                extrinsicReadyPassed = recorder.runExtrinsicHealthCheckBeforeStart(root, subject, taskName, episodeN, &checkLine);
+                extrinsicReadyChecked = true;
+                extrinsicReadyMessage = checkLine;
+                if(!checkLine.empty()) {
+                    pushUiLog(checkLine);
+                }
+                capUi.msg = extrinsicReadyPassed ? "Extrinsic check passed. Ready to start."
+                                                 : "Extrinsic check failed. Fix cameras or restart.";
+            }
+            const bool readyForStart = cameraReadiness.allReady
+                                    && (capUi.currentTaskIdx == -1 || (extrinsicReadyChecked && extrinsicReadyPassed));
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady) {
-                if(!cameraReadyAnnounced) {
+                if(readyForStart && !cameraReadyAnnounced) {
                     announce("ready", "ready");
                     cameraReadyAnnounced = true;
                 }
@@ -8197,14 +8554,26 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             std::string stateFootnoteLine;
             switch(captureState) {
             case CaptureState::IDLE:
-                if(cameraReadiness.allReady) {
+                if(readyForStart) {
                     sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
-                    stateEmphasisLine = cameraReadiness.message;
+                    stateEmphasisLine = extrinsicReadyMessage.empty() ? cameraReadiness.message : extrinsicReadyMessage;
+                }
+                else if(cameraReadiness.allReady) {
+                    if(extrinsicReadyChecked && !extrinsicReadyPassed) {
+                        sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
+                        stateEmphasisLine = extrinsicReadyMessage.empty() ? "Extrinsic check failed" : extrinsicReadyMessage;
+                        stateFootnoteLine = "Fix AprilTags/cameras, then re-enter capture or restart cameras to retry";
+                    }
+                    else {
+                        sd = {"CHECKING", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                        stateEmphasisLine = "Checking camera extrinsics...";
+                        stateFootnoteLine = "Start is enabled after the extrinsic check passes";
+                    }
                 }
                 else {
                     sd = {"WARMING UP", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
                     stateEmphasisLine = cameraReadiness.message;
-                    stateFootnoteLine = "Start is enabled after every active Orbbec RGB/Depth, fisheye RGB, and ego stream is ready";
+                    stateFootnoteLine = "Start is enabled after streams are ready and extrinsic check passes";
                 }
                 break;
             case CaptureState::RECORDING:
@@ -8337,7 +8706,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const bool modalFault = cameraFaultActive;
             const bool modalDelete = !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
             const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE)
-                                     && (capUi.currentTaskIdx != -1) && cameraReadiness.allReady;
+                                     && (capUi.currentTaskIdx != -1) && readyForStart;
             const bool allowStop   = !modalFault && !modalDelete && (captureState == CaptureState::RECORDING);
             const bool allowSave   = !modalFault && !modalDelete && (captureState == CaptureState::STOPPED_READY) && recorder.hasData();
             const bool allowReset  = !modalFault && !modalDelete
@@ -8356,10 +8725,18 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect bMenu (btnX, winH - 38,  btnW / 2 - 5, 30);
             cv::Rect bConfig(btnX + btnW / 2 + 5, winH - 38, btnW / 2 - 5, 30);
 
-            const std::string startLabel = (!allowStart && captureState == CaptureState::IDLE
-                                            && capUi.currentTaskIdx != -1 && !cameraReadiness.allReady)
-                                         ? "Start (warming up)"
-                                         : "Start  [Ctrl+1]";
+            std::string startLabel = "Start  [Ctrl+1]";
+            if(!allowStart && captureState == CaptureState::IDLE && capUi.currentTaskIdx != -1) {
+                if(!cameraReadiness.allReady) {
+                    startLabel = "Start (warming up)";
+                }
+                else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
+                    startLabel = "Start (check failed)";
+                }
+                else {
+                    startLabel = "Start (checking)";
+                }
+            }
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
             bool doSave     = uiButtonEx(ui, bSave,  "Confirm [Ctrl+3]", fm, allowSave);
@@ -8582,6 +8959,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 collectionSetStage("ui_capture_back_config");
                 announce("config", "config");
                 recorder.stopIfRunning(false);
+                resetCameraReadyAnnouncement();
                 page = CollectionPage::Config;
             }
             if(doStart) {
@@ -8591,7 +8969,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 const int episodeN = capUi.currentEpisode;
-                const bool ok = recorder.start(cfgUi) && recorder.beginRecord(root, subject, taskName, episodeN);
+                bool ok = recorder.start(cfgUi);
+                if(ok) {
+                    ok = recorder.beginRecord(root, subject, taskName, episodeN);
+                }
                 if(!ok) {
                     capUi.msg = "Failed to start capture";
                     pushUiLog("Start failed");
@@ -8698,6 +9079,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     recorder.clearStatus();
                     captureState = CaptureState::IDLE;
                     pendingResetAfterDrain = false;
+                    resetCameraReadyAnnouncement();
                 }
                 else {
                     capUi.msg = "Confirm failed: session not ready";
@@ -8712,6 +9094,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     recorder.clearStatus();
                     captureState = CaptureState::IDLE;
                     pendingResetAfterDrain = false;
+                    resetCameraReadyAnnouncement();
                     capUi.msg = "Capture discarded";
                     pushUiLog("Reset OK. Current episode discarded.");
                     announce("reset_confirm", "reset confirmed");

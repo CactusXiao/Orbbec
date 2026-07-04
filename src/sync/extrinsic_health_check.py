@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+try:
+    import cv2
+except Exception as exc:  # pragma: no cover - runtime dependency check
+    cv2 = None
+    CV2_IMPORT_ERROR = exc
+else:
+    CV2_IMPORT_ERROR = None
+
+
+APRILTAG_DICT_NAMES = {
+    "tag16h5": "DICT_APRILTAG_16h5",
+    "tag25h9": "DICT_APRILTAG_25h9",
+    "tag36h10": "DICT_APRILTAG_36h10",
+    "tag36h11": "DICT_APRILTAG_36h11",
+}
+
+
+def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    out[:3, 3] = np.asarray(translation, dtype=np.float64).reshape(3)
+    return out
+
+
+def invert_transform(T: np.ndarray) -> np.ndarray:
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    R = T[:3, :3]
+    t = T[:3, 3]
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = R.T
+    out[:3, 3] = -R.T @ t
+    return out
+
+
+def rotation_angle_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    R_rel = np.asarray(R_a, dtype=np.float64).reshape(3, 3).T @ np.asarray(R_b, dtype=np.float64).reshape(3, 3)
+    cos_theta = max(-1.0, min(1.0, (float(np.trace(R_rel)) - 1.0) / 2.0))
+    return math.degrees(math.acos(cos_theta))
+
+
+def matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(R))
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        q = np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s, (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        q = np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s, (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        q = np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s, 0.25 * s, (R[1, 2] + R[2, 1]) / s])
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        q = np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s, 0.25 * s])
+    n = np.linalg.norm(q)
+    return q / n if n > 1e-12 else np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+
+def quaternion_to_matrix(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = np.asarray(q, dtype=np.float64).reshape(4)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def average_poses(poses: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = weights / max(float(np.sum(weights)), 1e-12)
+    t = np.sum(np.array([p[:3, 3] for p in poses]) * weights[:, None], axis=0)
+    q0 = matrix_to_quaternion(poses[0][:3, :3])
+    q_sum = np.zeros(4, dtype=np.float64)
+    for pose, weight in zip(poses, weights):
+        q = matrix_to_quaternion(pose[:3, :3])
+        if float(np.dot(q0, q)) < 0.0:
+            q = -q
+        q_sum += float(weight) * q
+    q_norm = np.linalg.norm(q_sum)
+    q = q_sum / q_norm if q_norm > 1e-12 else q0
+    return make_transform(quaternion_to_matrix(q), t)
+
+
+def local_tag_corners(tag_size_m: float) -> np.ndarray:
+    h = 0.5 * float(tag_size_m)
+    return np.array([[-h, -h, 0.0], [h, -h, 0.0], [h, h, 0.0], [-h, h, 0.0]], dtype=np.float32)
+
+
+def create_detector(tag_family: str):
+    if cv2 is None:
+        raise RuntimeError(f"cv2 import failed: {CV2_IMPORT_ERROR}")
+    if not hasattr(cv2, "aruco"):
+        raise RuntimeError("OpenCV has no aruco module. Install opencv-contrib-python.")
+    dict_name = APRILTAG_DICT_NAMES.get(str(tag_family).lower())
+    if dict_name is None or not hasattr(cv2.aruco, dict_name):
+        raise RuntimeError(f"unsupported AprilTag family: {tag_family}")
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
+    params = cv2.aruco.DetectorParameters() if hasattr(cv2.aruco, "DetectorParameters") else cv2.aruco.DetectorParameters_create()
+    if hasattr(cv2.aruco, "CORNER_REFINE_SUBPIX"):
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    if hasattr(cv2.aruco, "ArucoDetector"):
+        return cv2.aruco.ArucoDetector(dictionary, params)
+    return dictionary, params
+
+
+def detect_tags(image: np.ndarray, detector) -> list[tuple[int, np.ndarray]]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if isinstance(detector, tuple):
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, detector[0], parameters=detector[1])
+    else:
+        corners, ids, _ = detector.detectMarkers(gray)
+    if ids is None:
+        return []
+    return [(int(tag_id[0]), np.asarray(corner, dtype=np.float32).reshape(4, 2)) for corner, tag_id in zip(corners, ids)]
+
+
+def load_camera_data(snapshot_dir: Path, manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, np.ndarray]]:
+    camera_params = json.loads((snapshot_dir / manifest.get("camera_params_json", "camera_params.json")).read_text(encoding="utf-8"))
+    extrinsics = json.loads((snapshot_dir / manifest.get("extrinsics_json", "extrinsics.json")).read_text(encoding="utf-8"))
+    cameras: dict[str, dict[str, Any]] = {}
+    world_from_camera: dict[str, np.ndarray] = {}
+    for cam_id, entry in camera_params.items():
+        if not isinstance(entry, dict) or cam_id == "viewer":
+            continue
+        rgb = entry.get("RGB")
+        extr = extrinsics.get(cam_id)
+        if not isinstance(rgb, dict) or not isinstance(extr, dict):
+            continue
+        intr = rgb.get("intrinsic", {})
+        dist = rgb.get("distortion", {})
+        K = np.array([[float(intr["fx"]), 0.0, float(intr["cx"])], [0.0, float(intr["fy"]), float(intr["cy"])], [0.0, 0.0, 1.0]], dtype=np.float64)
+        d = np.array(
+            [
+                float(dist.get("k1", 0.0)),
+                float(dist.get("k2", 0.0)),
+                float(dist.get("p1", 0.0)),
+                float(dist.get("p2", 0.0)),
+                float(dist.get("k3", 0.0)),
+                float(dist.get("k4", 0.0)),
+                float(dist.get("k5", 0.0)),
+                float(dist.get("k6", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+        R = np.asarray(extr["rotation"], dtype=np.float64).reshape(3, 3)
+        t = np.asarray(extr["translation"], dtype=np.float64).reshape(3)
+        T_camera_from_world = make_transform(R, t)
+        cameras[cam_id] = {"K": K, "dist": d}
+        world_from_camera[cam_id] = invert_transform(T_camera_from_world)
+    return cameras, world_from_camera
+
+
+def solve_single_tag(corners_px: np.ndarray, K: np.ndarray, dist: np.ndarray, object_pts: np.ndarray, reproj_limit_px: float):
+    ok, rvec, tvec = cv2.solvePnP(object_pts, corners_px.astype(np.float32), K, dist, flags=cv2.SOLVEPNP_IPPE)
+    if not ok:
+        return None
+    proj, _ = cv2.projectPoints(object_pts, rvec, tvec, K, dist)
+    err = np.linalg.norm(proj.reshape(-1, 2) - corners_px.reshape(-1, 2), axis=1)
+    rmse = float(np.sqrt(np.mean(err * err)))
+    if rmse > float(reproj_limit_px):
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    return make_transform(R, tvec.reshape(3)), rmse
+
+
+def fuse_tag_observations(observations: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any] | None:
+    if len(observations) < int(cfg["minSharedCamerasPerTag"]):
+        return None
+    best: list[int] = []
+    for i, hypo in enumerate(observations):
+        current = []
+        for j, obs in enumerate(observations):
+            trans = float(np.linalg.norm(obs["T_world_from_tag"][:3, 3] - hypo["T_world_from_tag"][:3, 3]))
+            rot = rotation_angle_deg(obs["T_world_from_tag"][:3, :3], hypo["T_world_from_tag"][:3, :3])
+            if trans <= float(cfg["fusionTransThreshM"]) and rot <= float(cfg["fusionRotThreshDeg"]):
+                current.append(j)
+        if len(current) > len(best):
+            best = current
+        elif len(current) == len(best) and current:
+            if sum(observations[x]["rmse"] for x in current) < sum(observations[x]["rmse"] for x in best):
+                best = current
+    if len(best) < int(cfg["minTagInlierObservations"]):
+        return None
+    inliers = [observations[i] for i in best]
+    weights = np.array([1.0 / max(float(obs["rmse"]), 1e-6) for obs in inliers], dtype=np.float64)
+    fused = average_poses([obs["T_world_from_tag"] for obs in inliers], weights)
+    return {"pose": fused, "inlier_cameras": sorted(obs["camera_id"] for obs in inliers), "candidate_count": len(observations)}
+
+
+def project_residual_px(T_camera_from_world: np.ndarray, T_world_from_tag: np.ndarray, K: np.ndarray, dist: np.ndarray, object_pts: np.ndarray, image_pts: np.ndarray) -> float:
+    T_camera_from_tag = T_camera_from_world @ T_world_from_tag
+    rvec, _ = cv2.Rodrigues(T_camera_from_tag[:3, :3])
+    tvec = T_camera_from_tag[:3, 3].reshape(3, 1)
+    proj, _ = cv2.projectPoints(object_pts, rvec, tvec, K, dist)
+    err = np.linalg.norm(proj.reshape(-1, 2) - image_pts.reshape(-1, 2), axis=1)
+    return float(np.sqrt(np.mean(err * err)))
+
+
+def median(values: list[float]) -> float:
+    if not values:
+        return float("inf")
+    return float(np.median(np.asarray(values, dtype=np.float64)))
+
+
+def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[str, dict[str, Any]], world_from_camera: dict[str, np.ndarray], detector, cfg: dict[str, Any]) -> dict[str, Any]:
+    object_pts = local_tag_corners(float(cfg["tagSizeM"]))
+    observations_by_tag: dict[int, list[dict[str, Any]]] = {}
+    detected_by_camera: dict[str, list[int]] = {}
+    expected_camera_ids: list[str] = []
+
+    for cam in sample.get("cameras", []):
+        cam_id = str(cam.get("id", ""))
+        if cam_id not in cameras or cam_id not in world_from_camera:
+            continue
+        expected_camera_ids.append(cam_id)
+        image = cv2.imread(str(snapshot_dir / cam.get("image", "")), cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        detections = detect_tags(image, detector)
+        detected_by_camera[cam_id] = sorted({tag_id for tag_id, _ in detections})
+        for tag_id, corners_px in detections:
+            solved = solve_single_tag(corners_px, cameras[cam_id]["K"], cameras[cam_id]["dist"], object_pts, float(cfg["singleTagReprojLimitPx"]))
+            if solved is None:
+                continue
+            T_camera_from_tag, rmse = solved
+            observations_by_tag.setdefault(tag_id, []).append(
+                {
+                    "camera_id": cam_id,
+                    "corners_px": corners_px,
+                    "T_camera_from_tag": T_camera_from_tag,
+                    "T_world_from_tag": world_from_camera[cam_id] @ T_camera_from_tag,
+                    "rmse": rmse,
+                }
+            )
+
+    fused_by_tag: dict[int, dict[str, Any]] = {}
+    for tag_id, observations in observations_by_tag.items():
+        fused = fuse_tag_observations(observations, cfg)
+        if fused is not None:
+            fused_by_tag[tag_id] = fused
+
+    residuals: dict[str, dict[str, list[float]]] = {}
+    for tag_id, fused in fused_by_tag.items():
+        for obs in observations_by_tag.get(tag_id, []):
+            cam_id = obs["camera_id"]
+            T_fused = fused["pose"]
+            trans = float(np.linalg.norm(obs["T_world_from_tag"][:3, 3] - T_fused[:3, 3]))
+            rot = rotation_angle_deg(obs["T_world_from_tag"][:3, :3], T_fused[:3, :3])
+            T_camera_from_world = invert_transform(world_from_camera[cam_id])
+            reproj = project_residual_px(T_camera_from_world, T_fused, cameras[cam_id]["K"], cameras[cam_id]["dist"], object_pts, obs["corners_px"])
+            r = residuals.setdefault(cam_id, {"trans_m": [], "rot_deg": [], "reproj_px": [], "tags": []})
+            r["trans_m"].append(trans)
+            r["rot_deg"].append(rot)
+            r["reproj_px"].append(reproj)
+            r["tags"].append(float(tag_id))
+
+    camera_results: dict[str, Any] = {}
+    fail_cameras = []
+    warn_cameras = []
+    checked_cameras = []
+    for cam_id, r in residuals.items():
+        tag_count = len(set(int(x) for x in r["tags"]))
+        if tag_count < int(cfg["minTagsPerCamera"]):
+            continue
+        trans = median(r["trans_m"])
+        rot = median(r["rot_deg"])
+        reproj = median(r["reproj_px"])
+        status = "pass"
+        if trans > float(cfg["failTransThreshM"]) or rot > float(cfg["failRotThreshDeg"]) or reproj > float(cfg["failReprojThreshPx"]):
+            status = "fail"
+            fail_cameras.append(cam_id)
+        elif trans > float(cfg["warnTransThreshM"]) or rot > float(cfg["warnRotThreshDeg"]) or reproj > float(cfg["warnReprojThreshPx"]):
+            status = "warn"
+            warn_cameras.append(cam_id)
+        checked_cameras.append(cam_id)
+        camera_results[cam_id] = {
+            "status": status,
+            "tag_count": tag_count,
+            "median_trans_m": trans,
+            "median_rot_deg": rot,
+            "median_reproj_px": reproj,
+        }
+
+    missing_checked_cameras = sorted(set(expected_camera_ids) - set(checked_cameras))
+    if fail_cameras:
+        status = "fail"
+        reason = "camera_residual_exceeded"
+    elif bool(cfg.get("requireAllCameras", True)) and missing_checked_cameras:
+        status = "inconclusive"
+        reason = "missing_checked_cameras"
+    elif len(checked_cameras) >= int(cfg["minCheckedCameras"]) and len(fused_by_tag) > 0:
+        status = "warn" if warn_cameras else "pass"
+        reason = "ok"
+    else:
+        status = "inconclusive"
+        reason = "insufficient_shared_tag_observations"
+
+    return {
+        "sample_index": sample.get("index"),
+        "status": status,
+        "reason": reason,
+        "checked_cameras": sorted(checked_cameras),
+        "missing_checked_cameras": missing_checked_cameras,
+        "fail_cameras": sorted(fail_cameras),
+        "warn_cameras": sorted(warn_cameras),
+        "fused_tag_count": len(fused_by_tag),
+        "detected_by_camera": detected_by_camera,
+        "cameras": camera_results,
+    }
+
+
+def summarize(samples: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
+    counts = {key: sum(1 for s in samples if s["status"] == key) for key in ("pass", "warn", "fail", "inconclusive")}
+    fail_cameras = sorted({cam for s in samples for cam in s.get("fail_cameras", [])})
+    warn_cameras = sorted({cam for s in samples for cam in s.get("warn_cameras", [])})
+    missing_cameras = sorted({cam for s in samples for cam in s.get("missing_checked_cameras", [])})
+    pass_like = counts["pass"] + counts["warn"]
+    if counts["fail"] >= int(cfg["minFailingSnapshots"]):
+        status = "fail"
+        reason = "repeated_camera_residual_failures"
+    elif pass_like >= int(cfg["minPassingSnapshots"]):
+        status = "warn" if counts["warn"] > 0 else "pass"
+        reason = "ok"
+    else:
+        status = "inconclusive"
+        reason = "not_enough_passing_snapshots"
+
+    parts = [f"status={status}", f"pass={counts['pass']}", f"warn={counts['warn']}", f"fail={counts['fail']}", f"inconclusive={counts['inconclusive']}"]
+    if fail_cameras:
+        parts.append("fail_cameras=" + ",".join(fail_cameras))
+    if warn_cameras:
+        parts.append("warn_cameras=" + ",".join(warn_cameras))
+    if missing_cameras:
+        parts.append("missing_cameras=" + ",".join(missing_cameras))
+    return {"status": status, "reason": reason, "counts": counts, "fail_cameras": fail_cameras, "warn_cameras": warn_cameras, "missing_cameras": missing_cameras, "summary_line": " ".join(parts), "samples": samples}
+
+
+def write_result(path: Path, result: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(result, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def run(snapshot_dir: Path, config_json: Path, result_json: Path) -> int:
+    try:
+        cfg = json.loads(config_json.read_text(encoding="utf-8"))
+        manifest = json.loads((snapshot_dir / "manifest.json").read_text(encoding="utf-8"))
+        detector = create_detector(str(cfg.get("tagFamily", "tag36h11")))
+        cameras, world_from_camera = load_camera_data(snapshot_dir, manifest)
+        samples = [
+            evaluate_sample(snapshot_dir, sample, cameras, world_from_camera, detector, cfg)
+            for sample in manifest.get("samples", [])
+        ]
+        result = summarize(samples, cfg)
+    except Exception as exc:
+        result = {"status": "error", "reason": str(exc), "summary_line": f"status=error reason={exc}"}
+        write_result(result_json, result)
+        print(result["summary_line"])
+        return 1
+
+    write_result(result_json, result)
+    print(result["summary_line"])
+    if result["status"] in ("pass", "warn"):
+        return 0
+    if result["status"] == "inconclusive":
+        return 2
+    if result["status"] == "fail":
+        return 3
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Check multi-camera extrinsic consistency from AprilTag snapshots.")
+    parser.add_argument("--snapshot-dir", type=Path, required=True)
+    parser.add_argument("--config-json", type=Path, required=True)
+    parser.add_argument("--result-json", type=Path, required=True)
+    args = parser.parse_args(argv)
+    return run(args.snapshot_dir.resolve(), args.config_json.resolve(), args.result_json.resolve())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
