@@ -29,11 +29,6 @@ add_executable(orbbec_probe
     src/probe_orbbec.cpp
 )
 
-add_executable(extrinsic_health_projector
-    src/sync/extrinsic_health_projector.cpp
-    src/sync/utils/cJSON.c
-)
-
 find_package(OrbbecSDK REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters registration segmentation sample_consensus)
@@ -60,15 +55,6 @@ target_link_libraries(orbbec_probe PRIVATE
     ob::OrbbecSDK
 )
 
-target_include_directories(extrinsic_health_projector PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}/src/sync
-    ${CMAKE_CURRENT_LIST_DIR}/src/sync/utils
-)
-
-target_link_libraries(extrinsic_health_projector PRIVATE
-    ob::OrbbecSDK
-)
-
 if(APPLE)
     set(CMAKE_MACOSX_RPATH ON)
     set(CMAKE_INSTALL_RPATH "@loader_path/../lib/OrbbecSDK_v2.7.2/lib")
@@ -81,7 +67,6 @@ elseif(UNIX)
     set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib/OrbbecSDK_v2.7.2/lib")
     set_target_properties(orbbec PROPERTIES BUILD_RPATH "${OrbbecSDK_ROOT}/lib")
     set_target_properties(orbbec_probe PROPERTIES BUILD_RPATH "${OrbbecSDK_ROOT}/lib")
-    set_target_properties(extrinsic_health_projector PROPERTIES BUILD_RPATH "${OrbbecSDK_ROOT}/lib")
 endif()
 
 install(FILES
@@ -91,4 +76,3 @@ install(FILES
     DESTINATION bin
 )
 install(TARGETS orbbec RUNTIME DESTINATION bin)
-install(TARGETS extrinsic_health_projector RUNTIME DESTINATION bin)

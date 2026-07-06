@@ -346,7 +346,6 @@ AppConfig loadConfig(const fs::path &configPath) {
     }
 
     cfg.extrinsicHealth.scriptPath = (configBase / "extrinsic_health_check.py").lexically_normal();
-    cfg.extrinsicHealth.projectorPath = (configBase / "extrinsic_health_projector").lexically_normal();
     if(auto *healthObj = cJSON_GetObjectItemCaseSensitive(root, "extrinsicHealthCheck")) {
         if(cJSON_IsObject(healthObj)) {
             if(auto v = getBool(healthObj, "enabled")) {
@@ -366,18 +365,6 @@ AppConfig loadConfig(const fs::path &configPath) {
             }
             else if(auto v = getString(healthObj, "script")) {
                 cfg.extrinsicHealth.scriptPath = resolveConfigRelativePath(*v);
-            }
-            if(auto v = getString(healthObj, "projectorPath")) {
-                cfg.extrinsicHealth.projectorPath = resolveConfigRelativePath(*v);
-            }
-            else if(auto v = getString(healthObj, "projector")) {
-                cfg.extrinsicHealth.projectorPath = resolveConfigRelativePath(*v);
-            }
-            if(auto v = getString(healthObj, "projectionBackend")) {
-                cfg.extrinsicHealth.projectionBackend = trimString(*v);
-            }
-            else if(auto v = getString(healthObj, "projection_backend")) {
-                cfg.extrinsicHealth.projectionBackend = trimString(*v);
             }
             if(auto v = getString(healthObj, "tagFamily")) {
                 cfg.extrinsicHealth.tagFamily = trimString(*v);

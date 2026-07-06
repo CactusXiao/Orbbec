@@ -4190,8 +4190,6 @@ private:
         const auto &h = cfg_.extrinsicHealth;
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "tagFamily", h.tagFamily.c_str());
-        cJSON_AddStringToObject(root, "projectorPath", h.projectorPath.string().c_str());
-        cJSON_AddStringToObject(root, "projectionBackend", h.projectionBackend.c_str());
         cJSON_AddNumberToObject(root, "tagSizeM", h.tagSizeM);
         cJSON_AddBoolToObject(root, "requireAllCameras", h.requireAllCameras);
         cJSON_AddNumberToObject(root, "minSharedCamerasPerTag", h.minSharedCamerasPerTag);
