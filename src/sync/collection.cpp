@@ -582,6 +582,25 @@ static bool isCtrlReleaseKeyEvent(int key) {
 
 static bool g_ctrlShortcutListening = false;
 
+static int parseIntOr(const std::string &s, int fallback) {
+    try {
+        return std::stoi(s);
+    }
+    catch(...) {
+        return fallback;
+    }
+}
+
+static double parseDoubleBound(const std::string &s, double fallback, double lo, double hi) {
+    try {
+        double v = std::stod(s);
+        return std::max(lo, std::min(hi, v));
+    }
+    catch(...) {
+        return std::max(lo, std::min(hi, fallback));
+    }
+}
+
 static std::string formatFrameIndex(size_t i) {
     std::ostringstream oss;
     oss << std::setw(5) << std::setfill('0') << i;
@@ -708,6 +727,8 @@ struct CollectionConfigUi {
     bool enableEgo       = false;
     std::string saveRoot;
     std::string subjectId = "test";
+    std::string exposureMs;
+    std::string brightness;
     std::string activeField;
     std::string error;
 
@@ -724,8 +745,13 @@ struct CollectionConfigUi {
     int widthInt() const { return kCollectionFixedWidth; }
     int heightInt() const { return kCollectionFixedHeight; }
     int fpsInt() const { return kCollectionFixedFps; }
-    float exposureMsFloat() const { return 0.0f; }
-    int brightnessInt() const { return -1; }
+    float exposureMsFloat() const {
+        if(trimString(exposureMs).empty()) {
+            return 0.0f;
+        }
+        return static_cast<float>(parseDoubleBound(exposureMs, 0.0, 0.05, 100.0));
+    }
+    int brightnessInt() const { return trimString(brightness).empty() ? -1 : parseIntOr(brightness, -1); }
     int maxDurationInt() const { return kCollectionFixedMaxDurationSec; }
 
     std::vector<CollectDataType> enabledTypesForSaving() const {
@@ -8008,6 +8034,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     std::string extrinsicReadyMessage;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
+    if(cfg.colorExposureMs > 0.0f) {
+        std::ostringstream oss;
+        oss << std::setprecision(4) << cfg.colorExposureMs;
+        cfgUi.exposureMs = oss.str();
+    }
+    if(cfg.colorBrightness >= 0) {
+        cfgUi.brightness = std::to_string(cfg.colorBrightness);
+    }
 
     auto pushUiLog = [&](std::string s) {
         s = trimString(std::move(s));
@@ -8132,12 +8166,20 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 cfgUi.activeField = "sub";
             }
 
-            if(!cfgUi.error.empty()) {
-                cv::putText(ui, cfgUi.error, cv::Point(left, fieldsTop + rowH + 46), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(60, 60, 255), 2, cv::LINE_AA);
+            const int tuneTop = fieldsTop + rowH;
+            if(uiTextField(ui, cv::Rect(left, tuneTop, 260, 36), "exposure_ms", cfgUi.exposureMs, cfgUi.activeField == "exp", fm)) {
+                cfgUi.activeField = "exp";
+            }
+            if(uiTextField(ui, cv::Rect(left + 300, tuneTop, 260, 36), "brightness", cfgUi.brightness, cfgUi.activeField == "bri", fm)) {
+                cfgUi.activeField = "bri";
             }
 
-            cv::Rect bBack(60, fieldsTop + 2 * rowH, 220, 60);
-            cv::Rect bEnter(340, fieldsTop + 2 * rowH, 260, 60);
+            if(!cfgUi.error.empty()) {
+                cv::putText(ui, cfgUi.error, cv::Point(left, tuneTop + rowH + 46), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(60, 60, 255), 2, cv::LINE_AA);
+            }
+
+            cv::Rect bBack(60, fieldsTop + 3 * rowH, 220, 60);
+            cv::Rect bEnter(340, fieldsTop + 3 * rowH, 260, 60);
             if(uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
                 announce("menu", "menu");
@@ -8210,6 +8252,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 }
                 else if(cfgUi.activeField == "sub") {
                     handleTextInputShortcut(cfgUi.subjectId, key, ctrlHeld);
+                }
+                else if(cfgUi.activeField == "exp") {
+                    handleTextInputShortcut(cfgUi.exposureMs, key, ctrlHeld);
+                }
+                else if(cfgUi.activeField == "bri") {
+                    handleTextInputShortcut(cfgUi.brightness, key, ctrlHeld);
                 }
             }
         }
