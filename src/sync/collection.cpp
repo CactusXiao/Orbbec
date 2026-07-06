@@ -582,25 +582,6 @@ static bool isCtrlReleaseKeyEvent(int key) {
 
 static bool g_ctrlShortcutListening = false;
 
-static int parseIntOr(const std::string &s, int fallback) {
-    try {
-        return std::stoi(s);
-    }
-    catch(...) {
-        return fallback;
-    }
-}
-
-static double parseDoubleBound(const std::string &s, double fallback, double lo, double hi) {
-    try {
-        double v = std::stod(s);
-        return std::max(lo, std::min(hi, v));
-    }
-    catch(...) {
-        return std::max(lo, std::min(hi, fallback));
-    }
-}
-
 static std::string formatFrameIndex(size_t i) {
     std::ostringstream oss;
     oss << std::setw(5) << std::setfill('0') << i;
@@ -716,36 +697,21 @@ static std::string presetLabel(int w, int h, int fps) {
     return std::to_string(w) + "x" + std::to_string(h) + "@" + std::to_string(fps);
 }
 
+static constexpr int kCollectionFixedWidth = 1280;
+static constexpr int kCollectionFixedHeight = 800;
+static constexpr int kCollectionFixedFps = 30;
+static constexpr int kCollectionFixedMaxDurationSec = 120;
+
 struct CollectionConfigUi {
     bool enableMultiview = true;
     bool enableFisheyes  = false;
     bool enableEgo       = false;
-    bool enableRgb       = true;
-    bool enableDepth     = true;
-    bool enableIrRight   = false;
-    bool enableIrLeft    = false;
-    bool enableCloud     = false;
-    bool enableColorCloud = false;
-    bool enableImu       = false;
-    std::string width    = "1280";
-    std::string height   = "800";
-    std::string fps      = "30";
-    std::string exposureMs;
-    std::string brightness;
     std::string saveRoot;
     std::string subjectId = "test";
-    std::string maxDurationSec = "120";
     std::string activeField;
     std::string error;
 
-    void enforceRules() {
-        if(enableCloud || enableColorCloud) {
-            enableDepth = true;
-        }
-        if(enableColorCloud) {
-            enableRgb = true;
-        }
-    }
+    void enforceRules() {}
 
     bool hasRequiredFields() const {
         return !trimString(saveRoot).empty() && !trimString(subjectId).empty();
@@ -755,62 +721,22 @@ struct CollectionConfigUi {
         return enableMultiview || enableFisheyes || enableEgo;
     }
 
-    int widthInt() const { return std::max(1, parseIntOr(width, 1280)); }
-    int heightInt() const { return std::max(1, parseIntOr(height, 800)); }
-    int fpsInt() const { return std::max(1, parseIntOr(fps, 30)); }
-    float exposureMsFloat() const {
-        if(trimString(exposureMs).empty()) {
-            return 0.0f;
-        }
-        return static_cast<float>(parseDoubleBound(exposureMs, 0.0, 0.05, 100.0));
-    }
-    int brightnessInt() const { return parseIntOr(brightness, -1); }
-    int maxDurationInt() const { return std::max(1, parseIntOr(maxDurationSec, 120)); }
+    int widthInt() const { return kCollectionFixedWidth; }
+    int heightInt() const { return kCollectionFixedHeight; }
+    int fpsInt() const { return kCollectionFixedFps; }
+    float exposureMsFloat() const { return 0.0f; }
+    int brightnessInt() const { return -1; }
+    int maxDurationInt() const { return kCollectionFixedMaxDurationSec; }
 
     std::vector<CollectDataType> enabledTypesForSaving() const {
-        std::vector<CollectDataType> out;
-        if(enableRgb) {
-            out.push_back(CollectDataType::RGB);
-        }
-        if(enableDepth) {
-            out.push_back(CollectDataType::Depth);
-        }
-        if(enableIrRight) {
-            out.push_back(CollectDataType::IRRight);
-        }
-        if(enableIrLeft) {
-            out.push_back(CollectDataType::IRLeft);
-        }
-        if(enableCloud) {
-            out.push_back(CollectDataType::CloudPoints);
-        }
-        if(enableColorCloud) {
-            out.push_back(CollectDataType::ColorCloudPoints);
-        }
-        return out;
+        return { CollectDataType::RGB, CollectDataType::Depth };
     }
 
     std::vector<CollectDataType> enabledTypesForStreaming() const {
-        std::vector<CollectDataType> out = enabledTypesForSaving();
-        if(!enableRgb) {
-            out.push_back(CollectDataType::RGB);
-        }
-        return out;
+        return enabledTypesForSaving();
     }
 
     CollectDataType referenceType() const {
-        if(enableRgb) {
-            return CollectDataType::RGB;
-        }
-        if(enableDepth) {
-            return CollectDataType::Depth;
-        }
-        if(enableIrLeft) {
-            return CollectDataType::IRLeft;
-        }
-        if(enableIrRight) {
-            return CollectDataType::IRRight;
-        }
         return CollectDataType::RGB;
     }
 };
@@ -3004,7 +2930,6 @@ public:
                 std::ostringstream oss;
                 oss.setf(std::ios::fixed);
                 oss << "Camera stream timeout: " << fault.displayName
-                    << " sn=" << state.sn
                     << " no frame for " << std::setprecision(2) << silentSeconds << "s";
                 if(!state.everReceived) {
                     oss << " since stream start";
@@ -3328,7 +3253,7 @@ public:
         const int w = ui.widthInt();
         const int h = ui.heightInt();
         const int f = ui.fpsInt();
-        imuEnabled_ = multiviewEnabled_ && ui.enableImu;
+        imuEnabled_ = false;
         typesStreaming_ = multiviewEnabled_ ? ui.enabledTypesForStreaming() : std::vector<CollectDataType>{};
         typesSaving_    = multiviewEnabled_ ? ui.enabledTypesForSaving() : std::vector<CollectDataType>{};
         refType_        = ui.referenceType();
@@ -7301,7 +7226,8 @@ private:
             std::lock_guard<std::mutex> lock(mtx_);
             for(auto &kv: buffers_) {
                 if(!kv.second.latestRgb.empty()) {
-                    out.emplace(kv.first, kv.second.latestRgb);
+                    const std::string label = kv.second.camKey.empty() ? kv.first : kv.second.camKey;
+                    out.emplace(label, kv.second.latestRgb);
                 }
             }
         }
@@ -8082,14 +8008,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     std::string extrinsicReadyMessage;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
-    if(cfg.colorExposureMs > 0.0f) {
-        std::ostringstream oss;
-        oss << std::setprecision(4) << cfg.colorExposureMs;
-        cfgUi.exposureMs = oss.str();
-    }
-    if(cfg.colorBrightness >= 0) {
-        cfgUi.brightness = std::to_string(cfg.colorBrightness);
-    }
 
     auto pushUiLog = [&](std::string s) {
         s = trimString(std::move(s));
@@ -8188,7 +8106,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const int left  = 60;
             const int top   = 110;
             const int rowH  = 64;
-            const int fieldW = 260;
 
             cv::putText(ui, "Capture Types", cv::Point(left, top - 22), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
             cv::Rect type1(left, top, 220, 36);
@@ -8207,104 +8124,20 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 cv::putText(ui, "Select at least one capture type", cv::Point(left, top + rowH - 8), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(60, 60, 255), 1, cv::LINE_AA);
             }
 
-            const int dataTop = top + 2 * rowH;
-            cv::putText(ui, "Data Types", cv::Point(left, dataTop - 22), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-            cv::Rect c1(left, dataTop, 220, 36);
-            cv::Rect c2(left + 240, dataTop, 220, 36);
-            cv::Rect c3(left + 480, dataTop, 220, 36);
-            cv::Rect c4(left + 720, dataTop, 220, 36);
-            cv::Rect c5(left, dataTop + rowH, 220, 36);
-            cv::Rect c6(left + 240, dataTop + rowH, 220, 36);
-            cv::Rect c7(left + 480, dataTop + rowH, 220, 36);
-
-            if(uiCheckbox(ui, c1, cfgUi.enableRgb, "RGB", fm)) {
-                cfgUi.enableRgb = !cfgUi.enableRgb;
-            }
-            if(uiCheckbox(ui, c2, cfgUi.enableDepth, "Depth", fm)) {
-                cfgUi.enableDepth = !cfgUi.enableDepth;
-            }
-            if(uiCheckbox(ui, c3, cfgUi.enableIrRight, "IR_right", fm)) {
-                cfgUi.enableIrRight = !cfgUi.enableIrRight;
-            }
-            if(uiCheckbox(ui, c4, cfgUi.enableIrLeft, "IR_left", fm)) {
-                cfgUi.enableIrLeft = !cfgUi.enableIrLeft;
-            }
-            if(uiCheckbox(ui, c5, cfgUi.enableCloud, "CloudPoints", fm)) {
-                cfgUi.enableCloud = !cfgUi.enableCloud;
-            }
-            if(uiCheckbox(ui, c6, cfgUi.enableColorCloud, "ColorCloud", fm)) {
-                cfgUi.enableColorCloud = !cfgUi.enableColorCloud;
-            }
-            if(uiCheckbox(ui, c7, cfgUi.enableImu, "IMU", fm)) {
-                cfgUi.enableImu = !cfgUi.enableImu;
-            }
-            if(!cfgUi.enableMultiview) {
-                cv::putText(ui, "multiview disabled: Data Types settings are ignored", cv::Point(left, dataTop + 1 * rowH - 6), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
-            }
-            if((cfgUi.enableCloud || cfgUi.enableColorCloud) && !cfgUi.enableDepth) {
-                cv::putText(ui, "CloudPoints selected: Depth auto-enabled", cv::Point(left, dataTop + 1 * rowH + 16), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(80, 200, 80), 1, cv::LINE_AA);
-                cfgUi.enableDepth = true;
-            }
-            if(cfgUi.enableColorCloud && !cfgUi.enableRgb) {
-                cv::putText(ui, "ColorCloud selected: RGB auto-enabled", cv::Point(left, dataTop + 1 * rowH + 40), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(80, 200, 80), 1, cv::LINE_AA);
-                cfgUi.enableRgb = true;
-            }
-
-            const int y2 = top + 4 * rowH;
-            cv::putText(ui, "Resolution/FPS", cv::Point(left, y2 - 22), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-            if(uiTextField(ui, cv::Rect(left, y2, fieldW, 36), "width", cfgUi.width, cfgUi.activeField == "w", fm)) {
-                cfgUi.activeField = "w";
-            }
-            if(uiTextField(ui, cv::Rect(left + 300, y2, fieldW, 36), "height", cfgUi.height, cfgUi.activeField == "h", fm)) {
-                cfgUi.activeField = "h";
-            }
-            if(uiTextField(ui, cv::Rect(left + 600, y2, fieldW, 36), "fps", cfgUi.fps, cfgUi.activeField == "fps", fm)) {
-                cfgUi.activeField = "fps";
-            }
-            cv::Rect p1(left, y2 + 44, 260, 44);
-            cv::Rect p2(left + 280, y2 + 44, 260, 44);
-            cv::Rect p3(left + 560, y2 + 44, 260, 44);
-            if(uiButton(ui, p1, presetLabel(1280, 800, 30), fm)) {
-                cfgUi.width  = "1280";
-                cfgUi.height = "800";
-                cfgUi.fps    = "30";
-            }
-            if(uiButton(ui, p2, presetLabel(1280, 720, 30), fm)) {
-                cfgUi.width  = "1280";
-                cfgUi.height = "720";
-                cfgUi.fps    = "30";
-            }
-            if(uiButton(ui, p3, presetLabel(1920, 1080, 30), fm)) {
-                cfgUi.width  = "1920";
-                cfgUi.height = "1080";
-                cfgUi.fps    = "30";
-            }
-
-            const int y3 = top + 6 * rowH;
-            if(uiTextField(ui, cv::Rect(left, y3, 520, 36), "save_path (required)", cfgUi.saveRoot, cfgUi.activeField == "save", fm)) {
+            const int fieldsTop = top + 2 * rowH;
+            if(uiTextField(ui, cv::Rect(left, fieldsTop, 520, 36), "save_path (required)", cfgUi.saveRoot, cfgUi.activeField == "save", fm)) {
                 cfgUi.activeField = "save";
             }
-            if(uiTextField(ui, cv::Rect(left + 560, y3, 260, 36), "subject_id (required)", cfgUi.subjectId, cfgUi.activeField == "sub", fm)) {
+            if(uiTextField(ui, cv::Rect(left + 560, fieldsTop, 260, 36), "subject_id (required)", cfgUi.subjectId, cfgUi.activeField == "sub", fm)) {
                 cfgUi.activeField = "sub";
             }
 
-            const int y4 = top + 7 * rowH;
-            if(uiTextField(ui, cv::Rect(left, y4, 260, 36), "max_duration_sec", cfgUi.maxDurationSec, cfgUi.activeField == "dur", fm)) {
-                cfgUi.activeField = "dur";
-            }
-            if(uiTextField(ui, cv::Rect(left + 300, y4, 260, 36), "exposure_ms", cfgUi.exposureMs, cfgUi.activeField == "exp", fm)) {
-                cfgUi.activeField = "exp";
-            }
-            if(uiTextField(ui, cv::Rect(left + 600, y4, 260, 36), "brightness", cfgUi.brightness, cfgUi.activeField == "bri", fm)) {
-                cfgUi.activeField = "bri";
-            }
-
             if(!cfgUi.error.empty()) {
-                cv::putText(ui, cfgUi.error, cv::Point(left, 640), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(60, 60, 255), 2, cv::LINE_AA);
+                cv::putText(ui, cfgUi.error, cv::Point(left, fieldsTop + rowH + 46), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(60, 60, 255), 2, cv::LINE_AA);
             }
 
-            cv::Rect bBack(60, 680, 220, 60);
-            cv::Rect bEnter(340, 680, 260, 60);
+            cv::Rect bBack(60, fieldsTop + 2 * rowH, 220, 60);
+            cv::Rect bEnter(340, fieldsTop + 2 * rowH, 260, 60);
             if(uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
                 announce("menu", "menu");
@@ -8372,29 +8205,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(!cfgUi.activeField.empty() && key > 0) {
                 const bool ctrlFromMask = ((key & 0x20000) != 0) || ((key & 0x04000000) != 0);
                 const bool ctrlHeld = g_ctrlShortcutListening || ctrlFromMask;
-                if(cfgUi.activeField == "w") {
-                    handleTextInputShortcut(cfgUi.width, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "h") {
-                    handleTextInputShortcut(cfgUi.height, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "fps") {
-                    handleTextInputShortcut(cfgUi.fps, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "save") {
+                if(cfgUi.activeField == "save") {
                     handleTextInputShortcut(cfgUi.saveRoot, key, ctrlHeld);
                 }
                 else if(cfgUi.activeField == "sub") {
                     handleTextInputShortcut(cfgUi.subjectId, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "dur") {
-                    handleTextInputShortcut(cfgUi.maxDurationSec, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "exp") {
-                    handleTextInputShortcut(cfgUi.exposureMs, key, ctrlHeld);
-                }
-                else if(cfgUi.activeField == "bri") {
-                    handleTextInputShortcut(cfgUi.brightness, key, ctrlHeld);
                 }
             }
         }
