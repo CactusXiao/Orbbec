@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -131,7 +132,8 @@ def detect_tags(image: np.ndarray, detector) -> list[tuple[int, np.ndarray]]:
         corners, ids, _ = detector.detectMarkers(gray)
     if ids is None:
         return []
-    return [(int(tag_id[0]), np.asarray(corner, dtype=np.float32).reshape(4, 2)) for corner, tag_id in zip(corners, ids)]
+    tag_ids = np.asarray(ids).reshape(-1)
+    return [(int(tag_id), np.asarray(corner, dtype=np.float32).reshape(4, 2)) for corner, tag_id in zip(corners, tag_ids)]
 
 
 def load_camera_data(snapshot_dir: Path, manifest: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], dict[str, np.ndarray]]:
@@ -372,7 +374,7 @@ def run(snapshot_dir: Path, config_json: Path, result_json: Path) -> int:
         ]
         result = summarize(samples, cfg)
     except Exception as exc:
-        result = {"status": "error", "reason": str(exc), "summary_line": f"status=error reason={exc}"}
+        result = {"status": "error", "reason": str(exc), "traceback": traceback.format_exc(), "summary_line": f"status=error reason={exc}"}
         write_result(result_json, result)
         print(result["summary_line"])
         return 1
