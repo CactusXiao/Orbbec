@@ -1,9 +1,9 @@
 #include "utils/cJSON.h"
 
-#include <libobsensor/h/Error.h>
-#include <libobsensor/h/Utils.h>
+#include <libobsensor/ObSensor.hpp>
 
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -184,13 +184,15 @@ int main() {
                 continue;
             }
             OBPoint2f p2{};
-            ob_error *error = nullptr;
-            const bool ok = ob_transformation_3d_to_2d(p3, intrinsic, distortion, identity, &p2, &error);
-            if(error) {
-                const char *message = ob_error_get_message(error);
-                cJSON_AddStringToObject(outPoint, "error", message ? message : "sdk projection error");
-                ob_delete_error(error);
-                error = nullptr;
+            bool ok = false;
+            try {
+                ok = ob::CoordinateTransformHelper::transformation3dto2d(p3, intrinsic, distortion, identity, &p2);
+            }
+            catch(const std::exception &ex) {
+                cJSON_AddStringToObject(outPoint, "error", ex.what());
+            }
+            catch(...) {
+                cJSON_AddStringToObject(outPoint, "error", "projection threw");
             }
 
             cJSON_AddBoolToObject(outPoint, "ok", ok);
