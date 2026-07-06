@@ -2979,7 +2979,8 @@ public:
                                             const std::string &subjectId,
                                             const std::string &taskName,
                                             int episodeN,
-                                            std::string *statusLine = nullptr) {
+                                            std::string *statusLine = nullptr,
+                                            std::vector<std::string> *detailLines = nullptr) {
         const auto &health = cfg_.extrinsicHealth;
         if(!health.enabled) {
             if(statusLine) {
@@ -3116,7 +3117,8 @@ public:
         const int exitCode = runCommandCapture(command, output);
         std::string resultStatus;
         std::string resultSummary;
-        readExtrinsicHealthResult(resultJson, resultStatus, resultSummary);
+        std::vector<std::string> resultDetails;
+        readExtrinsicHealthResult(resultJson, resultStatus, resultSummary, &resultDetails);
         if(resultSummary.empty()) {
             resultSummary = trimString(output);
         }
@@ -3143,6 +3145,9 @@ public:
             if(health.keepDebugSnapshots || !ok) {
                 *statusLine += " debug=" + checkDir.string();
             }
+        }
+        if(detailLines) {
+            detailLines->insert(detailLines->end(), resultDetails.begin(), resultDetails.end());
         }
         std::cerr << "[collection][extrinsic_check] status=" << (resultStatus.empty() ? "(missing)" : resultStatus)
                   << " ok=" << (ok ? 1 : 0)
@@ -4210,9 +4215,97 @@ private:
         cJSON_Delete(root);
     }
 
-    static bool readExtrinsicHealthResult(const fs::path &path, std::string &status, std::string &summary) {
+    struct ExtrinsicHealthMaxResidual {
+        double transM = 0.0;
+        double rotDeg = 0.0;
+        double reprojPx = 0.0;
+        bool hasTrans = false;
+        bool hasRot = false;
+        bool hasReproj = false;
+    };
+
+    static bool readJsonNumber(cJSON *obj, const char *name, double &out) {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, name);
+        if(!item || !cJSON_IsNumber(item)) {
+            return false;
+        }
+        out = item->valuedouble;
+        return true;
+    }
+
+    static bool readMetricWithFallback(cJSON *obj, const char *primary, const char *fallback, double &out) {
+        return readJsonNumber(obj, primary, out) || readJsonNumber(obj, fallback, out);
+    }
+
+    static std::string formatMetric(double value, int precision) {
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(precision) << value;
+        return oss.str();
+    }
+
+    static void collectExtrinsicHealthDetailLines(cJSON *root, std::vector<std::string> &detailLines) {
+        std::map<std::string, ExtrinsicHealthMaxResidual> byCamera;
+        cJSON *samplesObj = cJSON_GetObjectItemCaseSensitive(root, "samples");
+        if(!samplesObj || !cJSON_IsArray(samplesObj)) {
+            return;
+        }
+
+        cJSON *sampleObj = nullptr;
+        cJSON_ArrayForEach(sampleObj, samplesObj) {
+            if(!sampleObj || !cJSON_IsObject(sampleObj)) {
+                continue;
+            }
+            cJSON *camerasObj = cJSON_GetObjectItemCaseSensitive(sampleObj, "cameras");
+            if(!camerasObj || !cJSON_IsObject(camerasObj)) {
+                continue;
+            }
+            cJSON *cameraObj = nullptr;
+            cJSON_ArrayForEach(cameraObj, camerasObj) {
+                if(!cameraObj || !cJSON_IsObject(cameraObj) || !cameraObj->string) {
+                    continue;
+                }
+                auto &acc = byCamera[cameraObj->string];
+                double value = 0.0;
+                if(readMetricWithFallback(cameraObj, "max_trans_m", "median_trans_m", value)) {
+                    acc.transM = acc.hasTrans ? std::max(acc.transM, value) : value;
+                    acc.hasTrans = true;
+                }
+                if(readMetricWithFallback(cameraObj, "max_rot_deg", "median_rot_deg", value)) {
+                    acc.rotDeg = acc.hasRot ? std::max(acc.rotDeg, value) : value;
+                    acc.hasRot = true;
+                }
+                if(readMetricWithFallback(cameraObj, "max_reproj_px", "median_reproj_px", value)) {
+                    acc.reprojPx = acc.hasReproj ? std::max(acc.reprojPx, value) : value;
+                    acc.hasReproj = true;
+                }
+            }
+        }
+
+        if(byCamera.empty()) {
+            return;
+        }
+        detailLines.push_back("Extrinsic max residuals by camera:");
+        for(const auto &kv: byCamera) {
+            const auto &r = kv.second;
+            std::ostringstream oss;
+            oss << "cam" << kv.first
+                << " max reproj=" << (r.hasReproj ? formatMetric(r.reprojPx, 3) : "n/a") << "px"
+                << " trans=" << (r.hasTrans ? formatMetric(r.transM, 4) : "n/a") << "m"
+                << " rot=" << (r.hasRot ? formatMetric(r.rotDeg, 3) : "n/a") << "deg";
+            detailLines.push_back(oss.str());
+        }
+    }
+
+    static bool readExtrinsicHealthResult(const fs::path &path,
+                                          std::string &status,
+                                          std::string &summary,
+                                          std::vector<std::string> *detailLines = nullptr) {
         status.clear();
         summary.clear();
+        if(detailLines) {
+            detailLines->clear();
+        }
         std::string content;
         if(!readTextFile(path, content)) {
             return false;
@@ -4231,6 +4324,9 @@ private:
         cJSON *summaryObj = cJSON_GetObjectItemCaseSensitive(root, "summary_line");
         if(summaryObj && cJSON_IsString(summaryObj) && summaryObj->valuestring) {
             summary = summaryObj->valuestring;
+        }
+        if(detailLines) {
+            collectExtrinsicHealthDetailLines(root, *detailLines);
         }
         cJSON_Delete(root);
         return !status.empty();
@@ -8031,7 +8127,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     bool cameraReadyAnnounced = false;
     bool extrinsicReadyChecked = false;
     bool extrinsicReadyPassed = false;
-    std::string extrinsicReadyMessage;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
     if(cfg.colorExposureMs > 0.0f) {
@@ -8063,7 +8158,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         cameraReadyAnnounced = false;
         extrinsicReadyChecked = false;
         extrinsicReadyPassed = false;
-        extrinsicReadyMessage.clear();
     };
 
     auto updateReadyState = [&]() {
@@ -8288,7 +8382,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
                && capUi.currentTaskIdx != -1 && !extrinsicReadyChecked) {
                 collectionSetStage("ui_extrinsic_ready_check");
-                capUi.msg = "Checking camera extrinsics...";
                 pushUiLog("Checking camera extrinsics before READY...");
 
                 const fs::path root = fs::path(trimString(cfgUi.saveRoot));
@@ -8296,14 +8389,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 const int episodeN = capUi.currentEpisode;
                 std::string checkLine;
-                extrinsicReadyPassed = recorder.runExtrinsicHealthCheckBeforeStart(root, subject, taskName, episodeN, &checkLine);
+                std::vector<std::string> checkDetails;
+                extrinsicReadyPassed = recorder.runExtrinsicHealthCheckBeforeStart(root, subject, taskName, episodeN, &checkLine, &checkDetails);
                 extrinsicReadyChecked = true;
-                extrinsicReadyMessage = checkLine;
                 if(!checkLine.empty()) {
                     pushUiLog(checkLine);
                 }
-                capUi.msg = extrinsicReadyPassed ? "Extrinsic check passed. Ready to start."
-                                                 : "Extrinsic check failed. Fix cameras or restart.";
+                for(const auto &line: checkDetails) {
+                    pushUiLog(line);
+                }
             }
             const bool readyForStart = cameraReadiness.allReady
                                     && (capUi.currentTaskIdx == -1 || (extrinsicReadyChecked && extrinsicReadyPassed));
@@ -8419,12 +8513,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             case CaptureState::IDLE:
                 if(readyForStart) {
                     sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
-                    stateEmphasisLine = extrinsicReadyMessage.empty() ? cameraReadiness.message : extrinsicReadyMessage;
+                    stateEmphasisLine = cameraReadiness.message;
                 }
                 else if(cameraReadiness.allReady) {
                     if(extrinsicReadyChecked && !extrinsicReadyPassed) {
                         sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
-                        stateEmphasisLine = extrinsicReadyMessage.empty() ? "Extrinsic check failed" : extrinsicReadyMessage;
+                        stateEmphasisLine = "Extrinsic check failed";
                         stateFootnoteLine = "Fix AprilTags/cameras, then re-enter capture or restart cameras to retry";
                     }
                     else {

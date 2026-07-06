@@ -301,6 +301,9 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
             "median_trans_m": trans,
             "median_rot_deg": rot,
             "median_reproj_px": reproj,
+            "max_trans_m": max(r["trans_m"]) if r["trans_m"] else 0.0,
+            "max_rot_deg": max(r["rot_deg"]) if r["rot_deg"] else 0.0,
+            "max_reproj_px": max(r["reproj_px"]) if r["reproj_px"] else 0.0,
         }
 
     missing_checked_cameras = sorted(set(expected_camera_ids) - set(checked_cameras))
