@@ -101,6 +101,8 @@ struct ExtrinsicHealthConfig {
     bool enabled = false;
     std::string pythonExecutable = "python3";
     fs::path scriptPath;
+    fs::path projectorPath;
+    std::string projectionBackend = "orbbec_sdk";
     std::string tagFamily = "tag36h11";
     double tagSizeM = 0.096;
     int sampleCount = 5;

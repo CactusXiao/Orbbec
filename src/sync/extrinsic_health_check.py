@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -150,6 +151,25 @@ def load_camera_data(snapshot_dir: Path, manifest: dict[str, Any]) -> tuple[dict
             continue
         intr = rgb.get("intrinsic", {})
         dist = rgb.get("distortion", {})
+        intrinsic_json = {
+            "fx": float(intr["fx"]),
+            "fy": float(intr["fy"]),
+            "cx": float(intr["cx"]),
+            "cy": float(intr["cy"]),
+            "width": int(intr.get("width", rgb.get("width", 0))),
+            "height": int(intr.get("height", rgb.get("height", 0))),
+        }
+        distortion_json = {
+            "k1": float(dist.get("k1", 0.0)),
+            "k2": float(dist.get("k2", 0.0)),
+            "k3": float(dist.get("k3", 0.0)),
+            "k4": float(dist.get("k4", 0.0)),
+            "k5": float(dist.get("k5", 0.0)),
+            "k6": float(dist.get("k6", 0.0)),
+            "p1": float(dist.get("p1", 0.0)),
+            "p2": float(dist.get("p2", 0.0)),
+            "model": int(dist.get("model", 0)),
+        }
         K = np.array([[float(intr["fx"]), 0.0, float(intr["cx"])], [0.0, float(intr["fy"]), float(intr["cy"])], [0.0, 0.0, 1.0]], dtype=np.float64)
         d = np.array(
             [
@@ -167,7 +187,7 @@ def load_camera_data(snapshot_dir: Path, manifest: dict[str, Any]) -> tuple[dict
         R = np.asarray(extr["rotation"], dtype=np.float64).reshape(3, 3)
         t = np.asarray(extr["translation"], dtype=np.float64).reshape(3)
         T_camera_from_world = make_transform(R, t)
-        cameras[cam_id] = {"K": K, "dist": d}
+        cameras[cam_id] = {"K": K, "dist": d, "intrinsic": intrinsic_json, "distortion": distortion_json}
         world_from_camera[cam_id] = invert_transform(T_camera_from_world)
     return cameras, world_from_camera
 
@@ -209,12 +229,98 @@ def fuse_tag_observations(observations: list[dict[str, Any]], cfg: dict[str, Any
     return {"pose": fused, "inlier_cameras": sorted(obs["camera_id"] for obs in inliers), "candidate_count": len(observations)}
 
 
-def project_residual_px(T_camera_from_world: np.ndarray, T_world_from_tag: np.ndarray, K: np.ndarray, dist: np.ndarray, object_pts: np.ndarray, image_pts: np.ndarray) -> float:
-    T_camera_from_tag = T_camera_from_world @ T_world_from_tag
-    rvec, _ = cv2.Rodrigues(T_camera_from_tag[:3, :3])
-    tvec = T_camera_from_tag[:3, 3].reshape(3, 1)
-    proj, _ = cv2.projectPoints(object_pts, rvec, tvec, K, dist)
-    err = np.linalg.norm(proj.reshape(-1, 2) - image_pts.reshape(-1, 2), axis=1)
+def transform_points(T: np.ndarray, points: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    hom = np.concatenate([points, np.ones((points.shape[0], 1), dtype=np.float64)], axis=1)
+    return (np.asarray(T, dtype=np.float64).reshape(4, 4) @ hom.T).T[:, :3]
+
+
+def project_points_opencv(points_camera: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    rvec = np.zeros((3, 1), dtype=np.float64)
+    tvec = np.zeros((3, 1), dtype=np.float64)
+    proj, _ = cv2.projectPoints(np.asarray(points_camera, dtype=np.float64).reshape(-1, 3), rvec, tvec, K, dist)
+    return proj.reshape(-1, 2)
+
+
+class ProjectionBackend:
+    def __init__(self, cfg: dict[str, Any]):
+        mode = str(cfg.get("projectionBackend", "orbbec_sdk")).strip().lower()
+        if mode in ("opencv", "cv2"):
+            self.name = "opencv"
+        elif mode in ("orbbec", "orbbec_sdk", "orbbecsdk", "orbbec-sdk", "sdk"):
+            self.name = "orbbec_sdk"
+        else:
+            raise RuntimeError(f"unsupported projectionBackend: {mode}")
+        raw_path = str(cfg.get("projectorPath", "")).strip()
+        if not raw_path and self.name == "orbbec_sdk":
+            raw_path = str(Path(__file__).resolve().with_name("extrinsic_health_projector"))
+        self.projector_path = Path(raw_path) if raw_path else None
+
+    def project_batch(self, cameras: dict[str, dict[str, Any]], requests: list[dict[str, Any]]) -> list[np.ndarray | None]:
+        if not requests:
+            return []
+        if self.name == "orbbec_sdk":
+            if self.projector_path is None:
+                raise RuntimeError("projectionBackend is orbbec_sdk but projectorPath is empty")
+            if not self.projector_path.exists():
+                raise RuntimeError(f"projectionBackend is orbbec_sdk but projector not found: {self.projector_path}")
+            payload = {
+                "cameras": {
+                    cam_id: {
+                        "intrinsic": cameras[cam_id]["intrinsic"],
+                        "distortion": cameras[cam_id]["distortion"],
+                    }
+                    for cam_id in sorted({str(req["camera_id"]) for req in requests})
+                    if cam_id in cameras
+                },
+                "requests": [
+                    {
+                        "camera_id": str(req["camera_id"]),
+                        "points": np.asarray(req["points"], dtype=np.float64).reshape(-1, 3).tolist(),
+                    }
+                    for req in requests
+                ],
+            }
+            proc = subprocess.run(
+                [str(self.projector_path)],
+                input=json.dumps(payload),
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or f"exit={proc.returncode}").strip())
+            data = json.loads(proc.stdout)
+            if not data.get("ok", False):
+                raise RuntimeError(str(data.get("error", "projector returned not ok")))
+            out: list[np.ndarray | None] = []
+            for item in data.get("requests", []):
+                points = item.get("points", [])
+                if not item.get("ok", False) or not points:
+                    out.append(None)
+                    continue
+                xy = []
+                for point in points:
+                    if not point.get("ok", False):
+                        xy = []
+                        break
+                    xy.append([float(point["x"]), float(point["y"])])
+                out.append(np.asarray(xy, dtype=np.float64) if xy else None)
+            if len(out) != len(requests):
+                raise RuntimeError("projector response length mismatch")
+            return out
+
+        return [
+            project_points_opencv(req["points"], cameras[str(req["camera_id"])]["K"], cameras[str(req["camera_id"])]["dist"])
+            if str(req["camera_id"]) in cameras
+            else None
+            for req in requests
+        ]
+
+
+def projection_residual_px(projected_px: np.ndarray, image_pts: np.ndarray) -> float:
+    err = np.linalg.norm(np.asarray(projected_px, dtype=np.float64).reshape(-1, 2) - image_pts.reshape(-1, 2), axis=1)
     return float(np.sqrt(np.mean(err * err)))
 
 
@@ -224,7 +330,15 @@ def median(values: list[float]) -> float:
     return float(np.median(np.asarray(values, dtype=np.float64)))
 
 
-def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[str, dict[str, Any]], world_from_camera: dict[str, np.ndarray], detector, cfg: dict[str, Any]) -> dict[str, Any]:
+def evaluate_sample(
+    snapshot_dir: Path,
+    sample: dict[str, Any],
+    cameras: dict[str, dict[str, Any]],
+    world_from_camera: dict[str, np.ndarray],
+    detector,
+    cfg: dict[str, Any],
+    projector: ProjectionBackend,
+) -> dict[str, Any]:
     object_pts = local_tag_corners(float(cfg["tagSizeM"]))
     observations_by_tag: dict[int, list[dict[str, Any]]] = {}
     detected_by_camera: dict[str, list[int]] = {}
@@ -262,6 +376,8 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
             fused_by_tag[tag_id] = fused
 
     residuals: dict[str, dict[str, list[float]]] = {}
+    residual_jobs: list[tuple[str, int, np.ndarray, float, float]] = []
+    projection_requests: list[dict[str, Any]] = []
     for tag_id, fused in fused_by_tag.items():
         for obs in observations_by_tag.get(tag_id, []):
             cam_id = obs["camera_id"]
@@ -269,12 +385,20 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
             trans = float(np.linalg.norm(obs["T_world_from_tag"][:3, 3] - T_fused[:3, 3]))
             rot = rotation_angle_deg(obs["T_world_from_tag"][:3, :3], T_fused[:3, :3])
             T_camera_from_world = invert_transform(world_from_camera[cam_id])
-            reproj = project_residual_px(T_camera_from_world, T_fused, cameras[cam_id]["K"], cameras[cam_id]["dist"], object_pts, obs["corners_px"])
-            r = residuals.setdefault(cam_id, {"trans_m": [], "rot_deg": [], "reproj_px": [], "tags": []})
-            r["trans_m"].append(trans)
-            r["rot_deg"].append(rot)
-            r["reproj_px"].append(reproj)
-            r["tags"].append(float(tag_id))
+            T_camera_from_tag = T_camera_from_world @ T_fused
+            projection_requests.append({"camera_id": cam_id, "points": transform_points(T_camera_from_tag, object_pts)})
+            residual_jobs.append((cam_id, tag_id, obs["corners_px"], trans, rot))
+
+    projected_batches = projector.project_batch(cameras, projection_requests)
+    for (cam_id, tag_id, corners_px, trans, rot), projected_px in zip(residual_jobs, projected_batches):
+        if projected_px is None:
+            continue
+        reproj = projection_residual_px(projected_px, corners_px)
+        r = residuals.setdefault(cam_id, {"trans_m": [], "rot_deg": [], "reproj_px": [], "tags": []})
+        r["trans_m"].append(trans)
+        r["rot_deg"].append(rot)
+        r["reproj_px"].append(reproj)
+        r["tags"].append(float(tag_id))
 
     camera_results: dict[str, Any] = {}
     fail_cameras = []
@@ -371,11 +495,13 @@ def run(snapshot_dir: Path, config_json: Path, result_json: Path) -> int:
         manifest = json.loads((snapshot_dir / "manifest.json").read_text(encoding="utf-8"))
         detector = create_detector(str(cfg.get("tagFamily", "tag36h11")))
         cameras, world_from_camera = load_camera_data(snapshot_dir, manifest)
+        projector = ProjectionBackend(cfg)
         samples = [
-            evaluate_sample(snapshot_dir, sample, cameras, world_from_camera, detector, cfg)
+            evaluate_sample(snapshot_dir, sample, cameras, world_from_camera, detector, cfg, projector)
             for sample in manifest.get("samples", [])
         ]
         result = summarize(samples, cfg)
+        result["projection_backend"] = projector.name
     except Exception as exc:
         result = {"status": "error", "reason": str(exc), "traceback": traceback.format_exc(), "summary_line": f"status=error reason={exc}"}
         write_result(result_json, result)

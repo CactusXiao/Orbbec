@@ -35,6 +35,8 @@
         "enabled": true,
         "pythonExecutable": "python3",
         "scriptPath": "extrinsic_health_check.py",
+        "projectorPath": "extrinsic_health_projector",
+        "projectionBackend": "orbbec_sdk",
         "tagFamily": "tag36h11",
         "tagSizeM": 0.096,
         "sampleCount": 5,

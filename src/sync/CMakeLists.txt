@@ -30,6 +30,11 @@ add_executable(${PROJECT_NAME}
     utils/utils_opencv.cpp
 )
 
+add_executable(extrinsic_health_projector
+    extrinsic_health_projector.cpp
+    utils/cJSON.c
+)
+
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${OpenCV_INCLUDE_DIRS}
     ${PCL_INCLUDE_DIRS}
@@ -42,6 +47,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${OpenCV_LIBS}
     ${PCL_LIBRARIES}
     Threads::Threads
+)
+
+target_include_directories(extrinsic_health_projector PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}/utils
+)
+
+target_link_libraries(extrinsic_health_projector PRIVATE
+    ob::OrbbecSDK
 )
 
 add_definitions(${PCL_DEFINITIONS})
@@ -57,6 +71,7 @@ elseif(UNIX)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
     set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib/OrbbecSDK_v2.7.2/lib")
     set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_LIST_DIR}/../../lib/OrbbecSDK_v2.7.2/lib")
+    set_target_properties(extrinsic_health_projector PROPERTIES BUILD_RPATH "${CMAKE_CURRENT_LIST_DIR}/../../lib/OrbbecSDK_v2.7.2/lib")
 endif()
 
 install(FILES
@@ -66,3 +81,4 @@ install(FILES
     DESTINATION bin
 )
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+install(TARGETS extrinsic_health_projector RUNTIME DESTINATION bin)
