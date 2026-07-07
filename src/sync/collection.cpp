@@ -800,6 +800,10 @@ struct DeviceBuffer {
     cv::Mat   latestRgb;
     uint64_t  latestRgbTsUs = 0;
     std::chrono::steady_clock::time_point latestRgbSteady{};
+    cv::Mat   latestDepthAlignedRgb;
+    uint64_t  latestDepthTsUs = 0;
+    float     latestDepthValueScaleMm = 0.0f;
+    std::chrono::steady_clock::time_point latestDepthSteady{};
 
     OBCameraParam rgbDepthParam{};
     bool          rgbDepthParamValid = false;
@@ -2707,6 +2711,10 @@ public:
                 kv.second.latestRgb.release();
                 kv.second.latestRgbTsUs = 0;
                 kv.second.latestRgbSteady = {};
+                kv.second.latestDepthAlignedRgb.release();
+                kv.second.latestDepthTsUs = 0;
+                kv.second.latestDepthValueScaleMm = 0.0f;
+                kv.second.latestDepthSteady = {};
                 kv.second.accelSamples.clear();
                 kv.second.gyroSamples.clear();
             }
@@ -3035,12 +3043,18 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             for(const auto &kv: buffers_) {
                 const auto itRgb = kv.second.params.find(CollectDataType::RGB);
-                if(itRgb == kv.second.params.end() || !itRgb->second.valid) {
+                const auto itDepth = kv.second.params.find(CollectDataType::Depth);
+                if(itRgb == kv.second.params.end() || !itRgb->second.valid
+                   || itDepth == kv.second.params.end() || !itDepth->second.valid
+                   || !kv.second.rgbDepthParamValid) {
                     continue;
                 }
                 DeviceBuffer buf;
                 buf.camKey = kv.second.camKey;
                 buf.params[CollectDataType::RGB] = itRgb->second;
+                buf.params[CollectDataType::Depth] = itDepth->second;
+                buf.rgbDepthParam = kv.second.rgbDepthParam;
+                buf.rgbDepthParamValid = kv.second.rgbDepthParamValid;
                 paramsBuffers.emplace(kv.first, std::move(buf));
             }
         }
@@ -3049,11 +3063,11 @@ public:
                 try { fs::remove_all(checkDir); } catch(...) {}
             }
             if(statusLine) {
-                *statusLine = "Extrinsic check inconclusive: not enough RGB camera parameters";
+                *statusLine = "Extrinsic check inconclusive: not enough RGB/depth camera parameters";
             }
             return !health.blockOnInconclusive;
         }
-        writeParamsJson(checkDir, paramsBuffers, { CollectDataType::RGB }, cfg_.colorCloudRgbFrameOffset, cfg_.save);
+        writeParamsJson(checkDir, paramsBuffers, { CollectDataType::RGB, CollectDataType::Depth }, cfg_.colorCloudRgbFrameOffset, cfg_.save);
         writeExtrinsicsJson(checkDir);
         writeExtrinsicHealthConfigJson(checkDir / "health_config.json");
 
@@ -3079,21 +3093,33 @@ public:
             cJSON_AddNumberToObject(sampleObj, "index", sampleIdx);
             cJSON *cameras = cJSON_CreateArray();
             for(const auto &frame: frames) {
-                if(frame.bgr.empty() || frame.ageMs > static_cast<double>(health.maxSnapshotAgeMs)) {
+                const double maxAgeMs = std::max(frame.ageMs, frame.depthAgeMs);
+                if(frame.bgr.empty() || frame.depthAlignedRgb16.empty()
+                   || maxAgeMs > static_cast<double>(health.maxSnapshotAgeMs)) {
                     continue;
                 }
                 const std::string fileName = frame.camKey + ".jpg";
+                const std::string depthFileName = frame.camKey + ".depth.png";
                 const fs::path outPath = sampleDir / fileName;
+                const fs::path depthOutPath = sampleDir / depthFileName;
                 std::vector<int> params = { cv::IMWRITE_JPEG_QUALITY, std::max(1, std::min(100, health.jpegQuality)) };
                 if(!cv::imwrite(outPath.string(), frame.bgr, params)) {
+                    continue;
+                }
+                if(!cv::imwrite(depthOutPath.string(), frame.depthAlignedRgb16)) {
                     continue;
                 }
                 cJSON *camObj = cJSON_CreateObject();
                 cJSON_AddStringToObject(camObj, "id", frame.camKey.c_str());
                 cJSON_AddStringToObject(camObj, "sn", frame.sn.c_str());
                 cJSON_AddStringToObject(camObj, "image", (sampleName + "/" + fileName).c_str());
+                cJSON_AddStringToObject(camObj, "depth", (sampleName + "/" + depthFileName).c_str());
+                cJSON_AddBoolToObject(camObj, "depth_aligned_to_rgb", true);
                 cJSON_AddNumberToObject(camObj, "timestamp_us", static_cast<double>(frame.tsUs));
+                cJSON_AddNumberToObject(camObj, "depth_timestamp_us", static_cast<double>(frame.depthTsUs));
                 cJSON_AddNumberToObject(camObj, "age_ms", frame.ageMs);
+                cJSON_AddNumberToObject(camObj, "depth_age_ms", frame.depthAgeMs);
+                cJSON_AddNumberToObject(camObj, "depth_value_scale_mm", frame.depthValueScaleMm);
                 cJSON_AddItemToArray(cameras, camObj);
             }
             cJSON_AddItemToObject(sampleObj, "cameras", cameras);
@@ -4125,8 +4151,12 @@ private:
         std::string sn;
         std::string camKey;
         cv::Mat bgr;
+        cv::Mat depthAlignedRgb16;
         uint64_t tsUs = 0;
+        uint64_t depthTsUs = 0;
+        float depthValueScaleMm = 0.0f;
         double ageMs = 0.0;
+        double depthAgeMs = 0.0;
     };
 
     struct ProcessedRecord {
@@ -4167,18 +4197,27 @@ private:
         out.reserve(buffers_.size());
         for(const auto &kv: buffers_) {
             const auto &buf = kv.second;
-            if(buf.latestRgb.empty() || buf.latestRgbSteady.time_since_epoch().count() == 0) {
+            if(buf.latestRgb.empty() || buf.latestDepthAlignedRgb.empty()
+               || buf.latestRgbSteady.time_since_epoch().count() == 0
+               || buf.latestDepthSteady.time_since_epoch().count() == 0
+               || !(buf.latestDepthValueScaleMm > 0.0f)) {
                 continue;
             }
-            if(buf.params.find(CollectDataType::RGB) == buf.params.end()) {
+            if(buf.params.find(CollectDataType::RGB) == buf.params.end()
+               || buf.params.find(CollectDataType::Depth) == buf.params.end()
+               || !buf.rgbDepthParamValid) {
                 continue;
             }
             ExtrinsicHealthFrame frame;
             frame.sn = kv.first;
             frame.camKey = buf.camKey;
             frame.bgr = buf.latestRgb.clone();
+            frame.depthAlignedRgb16 = buf.latestDepthAlignedRgb.clone();
             frame.tsUs = buf.latestRgbTsUs;
+            frame.depthTsUs = buf.latestDepthTsUs;
+            frame.depthValueScaleMm = buf.latestDepthValueScaleMm;
             frame.ageMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - buf.latestRgbSteady).count();
+            frame.depthAgeMs = std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(now - buf.latestDepthSteady).count();
             out.push_back(std::move(frame));
         }
         std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
@@ -7500,12 +7539,56 @@ private:
                 if(shouldRefreshPreview) {
                     cv::Mat previewBgr;
                     if(copyColorFrameToBgr(frame, previewBgr) && !previewBgr.empty()) {
+                        OBCameraParam rgbDepthParam{};
+                        bool rgbDepthParamValid = false;
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            auto it = buffers_.find(deviceSn);
+                            if(it != buffers_.end() && it->second.rgbDepthParamValid) {
+                                rgbDepthParam = it->second.rgbDepthParam;
+                                rgbDepthParamValid = true;
+                            }
+                        }
+
+                        cv::Mat alignedDepth;
+                        uint64_t depthTs = 0;
+                        float depthValueScaleMm = 0.0f;
+                        if(rgbDepthParamValid) {
+                            auto depthFrame = getFrameForType(CollectDataType::Depth);
+                            cv::Mat depthRaw;
+                            if(depthFrame && copyVideoFrameToRawMat(depthFrame, depthRaw, &depthValueScaleMm)
+                               && depthRaw.type() == CV_16UC1 && depthValueScaleMm > 0.0f) {
+                                cv::Mat zBuf;
+                                alignDepthToRgbInto(depthRaw, depthValueScaleMm, rgbDepthParam,
+                                                    previewBgr.cols, previewBgr.rows, alignedDepth, zBuf);
+                                if(alignedDepth.empty() || alignedDepth.type() != CV_16UC1 || cv::countNonZero(alignedDepth) == 0) {
+                                    alignedDepth.release();
+                                    depthValueScaleMm = 0.0f;
+                                }
+                                else {
+                                    depthTs = getFrameTimestampUs(depthFrame, true);
+                                }
+                            }
+                        }
+
                         std::lock_guard<std::mutex> lock(mtx_);
                         auto it = buffers_.find(deviceSn);
                         if(it != buffers_.end()) {
                             it->second.latestRgb = std::move(previewBgr);
                             it->second.latestRgbTsUs = ts;
                             it->second.latestRgbSteady = std::chrono::steady_clock::now();
+                            if(!alignedDepth.empty() && depthValueScaleMm > 0.0f) {
+                                it->second.latestDepthAlignedRgb = std::move(alignedDepth);
+                                it->second.latestDepthTsUs = depthTs;
+                                it->second.latestDepthValueScaleMm = depthValueScaleMm;
+                                it->second.latestDepthSteady = it->second.latestRgbSteady;
+                            }
+                            else {
+                                it->second.latestDepthAlignedRgb.release();
+                                it->second.latestDepthTsUs = 0;
+                                it->second.latestDepthValueScaleMm = 0.0f;
+                                it->second.latestDepthSteady = {};
+                            }
                         }
                     }
                 }
