@@ -224,6 +224,10 @@ def median(values: list[float]) -> float:
     return float(np.median(np.asarray(values, dtype=np.float64)))
 
 
+def status_counts(statuses: list[str]) -> dict[str, int]:
+    return {key: sum(1 for status in statuses if status == key) for key in ("pass", "warn", "fail", "inconclusive")}
+
+
 def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[str, dict[str, Any]], world_from_camera: dict[str, np.ndarray], detector, cfg: dict[str, Any]) -> dict[str, Any]:
     object_pts = local_tag_corners(float(cfg["tagSizeM"]))
     observations_by_tag: dict[int, list[dict[str, Any]]] = {}
@@ -277,9 +281,10 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
             r["tags"].append(float(tag_id))
 
     camera_results: dict[str, Any] = {}
-    fail_cameras = []
-    warn_cameras = []
-    checked_cameras = []
+    pass_cameras: list[str] = []
+    fail_cameras: list[str] = []
+    warn_cameras: list[str] = []
+    checked_cameras: list[str] = []
     for cam_id, r in residuals.items():
         tag_count = len(set(int(x) for x in r["tags"]))
         if tag_count < int(cfg["minTagsPerCamera"]):
@@ -294,6 +299,8 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
         elif trans > float(cfg["warnTransThreshM"]) or rot > float(cfg["warnRotThreshDeg"]) or reproj > float(cfg["warnReprojThreshPx"]):
             status = "warn"
             warn_cameras.append(cam_id)
+        else:
+            pass_cameras.append(cam_id)
         checked_cameras.append(cam_id)
         camera_results[cam_id] = {
             "status": status,
@@ -320,44 +327,133 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
         status = "inconclusive"
         reason = "insufficient_shared_tag_observations"
 
+    camera_statuses = {cam_id: "pass" for cam_id in pass_cameras}
+    camera_statuses.update({cam_id: "warn" for cam_id in warn_cameras})
+    camera_statuses.update({cam_id: "fail" for cam_id in fail_cameras})
+    camera_statuses.update({cam_id: "inconclusive" for cam_id in missing_checked_cameras})
+    camera_counts = status_counts(list(camera_statuses.values()))
+    camera_counts["total"] = len(camera_statuses)
+
     return {
         "sample_index": sample.get("index"),
         "status": status,
         "reason": reason,
+        "expected_cameras": sorted(expected_camera_ids),
         "checked_cameras": sorted(checked_cameras),
         "missing_checked_cameras": missing_checked_cameras,
+        "pass_cameras": sorted(pass_cameras),
         "fail_cameras": sorted(fail_cameras),
         "warn_cameras": sorted(warn_cameras),
+        "inconclusive_cameras": missing_checked_cameras,
+        "camera_counts": camera_counts,
+        "camera_statuses": dict(sorted(camera_statuses.items())),
         "fused_tag_count": len(fused_by_tag),
         "detected_by_camera": detected_by_camera,
         "cameras": camera_results,
     }
 
 
+def sample_expected_cameras(sample: dict[str, Any]) -> set[str]:
+    expected = {str(cam) for cam in sample.get("expected_cameras", [])}
+    expected.update(str(cam) for cam in sample.get("checked_cameras", []))
+    expected.update(str(cam) for cam in sample.get("missing_checked_cameras", []))
+    expected.update(str(cam) for cam in sample.get("cameras", {}).keys())
+    return expected
+
+
+def aggregate_camera_statuses(samples: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
+    all_cameras = sorted({cam for sample in samples for cam in sample_expected_cameras(sample)})
+    by_camera: dict[str, dict[str, Any]] = {}
+    for cam_id in all_cameras:
+        per_sample: list[str] = []
+        for sample in samples:
+            expected = sample_expected_cameras(sample)
+            if cam_id not in expected:
+                continue
+            camera_entry = sample.get("cameras", {}).get(cam_id)
+            if isinstance(camera_entry, dict) and camera_entry.get("status") in ("pass", "warn", "fail"):
+                per_sample.append(str(camera_entry["status"]))
+            else:
+                per_sample.append("inconclusive")
+        counts = status_counts(per_sample)
+        pass_like = counts["pass"] + counts["warn"]
+        if counts["fail"] >= int(cfg["minFailingSnapshots"]):
+            status = "fail"
+        elif pass_like >= int(cfg["minPassingSnapshots"]):
+            status = "warn" if counts["fail"] > 0 or counts["warn"] > 0 else "pass"
+        else:
+            status = "inconclusive"
+        by_camera[cam_id] = {"status": status, "sample_counts": counts, "samples_seen": len(per_sample)}
+
+    camera_statuses = {cam_id: item["status"] for cam_id, item in by_camera.items()}
+    camera_counts = status_counts(list(camera_statuses.values()))
+    camera_counts["total"] = len(all_cameras)
+    return {
+        "camera_statuses": dict(sorted(camera_statuses.items())),
+        "camera_sample_counts": by_camera,
+        "camera_counts": camera_counts,
+        "pass_cameras": [cam for cam in all_cameras if camera_statuses.get(cam) == "pass"],
+        "warn_cameras": [cam for cam in all_cameras if camera_statuses.get(cam) == "warn"],
+        "fail_cameras": [cam for cam in all_cameras if camera_statuses.get(cam) == "fail"],
+        "inconclusive_cameras": [cam for cam in all_cameras if camera_statuses.get(cam) == "inconclusive"],
+    }
+
+
 def summarize(samples: list[dict[str, Any]], cfg: dict[str, Any]) -> dict[str, Any]:
-    counts = {key: sum(1 for s in samples if s["status"] == key) for key in ("pass", "warn", "fail", "inconclusive")}
-    fail_cameras = sorted({cam for s in samples for cam in s.get("fail_cameras", [])})
-    warn_cameras = sorted({cam for s in samples for cam in s.get("warn_cameras", [])})
-    missing_cameras = sorted({cam for s in samples for cam in s.get("missing_checked_cameras", [])})
-    pass_like = counts["pass"] + counts["warn"]
-    if counts["fail"] >= int(cfg["minFailingSnapshots"]):
+    sample_counts = status_counts([str(s["status"]) for s in samples])
+    camera_summary = aggregate_camera_statuses(samples, cfg)
+    pass_like = sample_counts["pass"] + sample_counts["warn"]
+    if sample_counts["fail"] >= int(cfg["minFailingSnapshots"]):
         status = "fail"
         reason = "repeated_camera_residual_failures"
     elif pass_like >= int(cfg["minPassingSnapshots"]):
-        status = "warn" if counts["warn"] > 0 else "pass"
+        status = "warn" if sample_counts["warn"] > 0 else "pass"
         reason = "ok"
     else:
         status = "inconclusive"
         reason = "not_enough_passing_snapshots"
 
-    parts = [f"status={status}", f"pass={counts['pass']}", f"warn={counts['warn']}", f"fail={counts['fail']}", f"inconclusive={counts['inconclusive']}"]
+    camera_counts = camera_summary["camera_counts"]
+    parts = [
+        f"status={status}",
+        f"sample_pass={sample_counts['pass']}",
+        f"sample_warn={sample_counts['warn']}",
+        f"sample_fail={sample_counts['fail']}",
+        f"sample_inconclusive={sample_counts['inconclusive']}",
+        f"camera_total={camera_counts['total']}",
+        f"camera_pass={camera_counts['pass']}",
+        f"camera_warn={camera_counts['warn']}",
+        f"camera_fail={camera_counts['fail']}",
+        f"camera_inconclusive={camera_counts['inconclusive']}",
+    ]
+    fail_cameras = camera_summary["fail_cameras"]
+    warn_cameras = camera_summary["warn_cameras"]
+    pass_cameras = camera_summary["pass_cameras"]
+    inconclusive_cameras = camera_summary["inconclusive_cameras"]
+    if pass_cameras:
+        parts.append("pass_cameras=" + ",".join(pass_cameras))
     if fail_cameras:
         parts.append("fail_cameras=" + ",".join(fail_cameras))
     if warn_cameras:
         parts.append("warn_cameras=" + ",".join(warn_cameras))
-    if missing_cameras:
-        parts.append("missing_cameras=" + ",".join(missing_cameras))
-    return {"status": status, "reason": reason, "counts": counts, "fail_cameras": fail_cameras, "warn_cameras": warn_cameras, "missing_cameras": missing_cameras, "summary_line": " ".join(parts), "samples": samples}
+    if inconclusive_cameras:
+        parts.append("inconclusive_cameras=" + ",".join(inconclusive_cameras))
+    return {
+        "status": status,
+        "reason": reason,
+        "sample_counts": sample_counts,
+        "camera_counts": camera_counts,
+        "counts": camera_counts,
+        "pass_cameras": pass_cameras,
+        "fail_cameras": fail_cameras,
+        "warn_cameras": warn_cameras,
+        "inconclusive_cameras": inconclusive_cameras,
+        "missing_cameras": inconclusive_cameras,
+        "camera_statuses": camera_summary["camera_statuses"],
+        "camera_sample_counts": camera_summary["camera_sample_counts"],
+        "summary_line": " ".join(parts),
+        "samples": samples,
+    }
 
 
 def write_result(path: Path, result: dict[str, Any]) -> None:

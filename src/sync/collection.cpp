@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <condition_variable>
 #include <deque>
@@ -4244,7 +4245,57 @@ private:
         return oss.str();
     }
 
+    static int readJsonIntDefault(cJSON *obj, const char *name, int fallback = 0) {
+        double value = static_cast<double>(fallback);
+        if(readJsonNumber(obj, name, value)) {
+            return static_cast<int>(std::llround(value));
+        }
+        return fallback;
+    }
+
+    static std::string readStringArrayJoined(cJSON *root, const char *name) {
+        cJSON *array = cJSON_GetObjectItemCaseSensitive(root, name);
+        if(!array || !cJSON_IsArray(array)) {
+            return "";
+        }
+        std::ostringstream oss;
+        bool first = true;
+        cJSON *item = nullptr;
+        cJSON_ArrayForEach(item, array) {
+            if(!item || !cJSON_IsString(item) || !item->valuestring) {
+                continue;
+            }
+            if(!first) {
+                oss << ",";
+            }
+            first = false;
+            oss << item->valuestring;
+        }
+        return oss.str();
+    }
+
+    static void appendExtrinsicHealthCameraStatusLine(cJSON *root, std::vector<std::string> &detailLines) {
+        cJSON *counts = cJSON_GetObjectItemCaseSensitive(root, "camera_counts");
+        if(!counts || !cJSON_IsObject(counts)) {
+            return;
+        }
+        const int total = readJsonIntDefault(counts, "total");
+        const int pass = readJsonIntDefault(counts, "pass");
+        const int warn = readJsonIntDefault(counts, "warn");
+        const int fail = readJsonIntDefault(counts, "fail");
+        const int inconclusive = readJsonIntDefault(counts, "inconclusive");
+        std::ostringstream oss;
+        oss << "Extrinsic camera status:"
+            << " total=" << total
+            << " pass=" << pass << "[" << readStringArrayJoined(root, "pass_cameras") << "]"
+            << " warn=" << warn << "[" << readStringArrayJoined(root, "warn_cameras") << "]"
+            << " fail=" << fail << "[" << readStringArrayJoined(root, "fail_cameras") << "]"
+            << " inconclusive=" << inconclusive << "[" << readStringArrayJoined(root, "inconclusive_cameras") << "]";
+        detailLines.push_back(oss.str());
+    }
+
     static void collectExtrinsicHealthDetailLines(cJSON *root, std::vector<std::string> &detailLines) {
+        appendExtrinsicHealthCameraStatusLine(root, detailLines);
         std::map<std::string, ExtrinsicHealthMaxResidual> byCamera;
         cJSON *samplesObj = cJSON_GetObjectItemCaseSensitive(root, "samples");
         if(!samplesObj || !cJSON_IsArray(samplesObj)) {
