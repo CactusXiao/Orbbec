@@ -1,6 +1,7 @@
 #include "collection.hpp"
 #include "ego.hpp"
 #include "fisheyes.hpp"
+#include "task_backend_client.hpp"
 
 #include "utils/utils.hpp"
 
@@ -7955,6 +7956,8 @@ struct TaskInfo {
     std::string description_cn;
     std::string description_en;
     int         repeat_times = 1;
+    int         completed = 0;
+    int         total = 1;
 };
 
 struct TaskProgress {
@@ -8102,6 +8105,108 @@ static int getCurrentTaskIndex(const std::vector<TaskProgress> &progress) {
     return -1;
 }
 
+enum class CaptureState { IDLE, RECORDING, DRAINING, STOPPED_READY, BACKEND_SYNC_PENDING, DELETE_CONFIRM };
+
+enum class PendingExitAction { None, ExitCollection, ReturnConfig, ReturnTaskSelect };
+
+struct EpisodeReservationUi {
+    bool        active = false;
+    std::string reservationId;
+    std::string taskName;
+    int         episodeNumber = 0;
+    fs::path    localPath;
+    std::string idempotencyKey;
+    bool        localFinalized = false;
+    bool        countedComplete = false;
+
+    void clear() {
+        active = false;
+        reservationId.clear();
+        taskName.clear();
+        episodeNumber = 0;
+        localPath.clear();
+        idempotencyKey.clear();
+        localFinalized = false;
+        countedComplete = false;
+    }
+};
+
+static TaskInfo taskInfoFromBackend(const TaskBackendTask &src) {
+    TaskInfo out;
+    out.name = src.taskName;
+    out.description_cn = src.descriptionCn;
+    out.description_en = src.descriptionEn;
+    out.repeat_times = std::max(1, src.total);
+    out.total = std::max(1, src.total);
+    out.completed = std::max(0, std::min(src.completed, out.total));
+    return out;
+}
+
+static int findTaskIndexByName(const std::vector<TaskInfo> &tasks, const std::string &taskName) {
+    for(int i = 0; i < static_cast<int>(tasks.size()); ++i) {
+        if(tasks[static_cast<size_t>(i)].name == taskName) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool isTaskComplete(const TaskInfo &task) {
+    return task.completed >= task.total;
+}
+
+static std::string makeCollectionClientId() {
+    char host[128] = {0};
+#if defined(__unix__) || defined(__APPLE__)
+    if(::gethostname(host, sizeof(host) - 1) != 0) {
+        std::snprintf(host, sizeof(host), "host");
+    }
+    const long pid = static_cast<long>(::getpid());
+#else
+    std::snprintf(host, sizeof(host), "host");
+    const long pid = 0;
+#endif
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::system_clock::now().time_since_epoch()).count();
+    std::ostringstream oss;
+    oss << host << "-" << pid << "-" << now;
+    return oss.str();
+}
+
+static std::string makeIdempotencyKey(const std::string &clientId,
+                                      const std::string &reservationId,
+                                      int episodeNumber) {
+    std::ostringstream oss;
+    oss << clientId << ":" << reservationId << ":episode_" << episodeNumber << ":confirm";
+    return oss.str();
+}
+
+static std::string captureStateName(CaptureState state,
+                                    const EpisodeReservationUi &reservation,
+                                    bool cameraFaultActive) {
+    if(cameraFaultActive) {
+        return "camera-error";
+    }
+    if(reservation.active && reservation.localFinalized && state == CaptureState::BACKEND_SYNC_PENDING) {
+        return "backend-sync-pending";
+    }
+    switch(state) {
+    case CaptureState::IDLE:
+        return "idle";
+    case CaptureState::RECORDING:
+        return "recording";
+    case CaptureState::DRAINING:
+        return "draining";
+    case CaptureState::STOPPED_READY:
+        return "stopped-not-confirmed";
+    case CaptureState::BACKEND_SYNC_PENDING:
+        return "backend-sync-pending";
+    case CaptureState::DELETE_CONFIRM:
+        return "delete-confirm";
+    }
+    return "unknown";
+}
+
 static bool uiButtonEx(cv::Mat &img, const cv::Rect &r, const std::string &label,
                         FrameMouse &ms, bool enabled) {
     const bool hover   = enabled && r.contains(cv::Point(ms.x, ms.y));
@@ -8119,18 +8224,16 @@ static bool uiButtonEx(cv::Mat &img, const cv::Rect &r, const std::string &label
     return false;
 }
 
-enum class CollectionPage { Config, Capture };
-
-enum class CaptureState { IDLE, RECORDING, DRAINING, STOPPED_READY, DELETE_CONFIRM };
+enum class CollectionPage { Config, TaskSelect, Capture };
 
 struct CollectionCaptureUi {
     std::string activeField;
     std::string msg;
 
     std::vector<TaskInfo>     tasks;
-    std::vector<TaskProgress> progress;
     int                       currentTaskIdx = -1;
     int                       currentEpisode = 0;
+    int                       taskListScroll = 0;
     bool                      taskLoadError  = false;
     std::string               taskErrorMsg;
 };
@@ -8231,6 +8334,85 @@ static CameraFaultModalActions drawCameraFaultModal(cv::Mat &ui,
     return actions;
 }
 
+struct ExitConfirmModalActions {
+    bool confirm = false;
+    bool cancel = false;
+};
+
+static ExitConfirmModalActions drawExitConfirmModal(cv::Mat &ui,
+                                                    FrameMouse &fm,
+                                                    PendingExitAction action,
+                                                    const std::string &taskName,
+                                                    int completedThisRun,
+                                                    const std::string &episodeState,
+                                                    const EpisodeReservationUi &reservation) {
+    ExitConfirmModalActions actions;
+    cv::Mat shade(ui.size(), ui.type(), cv::Scalar(0, 0, 0));
+    cv::addWeighted(shade, 0.62, ui, 0.38, 0.0, ui);
+
+    const int winW = ui.cols;
+    const int winH = ui.rows;
+    const int modalW = std::min(900, winW - 60);
+    const int modalH = 390;
+    const cv::Rect modal((winW - modalW) / 2, (winH - modalH) / 2, modalW, modalH);
+    cv::rectangle(ui, modal, cv::Scalar(24, 24, 30), cv::FILLED);
+    cv::rectangle(ui, modal, cv::Scalar(255, 220, 120), 3);
+
+    const std::string title = (action == PendingExitAction::ReturnConfig)
+                                  ? "Return to Config?"
+                                  : (action == PendingExitAction::ReturnTaskSelect ? "Return to Tasks?" : "Exit Collection?");
+    int baseline = 0;
+    const auto titleSz = cv::getTextSize(title, cv::FONT_HERSHEY_DUPLEX, 1.18, 3, &baseline);
+    cv::putText(ui, title, cv::Point(modal.x + (modal.width - titleSz.width) / 2, modal.y + 58),
+                cv::FONT_HERSHEY_DUPLEX, 1.18, cv::Scalar(255, 220, 120), 3, cv::LINE_AA);
+
+    std::vector<std::string> lines;
+    lines.push_back("Current task: " + (taskName.empty() ? std::string("(none)") : taskName));
+    lines.push_back("Completed since entering collection: " + std::to_string(completedThisRun));
+    lines.push_back("Current episode state: " + episodeState);
+    if(reservation.active) {
+        lines.push_back("Reserved episode: " + reservation.taskName + " episode_" + std::to_string(reservation.episodeNumber));
+    }
+    if(action == PendingExitAction::ReturnConfig) {
+        lines.push_back("Returning to Config stops cameras but keeps collection open.");
+    }
+    else if(action == PendingExitAction::ReturnTaskSelect) {
+        lines.push_back("Returning to Tasks stops cameras and keeps collection open.");
+    }
+    else {
+        lines.push_back("Confirming will stop cameras and leave collection.");
+    }
+
+    const int textLeft = modal.x + 34;
+    const int textWidth = modal.width - 68;
+    int y = modal.y + 110;
+    for(const auto &line: lines) {
+        auto wrapped = wrapTextToWidth(line, textWidth, cv::FONT_HERSHEY_DUPLEX, 0.68, 1);
+        for(const auto &w: wrapped) {
+            if(y > modal.y + modal.height - 115) {
+                break;
+            }
+            cv::putText(ui, w, cv::Point(textLeft, y),
+                        cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+            y += 30;
+        }
+    }
+
+    cv::putText(ui, "Ctrl+1 confirm    Ctrl+4 cancel",
+                cv::Point(textLeft, modal.y + modal.height - 84),
+                cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+
+    cv::Rect bConfirm(modal.x + 34, modal.y + modal.height - 62, (modal.width - 88) / 2, 46);
+    cv::Rect bCancel(modal.x + bConfirm.width + 54, modal.y + modal.height - 62, (modal.width - 88) / 2, 46);
+    actions.confirm = uiButtonEx(ui, bConfirm,
+                                 action == PendingExitAction::ReturnConfig
+                                     ? "Return Config [Ctrl+1]"
+                                     : (action == PendingExitAction::ReturnTaskSelect ? "Return Tasks [Ctrl+1]" : "Exit [Ctrl+1]"),
+                                 fm, true);
+    actions.cancel = uiButtonEx(ui, bCancel, "Cancel [Ctrl+4]", fm, true);
+    return actions;
+}
+
 }  // namespace
 
 int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
@@ -8251,11 +8433,18 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     CollectionConfigUi cfgUi;
     CollectionCaptureUi capUi;
     MultiDeviceStreamingRecorder recorder(cfg);
+    TaskBackendClient backendClient(cfg.taskBackend.baseUrl, cfg.taskBackend.timeoutMs);
+    const std::string collectionClientId = makeCollectionClientId();
+    EpisodeReservationUi currentReservation;
     VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
+    int completedThisCollection = 0;
+    bool exitConfirmActive = false;
+    PendingExitAction pendingExitAction = PendingExitAction::None;
+    bool pendingExitDeleteFaultEpisode = false;
     std::optional<MultiDeviceStreamingRecorder::CameraStreamFault> activeCameraFault;
     bool cameraFaultDrainCompleteLogged = false;
     bool cameraReadyAnnounced = false;
@@ -8294,6 +8483,127 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         extrinsicReadyPassed = false;
     };
 
+    auto selectedTaskName = [&]() -> std::string {
+        if(currentReservation.active && !currentReservation.taskName.empty()) {
+            return currentReservation.taskName;
+        }
+        if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
+            return capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
+        }
+        return "";
+    };
+
+    auto applyBackendTasks = [&](const std::vector<TaskBackendTask> &backendTasks,
+                                 const std::string &preferredTaskName,
+                                 bool preserveCurrentSelection) {
+        std::string keep = preferredTaskName;
+        if(keep.empty() && preserveCurrentSelection
+           && capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
+            keep = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
+        }
+
+        capUi.tasks.clear();
+        capUi.tasks.reserve(backendTasks.size());
+        for(const auto &task: backendTasks) {
+            capUi.tasks.push_back(taskInfoFromBackend(task));
+        }
+
+        capUi.currentTaskIdx = keep.empty() ? -1 : findTaskIndexByName(capUi.tasks, keep);
+        if(capUi.currentTaskIdx >= 0) {
+            const auto &task = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)];
+            capUi.currentEpisode = isTaskComplete(task) ? task.total : task.completed + 1;
+        }
+        else {
+            capUi.currentEpisode = 0;
+        }
+        const int maxScroll = std::max(0, static_cast<int>(capUi.tasks.size()) - 1);
+        capUi.taskListScroll = std::max(0, std::min(capUi.taskListScroll, maxScroll));
+        capUi.taskLoadError = false;
+        capUi.taskErrorMsg.clear();
+    };
+
+    auto refreshTasksFromBackend = [&](const std::string &preferredTaskName,
+                                       bool preserveCurrentSelection,
+                                       std::string *errorMessage = nullptr) {
+        std::vector<TaskBackendTask> tasks;
+        std::string error;
+        if(!backendClient.getTasks(trimString(cfgUi.subjectId), tasks, &error)) {
+            capUi.taskLoadError = true;
+            capUi.taskErrorMsg = error;
+            if(errorMessage) {
+                *errorMessage = error;
+            }
+            return false;
+        }
+        applyBackendTasks(tasks, preferredTaskName, preserveCurrentSelection);
+        return true;
+    };
+
+    auto requestExit = [&](PendingExitAction action, bool deleteFaultEpisode) {
+        exitConfirmActive = true;
+        pendingExitAction = action;
+        pendingExitDeleteFaultEpisode = deleteFaultEpisode;
+        capUi.msg.clear();
+    };
+
+    auto releaseCurrentReservation = [&](const std::string &reason) {
+        if(!currentReservation.active) {
+            return true;
+        }
+        if(currentReservation.localFinalized) {
+            capUi.msg = "Cannot release: local episode is finalized and waiting for backend confirm";
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        std::string error;
+        const std::string subject = trimString(cfgUi.subjectId);
+        if(!backendClient.releaseEpisode(currentReservation.reservationId,
+                                         subject,
+                                         currentReservation.taskName,
+                                         &error)) {
+            capUi.msg = "Backend release failed: " + error;
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        pushUiLog("Backend reservation released (" + reason + "): "
+                  + currentReservation.taskName + " ep" + std::to_string(currentReservation.episodeNumber));
+        currentReservation.clear();
+        return true;
+    };
+
+    auto confirmReservationWithBackend = [&]() {
+        if(!currentReservation.active) {
+            capUi.msg = "Backend confirm failed: no active reservation";
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        std::vector<TaskBackendTask> refreshedTasks;
+        std::string error;
+        const std::string subject = trimString(cfgUi.subjectId);
+        if(!backendClient.confirmEpisode(currentReservation.reservationId,
+                                         subject,
+                                         currentReservation.taskName,
+                                         currentReservation.episodeNumber,
+                                         currentReservation.localPath.string(),
+                                         currentReservation.idempotencyKey,
+                                         refreshedTasks,
+                                         &error)) {
+            capUi.msg = "Backend confirm failed: " + error;
+            pushUiLog(capUi.msg);
+            return false;
+        }
+
+        applyBackendTasks(refreshedTasks, currentReservation.taskName, true);
+        if(!currentReservation.countedComplete) {
+            completedThisCollection += 1;
+            currentReservation.countedComplete = true;
+        }
+        pushUiLog("Backend confirm OK: " + currentReservation.taskName
+                  + " ep" + std::to_string(currentReservation.episodeNumber));
+        currentReservation.clear();
+        return true;
+    };
+
     auto updateReadyState = [&]() {
         captureState = CaptureState::STOPPED_READY;
         if(recorder.hasData()) {
@@ -8327,6 +8637,84 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     };
 
     bool running = true;
+    auto performConfirmedExit = [&]() {
+        const PendingExitAction action = pendingExitAction;
+        const bool deleteFaultEpisode = pendingExitDeleteFaultEpisode;
+        exitConfirmActive = false;
+        pendingExitAction = PendingExitAction::None;
+        pendingExitDeleteFaultEpisode = false;
+
+        bool okToLeave = true;
+        if(currentReservation.active && currentReservation.localFinalized) {
+            pushUiLog("Exit requested while backend sync is pending. Retrying backend confirm first.");
+            if(!confirmReservationWithBackend()) {
+                captureState = CaptureState::BACKEND_SYNC_PENDING;
+                okToLeave = false;
+                announce("confirm_failed", "confirm failed");
+            }
+        }
+        else {
+            if(recorder.isRecording()) {
+                recorder.stopRecording();
+            }
+            if(recorder.hasCurrentSession()) {
+                capUi.msg = deleteFaultEpisode ? "Deleting faulted episode before exit..." : "Deleting unconfirmed episode before exit...";
+                pushUiLog(capUi.msg);
+                collectionSetStage("ui_exit_wait_drain");
+                while(!recorder.isDrainComplete()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                }
+                std::string error;
+                if(!recorder.discardCurrentSession(&error)) {
+                    capUi.msg = "Delete failed";
+                    pushUiLog("Delete failed before exit: " + error);
+                    okToLeave = false;
+                }
+            }
+            if(okToLeave && currentReservation.active && !currentReservation.localFinalized) {
+                okToLeave = releaseCurrentReservation("exit");
+            }
+        }
+
+        if(!okToLeave) {
+            return;
+        }
+
+        if(action == PendingExitAction::ReturnConfig || action == PendingExitAction::ReturnTaskSelect) {
+            collectionSetStage(action == PendingExitAction::ReturnConfig ? "ui_confirm_return_config" : "ui_confirm_return_tasks");
+            announce(action == PendingExitAction::ReturnConfig ? "config" : "tasks",
+                     action == PendingExitAction::ReturnConfig ? "config" : "tasks");
+            recorder.stopIfRunning(false);
+            latestFrameCache.clear();
+            activeCameraFault.reset();
+            recorder.clearCameraStreamFault();
+            cameraFaultDrainCompleteLogged = false;
+            pendingResetAfterDrain = false;
+            resetCameraReadyAnnouncement();
+            captureState = CaptureState::IDLE;
+            if(action == PendingExitAction::ReturnTaskSelect) {
+                std::string error;
+                if(!refreshTasksFromBackend(selectedTaskName(), true, &error)) {
+                    capUi.msg = "Task refresh failed: " + error;
+                    pushUiLog(capUi.msg);
+                }
+                else {
+                    capUi.msg.clear();
+                }
+                page = CollectionPage::TaskSelect;
+            }
+            else {
+                page = CollectionPage::Config;
+                capUi.msg.clear();
+            }
+        }
+        else {
+            collectionSetStage("ui_confirm_exit_collection");
+            recorder.stopIfRunning();
+            running = false;
+        }
+    };
+
     while(running) {
         collectionSetStage("ui_waitKey");
         const int key = cv::waitKey(1);
@@ -8341,9 +8729,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         auto fm = beginFrame(ms);
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
-            recorder.stopIfRunning();
-            running = false;
-            break;
+            if(exitConfirmActive) {
+                exitConfirmActive = false;
+                pendingExitAction = PendingExitAction::None;
+                pendingExitDeleteFaultEpisode = false;
+            }
+            else {
+                requestExit(PendingExitAction::ExitCollection, activeCameraFault.has_value());
+            }
         }
 
         collectionSetStage("ui_draw");
@@ -8408,13 +8801,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
             cv::Rect bBack(60, fieldsTop + 3 * rowH, 220, 60);
             cv::Rect bEnter(340, fieldsTop + 3 * rowH, 260, 60);
-            if(uiButton(ui, bBack, "Back to Menu", fm)) {
+            if(!exitConfirmActive && uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
                 announce("menu", "menu");
-                recorder.stopIfRunning();
-                running = false;
+                requestExit(PendingExitAction::ExitCollection, false);
             }
-            if(uiButton(ui, bEnter, "Enter Capture", fm)) {
+            if(!exitConfirmActive && uiButton(ui, bEnter, "Load Tasks", fm)) {
                 collectionSetStage("ui_enter_capture");
                 cfgUi.enforceRules();
                 if(!cfgUi.hasSelectedCaptureType()) {
@@ -8428,51 +8820,39 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
                     const std::string subject = trimString(cfgUi.subjectId);
-                    auto tasks = loadTaskJson(saveRoot / "task.json");
-                    if(tasks.empty()) {
-                        cfgUi.error = "task.json not found or empty at: " + saveRoot.string();
+                    (void)saveRoot;
+                    (void)subject;
+                    if(!cfg.taskBackend.enabled) {
+                        cfgUi.error = "Task backend is disabled in config";
                         announce("enter_failed", "enter failed");
                     }
                     else {
-                        cfgUi.error.clear();
-                        const fs::path progressPath = saveRoot / subject / "progress.csv";
-                        fs::create_directories(saveRoot / subject);
-                        const auto existing = loadProgressCsv(progressPath);
-                        capUi.tasks = std::move(tasks);
-                        capUi.progress = buildProgressFromTasks(capUi.tasks, existing);
-                        saveProgressCsv(progressPath, capUi.progress);
-                        capUi.currentTaskIdx = getCurrentTaskIndex(capUi.progress);
-                        if(capUi.currentTaskIdx == -1) {
-                            capUi.msg = "All tasks completed!";
-                            capUi.currentEpisode = 0;
+                        std::string backendError;
+                        if(!refreshTasksFromBackend("", false, &backendError) || capUi.tasks.empty()) {
+                            cfgUi.error = capUi.tasks.empty() && backendError.empty()
+                                              ? "Task backend returned no tasks"
+                                              : "Task backend unavailable: " + backendError;
+                            announce("enter_failed", "enter failed");
+                            pushUiLog(cfgUi.error);
                         }
                         else {
-                            capUi.currentEpisode = capUi.progress[static_cast<size_t>(capUi.currentTaskIdx)].completed + 1;
-                            capUi.msg.clear();
-                        }
-                        captureState = CaptureState::IDLE;
-                        page = CollectionPage::Capture;
-                        const bool ok = recorder.start(cfgUi);
-                        if(ok) {
+                            cfgUi.error.clear();
+                            capUi.currentTaskIdx = -1;
+                            capUi.currentEpisode = 0;
+                            capUi.msg = "Select one task";
+                            currentReservation.clear();
+                            captureState = CaptureState::IDLE;
+                            pendingResetAfterDrain = false;
+                            page = CollectionPage::TaskSelect;
                             resetCameraReadyAnnouncement();
                             announce("enter", "enter");
-                            pushUiLog("Enter capture");
-                            {
-                                const std::string s = recorder.streamProfilesLine();
-                                if(!s.empty()) {
-                                    pushUiLog(s);
-                                }
-                            }
-                        }
-                        else {
-                            announce("enter_failed", "enter failed");
-                            pushUiLog("Enter capture failed");
+                            pushUiLog("Task list loaded from " + backendClient.baseUrl());
                         }
                     }
                 }
             }
 
-            if(!cfgUi.activeField.empty() && key > 0) {
+            if(!exitConfirmActive && !cfgUi.activeField.empty() && key > 0) {
                 const bool ctrlFromMask = ((key & 0x20000) != 0) || ((key & 0x04000000) != 0);
                 const bool ctrlHeld = g_ctrlShortcutListening || ctrlFromMask;
                 if(cfgUi.activeField == "save") {
@@ -8487,6 +8867,249 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else if(cfgUi.activeField == "bri") {
                     handleTextInputShortcut(cfgUi.brightness, key, ctrlHeld);
                 }
+            }
+        }
+        else if(page == CollectionPage::TaskSelect) {
+            collectionSetStage("ui_page_task_select");
+            cv::putText(ui, "Collection - Select Task", cv::Point(24, 48),
+                        cv::FONT_HERSHEY_DUPLEX, 1.0, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+
+            const std::string header = "Subject: " + trimString(cfgUi.subjectId)
+                                     + "    Backend: " + backendClient.baseUrl();
+            cv::putText(ui, header, cv::Point(28, 82),
+                        cv::FONT_HERSHEY_DUPLEX, 0.58, cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
+
+            const int margin = 28;
+            const int top = 110;
+            const int bottomButtonsH = 78;
+            const cv::Rect listPanel(margin, top,
+                                     std::max(360, winW / 2 - 48),
+                                     std::max(240, winH - top - bottomButtonsH - 18));
+            const cv::Rect detailPanel(listPanel.x + listPanel.width + 24, top,
+                                       std::max(320, winW - (listPanel.x + listPanel.width + 24) - margin),
+                                       listPanel.height);
+            cv::rectangle(ui, listPanel, cv::Scalar(24, 24, 26), cv::FILLED);
+            cv::rectangle(ui, listPanel, cv::Scalar(90, 90, 90), 1);
+            cv::rectangle(ui, detailPanel, cv::Scalar(28, 28, 32), cv::FILLED);
+            cv::rectangle(ui, detailPanel, cv::Scalar(90, 90, 90), 1);
+
+            cv::putText(ui, "Tasks", cv::Point(listPanel.x + 14, listPanel.y + 28),
+                        cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            const int rowH = 42;
+            const int rowTop = listPanel.y + 44;
+            const int maxRows = std::max(1, (listPanel.height - 54) / rowH);
+            const int maxScroll = std::max(0, static_cast<int>(capUi.tasks.size()) - maxRows);
+            if(fm.wheelDelta != 0 && listPanel.contains(cv::Point(fm.x, fm.y))) {
+                const int step = (fm.wheelDelta > 0) ? -3 : 3;
+                capUi.taskListScroll = std::max(0, std::min(maxScroll, capUi.taskListScroll + step));
+            }
+            capUi.taskListScroll = std::max(0, std::min(maxScroll, capUi.taskListScroll));
+
+            for(int row = 0; row < maxRows; ++row) {
+                const int taskIdx = capUi.taskListScroll + row;
+                if(taskIdx >= static_cast<int>(capUi.tasks.size())) {
+                    break;
+                }
+                const auto &task = capUi.tasks[static_cast<size_t>(taskIdx)];
+                const cv::Rect rowRect(listPanel.x + 10, rowTop + row * rowH,
+                                       listPanel.width - 20, rowH - 6);
+                const bool selected = taskIdx == capUi.currentTaskIdx;
+                const bool complete = isTaskComplete(task);
+                const bool hover = rowRect.contains(cv::Point(fm.x, fm.y));
+                cv::Scalar bg = selected ? cv::Scalar(62, 58, 34)
+                              : (hover ? cv::Scalar(44, 44, 48) : cv::Scalar(32, 32, 35));
+                if(complete && !selected) {
+                    bg = hover ? cv::Scalar(38, 50, 38) : cv::Scalar(28, 38, 28);
+                }
+                cv::rectangle(ui, rowRect, bg, cv::FILLED);
+                cv::rectangle(ui, rowRect, selected ? cv::Scalar(255, 220, 80) : cv::Scalar(68, 68, 72), 1);
+
+                const std::string progress = std::to_string(task.completed) + "/" + std::to_string(task.total);
+                int baseline = 0;
+                const auto progSz = cv::getTextSize(progress, cv::FONT_HERSHEY_DUPLEX, 0.58, 1, &baseline);
+                cv::putText(ui, progress,
+                            cv::Point(rowRect.x + rowRect.width - progSz.width - 10, rowRect.y + 24),
+                            cv::FONT_HERSHEY_DUPLEX, 0.58,
+                            complete ? cv::Scalar(120, 220, 120) : cv::Scalar(220, 220, 220),
+                            1, cv::LINE_AA);
+
+                std::string label = task.name;
+                const int labelMaxW = std::max(40, rowRect.width - progSz.width - 34);
+                while(!label.empty()) {
+                    const auto sz = cv::getTextSize(label, cv::FONT_HERSHEY_DUPLEX, 0.55, 1, &baseline);
+                    if(sz.width <= labelMaxW) {
+                        break;
+                    }
+                    label.pop_back();
+                }
+                cv::putText(ui, label, cv::Point(rowRect.x + 10, rowRect.y + 24),
+                            cv::FONT_HERSHEY_DUPLEX, 0.55,
+                            selected ? cv::Scalar(255, 235, 130) : cv::Scalar(235, 235, 235),
+                            1, cv::LINE_AA);
+
+                if(!exitConfirmActive && fm.clicked && rowRect.contains(cv::Point(fm.clickX, fm.clickY))) {
+                    fm.clicked = false;
+                    capUi.currentTaskIdx = taskIdx;
+                    capUi.currentEpisode = complete ? task.total : task.completed + 1;
+                    capUi.msg = complete ? "Selected task is complete" : "Task selected";
+                    resetCameraReadyAnnouncement();
+                    pushUiLog("Selected task: " + task.name + " progress "
+                              + std::to_string(task.completed) + "/" + std::to_string(task.total));
+                }
+            }
+
+            cv::putText(ui, "Task Detail", cv::Point(detailPanel.x + 16, detailPanel.y + 30),
+                        cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            const bool taskSelected = capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size());
+            const bool selectedTaskComplete = taskSelected && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
+            if(taskSelected) {
+                const auto &task = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)];
+                auto nameLines = wrapTextToWidth(task.name, detailPanel.width - 32,
+                                                 cv::FONT_HERSHEY_DUPLEX, 0.95, 2);
+                int y = detailPanel.y + 72;
+                for(size_t i = 0; i < nameLines.size() && i < 3; ++i) {
+                    cv::putText(ui, nameLines[i], cv::Point(detailPanel.x + 16, y),
+                                cv::FONT_HERSHEY_DUPLEX, 0.95,
+                                selectedTaskComplete ? cv::Scalar(120, 220, 120) : cv::Scalar(255, 220, 50),
+                                2, cv::LINE_AA);
+                    y += 36;
+                }
+                const std::string progressLine = "Progress " + std::to_string(task.completed)
+                                               + " / " + std::to_string(task.total)
+                                               + (selectedTaskComplete ? "  complete" : "  ready to capture");
+                cv::putText(ui, progressLine, cv::Point(detailPanel.x + 16, y + 8),
+                            cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
+
+                const std::string &desc = task.description_cn.empty() ? task.description_en : task.description_cn;
+                if(!desc.empty()) {
+                    const int descLeft = detailPanel.x + 16;
+                    const int descTop = y + 46;
+                    const int descWidth = std::max(1, detailPanel.width - 32);
+                    const int descMaxHeight = std::max(80, detailPanel.y + detailPanel.height - descTop - 18);
+                    const int descFontH = choosePromptFontHeight(desc, descWidth, descMaxHeight, 42, 22);
+                    const int lineGap = std::max(10, descFontH / 3);
+                    const auto lines = wrapMultilineTextUtf8(desc, descWidth, descFontH);
+                    int descY = descTop + descFontH;
+                    const int descBottom = detailPanel.y + detailPanel.height - 14;
+                    for(const auto &line: lines) {
+                        if(descY > descBottom) {
+                            break;
+                        }
+                        if(line.empty()) {
+                            descY += lineGap;
+                            continue;
+                        }
+                        putTextUtf8(ui, line, cv::Point(descLeft, descY),
+                                    descFontH, cv::Scalar(225, 225, 225));
+                        descY += descFontH + lineGap;
+                    }
+                }
+            }
+            else {
+                cv::putText(ui, capUi.tasks.empty() ? "No tasks loaded" : "Select a task from the list",
+                            cv::Point(detailPanel.x + 16, detailPanel.y + 78),
+                            cv::FONT_HERSHEY_DUPLEX, 0.78, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+            }
+
+            const int btnY = winH - 62;
+            const int btnH = 42;
+            cv::Rect bConfig(margin, btnY, 170, btnH);
+            cv::Rect bMenu(margin + 184, btnY, 150, btnH);
+            cv::Rect bRefresh(winW - margin - 380, btnY, 160, btnH);
+            cv::Rect bContinue(winW - margin - 204, btnY, 204, btnH);
+            const bool allowContinue = !exitConfirmActive && taskSelected && !selectedTaskComplete;
+            bool doConfig = uiButtonEx(ui, bConfig, "Back Config", fm, !exitConfirmActive);
+            bool doMenu = uiButtonEx(ui, bMenu, "Menu", fm, !exitConfirmActive);
+            bool doRefresh = uiButtonEx(ui, bRefresh, "Refresh", fm, !exitConfirmActive);
+            bool doContinue = uiButtonEx(ui, bContinue, "Enter Capture", fm, allowContinue);
+
+            if(key > 0 && !exitConfirmActive) {
+                const bool ctrlFromMask = ((key & 0x20000) != 0) || ((key & 0x04000000) != 0);
+                const bool ctrlHeld = g_ctrlShortcutListening || ctrlFromMask;
+                const int baseKey = key & 0xFFFF;
+                if(ctrlHeld) {
+                    if(baseKey == '1') {
+                        doContinue = allowContinue;
+                    }
+                    else if(baseKey == '2') {
+                        doRefresh = true;
+                    }
+                    else if(baseKey == '3') {
+                        doConfig = true;
+                    }
+                    else if(baseKey == '4') {
+                        doMenu = true;
+                    }
+                }
+            }
+
+            if(doConfig) {
+                page = CollectionPage::Config;
+                capUi.msg.clear();
+            }
+            if(doMenu) {
+                announce("menu", "menu");
+                requestExit(PendingExitAction::ExitCollection, false);
+            }
+            if(doRefresh) {
+                std::string error;
+                const std::string keep = selectedTaskName();
+                if(refreshTasksFromBackend(keep, true, &error)) {
+                    capUi.msg = "Tasks refreshed";
+                    pushUiLog("Tasks refreshed from backend.");
+                }
+                else {
+                    capUi.msg = "Task refresh failed: " + error;
+                    pushUiLog(capUi.msg);
+                    announce("enter_failed", "enter failed");
+                }
+            }
+            if(doContinue) {
+                collectionSetStage("ui_task_select_enter_capture");
+                std::string keep = selectedTaskName();
+                if(keep.empty()) {
+                    capUi.msg = "Select one task";
+                }
+                else {
+                    currentReservation.clear();
+                    activeCameraFault.reset();
+                    recorder.clearCameraStreamFault();
+                    cameraFaultDrainCompleteLogged = false;
+                    captureState = CaptureState::IDLE;
+                    pendingResetAfterDrain = false;
+                    resetCameraReadyAnnouncement();
+                    const bool ok = recorder.start(cfgUi);
+                    if(ok) {
+                        page = CollectionPage::Capture;
+                        announce("enter", "enter");
+                        pushUiLog("Enter capture: " + keep);
+                        const std::string s = recorder.streamProfilesLine();
+                        if(!s.empty()) {
+                            pushUiLog(s);
+                        }
+                    }
+                    else {
+                        capUi.msg = "Camera start failed";
+                        announce("enter_failed", "enter failed");
+                        pushUiLog("Enter capture camera start failed");
+                        const std::string line = recorder.lastInfoLine();
+                        if(!line.empty()) {
+                            pushUiLog(line);
+                        }
+                    }
+                }
+            }
+
+            if(!capUi.msg.empty()) {
+                std::string lowerMsg = capUi.msg;
+                std::transform(lowerMsg.begin(), lowerMsg.end(), lowerMsg.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                const bool isError = (lowerMsg.find("fail") != std::string::npos) || (lowerMsg.find("error") != std::string::npos);
+                cv::putText(ui, capUi.msg, cv::Point(28, winH - 82),
+                            cv::FONT_HERSHEY_DUPLEX, 0.62,
+                            isError ? cv::Scalar(60, 60, 255) : cv::Scalar(80, 200, 80),
+                            1, cv::LINE_AA);
             }
         }
         else {
@@ -8513,8 +9136,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const bool cameraFaultActive = activeCameraFault.has_value();
             const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
             const auto cameraReadiness = recorder.cameraStreamReadiness();
+            const bool taskSelected = capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size());
+            const bool selectedTaskComplete = taskSelected && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
-               && capUi.currentTaskIdx != -1 && !extrinsicReadyChecked) {
+               && taskSelected && !selectedTaskComplete && !extrinsicReadyChecked) {
                 collectionSetStage("ui_extrinsic_ready_check");
                 pushUiLog("Checking camera extrinsics before READY...");
 
@@ -8534,7 +9159,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 }
             }
             const bool readyForStart = cameraReadiness.allReady
-                                    && (capUi.currentTaskIdx == -1 || (extrinsicReadyChecked && extrinsicReadyPassed));
+                                    && taskSelected
+                                    && !selectedTaskComplete
+                                    && (extrinsicReadyChecked && extrinsicReadyPassed);
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady) {
                 if(readyForStart && !cameraReadyAnnounced) {
                     announce("ready", "ready");
@@ -8588,39 +9215,44 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             // --- 任务信息面板（右侧）---
             cv::rectangle(ui, taskPanel, cv::Scalar(25, 25, 25), cv::FILLED);
             cv::rectangle(ui, taskPanel, cv::Scalar(80, 80, 80), 1);
+            cv::putText(ui, "Current Task", cv::Point(taskPanel.x + 20, taskPanel.y + 32),
+                        cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
             if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
                 const auto &task = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)];
-                const auto &prog = capUi.progress[static_cast<size_t>(capUi.currentTaskIdx)];
+                auto nameLines = wrapTextToWidth(task.name, taskPanel.width - 40,
+                                                 cv::FONT_HERSHEY_DUPLEX, 1.08, 2);
+                int y = taskPanel.y + 76;
+                for(size_t i = 0; i < nameLines.size() && i < 3; ++i) {
+                    cv::putText(ui, nameLines[i], cv::Point(taskPanel.x + 20, y),
+                                cv::FONT_HERSHEY_DUPLEX, 1.08,
+                                isTaskComplete(task) ? cv::Scalar(120, 220, 120) : cv::Scalar(255, 220, 50),
+                                2, cv::LINE_AA);
+                    y += 40;
+                }
+                const std::string progressLine = "Progress " + std::to_string(task.completed)
+                                               + " / " + std::to_string(task.total)
+                                               + (isTaskComplete(task) ? "  complete" : "  next episode after reserve");
+                cv::putText(ui, progressLine, cv::Point(taskPanel.x + 20, y + 8),
+                            cv::FONT_HERSHEY_DUPLEX, 0.72, cv::Scalar(205, 205, 205), 1, cv::LINE_AA);
 
-                cv::putText(ui, task.name,
-                            cv::Point(taskPanel.x + 20, taskPanel.y + 60),
-                            cv::FONT_HERSHEY_DUPLEX, 1.4, cv::Scalar(255, 220, 50), 2, cv::LINE_AA);
-
-                const std::string episodeStr = "Episode " + std::to_string(capUi.currentEpisode)
-                                              + " / " + std::to_string(prog.total);
-                cv::putText(ui, episodeStr,
-                            cv::Point(taskPanel.x + 20, taskPanel.y + 100),
-                            cv::FONT_HERSHEY_DUPLEX, 0.9, cv::Scalar(180, 180, 180), 1, cv::LINE_AA);
-
-                // 优先显示中文描述，无中文时回退到英文
                 const std::string &desc = task.description_cn.empty() ? task.description_en : task.description_cn;
                 if(!desc.empty()) {
-                    const int descLeft      = taskPanel.x + 20;
-                    const int descTop       = taskPanel.y + 150;
-                    const int descWidth     = std::max(1, taskPanel.width - 40);
-                    const int descMaxHeight = std::max(120, taskPanel.height - 180);
-                    const int descFontH     = choosePromptFontHeight(desc, descWidth, descMaxHeight, 72, 28);
-                    const int lineGap       = std::max(12, descFontH / 3);
-                    const auto lines        = wrapMultilineTextUtf8(desc, descWidth, descFontH);
-                    const int descBottom    = taskPanel.y + taskPanel.height - 20;
+                    const int descLeft = taskPanel.x + 20;
+                    const int descTop = y + 34;
+                    const int descWidth = std::max(1, taskPanel.width - 40);
+                    const int descMaxHeight = std::max(80, taskPanel.y + taskPanel.height - descTop - 20);
+                    const int descFontH = choosePromptFontHeight(desc, descWidth, descMaxHeight, 48, 24);
+                    const int lineGap = std::max(10, descFontH / 3);
+                    const auto lines = wrapMultilineTextUtf8(desc, descWidth, descFontH);
                     int descY = descTop + descFontH;
+                    const int descBottom = taskPanel.y + taskPanel.height - 18;
                     for(const auto &line: lines) {
+                        if(descY > descBottom) {
+                            break;
+                        }
                         if(line.empty()) {
                             descY += lineGap;
                             continue;
-                        }
-                        if(descY > descBottom) {
-                            break;
                         }
                         putTextUtf8(ui, line, cv::Point(descLeft, descY),
                                     descFontH, cv::Scalar(220, 220, 220));
@@ -8628,10 +9260,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     }
                 }
             }
-            else if(capUi.currentTaskIdx == -1 && !capUi.tasks.empty()) {
-                cv::putText(ui, "All tasks completed!",
-                            cv::Point(taskPanel.x + 20, taskPanel.y + 60),
-                            cv::FONT_HERSHEY_DUPLEX, 1.2, cv::Scalar(50, 220, 50), 2, cv::LINE_AA);
+            else {
+                const std::string prompt = capUi.tasks.empty() ? "No tasks from backend" : "Return to Tasks and select one task";
+                cv::putText(ui, prompt, cv::Point(taskPanel.x + 20, taskPanel.y + 86),
+                            cv::FONT_HERSHEY_DUPLEX, 0.75, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
             }
 
             // --- 状态显示区（预览正下方）---
@@ -8645,7 +9277,17 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             std::string stateFootnoteLine;
             switch(captureState) {
             case CaptureState::IDLE:
-                if(readyForStart) {
+                if(!taskSelected) {
+                    sd = {"SELECT TASK", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                    stateEmphasisLine = "Choose one task from the backend task list";
+                    stateFootnoteLine = cameraReadiness.message;
+                }
+                else if(selectedTaskComplete) {
+                    sd = {"TASK COMPLETE", cv::Scalar(120, 220, 120), cv::Scalar(30, 60, 30)};
+                    stateEmphasisLine = "Selected task already reached total episodes";
+                    stateFootnoteLine = "Select another task to continue";
+                }
+                else if(readyForStart) {
                     sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
                     stateEmphasisLine = cameraReadiness.message;
                 }
@@ -8685,6 +9327,13 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             case CaptureState::STOPPED_READY:
                 sd = {"STOPPED - CONFIRM", cv::Scalar(50, 200, 255), cv::Scalar(20, 40, 80)};
                 stateEmphasisLine = recorder.captureFrameSummaryLine();
+                break;
+            case CaptureState::BACKEND_SYNC_PENDING:
+                sd = {"BACKEND SYNC PENDING", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
+                stateEmphasisLine = "Retry Confirm after backend is reachable";
+                if(currentReservation.active) {
+                    stateFootnoteLine = currentReservation.taskName + " episode_" + std::to_string(currentReservation.episodeNumber);
+                }
                 break;
             case CaptureState::DELETE_CONFIRM:
                 sd = {"DELETE CONFIRM", cv::Scalar(255, 180, 80), cv::Scalar(80, 40, 20)};
@@ -8794,17 +9443,22 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
 
             // --- 状态机：允许操作判断 ---
-            const bool modalFault = cameraFaultActive;
-            const bool modalDelete = !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
+            const bool modalExit = exitConfirmActive;
+            const bool modalFault = !modalExit && cameraFaultActive;
+            const bool modalDelete = !modalExit && !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
             const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE)
-                                     && (capUi.currentTaskIdx != -1) && readyForStart;
-            const bool allowStop   = !modalFault && !modalDelete && (captureState == CaptureState::RECORDING);
-            const bool allowSave   = !modalFault && !modalDelete && (captureState == CaptureState::STOPPED_READY) && recorder.hasData();
+                                     && !modalExit && !currentReservation.active && readyForStart;
+            const bool allowStop   = !modalFault && !modalDelete && !modalExit && (captureState == CaptureState::RECORDING);
+            const bool allowSave   = !modalFault && !modalDelete && !modalExit
+                                     && ((captureState == CaptureState::STOPPED_READY && recorder.hasData())
+                                         || (captureState == CaptureState::BACKEND_SYNC_PENDING && currentReservation.active && currentReservation.localFinalized));
             const bool allowReset  = !modalFault && !modalDelete
+                                     && !modalExit
                                      && (captureState == CaptureState::RECORDING
                                          || captureState == CaptureState::STOPPED_READY
                                          || (captureState == CaptureState::DRAINING && !pendingResetAfterDrain));
-            const bool allowNav    = !modalFault && !modalDelete && (captureState == CaptureState::IDLE);
+            const bool allowNav    = !modalFault && !modalDelete && !modalExit
+                                     && (captureState == CaptureState::IDLE || captureState == CaptureState::BACKEND_SYNC_PENDING);
 
             // --- 右侧按钮区 ---
             const int btnX = taskPanelX + 20;
@@ -8814,11 +9468,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect bSave (btnX, winH - 160, btnW, 50);
             cv::Rect bReset(btnX, winH - 100, btnW, 50);
             cv::Rect bMenu (btnX, winH - 38,  btnW / 2 - 5, 30);
-            cv::Rect bConfig(btnX + btnW / 2 + 5, winH - 38, btnW / 2 - 5, 30);
+            cv::Rect bTasks(btnX + btnW / 2 + 5, winH - 38, btnW / 2 - 5, 30);
 
             std::string startLabel = "Start  [Ctrl+1]";
-            if(!allowStart && captureState == CaptureState::IDLE && capUi.currentTaskIdx != -1) {
-                if(!cameraReadiness.allReady) {
+            if(!allowStart && captureState == CaptureState::IDLE && taskSelected) {
+                if(selectedTaskComplete) {
+                    startLabel = "Start (task complete)";
+                }
+                else if(!cameraReadiness.allReady) {
                     startLabel = "Start (warming up)";
                 }
                 else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
@@ -8830,14 +9487,20 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
-            bool doSave     = uiButtonEx(ui, bSave,  "Confirm [Ctrl+3]", fm, allowSave);
+            bool doSave     = uiButtonEx(ui, bSave,
+                                         captureState == CaptureState::BACKEND_SYNC_PENDING
+                                             ? "Retry Backend Confirm [Ctrl+3]"
+                                             : "Confirm [Ctrl+3]",
+                                         fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);
             bool doBackMenu = uiButtonEx(ui, bMenu,  "Menu",            fm, allowNav);
-            bool doBackCfg  = uiButtonEx(ui, bConfig,"Config",          fm, allowNav);
+            bool doBackTasks = uiButtonEx(ui, bTasks,"Tasks",           fm, allowNav);
             bool doDeleteConfirm = false;
             bool doDeleteCancel  = false;
             bool doFaultExit = false;
             bool doFaultRestart = false;
+            bool doExitConfirm = false;
+            bool doExitCancel = false;
 
             // --- Ctrl+1/2/3/4 快捷键 ---
             // 说明：当前环境里 Ctrl 按下会单独上报 0xE3/0xE4，数字键再单独上报 ASCII；
@@ -8855,7 +9518,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 const bool ctrlHeld     = g_ctrlShortcutListening || ctrlFromMask;
                 const int  baseKey      = key & 0xFFFF;
                 if(ctrlHeld) {
-                    if(modalFault) {
+                    if(modalExit) {
+                        if(baseKey == '1') {
+                            doExitConfirm = true;
+                        }
+                        else if(baseKey == '4') {
+                            doExitCancel = true;
+                        }
+                    }
+                    else if(modalFault) {
                         if(baseKey == '1') {
                             doFaultExit = true;
                         }
@@ -8952,39 +9623,32 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 doFaultRestart = doFaultRestart || actions.restartCapture;
             }
 
+            if(modalExit) {
+                const auto actions = drawExitConfirmModal(ui, fm,
+                                                          pendingExitAction,
+                                                          selectedTaskName(),
+                                                          completedThisCollection,
+                                                          captureStateName(captureState, currentReservation, cameraFaultActive),
+                                                          currentReservation);
+                doExitConfirm = doExitConfirm || actions.confirm;
+                doExitCancel = doExitCancel || actions.cancel;
+            }
+
             // --- 处理按钮动作 ---
+            if(doExitCancel) {
+                exitConfirmActive = false;
+                pendingExitAction = PendingExitAction::None;
+                pendingExitDeleteFaultEpisode = false;
+                capUi.msg = "Exit canceled";
+                pushUiLog("Exit canceled");
+            }
+            if(doExitConfirm) {
+                performConfirmedExit();
+            }
             if(doFaultExit) {
                 collectionSetStage("ui_camera_fault_exit");
                 announce("fault_exit", "exit");
-                if(recorder.isRecording()) {
-                    recorder.stopRecording();
-                }
-
-                bool okToExit = true;
-                if(recorder.hasCurrentSession()) {
-                    capUi.msg = "Deleting faulted episode before exit...";
-                    pushUiLog("Exit requested. Deleting faulted episode before leaving collection.");
-                    collectionSetStage("ui_camera_fault_exit_wait_drain");
-                    while(!recorder.isDrainComplete()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                    }
-
-                    std::string error;
-                    if(recorder.discardCurrentSession(&error)) {
-                        pushUiLog("Faulted episode deleted.");
-                    }
-                    else {
-                        okToExit = false;
-                        capUi.msg = "Delete failed";
-                        pushUiLog("Delete failed before exit: " + error);
-                        std::cerr << "[collection][camera_fault] delete before exit failed: " << error << std::endl;
-                    }
-                }
-
-                if(okToExit) {
-                    recorder.stopIfRunning();
-                    running = false;
-                }
+                requestExit(PendingExitAction::ExitCollection, true);
             }
             if(doFaultRestart && running) {
                 collectionSetStage("ui_camera_fault_restart");
@@ -9002,6 +9666,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         capUi.msg = "Delete failed";
                         pushUiLog("Delete failed before camera restart: " + error);
                         announce("delete_failed", "delete failed");
+                    }
+                    if(okToRestart && currentReservation.active && !currentReservation.localFinalized) {
+                        okToRestart = releaseCurrentReservation("camera restart");
                     }
 
                     if(okToRestart) {
@@ -9043,15 +9710,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(doBackMenu) {
                 collectionSetStage("ui_capture_back_menu");
                 announce("menu", "menu");
-                recorder.stopIfRunning();
-                running = false;
+                requestExit(PendingExitAction::ExitCollection, false);
             }
-            if(doBackCfg) {
-                collectionSetStage("ui_capture_back_config");
-                announce("config", "config");
-                recorder.stopIfRunning(false);
-                resetCameraReadyAnnouncement();
-                page = CollectionPage::Config;
+            if(doBackTasks) {
+                collectionSetStage("ui_capture_back_tasks");
+                requestExit(PendingExitAction::ReturnTaskSelect, false);
             }
             if(doStart) {
                 collectionSetStage("ui_capture_start");
@@ -9059,13 +9722,38 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 const fs::path root = fs::path(trimString(cfgUi.saveRoot));
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
-                const int episodeN = capUi.currentEpisode;
-                bool ok = recorder.start(cfgUi);
+                TaskEpisodeReservation reservation;
+                std::string backendError;
+                bool ok = backendClient.reserveEpisode(collectionClientId, subject, taskName, reservation, &backendError);
+                if(!ok) {
+                    capUi.msg = "Backend reserve failed: " + backendError;
+                    pushUiLog(capUi.msg);
+                    announce("start_failed", "start failed");
+                }
                 if(ok) {
-                    ok = recorder.beginRecord(root, subject, taskName, episodeN);
+                    currentReservation.clear();
+                    currentReservation.active = true;
+                    currentReservation.reservationId = reservation.reservationId;
+                    currentReservation.taskName = reservation.taskName;
+                    currentReservation.episodeNumber = reservation.episodeNumber;
+                    currentReservation.localPath = root / subject / reservation.taskName
+                                                   / ("episode_" + std::to_string(reservation.episodeNumber));
+                    currentReservation.idempotencyKey = makeIdempotencyKey(collectionClientId,
+                                                                           reservation.reservationId,
+                                                                           reservation.episodeNumber);
+                    capUi.currentEpisode = reservation.episodeNumber;
+                    pushUiLog("Backend reserved: " + reservation.taskName
+                              + " ep" + std::to_string(reservation.episodeNumber));
+
+                    ok = recorder.start(cfgUi);
+                    if(ok) {
+                        ok = recorder.beginRecord(root, subject, reservation.taskName, reservation.episodeNumber);
+                    }
                 }
                 if(!ok) {
-                    capUi.msg = "Failed to start capture";
+                    if(capUi.msg.empty() || capUi.msg.find("Backend reserve failed") == std::string::npos) {
+                        capUi.msg = "Failed to start capture";
+                    }
                     pushUiLog("Start failed");
                     announce("start_failed", "start failed");
                     {
@@ -9074,13 +9762,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                             pushUiLog(line);
                         }
                     }
+                    if(currentReservation.active && !currentReservation.localFinalized) {
+                        (void)releaseCurrentReservation("start failed");
+                    }
                 }
                 else {
                     captureState = CaptureState::RECORDING;
                     pendingResetAfterDrain = false;
                     capUi.msg.clear();
                     announce("start", "start");
-                    pushUiLog("Recording: " + capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name
+                    pushUiLog("Recording: " + currentReservation.taskName
                               + " ep" + std::to_string(capUi.currentEpisode));
                     {
                         const std::string label = recorder.currentSessionLabel();
@@ -9137,45 +9828,51 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
             if(doSave) {
                 collectionSetStage("ui_capture_save");
-                const bool confirmed = recorder.confirmCurrentSession();
-                if(confirmed) {
-                    announce("confirm", "confirm");
-                    const int idx = capUi.currentTaskIdx;
-                    if(idx >= 0 && idx < static_cast<int>(capUi.progress.size())) {
-                        capUi.progress[static_cast<size_t>(idx)].completed += 1;
-                        const fs::path root = fs::path(trimString(cfgUi.saveRoot));
-                        const std::string subject = trimString(cfgUi.subjectId);
-                        saveProgressCsv(root / subject / "progress.csv", capUi.progress);
-                        const double maxDiff = recorder.lastAlignedMaxDiffMs();
+                bool localConfirmed = currentReservation.localFinalized;
+                if(!localConfirmed) {
+                    localConfirmed = recorder.confirmCurrentSession();
+                    if(localConfirmed) {
+                        currentReservation.localFinalized = true;
+                    }
+                }
+                if(!localConfirmed) {
+                    capUi.msg = "Confirm failed: session not ready";
+                    pushUiLog("Confirm failed");
+                    announce("confirm_failed", "confirm failed");
+                }
+                else {
+                    const double maxDiff = recorder.lastAlignedMaxDiffMs();
+                    if(confirmReservationWithBackend()) {
+                        announce("confirm", "confirm");
                         if(maxDiff > 0.0) {
                             std::ostringstream oss;
                             oss.setf(std::ios::fixed);
                             oss << "MaxTsDiff: " << std::setprecision(3) << maxDiff << " ms";
                             pushUiLog(oss.str());
                         }
-                    }
-
-                    capUi.currentTaskIdx = getCurrentTaskIndex(capUi.progress);
-                    if(capUi.currentTaskIdx == -1) {
-                        capUi.msg = "All tasks completed!";
-                        capUi.currentEpisode = 0;
-                        pushUiLog("Confirm OK. All tasks completed.");
+                        if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())
+                           && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)])) {
+                            capUi.msg = "Task complete";
+                            pushUiLog("Confirm OK. Selected task complete.");
+                        }
+                        else if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
+                            capUi.msg = "Capture confirmed";
+                            pushUiLog("Confirm OK. Same task next backend episode will be reserved on Start.");
+                        }
+                        else {
+                            capUi.msg = "Capture confirmed";
+                            pushUiLog("Confirm OK. Select a task.");
+                        }
+                        recorder.clearStatus();
+                        captureState = CaptureState::IDLE;
+                        pendingResetAfterDrain = false;
+                        resetCameraReadyAnnouncement();
                     }
                     else {
-                        capUi.currentEpisode = capUi.progress[static_cast<size_t>(capUi.currentTaskIdx)].completed + 1;
-                        capUi.msg = "Capture confirmed";
-                        pushUiLog("Confirm OK. Next: " + capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name
-                                  + " ep" + std::to_string(capUi.currentEpisode));
+                        captureState = CaptureState::BACKEND_SYNC_PENDING;
+                        pendingResetAfterDrain = false;
+                        announce("confirm_failed", "confirm failed");
                     }
-                    recorder.clearStatus();
-                    captureState = CaptureState::IDLE;
-                    pendingResetAfterDrain = false;
-                    resetCameraReadyAnnouncement();
-                }
-                else {
-                    capUi.msg = "Confirm failed: session not ready";
-                    pushUiLog("Confirm failed");
-                    announce("confirm_failed", "confirm failed");
                 }
             }
             if(doDeleteConfirm) {
@@ -9183,12 +9880,18 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 std::string error;
                 if(recorder.discardCurrentSession(&error)) {
                     recorder.clearStatus();
+                    const bool releaseOk = releaseCurrentReservation("reset");
                     captureState = CaptureState::IDLE;
                     pendingResetAfterDrain = false;
                     resetCameraReadyAnnouncement();
-                    capUi.msg = "Capture discarded";
-                    pushUiLog("Reset OK. Current episode discarded.");
-                    announce("reset_confirm", "reset confirmed");
+                    if(releaseOk) {
+                        capUi.msg = "Capture discarded";
+                        pushUiLog("Reset OK. Current episode discarded.");
+                        announce("reset_confirm", "reset confirmed");
+                    }
+                    else {
+                        announce("delete_failed", "delete failed");
+                    }
                 }
                 else {
                     capUi.msg = "Delete failed";
@@ -9240,6 +9943,40 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     cv::putText(ui, info, cv::Point(4, winH - 20),
                                 cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
                 }
+            }
+        }
+
+        if((page == CollectionPage::Config || page == CollectionPage::TaskSelect) && exitConfirmActive) {
+            bool doExitConfirm = false;
+            bool doExitCancel = false;
+            if(key > 0) {
+                const bool ctrlFromMask = ((key & 0x20000) != 0) || ((key & 0x04000000) != 0);
+                const bool ctrlHeld = g_ctrlShortcutListening || ctrlFromMask;
+                const int baseKey = key & 0xFFFF;
+                if(ctrlHeld) {
+                    if(baseKey == '1') {
+                        doExitConfirm = true;
+                    }
+                    else if(baseKey == '4') {
+                        doExitCancel = true;
+                    }
+                }
+            }
+            const auto actions = drawExitConfirmModal(ui, fm,
+                                                      pendingExitAction,
+                                                      selectedTaskName(),
+                                                      completedThisCollection,
+                                                      captureStateName(captureState, currentReservation, activeCameraFault.has_value()),
+                                                      currentReservation);
+            doExitConfirm = doExitConfirm || actions.confirm;
+            doExitCancel = doExitCancel || actions.cancel;
+            if(doExitCancel) {
+                exitConfirmActive = false;
+                pendingExitAction = PendingExitAction::None;
+                pendingExitDeleteFaultEpisode = false;
+            }
+            if(doExitConfirm) {
+                performConfirmedExit();
             }
         }
 

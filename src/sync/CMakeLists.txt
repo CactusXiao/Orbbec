@@ -23,6 +23,7 @@ add_executable(${PROJECT_NAME}
     interactive_visualization.cpp
     viewer.cpp
     collection.cpp
+    task_backend_client.cpp
     calibration.cpp
     utils/cJSON.c
     utils/utils.cpp

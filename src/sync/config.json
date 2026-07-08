@@ -77,6 +77,12 @@
     "depthAlignWorkers": 0,
     "depthAlignQueueCapacity": 90,
     "cameraStreamTimeoutSec": 2.0,
+    "taskBackend": {
+        "_comment": "Backend-owned collection task/episode service. Start scripts/task_backend_server.py before entering collection.",
+        "enabled": true,
+        "baseUrl": "http://127.0.0.1:8765",
+        "timeoutMs": 3000
+    },
     "voiceFeedback": {
         "_comment": "Voice prompts for collection mode. speakerDevice is used by the default Linux command as the ALSA aplay -D value, for example default, hw:1,0, or plughw:1,0. Optional command supports {text} and {device}, for example: espeak --stdout {text} | aplay -q -D {device}",
         "enabled": true,

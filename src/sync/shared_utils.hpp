@@ -153,6 +153,12 @@ struct VoiceFeedbackConfig {
     std::unordered_map<std::string, std::string> messages;
 };
 
+struct TaskBackendConfig {
+    bool        enabled   = true;
+    std::string baseUrl   = "http://127.0.0.1:8765";
+    int         timeoutMs = 3000;
+};
+
 struct AppConfig {
     fs::path                  outputDir;
     int                       durationSec   = 0;
@@ -180,6 +186,7 @@ struct AppConfig {
     int                       colorCloudRgbFrameOffset = 0;
     SaveOptions               save;
     VoiceFeedbackConfig       voiceFeedback;
+    TaskBackendConfig         taskBackend;
     EgoModuleConfig           ego;
     FisheyeModuleConfig       fisheye;
     DepthPointCloudFiltersConfig filters;

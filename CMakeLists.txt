@@ -18,6 +18,7 @@ add_executable(orbbec
     src/sync/interactive_visualization.cpp
     src/sync/viewer.cpp
     src/sync/collection.cpp
+    src/sync/task_backend_client.cpp
     src/sync/calibration.cpp
     src/sync/utils/cJSON.c
     src/sync/utils/utils.cpp

@@ -1,5 +1,7 @@
 #include "shared_utils.hpp"
 
+#include <cstdlib>
+
 namespace sync_app {
 
 std::string streamTypeToString(StreamType t) {
@@ -533,6 +535,43 @@ AppConfig loadConfig(const fs::path &configPath) {
                 }
             }
         }
+    }
+
+    if(auto *backendObj = cJSON_GetObjectItemCaseSensitive(root, "taskBackend")) {
+        if(cJSON_IsObject(backendObj)) {
+            if(auto v = getBool(backendObj, "enabled")) {
+                cfg.taskBackend.enabled = *v;
+            }
+            if(auto v = getString(backendObj, "baseUrl")) {
+                cfg.taskBackend.baseUrl = trimString(*v);
+            }
+            else if(auto v = getString(backendObj, "url")) {
+                cfg.taskBackend.baseUrl = trimString(*v);
+            }
+            if(auto v = getInt(backendObj, "timeoutMs")) {
+                cfg.taskBackend.timeoutMs = std::max(500, *v);
+            }
+        }
+    }
+    if(const char *v = std::getenv("ORBBEC_TASK_BACKEND_URL")) {
+        const std::string value = trimString(v);
+        if(!value.empty()) {
+            cfg.taskBackend.baseUrl = value;
+        }
+    }
+    if(const char *v = std::getenv("ORBBEC_TASK_BACKEND_TIMEOUT_MS")) {
+        try {
+            cfg.taskBackend.timeoutMs = std::max(500, std::stoi(v));
+        }
+        catch(...) {
+        }
+    }
+    if(const char *v = std::getenv("ORBBEC_TASK_BACKEND_ENABLED")) {
+        std::string value = normalizePresetKey(v);
+        cfg.taskBackend.enabled = !(value == "0" || value == "false" || value == "no" || value == "off");
+    }
+    if(cfg.taskBackend.baseUrl.empty()) {
+        cfg.taskBackend.baseUrl = "http://127.0.0.1:8765";
     }
 
     if(auto *saveObj = cJSON_GetObjectItemCaseSensitive(root, "save")) {
