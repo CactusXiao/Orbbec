@@ -16,8 +16,8 @@ From the repository root:
 
 ```bash
 python3 task_backend/server.py \
-  --data-root /var/lib/orbbec-task-backend \
-  --task-file tasks.json \
+  --data-root ./task_backend_state \
+  --task-file ./tasks.json \
   --host 0.0.0.0 \
   --port 8765
 ```
