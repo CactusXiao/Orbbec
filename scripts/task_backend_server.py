@@ -106,10 +106,10 @@ def load_task_file(path: Path) -> List[Task]:
     return tasks
 
 
-def default_task_file(save_root: Path) -> Path:
+def default_task_file(data_root: Path) -> Path:
     candidates = [
-        save_root / "task.json",
-        save_root / "tasks.json",
+        data_root / "task.json",
+        data_root / "tasks.json",
         Path.cwd() / "task.json",
         Path.cwd() / "tasks.json",
     ]
@@ -183,14 +183,14 @@ class BackendError(Exception):
 
 
 class TaskBackend:
-    def __init__(self, save_root: Path, task_file: Path, state_file: Optional[Path] = None):
-        self.save_root = save_root
+    def __init__(self, data_root: Path, task_file: Path, state_file: Optional[Path] = None):
+        self.data_root = data_root
         self.task_file = task_file
-        self.state_file = state_file or (save_root / "progress_state.json")
+        self.state_file = state_file or (data_root / "progress_state.json")
         self.lock_file = self.state_file.with_suffix(self.state_file.suffix + ".lock")
         self.tasks = load_task_file(task_file)
         self.tasks_by_name = {task["task_name"]: task for task in self.tasks}
-        self.save_root.mkdir(parents=True, exist_ok=True)
+        self.data_root.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
     def locked_state(self):
@@ -438,24 +438,32 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Orbbec collection task backend")
     parser.add_argument("--host", default="127.0.0.1", help="bind host, default: 127.0.0.1")
     parser.add_argument("--port", default=8765, type=int, help="bind port, default: 8765")
-    parser.add_argument("--save-root", required=True, type=Path, help="collection save root; progress_state.json is stored here")
-    parser.add_argument("--task-file", type=Path, help="task.json/tasks.json file; defaults to save-root/task.json, save-root/tasks.json, then cwd/tasks.json")
+    parser.add_argument("--data-root", type=Path, help="backend-owned state directory; progress_state.json is stored here")
+    parser.add_argument("--save-root", type=Path, help="deprecated alias for --data-root")
+    parser.add_argument("--task-file", type=Path, help="task.json/tasks.json file; defaults to data-root/task.json, data-root/tasks.json, then cwd/tasks.json")
     parser.add_argument("--state-file", type=Path, help="override progress_state.json path")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.data_root is None and args.save_root is None:
+        parser.error("--data-root is required (or legacy --save-root)")
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    save_root = args.save_root.expanduser().resolve()
-    task_file = (args.task_file.expanduser().resolve() if args.task_file else default_task_file(save_root).resolve())
+    data_root_arg = args.data_root if args.data_root is not None else args.save_root
+    if args.data_root is None and args.save_root is not None:
+        print("[task-backend] warning: --save-root is deprecated; use --data-root", file=sys.stderr)
+    data_root = data_root_arg.expanduser().resolve()
+    task_file = (args.task_file.expanduser().resolve() if args.task_file else default_task_file(data_root).resolve())
     if not task_file.exists():
         print(f"task file not found: {task_file}", file=sys.stderr)
         return 2
 
     state_file = args.state_file.expanduser().resolve() if args.state_file else None
-    backend = TaskBackend(save_root=save_root, task_file=task_file, state_file=state_file)
+    backend = TaskBackend(data_root=data_root, task_file=task_file, state_file=state_file)
     host_info = socket.getfqdn(args.host) if args.host not in ("", "0.0.0.0", "::") else args.host
     print(f"[task-backend] tasks={len(backend.tasks)} task_file={task_file}", file=sys.stderr)
+    print(f"[task-backend] data_root={backend.data_root}", file=sys.stderr)
     print(f"[task-backend] state_file={backend.state_file}", file=sys.stderr)
     print(f"[task-backend] listening http://{args.host}:{args.port} ({host_info})", file=sys.stderr)
 

@@ -1,10 +1,11 @@
 # Collection Task Backend
 
-Collection now uses a backend-owned task and episode allocator. The frontend
-still saves local data as:
+Collection now uses a backend-owned task and episode allocator. The backend does
+not need access to the capture machine's local files. The frontend still saves
+local data on the capture machine as:
 
 ```text
-<saveRoot>/<subjectId>/<taskName>/episode_<N>
+<captureSaveRoot>/<subjectId>/<taskName>/episode_<N>
 ```
 
 `N` is always the episode number returned by the backend reserve API.
@@ -15,22 +16,30 @@ From the repository root:
 
 ```bash
 python3 scripts/task_backend_server.py \
-  --save-root /path/to/saveRoot \
+  --data-root /var/lib/orbbec-task-backend \
   --task-file tasks.json \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8765
 ```
 
+Use `--host 127.0.0.1` only when the frontend runs on the same machine. For a
+separate backend machine, bind to an address reachable by the capture machine
+such as `0.0.0.0`, and point the frontend `baseUrl` to the backend machine's IP.
+
 If `--task-file` is omitted, the server searches:
 
-1. `<saveRoot>/task.json`
-2. `<saveRoot>/tasks.json`
+1. `<dataRoot>/task.json`
+2. `<dataRoot>/tasks.json`
 3. `./task.json`
 4. `./tasks.json`
 
-Backend state is stored in `<saveRoot>/progress_state.json`. Updates are written
+Backend state is stored in `<dataRoot>/progress_state.json`. Updates are written
 to a temporary file and atomically renamed. On Linux, a sidecar lock file is used
 with `fcntl` to protect concurrent frontends.
+
+`--save-root` is still accepted as a deprecated alias for `--data-root` so older
+startup commands keep working, but new deployments should not use the capture
+save directory as backend state storage.
 
 ## Task File Format
 
@@ -75,7 +84,7 @@ Array form is also accepted:
 ```json
 "taskBackend": {
   "enabled": true,
-  "baseUrl": "http://127.0.0.1:8765",
+  "baseUrl": "http://<backend-host>:8765",
   "timeoutMs": 3000
 }
 ```
@@ -83,7 +92,7 @@ Array form is also accepted:
 Environment overrides:
 
 ```bash
-export ORBBEC_TASK_BACKEND_URL=http://127.0.0.1:8765
+export ORBBEC_TASK_BACKEND_URL=http://<backend-host>:8765
 export ORBBEC_TASK_BACKEND_TIMEOUT_MS=3000
 export ORBBEC_TASK_BACKEND_ENABLED=1
 ```
@@ -92,6 +101,9 @@ When entering Collection, the frontend must reach the backend and fetch all
 tasks. If the backend is unavailable, reserve fails, confirm fails, or release
 fails, the UI shows an explicit error and does not advance completed progress
 locally.
+
+The Collection page's `save_path` remains a frontend-local setting. It does not
+have to match any path on the backend machine.
 
 ## Runtime Flow
 
@@ -102,7 +114,7 @@ locally.
 3. `Enter Capture` starts cameras and opens the capture page for only that
    selected task.
 4. Start first reserves an episode from the backend.
-5. Local capture writes to `saveRoot/subjectId/taskName/episode_N`.
+5. Local capture writes to `captureSaveRoot/subjectId/taskName/episode_N`.
 6. Confirm finalizes local data, then confirms the reservation with an
    idempotency key.
 7. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
