@@ -9,6 +9,7 @@ on a capture host without extra packages.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import socket
@@ -21,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     import fcntl  # type: ignore
@@ -175,6 +176,88 @@ def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
     return episode
 
 
+def html_escape(value: Any) -> str:
+    return html.escape("" if value is None else str(value), quote=True)
+
+
+def url_part(value: Any) -> str:
+    return quote(str(value), safe="")
+
+
+def reservation_sort_key(item: Dict[str, Any]) -> Tuple[str, str, int, str]:
+    try:
+        episode = int(item.get("episode_number", 0))
+    except (TypeError, ValueError):
+        episode = 0
+    return (
+        str(item.get("subject_id", "")),
+        str(item.get("task_name", "")),
+        episode,
+        str(item.get("created_at", "")),
+    )
+
+
+def latest_timestamp(items: Iterable[Dict[str, Any]]) -> str:
+    latest = ""
+    for item in items:
+        for key in ("updated_at", "confirmed_at", "released_at", "created_at"):
+            value = str(item.get(key, "") or "")
+            if value > latest:
+                latest = value
+    return latest
+
+
+def count_statuses(items: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"reserved": 0, "confirmed": 0, "released": 0, "other": 0}
+    for item in items:
+        status = str(item.get("status", "other"))
+        if status in counts:
+            counts[status] += 1
+        else:
+            counts["other"] += 1
+    return counts
+
+
+def status_class(status: str) -> str:
+    if status == "confirmed":
+        return "ok"
+    if status == "reserved":
+        return "warn"
+    if status == "released":
+        return "muted"
+    return "neutral"
+
+
+def metadata_pairs(task: Task) -> List[Tuple[str, str]]:
+    raw = task.get("raw", {})
+    if not isinstance(raw, dict):
+        return []
+    hidden = {
+        "task_name",
+        "name",
+        "total",
+        "repeat_times",
+        "episodes",
+        "description_cn",
+        "description_en",
+        "task_description_cn",
+        "task_description_en",
+    }
+    result: List[Tuple[str, str]] = []
+    for key in sorted(raw.keys()):
+        if key in hidden:
+            continue
+        value = raw.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        else:
+            rendered = str(value)
+        result.append((str(key), rendered))
+    return result
+
+
 class BackendError(Exception):
     def __init__(self, status: HTTPStatus, message: str):
         super().__init__(message)
@@ -242,6 +325,97 @@ class TaskBackend:
                     tmp_path.unlink()
                 except OSError:
                     pass
+
+    def state_snapshot(self) -> State:
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_file.open("a+", encoding="utf-8") as lock_f:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_SH)
+            try:
+                return self._read_state_unlocked()
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def reservation_list(self, state: State) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        subjects = state.get("subjects", {})
+        if not isinstance(subjects, dict):
+            return result
+        for subject_id, subject in subjects.items():
+            if not isinstance(subject, dict):
+                continue
+            reservations = subject.get("reservations", {})
+            if not isinstance(reservations, dict):
+                continue
+            for reservation_key, reservation in reservations.items():
+                if not isinstance(reservation, dict):
+                    continue
+                item = dict(reservation)
+                item["reservation_id"] = str(item.get("reservation_id", reservation_key))
+                item["subject_id"] = str(item.get("subject_id", subject_id))
+                result.append(item)
+        result.sort(key=reservation_sort_key)
+        return result
+
+    def dashboard_model(self) -> Dict[str, Any]:
+        state = self.state_snapshot()
+        reservations = self.reservation_list(state)
+        subjects_obj = state.get("subjects", {})
+        subjects = sorted(str(key) for key in subjects_obj.keys()) if isinstance(subjects_obj, dict) else []
+        summaries = []
+        for task in self.tasks:
+            task_name = str(task["task_name"])
+            related = [item for item in reservations if item.get("task_name") == task_name]
+            counts = count_statuses(related)
+            task_subjects = sorted({str(item.get("subject_id", "")) for item in related if item.get("subject_id")})
+            summaries.append(
+                {
+                    "task": task,
+                    "counts": counts,
+                    "subjects": task_subjects,
+                    "latest_at": latest_timestamp(related),
+                    "reservation_count": len(related),
+                }
+            )
+        return {
+            "tasks": summaries,
+            "subjects": subjects,
+            "reservation_count": len(reservations),
+            "state_file": str(self.state_file),
+            "task_file": str(self.task_file),
+        }
+
+    def task_detail_model(self, task_name: str) -> Dict[str, Any]:
+        task = self.tasks_by_name.get(task_name)
+        if task is None:
+            raise BackendError(HTTPStatus.NOT_FOUND, f"unknown task: {task_name}")
+        state = self.state_snapshot()
+        reservations = [
+            item
+            for item in self.reservation_list(state)
+            if item.get("task_name") == task_name
+        ]
+        subjects = sorted({str(item.get("subject_id", "")) for item in reservations if item.get("subject_id")})
+        return {
+            "task": task,
+            "reservations": reservations,
+            "subjects": subjects,
+            "counts": count_statuses(reservations),
+            "latest_at": latest_timestamp(reservations),
+        }
+
+    def episode_detail_model(self, reservation_id: str) -> Dict[str, Any]:
+        state = self.state_snapshot()
+        for item in self.reservation_list(state):
+            if item.get("reservation_id") == reservation_id:
+                task = self.tasks_by_name.get(str(item.get("task_name", "")))
+                return {
+                    "reservation": item,
+                    "task": task,
+                    "metadata_pairs": metadata_pairs(task) if task is not None else [],
+                }
+        raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
 
     def get_tasks(self, subject_id: str) -> Dict[str, Any]:
         with self.locked_state() as state:
@@ -356,6 +530,299 @@ class TaskBackend:
             return {"released": released, **progress_payload(subject, self.tasks)}
 
 
+def render_layout(title: str, body: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html_escape(title)}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-2: #eef2f6;
+      --text: #17202a;
+      --muted: #647181;
+      --line: #d7dde5;
+      --accent: #176b87;
+      --accent-2: #1f8a70;
+      --warn: #a86400;
+      --bad: #9d2f3f;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    a:hover {{ text-decoration: underline; }}
+    header {{
+      background: #0f1c24;
+      color: #f8fbfd;
+      padding: 18px 28px;
+      border-bottom: 4px solid var(--accent-2);
+    }}
+    header h1 {{ margin: 0; font-size: 24px; font-weight: 650; }}
+    main {{ padding: 24px 28px 40px; max-width: 1440px; margin: 0 auto; }}
+    .crumbs {{ margin-bottom: 16px; color: var(--muted); }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .metric {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 14px 16px;
+    }}
+    .metric .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }}
+    .metric .value {{ margin-top: 6px; font-size: 24px; font-weight: 680; }}
+    section {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      margin-top: 16px;
+      overflow: hidden;
+    }}
+    section h2 {{
+      margin: 0;
+      padding: 13px 16px;
+      font-size: 16px;
+      background: var(--panel-2);
+      border-bottom: 1px solid var(--line);
+    }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ padding: 10px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
+    th {{ color: var(--muted); font-weight: 650; font-size: 12px; text-transform: uppercase; letter-spacing: .035em; }}
+    tr:last-child td {{ border-bottom: none; }}
+    .num {{ text-align: right; white-space: nowrap; }}
+    .muted {{ color: var(--muted); }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }}
+    .badge {{
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 650;
+      border: 1px solid transparent;
+      white-space: nowrap;
+    }}
+    .badge.ok {{ color: #0f5f46; background: #e5f5ed; border-color: #b7e0cc; }}
+    .badge.warn {{ color: var(--warn); background: #fff3dc; border-color: #f0d09b; }}
+    .badge.muted {{ color: #596675; background: #eef1f4; border-color: #d4dae1; }}
+    .badge.neutral {{ color: #535f6d; background: #eef2f7; border-color: #d5dde8; }}
+    .desc {{ max-width: 760px; white-space: pre-wrap; }}
+    .kv {{ display: grid; grid-template-columns: minmax(160px, 240px) 1fr; }}
+    .kv div {{ padding: 10px 12px; border-bottom: 1px solid var(--line); }}
+    .kv div:nth-child(odd) {{ color: var(--muted); background: #fbfcfd; }}
+    .empty {{ padding: 16px; color: var(--muted); }}
+    @media (max-width: 760px) {{
+      main {{ padding: 18px 14px 28px; }}
+      header {{ padding: 16px; }}
+      .wide {{ overflow-x: auto; }}
+      .kv {{ grid-template-columns: 1fr; }}
+      .kv div:nth-child(odd) {{ padding-bottom: 2px; }}
+      .kv div:nth-child(even) {{ padding-top: 2px; }}
+    }}
+  </style>
+</head>
+<body>
+  <header><h1>{html_escape(title)}</h1></header>
+  <main>{body}</main>
+</body>
+</html>"""
+
+
+def render_metric(label: str, value: Any, note: str = "") -> str:
+    note_html = f"<div class=\"muted\">{html_escape(note)}</div>" if note else ""
+    return (
+        "<div class=\"metric\">"
+        f"<div class=\"label\">{html_escape(label)}</div>"
+        f"<div class=\"value\">{html_escape(value)}</div>"
+        f"{note_html}</div>"
+    )
+
+
+def render_status_badge(status: str) -> str:
+    return f"<span class=\"badge {status_class(status)}\">{html_escape(status or 'unknown')}</span>"
+
+
+def render_dashboard(model: Dict[str, Any]) -> str:
+    task_rows = []
+    totals = {"reserved": 0, "confirmed": 0, "released": 0, "other": 0}
+    for summary in model["tasks"]:
+        task = summary["task"]
+        counts = summary["counts"]
+        for key in totals:
+            totals[key] += int(counts.get(key, 0))
+        task_name = str(task["task_name"])
+        subjects = summary["subjects"]
+        task_rows.append(
+            "<tr>"
+            f"<td><a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a></td>"
+            f"<td class=\"num\">{html_escape(task.get('total', ''))}</td>"
+            f"<td class=\"num\">{html_escape(counts.get('confirmed', 0))}</td>"
+            f"<td class=\"num\">{html_escape(counts.get('reserved', 0))}</td>"
+            f"<td class=\"num\">{html_escape(counts.get('released', 0))}</td>"
+            f"<td>{html_escape(', '.join(subjects) if subjects else '-')}</td>"
+            f"<td class=\"muted mono\">{html_escape(summary.get('latest_at') or '-')}</td>"
+            "</tr>"
+        )
+    table_body = "\n".join(task_rows) if task_rows else "<tr><td colspan=\"7\" class=\"empty\">No tasks loaded.</td></tr>"
+    subject_note = ", ".join(model["subjects"]) if model["subjects"] else "No subjects yet"
+    body = (
+        "<div class=\"crumbs\">Task backend / Overview</div>"
+        "<div class=\"summary\">"
+        + render_metric("Tasks", len(model["tasks"]), "from task file")
+        + render_metric("Subjects", len(model["subjects"]), subject_note)
+        + render_metric("Episodes", model["reservation_count"], "all reservations")
+        + render_metric("Confirmed", totals["confirmed"], "completed episodes")
+        + "</div>"
+        "<section><h2>Task Summary</h2><div class=\"wide\"><table>"
+        "<thead><tr>"
+        "<th>Task</th><th class=\"num\">Required / Subject</th><th class=\"num\">Confirmed</th>"
+        "<th class=\"num\">Reserved</th><th class=\"num\">Released</th><th>Subjects</th><th>Latest Update</th>"
+        "</tr></thead><tbody>"
+        + table_body
+        + "</tbody></table></div></section>"
+        "<section><h2>Backend Files</h2><div class=\"kv\">"
+        f"<div>Task file</div><div class=\"mono\">{html_escape(model['task_file'])}</div>"
+        f"<div>State file</div><div class=\"mono\">{html_escape(model['state_file'])}</div>"
+        "</div></section>"
+    )
+    return render_layout("Task Dashboard", body)
+
+
+def render_task_detail(model: Dict[str, Any]) -> str:
+    task = model["task"]
+    task_name = str(task["task_name"])
+    counts = model["counts"]
+    rows = []
+    for item in model["reservations"]:
+        reservation_id = str(item.get("reservation_id", ""))
+        status = str(item.get("status", "unknown"))
+        rows.append(
+            "<tr>"
+            f"<td><a class=\"mono\" href=\"/episodes/{url_part(reservation_id)}\">{html_escape(reservation_id[:8])}</a></td>"
+            f"<td>{html_escape(item.get('subject_id', ''))}</td>"
+            f"<td class=\"num\">{html_escape(item.get('episode_number', ''))}</td>"
+            f"<td>{render_status_badge(status)}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('client_id', '-'))}</td>"
+            f"<td class=\"muted mono\">{html_escape(item.get('updated_at') or item.get('created_at') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('local_path') or '-')}</td>"
+            "</tr>"
+        )
+    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"7\" class=\"empty\">No episodes reserved yet.</td></tr>"
+    meta_rows = []
+    for key, value in metadata_pairs(task):
+        meta_rows.append(f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>")
+    if not meta_rows:
+        meta_rows.append("<div>Extra metadata</div><div class=\"muted\">No extra task metadata.</div>")
+    description = task.get("description_cn") or task.get("description_en") or ""
+    body = (
+        f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / {html_escape(task_name)}</div>"
+        "<div class=\"summary\">"
+        + render_metric("Required / Subject", task.get("total", ""), "configured episodes")
+        + render_metric("Confirmed", counts.get("confirmed", 0))
+        + render_metric("Reserved", counts.get("reserved", 0))
+        + render_metric("Released", counts.get("released", 0))
+        + "</div>"
+        "<section><h2>Task Description</h2>"
+        f"<div class=\"empty desc\">{html_escape(description or 'No description.')}</div></section>"
+        "<section><h2>Task Metadata</h2><div class=\"kv\">"
+        + "".join(meta_rows)
+        + f"<div>Subjects</div><div>{html_escape(', '.join(model['subjects']) if model['subjects'] else '-')}</div>"
+        + f"<div>Latest update</div><div class=\"mono\">{html_escape(model.get('latest_at') or '-')}</div>"
+        + "</div></section>"
+        "<section><h2>Episodes</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Episode</th><th>Subject</th><th class=\"num\">No.</th><th>Status</th>"
+        "<th>Client</th><th>Updated</th><th>Local Path</th></tr></thead><tbody>"
+        + episode_rows
+        + "</tbody></table></div></section>"
+    )
+    return render_layout(task_name, body)
+
+
+def render_episode_detail(model: Dict[str, Any]) -> str:
+    item = model["reservation"]
+    task = model["task"]
+    task_name = str(item.get("task_name", ""))
+    reservation_id = str(item.get("reservation_id", ""))
+    status = str(item.get("status", "unknown"))
+    fields = [
+        ("Reservation ID", reservation_id),
+        ("Task", task_name),
+        ("Subject", item.get("subject_id", "")),
+        ("Episode number", item.get("episode_number", "")),
+        ("Status", status),
+        ("Client ID", item.get("client_id", "")),
+        ("Local capture path", item.get("local_path") or "-"),
+        ("Idempotency key", item.get("idempotency_key") or "-"),
+        ("Created at", item.get("created_at") or "-"),
+        ("Updated at", item.get("updated_at") or "-"),
+        ("Confirmed at", item.get("confirmed_at") or "-"),
+        ("Released at", item.get("released_at") or "-"),
+    ]
+    field_html = "".join(
+        f"<div>{html_escape(label)}</div><div class=\"mono\">{html_escape(value)}</div>"
+        for label, value in fields
+    )
+    meta_html = "".join(
+        f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>"
+        for key, value in model["metadata_pairs"]
+    )
+    if not meta_html:
+        meta_html = "<div>Task metadata</div><div class=\"muted\">No extra task metadata.</div>"
+    storage_note = (
+        "Capture data is still stored on the capture host. NAS-backed file indexing "
+        "and quality results can be attached here later."
+    )
+    body = (
+        f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / "
+        f"<a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a> / "
+        f"{html_escape(reservation_id[:8])}</div>"
+        "<div class=\"summary\">"
+        + render_metric("Status", status)
+        + render_metric("Subject", item.get("subject_id", ""))
+        + render_metric("Episode", item.get("episode_number", ""))
+        + render_metric("QA", "Pending", "quality module not connected")
+        + "</div>"
+        "<section><h2>Episode Details</h2><div class=\"kv\">"
+        + field_html
+        + "</div></section>"
+        "<section><h2>Storage And Quality</h2><div class=\"kv\">"
+        f"<div>Storage status</div><div>{html_escape('Local path recorded' if item.get('local_path') else 'Waiting for confirm')}</div>"
+        f"<div>Backend file access</div><div class=\"muted\">{html_escape(storage_note)}</div>"
+        f"<div>Quality status</div><div class=\"muted\">Not integrated yet.</div>"
+        + "</div></section>"
+        "<section><h2>Task Metadata Snapshot</h2><div class=\"kv\">"
+        + meta_html
+        + "</div></section>"
+        "<section><h2>Raw Reservation JSON</h2>"
+        f"<div class=\"empty\"><pre class=\"mono\">{html_escape(json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True))}</pre></div>"
+        "</section>"
+    )
+    return render_layout("Episode " + reservation_id[:8], body)
+
+
+def render_error_page(status: HTTPStatus, message: str) -> str:
+    body = (
+        "<div class=\"crumbs\"><a href=\"/\">Task backend</a> / Error</div>"
+        "<section><h2>Error</h2>"
+        f"<div class=\"empty\">{html_escape(int(status))} {html_escape(status.phrase)}: {html_escape(message)}</div>"
+        "</section>"
+    )
+    return render_layout("Task Backend Error", body)
+
+
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "OrbbecTaskBackend/1.0"
 
@@ -370,6 +837,15 @@ class RequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _html_response(self, status: HTTPStatus, html_body: str) -> None:
+        body = html_body.encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -393,6 +869,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        is_api = parsed.path.startswith("/api/")
         try:
             if parsed.path == "/api/v1/tasks":
                 query = parse_qs(parsed.query)
@@ -400,12 +877,33 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not subject_id:
                     raise BackendError(HTTPStatus.BAD_REQUEST, "subject_id is required")
                 self._json_response(HTTPStatus.OK, self.backend.get_tasks(subject_id))
+            elif parsed.path in ("", "/", "/tasks"):
+                self._html_response(HTTPStatus.OK, render_dashboard(self.backend.dashboard_model()))
+            elif parsed.path.startswith("/tasks/"):
+                task_name = unquote(parsed.path[len("/tasks/"):]).strip()
+                if not task_name:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "task not found")
+                self._html_response(HTTPStatus.OK, render_task_detail(self.backend.task_detail_model(task_name)))
+            elif parsed.path.startswith("/episodes/"):
+                reservation_id = unquote(parsed.path[len("/episodes/"):]).strip()
+                if not reservation_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                self._html_response(HTTPStatus.OK, render_episode_detail(self.backend.episode_detail_model(reservation_id)))
             else:
                 raise BackendError(HTTPStatus.NOT_FOUND, "not found")
         except BackendError as exc:
-            self._json_response(exc.status, {"error": exc.message})
+            if is_api:
+                self._json_response(exc.status, {"error": exc.message})
+            else:
+                self._html_response(exc.status, render_error_page(exc.status, exc.message))
         except Exception as exc:  # pragma: no cover - defensive server boundary
-            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            if is_api:
+                self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            else:
+                self._html_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    render_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc)),
+                )
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

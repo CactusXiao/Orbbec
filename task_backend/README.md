@@ -41,6 +41,20 @@ with `fcntl` to protect concurrent frontends.
 startup commands keep working, but new deployments should not use the capture
 save directory as backend state storage.
 
+## Web Dashboard
+
+The same service exposes a lightweight browser dashboard:
+
+- `http://127.0.0.1:8765/` shows the overall task and episode summary.
+- `http://127.0.0.1:8765/tasks/<task_name>` shows one task and its episodes.
+- `http://127.0.0.1:8765/episodes/<reservation_id>` shows one episode detail page.
+
+The current detail pages use backend-owned metadata only: task definitions,
+subject IDs, reservation IDs, episode numbers, status, timestamps, idempotency
+keys, and the local capture path reported by the capture host. NAS-backed file
+indexes and quality inspection results can be added to the episode detail model
+later without changing the collection API.
+
 ## Task File Format
 
 The existing object-style `tasks.json` is supported:
