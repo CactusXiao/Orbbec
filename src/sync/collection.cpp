@@ -8233,7 +8233,7 @@ struct CollectionCaptureUi {
     std::vector<TaskInfo>     tasks;
     int                       currentTaskIdx = -1;
     int                       currentEpisode = 0;
-    int                       taskListScroll = 0;
+    int                       taskListPage = 0;
     bool                      taskLoadError  = false;
     std::string               taskErrorMsg;
 };
@@ -8516,8 +8516,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         else {
             capUi.currentEpisode = 0;
         }
-        const int maxScroll = std::max(0, static_cast<int>(capUi.tasks.size()) - 1);
-        capUi.taskListScroll = std::max(0, std::min(capUi.taskListScroll, maxScroll));
+        const int maxPageByTask = std::max(0, static_cast<int>(capUi.tasks.size()) - 1);
+        capUi.taskListPage = std::max(0, std::min(capUi.taskListPage, maxPageByTask));
         capUi.taskLoadError = false;
         capUi.taskErrorMsg.clear();
     };
@@ -8896,18 +8896,36 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::putText(ui, "Tasks", cv::Point(listPanel.x + 14, listPanel.y + 28),
                         cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
             const int rowH = 42;
-            const int rowTop = listPanel.y + 44;
-            const int maxRows = std::max(1, (listPanel.height - 54) / rowH);
-            const int maxScroll = std::max(0, static_cast<int>(capUi.tasks.size()) - maxRows);
+            const int rowTop = listPanel.y + 58;
+            const int maxRows = std::max(1, (listPanel.height - 70) / rowH);
+            const int taskCount = static_cast<int>(capUi.tasks.size());
+            const int pageCount = std::max(1, (taskCount + maxRows - 1) / maxRows);
+            capUi.taskListPage = std::max(0, std::min(capUi.taskListPage, pageCount - 1));
             if(fm.wheelDelta != 0 && listPanel.contains(cv::Point(fm.x, fm.y))) {
-                const int step = (fm.wheelDelta > 0) ? -3 : 3;
-                capUi.taskListScroll = std::max(0, std::min(maxScroll, capUi.taskListScroll + step));
+                const int step = (fm.wheelDelta > 0) ? -1 : 1;
+                capUi.taskListPage = std::max(0, std::min(pageCount - 1, capUi.taskListPage + step));
             }
-            capUi.taskListScroll = std::max(0, std::min(maxScroll, capUi.taskListScroll));
 
+            const cv::Rect bPrev(listPanel.x + listPanel.width - 176, listPanel.y + 8, 62, 30);
+            const cv::Rect bNext(listPanel.x + listPanel.width - 76, listPanel.y + 8, 62, 30);
+            const std::string pageLabel = "Page " + std::to_string(capUi.taskListPage + 1)
+                                        + "/" + std::to_string(pageCount);
+            int pageBaseline = 0;
+            const auto pageSz = cv::getTextSize(pageLabel, cv::FONT_HERSHEY_DUPLEX, 0.52, 1, &pageBaseline);
+            cv::putText(ui, pageLabel,
+                        cv::Point(std::max(listPanel.x + 86, bPrev.x - pageSz.width - 10), listPanel.y + 28),
+                        cv::FONT_HERSHEY_DUPLEX, 0.52, cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
+            if(uiButtonEx(ui, bPrev, "Prev", fm, !exitConfirmActive && capUi.taskListPage > 0)) {
+                capUi.taskListPage = std::max(0, capUi.taskListPage - 1);
+            }
+            if(uiButtonEx(ui, bNext, "Next", fm, !exitConfirmActive && capUi.taskListPage + 1 < pageCount)) {
+                capUi.taskListPage = std::min(pageCount - 1, capUi.taskListPage + 1);
+            }
+
+            const int pageStart = capUi.taskListPage * maxRows;
             for(int row = 0; row < maxRows; ++row) {
-                const int taskIdx = capUi.taskListScroll + row;
-                if(taskIdx >= static_cast<int>(capUi.tasks.size())) {
+                const int taskIdx = pageStart + row;
+                if(taskIdx >= taskCount) {
                     break;
                 }
                 const auto &task = capUi.tasks[static_cast<size_t>(taskIdx)];
