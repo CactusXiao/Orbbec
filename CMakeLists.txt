@@ -18,7 +18,7 @@ add_executable(orbbec
     src/sync/interactive_visualization.cpp
     src/sync/viewer.cpp
     src/sync/collection.cpp
-    src/sync/task_backend_client.cpp
+    task_backend/task_backend_client.cpp
     src/sync/calibration.cpp
     src/sync/utils/cJSON.c
     src/sync/utils/utils.cpp
@@ -41,6 +41,7 @@ target_include_directories(orbbec PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
     ${CMAKE_CURRENT_LIST_DIR}/src/sync
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/utils
+    ${CMAKE_CURRENT_LIST_DIR}/task_backend
 )
 
 add_definitions(${PCL_DEFINITIONS})

@@ -78,7 +78,7 @@
     "depthAlignQueueCapacity": 90,
     "cameraStreamTimeoutSec": 2.0,
     "taskBackend": {
-        "_comment": "Backend-owned collection task/episode service. Start scripts/task_backend_server.py before entering collection.",
+        "_comment": "Backend-owned collection task/episode service. Start task_backend/server.py before entering collection.",
         "enabled": true,
         "baseUrl": "http://127.0.0.1:8765",
         "timeoutMs": 3000

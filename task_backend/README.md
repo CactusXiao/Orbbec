@@ -15,7 +15,7 @@ local data on the capture machine as:
 From the repository root:
 
 ```bash
-python3 scripts/task_backend_server.py \
+python3 task_backend/server.py \
   --data-root /var/lib/orbbec-task-backend \
   --task-file tasks.json \
   --host 0.0.0.0 \

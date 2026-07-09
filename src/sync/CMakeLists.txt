@@ -23,7 +23,7 @@ add_executable(${PROJECT_NAME}
     interactive_visualization.cpp
     viewer.cpp
     collection.cpp
-    task_backend_client.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/../../task_backend/task_backend_client.cpp
     calibration.cpp
     utils/cJSON.c
     utils/utils.cpp
@@ -37,6 +37,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/..
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/utils
+    ${CMAKE_CURRENT_LIST_DIR}/../../task_backend
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ob::OrbbecSDK
