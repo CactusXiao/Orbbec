@@ -4231,6 +4231,7 @@ private:
         cJSON *root = cJSON_CreateObject();
         cJSON_AddStringToObject(root, "tagFamily", h.tagFamily.c_str());
         cJSON_AddNumberToObject(root, "tagSizeM", h.tagSizeM);
+        cJSON_AddStringToObject(root, "rotationMethod", h.rotationMethod.c_str());
         cJSON_AddBoolToObject(root, "requireAllCameras", h.requireAllCameras);
         cJSON_AddNumberToObject(root, "minSharedCamerasPerTag", h.minSharedCamerasPerTag);
         cJSON_AddNumberToObject(root, "minTagInlierObservations", h.minTagInlierObservations);
