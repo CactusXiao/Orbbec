@@ -560,6 +560,8 @@ static cv::Vec3b gtSkeletonColorForSide(const std::string &side) {
     return side == "Left" ? cv::Vec3b(190, 235, 255) : cv::Vec3b(255, 210, 160);
 }
 
+static std::string jsonStringLocal(const std::string &s);
+
 class LiveGtJointWorker {
 public:
     LiveGtJointWorker() = default;
