@@ -221,6 +221,44 @@ struct GtInferenceResult {
     std::string          status;
 };
 
+struct EgoAprilTagCameraPacket {
+    std::string camIndex;
+    int         deviceIndex = -1;
+    cv::Mat     rgbBgr;
+    float       rgbScaleX = 1.0f;
+    float       rgbScaleY = 1.0f;
+    OBCameraIntrinsic rgbIntrinsic{};
+    OBCameraDistortion rgbDistortion{};
+    cv::Matx33f Rwc = cv::Matx33f::eye();
+    cv::Vec3f   twc = cv::Vec3f(0.0f, 0.0f, 0.0f);
+};
+
+struct EgoAprilTagRequest {
+    uint64_t frameId = 0;
+    int      egoVideoFrameIndex = -1;
+    fs::path egoVideoPath;
+    fs::path egoCameraParamsPath;
+    std::vector<EgoAprilTagCameraPacket> cameras;
+};
+
+struct EgoAprilTagLine {
+    cv::Vec3f p0 = cv::Vec3f(0.0f, 0.0f, 0.0f);
+    cv::Vec3f p1 = cv::Vec3f(0.0f, 0.0f, 0.0f);
+    cv::Vec3b color = cv::Vec3b(255, 255, 255);
+};
+
+struct EgoAprilTagResult {
+    bool                       valid = false;
+    uint64_t                   frameId = 0;
+    int                        egoVideoFrameIndex = -1;
+    int                        tagCount = 0;
+    int                        referenceTagCount = 0;
+    double                     rmsePx = 0.0;
+    double                     workerFps = 0.0;
+    std::string                status;
+    std::vector<EgoAprilTagLine> lines;
+};
+
 static bool isDigits(const std::string &s) {
     if(s.empty()) {
         return false;
@@ -965,6 +1003,414 @@ private:
 #endif
 };
 
+class LiveEgoAprilTagWorker {
+public:
+    LiveEgoAprilTagWorker() = default;
+
+    ~LiveEgoAprilTagWorker() {
+        stop();
+    }
+
+    void setScriptPath(fs::path scriptPath) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        scriptPath_ = std::move(scriptPath);
+    }
+
+    void ensureRunning() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if(workerThread_.joinable()) {
+            return;
+        }
+        stopRequested_ = false;
+        hasPendingRequest_ = false;
+        latestResult_ = EgoAprilTagResult{};
+        statusLine_ = "Ego tags worker starting";
+        workerThread_ = std::thread([this]() { workerLoop(); });
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = true;
+            hasPendingRequest_ = false;
+            cv_.notify_all();
+        }
+        if(workerThread_.joinable()) {
+            workerThread_.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = false;
+            latestResult_ = EgoAprilTagResult{};
+            statusLine_ = "Ego tags off";
+        }
+    }
+
+    void submitLatest(EgoAprilTagRequest req) {
+        ensureRunning();
+        std::lock_guard<std::mutex> lock(mtx_);
+        pendingRequest_ = std::move(req);
+        hasPendingRequest_ = true;
+        cv_.notify_one();
+    }
+
+    void setIdleStatus(const std::string &status, bool clearResult) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        statusLine_ = status;
+        if(clearResult) {
+            latestResult_ = EgoAprilTagResult{};
+            latestResult_.status = status;
+            latestResult_.workerFps = smoothedFps_;
+        }
+    }
+
+    EgoAprilTagResult latestResult() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return latestResult_;
+    }
+
+    bool hasPendingRequest() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return hasPendingRequest_;
+    }
+
+    std::string statusLine() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return statusLine_;
+    }
+
+private:
+#if !defined(_WIN32)
+    bool launchChild() {
+        fs::path scriptPath;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            scriptPath = scriptPath_;
+        }
+        if(scriptPath.empty() || !fs::exists(scriptPath)) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "Ego tags worker script not found";
+            return false;
+        }
+
+        int stdinPipe[2] = { -1, -1 };
+        int stdoutPipe[2] = { -1, -1 };
+        if(::pipe(stdinPipe) != 0 || ::pipe(stdoutPipe) != 0) {
+            if(stdinPipe[0] >= 0) {
+                ::close(stdinPipe[0]);
+            }
+            if(stdinPipe[1] >= 0) {
+                ::close(stdinPipe[1]);
+            }
+            if(stdoutPipe[0] >= 0) {
+                ::close(stdoutPipe[0]);
+            }
+            if(stdoutPipe[1] >= 0) {
+                ::close(stdoutPipe[1]);
+            }
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "Ego tags worker pipe creation failed";
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if(pid < 0) {
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "Ego tags worker fork failed";
+            return false;
+        }
+
+        if(pid == 0) {
+            ::dup2(stdinPipe[0], STDIN_FILENO);
+            ::dup2(stdoutPipe[1], STDOUT_FILENO);
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            ::execlp("python3", "python3", scriptPath.string().c_str(), nullptr);
+            ::execlp("python", "python", scriptPath.string().c_str(), nullptr);
+            _exit(127);
+        }
+
+        ::close(stdinPipe[0]);
+        ::close(stdoutPipe[1]);
+        childPid_ = pid;
+        childStdinFd_ = stdinPipe[1];
+        childStdoutFd_ = stdoutPipe[0];
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "Ego tags worker ready";
+        }
+        return true;
+    }
+
+    void closeChild() {
+        if(childStdinFd_ >= 0) {
+            ::close(childStdinFd_);
+            childStdinFd_ = -1;
+        }
+        if(childStdoutFd_ >= 0) {
+            ::close(childStdoutFd_);
+            childStdoutFd_ = -1;
+        }
+        if(childPid_ > 0) {
+            ::kill(childPid_, SIGTERM);
+            int status = 0;
+            ::waitpid(childPid_, &status, 0);
+            childPid_ = -1;
+        }
+    }
+
+    std::string buildRequestJson(const EgoAprilTagRequest &req, uint64_t &payloadBytesOut) const {
+        payloadBytesOut = 0;
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(9);
+        oss << "{\"type\":\"frame\",\"frame_id\":" << req.frameId
+            << ",\"ego_video_frame_index\":" << req.egoVideoFrameIndex
+            << ",\"ego_video_path\":" << jsonStringLocal(req.egoVideoPath.string())
+            << ",\"ego_camera_params_path\":" << jsonStringLocal(req.egoCameraParamsPath.string())
+            << ",\"tag_family\":\"tag36h11\",\"tag_size_m\":0.096,\"cameras\":[";
+        uint64_t payloadOffset = 0;
+        for(size_t i = 0; i < req.cameras.size(); ++i) {
+            const auto &cam = req.cameras[i];
+            const uint64_t rgbBytes = static_cast<uint64_t>(matByteSize(cam.rgbBgr));
+            if(i != 0) {
+                oss << ",";
+            }
+            oss << "{\"camera_id\":" << jsonStringLocal(cam.camIndex)
+                << ",\"device_index\":" << cam.deviceIndex
+                << ",\"rgb_width\":" << cam.rgbBgr.cols
+                << ",\"rgb_height\":" << cam.rgbBgr.rows
+                << ",\"rgb_scale_x\":" << cam.rgbScaleX
+                << ",\"rgb_scale_y\":" << cam.rgbScaleY
+                << ",\"rgb_offset\":" << payloadOffset
+                << ",\"rgb_size\":" << rgbBytes
+                << ",\"intrinsic\":{\"fx\":" << cam.rgbIntrinsic.fx
+                << ",\"fy\":" << cam.rgbIntrinsic.fy
+                << ",\"cx\":" << cam.rgbIntrinsic.cx
+                << ",\"cy\":" << cam.rgbIntrinsic.cy
+                << "},\"distortion\":{\"k1\":" << cam.rgbDistortion.k1
+                << ",\"k2\":" << cam.rgbDistortion.k2
+                << ",\"k3\":" << cam.rgbDistortion.k3
+                << ",\"k4\":" << cam.rgbDistortion.k4
+                << ",\"k5\":" << cam.rgbDistortion.k5
+                << ",\"k6\":" << cam.rgbDistortion.k6
+                << ",\"p1\":" << cam.rgbDistortion.p1
+                << ",\"p2\":" << cam.rgbDistortion.p2
+                << "},\"Rwc\":[" << cam.Rwc(0, 0) << "," << cam.Rwc(0, 1) << "," << cam.Rwc(0, 2)
+                << "," << cam.Rwc(1, 0) << "," << cam.Rwc(1, 1) << "," << cam.Rwc(1, 2)
+                << "," << cam.Rwc(2, 0) << "," << cam.Rwc(2, 1) << "," << cam.Rwc(2, 2)
+                << "],\"twc\":[" << cam.twc[0] << "," << cam.twc[1] << "," << cam.twc[2] << "]}";
+            payloadOffset += rgbBytes;
+        }
+        oss << "]}";
+        payloadBytesOut = payloadOffset;
+        return oss.str();
+    }
+
+    bool sendRequest(const EgoAprilTagRequest &req) {
+        if(childStdinFd_ < 0) {
+            return false;
+        }
+        uint64_t payloadBytes = 0;
+        const std::string json = buildRequestJson(req, payloadBytes);
+        uint8_t header[12];
+        putU32Le(header, static_cast<uint32_t>(json.size()));
+        putU64Le(header + 4, payloadBytes);
+        if(!writeAllFd(childStdinFd_, header, sizeof(header))) {
+            return false;
+        }
+        if(!json.empty() && !writeAllFd(childStdinFd_, json.data(), json.size())) {
+            return false;
+        }
+        for(const auto &cam : req.cameras) {
+            if(!cam.rgbBgr.empty() && !writeAllFd(childStdinFd_, cam.rgbBgr.data, matByteSize(cam.rgbBgr))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool readResponse(EgoAprilTagResult &out) {
+        if(childStdoutFd_ < 0) {
+            return false;
+        }
+        uint8_t header[12];
+        if(!readAllFd(childStdoutFd_, header, sizeof(header))) {
+            return false;
+        }
+        const uint32_t jsonBytes = getU32Le(header);
+        const uint64_t payloadBytes = getU64Le(header + 4);
+        if(payloadBytes != 0) {
+            return false;
+        }
+        std::string json(jsonBytes, '\0');
+        if(jsonBytes > 0 && !readAllFd(childStdoutFd_, json.data(), jsonBytes)) {
+            return false;
+        }
+
+        cJSON *root = cJSON_Parse(json.c_str());
+        if(!root || !cJSON_IsObject(root)) {
+            if(root) {
+                cJSON_Delete(root);
+            }
+            return false;
+        }
+
+        out = EgoAprilTagResult{};
+        auto *okItem = cJSON_GetObjectItemCaseSensitive(root, "ok");
+        out.valid = okItem && cJSON_IsBool(okItem) ? (okItem->valueint != 0) : false;
+        auto *frameIdItem = cJSON_GetObjectItemCaseSensitive(root, "frame_id");
+        if(frameIdItem && cJSON_IsNumber(frameIdItem)) {
+            out.frameId = static_cast<uint64_t>(frameIdItem->valuedouble);
+        }
+        auto *egoFrameItem = cJSON_GetObjectItemCaseSensitive(root, "ego_video_frame_index");
+        if(egoFrameItem && cJSON_IsNumber(egoFrameItem)) {
+            out.egoVideoFrameIndex = egoFrameItem->valueint;
+        }
+        auto *tagCountItem = cJSON_GetObjectItemCaseSensitive(root, "tag_count");
+        if(tagCountItem && cJSON_IsNumber(tagCountItem)) {
+            out.tagCount = tagCountItem->valueint;
+        }
+        auto *refCountItem = cJSON_GetObjectItemCaseSensitive(root, "reference_tag_count");
+        if(refCountItem && cJSON_IsNumber(refCountItem)) {
+            out.referenceTagCount = refCountItem->valueint;
+        }
+        auto *rmseItem = cJSON_GetObjectItemCaseSensitive(root, "rmse_px");
+        if(rmseItem && cJSON_IsNumber(rmseItem)) {
+            out.rmsePx = rmseItem->valuedouble;
+        }
+        auto *fpsItem = cJSON_GetObjectItemCaseSensitive(root, "worker_fps");
+        if(fpsItem && cJSON_IsNumber(fpsItem)) {
+            out.workerFps = fpsItem->valuedouble;
+        }
+        auto *statusItem = cJSON_GetObjectItemCaseSensitive(root, "status");
+        if(statusItem && cJSON_IsString(statusItem) && statusItem->valuestring) {
+            out.status = statusItem->valuestring;
+        }
+
+        auto clampByte = [](double v) -> uint8_t {
+            if(!std::isfinite(v)) {
+                return 255;
+            }
+            return static_cast<uint8_t>(std::max(0.0, std::min(255.0, std::round(v))));
+        };
+
+        auto *linesItem = cJSON_GetObjectItemCaseSensitive(root, "lines");
+        if(linesItem && cJSON_IsArray(linesItem)) {
+            const int lineCount = cJSON_GetArraySize(linesItem);
+            out.lines.reserve(static_cast<size_t>(lineCount));
+            for(int i = 0; i < lineCount; ++i) {
+                auto *arr = cJSON_GetArrayItem(linesItem, i);
+                if(!arr || !cJSON_IsArray(arr) || cJSON_GetArraySize(arr) < 9) {
+                    continue;
+                }
+                double v[9] = {};
+                bool ok = true;
+                for(int j = 0; j < 9; ++j) {
+                    auto *item = cJSON_GetArrayItem(arr, j);
+                    if(!item || !cJSON_IsNumber(item)) {
+                        ok = false;
+                        break;
+                    }
+                    v[j] = item->valuedouble;
+                }
+                if(!ok) {
+                    continue;
+                }
+                EgoAprilTagLine line;
+                line.p0 = cv::Vec3f(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2]));
+                line.p1 = cv::Vec3f(static_cast<float>(v[3]), static_cast<float>(v[4]), static_cast<float>(v[5]));
+                line.color = cv::Vec3b(clampByte(v[6]), clampByte(v[7]), clampByte(v[8]));
+                out.lines.push_back(line);
+            }
+        }
+
+        cJSON_Delete(root);
+        return true;
+    }
+#endif
+
+    void workerLoop() {
+#if defined(_WIN32)
+        std::lock_guard<std::mutex> lock(mtx_);
+        statusLine_ = "Ego tags worker unsupported on Windows";
+#else
+        for(;;) {
+            EgoAprilTagRequest req;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [&]() { return stopRequested_ || hasPendingRequest_; });
+                if(stopRequested_) {
+                    break;
+                }
+                req = std::move(pendingRequest_);
+                hasPendingRequest_ = false;
+            }
+
+            if(childPid_ <= 0 && !launchChild()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                continue;
+            }
+
+            EgoAprilTagResult response;
+            if(!sendRequest(req) || !readResponse(response)) {
+                closeChild();
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    latestResult_ = EgoAprilTagResult{};
+                    latestResult_.status = "Ego tags worker disconnected";
+                    latestResult_.workerFps = smoothedFps_;
+                    statusLine_ = "Ego tags worker disconnected";
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                const auto now = std::chrono::steady_clock::now();
+                if(lastResponseTime_.time_since_epoch().count() != 0) {
+                    const double dt = std::chrono::duration<double>(now - lastResponseTime_).count();
+                    if(dt > 1e-6) {
+                        const double instantFps = 1.0 / dt;
+                        smoothedFps_ = smoothedFps_ > 0.0 ? (0.8 * smoothedFps_ + 0.2 * instantFps) : instantFps;
+                    }
+                }
+                lastResponseTime_ = now;
+                response.workerFps = response.workerFps > 0.0 ? response.workerFps : smoothedFps_;
+                latestResult_ = std::move(response);
+                statusLine_ = latestResult_.status.empty() ? "Ego tags worker ready" : latestResult_.status;
+            }
+        }
+
+        closeChild();
+#endif
+    }
+
+    mutable std::mutex      mtx_;
+    std::condition_variable cv_;
+    bool                    stopRequested_ = false;
+    bool                    hasPendingRequest_ = false;
+    EgoAprilTagRequest      pendingRequest_;
+    EgoAprilTagResult       latestResult_;
+    std::string             statusLine_ = "Ego tags off";
+    fs::path                scriptPath_;
+    std::thread             workerThread_;
+    double                  smoothedFps_ = 0.0;
+    std::chrono::steady_clock::time_point lastResponseTime_{};
+#if !defined(_WIN32)
+    pid_t childPid_ = -1;
+    int   childStdinFd_ = -1;
+    int   childStdoutFd_ = -1;
+#endif
+};
+
 struct InteractiveViewState {
     int width = 1600;
     int height = 900;
@@ -1153,6 +1599,38 @@ static std::string readFileAllLocal(const fs::path &path) {
     std::ostringstream oss;
     oss << file.rdbuf();
     return oss.str();
+}
+
+static std::string jsonEscapeLocal(const std::string &s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for(char ch : s) {
+        switch(ch) {
+        case '\\':
+            out += "\\\\";
+            break;
+        case '"':
+            out += "\\\"";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            out.push_back(ch);
+            break;
+        }
+    }
+    return out;
+}
+
+static std::string jsonStringLocal(const std::string &s) {
+    return "\"" + jsonEscapeLocal(s) + "\"";
 }
 
 static bool parseVec3(cJSON *arr, cv::Vec3f &out) {
@@ -1685,6 +2163,7 @@ public:
                 lastRenderUs = loopNowUs;
                 auto frameSnapshot = snapshotProcessingFrames();
                 submitGtInferenceIfNeeded(frameSnapshot, loopNowUs);
+                submitEgoAprilTagsIfNeeded(frameSnapshot, loopNowUs);
                 ivizSetStage("loop_render_pointcloud");
                 lastPc = renderUnifiedPointCloud(frameSnapshot, viewState);
             }
@@ -1791,6 +2270,28 @@ private:
         return candidates.empty() ? fs::path() : candidates.front();
     }
 
+    fs::path resolveEgoAprilTagWorkerScriptPath() const {
+        std::vector<fs::path> candidates;
+        if(!cfg_.initExtrinsicPath.empty()) {
+            const fs::path base = fs::absolute(fs::path(cfg_.initExtrinsicPath)).parent_path();
+            candidates.push_back(base / "ego_apriltag_overlay_worker.py");
+        }
+        candidates.push_back(fs::current_path() / "ego_apriltag_overlay_worker.py");
+        candidates.push_back(fs::current_path() / "src" / "sync" / "ego_apriltag_overlay_worker.py");
+        candidates.push_back(fs::current_path() / ".." / "src" / "sync" / "ego_apriltag_overlay_worker.py");
+        for(const auto &p : candidates) {
+            std::error_code ec;
+            const fs::path absP = fs::absolute(p, ec);
+            if(!ec && fs::exists(absP)) {
+                return absP;
+            }
+            if(fs::exists(p)) {
+                return p;
+            }
+        }
+        return candidates.empty() ? fs::path() : candidates.front();
+    }
+
     void setGtVisualizationEnabled(bool enabled) {
         if(showGtJoints_ == enabled) {
             return;
@@ -1804,6 +2305,78 @@ private:
         else {
             gtWorker_.stop();
         }
+    }
+
+    fs::path resolveEgoPreviewEpisodeDir() const {
+        fs::path base = cfg_.outputDir.empty() ? (fs::current_path() / "interaction_ego_preview") : cfg_.outputDir;
+        if(base.is_relative()) {
+            base = (fs::current_path() / base).lexically_normal();
+        }
+        return base / "interaction_ego_preview";
+    }
+
+    void setEgoAprilTagOverlayEnabled(bool enabled) {
+        if(showEgoAprilTags_ == enabled) {
+            return;
+        }
+        if(!enabled) {
+            showEgoAprilTags_ = false;
+            egoTagWorker_.stop();
+            if(egoRecorder_.isSessionActive()) {
+                std::string err;
+                (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
+            }
+            egoRecorder_.stop();
+            latestEgoFrame_.reset();
+            lastEgoTagSubmitUs_ = 0;
+            egoTagStatusLine_ = "Ego tags off";
+            return;
+        }
+
+        if(!cfg_.ego.enabled) {
+            egoTagStatusLine_ = "Enable ego in config first";
+            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
+            return;
+        }
+
+        std::string err;
+        if(!egoRecorder_.isRunning()) {
+            if(!egoRecorder_.start(cfg_.ego, &err)) {
+                egoTagStatusLine_ = "Ego start failed: " + err;
+                egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
+                return;
+            }
+        }
+        if(!egoRecorder_.waitUntilReady(std::chrono::seconds(2))) {
+            egoTagStatusLine_ = "Waiting for PICO ego client";
+            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
+            return;
+        }
+
+        egoPreviewEpisodeDir_ = resolveEgoPreviewEpisodeDir();
+        try {
+            fs::create_directories(egoPreviewEpisodeDir_);
+        }
+        catch(const std::exception &ex) {
+            egoTagStatusLine_ = std::string("Ego preview dir failed: ") + ex.what();
+            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
+            return;
+        }
+        if(!egoRecorder_.beginSession(egoPreviewEpisodeDir_, "interaction_preview", &err)) {
+            egoTagStatusLine_ = "Ego session failed: " + err;
+            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
+            return;
+        }
+
+        egoVideoPath_ = egoPreviewEpisodeDir_ / "ego" / "RGB" / "rgb.h265";
+        egoCameraParamsPath_ = egoPreviewEpisodeDir_ / "ego" / "camera_params.json";
+        latestEgoFrame_.reset();
+        lastEgoTagSubmitUs_ = 0;
+        showEgoAprilTags_ = true;
+        egoTagWorker_.setScriptPath(resolveEgoAprilTagWorkerScriptPath());
+        egoTagWorker_.ensureRunning();
+        egoTagWorker_.setIdleStatus("Ego tags waiting for frames", true);
+        egoTagStatusLine_ = "Ego tags waiting for frames";
     }
 
     GtInferenceRequest buildGtInferenceRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
@@ -1881,6 +2454,112 @@ private:
         gtWorker_.submitLatest(std::move(req));
     }
 
+    void pollEgoFrames() {
+        if(!showEgoAprilTags_ || !egoRecorder_.isRunning()) {
+            return;
+        }
+        EgoFrame frame;
+        int      popped = 0;
+        while(popped < 32 && egoRecorder_.popFrame(frame, std::chrono::milliseconds(0))) {
+            latestEgoFrame_ = frame;
+            popped++;
+        }
+    }
+
+    EgoAprilTagRequest buildEgoAprilTagRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
+        EgoAprilTagRequest req;
+        req.frameId = frameId;
+        req.egoVideoPath = egoVideoPath_;
+        req.egoCameraParamsPath = egoCameraParamsPath_;
+        if(latestEgoFrame_.has_value()) {
+            req.egoVideoFrameIndex = latestEgoFrame_->videoFrameIndex;
+        }
+
+        for(const auto &kv : frames) {
+            const int deviceIndex = kv.first;
+            const auto &cached = kv.second;
+            if(!isCameraEnabled(deviceIndex) || !cached.color) {
+                continue;
+            }
+
+            auto itValid = rgbDepthParamsValid_.find(deviceIndex);
+            auto itParam = rgbDepthParamsByDevice_.find(deviceIndex);
+            if(itValid == rgbDepthParamsValid_.end() || itParam == rgbDepthParamsByDevice_.end() || !itValid->second) {
+                continue;
+            }
+            if(!(itParam->second.rgbIntrinsic.fx > 0.0f) || !(itParam->second.rgbIntrinsic.fy > 0.0f)) {
+                continue;
+            }
+
+            const auto *rgbPose = findByCamKeyVariants(rgbExtrinsicsCamToWorld_, cached.camIndex);
+            if(!rgbPose || !rgbPose->valid) {
+                continue;
+            }
+
+            cv::Mat rgb = visualizeObFrame(cached.color);
+            if(rgb.empty()) {
+                continue;
+            }
+
+            EgoAprilTagCameraPacket cam;
+            cam.camIndex = cached.camIndex;
+            cam.deviceIndex = deviceIndex;
+            cam.rgbIntrinsic = itParam->second.rgbIntrinsic;
+            cam.rgbDistortion = itParam->second.rgbDistortion;
+            cam.Rwc = rgbPose->R;
+            cam.twc = rgbPose->t;
+            cam.rgbBgr = resizeMatKeepingAspect(rgb, egoTagWorkerMaxImageSide_, cv::INTER_AREA, cam.rgbScaleX, cam.rgbScaleY);
+            if(cam.rgbBgr.empty()) {
+                continue;
+            }
+            if(!cam.rgbBgr.isContinuous()) {
+                cam.rgbBgr = cam.rgbBgr.clone();
+            }
+            req.cameras.push_back(std::move(cam));
+        }
+
+        std::sort(req.cameras.begin(), req.cameras.end(), [](const EgoAprilTagCameraPacket &a, const EgoAprilTagCameraPacket &b) {
+            if(a.camIndex == b.camIndex) {
+                return a.deviceIndex < b.deviceIndex;
+            }
+            return a.camIndex < b.camIndex;
+        });
+        return req;
+    }
+
+    void submitEgoAprilTagsIfNeeded(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) {
+        if(!showEgoAprilTags_) {
+            return;
+        }
+        pollEgoFrames();
+        if(egoTagWorker_.hasPendingRequest()) {
+            return;
+        }
+        if(lastEgoTagSubmitUs_ != 0 && frameId > lastEgoTagSubmitUs_ && frameId - lastEgoTagSubmitUs_ < 120000) {
+            return;
+        }
+        if(!latestEgoFrame_.has_value()) {
+            egoTagWorker_.setIdleStatus("Ego tags waiting for ego frames", true);
+            return;
+        }
+        if(latestEgoFrame_->videoFrameIndex < 0) {
+            egoTagWorker_.setIdleStatus("Ego tags waiting for mapped video frame", true);
+            return;
+        }
+        if(egoVideoPath_.empty() || egoCameraParamsPath_.empty()) {
+            egoTagWorker_.setIdleStatus("Ego tags missing preview paths", true);
+            return;
+        }
+
+        EgoAprilTagRequest req = buildEgoAprilTagRequest(frames, frameId);
+        if(req.cameras.empty()) {
+            egoTagWorker_.setIdleStatus("Ego tags need calibrated Orbbec RGB", true);
+            return;
+        }
+        lastEgoTagSubmitUs_ = frameId;
+        egoTagWorker_.submitLatest(std::move(req));
+    }
+
     std::string buildGtStatusLine() const {
         if(!showGtJoints_) {
             return "GT hands off";
@@ -1899,6 +2578,31 @@ private:
             oss << (firstVisible ? " | " : " ");
             firstVisible = false;
             oss << hand.side << ":" << hand.validJointCount;
+        }
+        if(result.workerFps > 0.0) {
+            oss << " | " << result.workerFps << " Hz";
+        }
+        if(!workerStatus.empty()) {
+            oss << " | " << workerStatus;
+        }
+        return oss.str();
+    }
+
+    std::string buildEgoAprilTagStatusLine() const {
+        if(!showEgoAprilTags_) {
+            return egoTagStatusLine_.empty() ? "Ego tags off" : egoTagStatusLine_;
+        }
+        const auto result = egoTagWorker_.latestResult();
+        const std::string workerStatus = egoTagWorker_.statusLine();
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(1);
+        oss << "Ego tags";
+        if(result.referenceTagCount > 0 || result.tagCount > 0) {
+            oss << " " << result.tagCount << " | ref " << result.referenceTagCount;
+        }
+        if(result.rmsePx > 0.0) {
+            oss << " | " << result.rmsePx << "px";
         }
         if(result.workerFps > 0.0) {
             oss << " | " << result.workerFps << " Hz";
@@ -1997,8 +2701,60 @@ private:
         }
     }
 
+    void drawEgoAprilTagsOnCanvas(cv::Mat &canvas,
+                                  const EgoAprilTagResult &result,
+                                  const cv::Vec3f &right,
+                                  const cv::Vec3f &up,
+                                  const cv::Vec3f &forward,
+                                  const cv::Vec3f &camPos,
+                                  float fx,
+                                  float fy,
+                                  float cx,
+                                  float cy) const {
+        if(result.lines.empty()) {
+            return;
+        }
+
+        auto project = [&](const cv::Vec3f &p, cv::Point &pt, float &depth) -> bool {
+            const cv::Vec3f v = p - camPos;
+            const float xc = v.dot(right);
+            const float yc = v.dot(up);
+            const float zc = v.dot(forward);
+            if(zc <= 0.05f) {
+                return false;
+            }
+            const int u = static_cast<int>(fx * (xc / zc) + cx);
+            const int vpx = static_cast<int>(fy * (-yc / zc) + cy);
+            if(u < 0 || u >= canvas.cols || vpx < 0 || vpx >= canvas.rows) {
+                return false;
+            }
+            pt = cv::Point(u, vpx);
+            depth = zc;
+            return true;
+        };
+
+        for(const auto &line : result.lines) {
+            cv::Point a;
+            cv::Point b;
+            float depthA = 0.0f;
+            float depthB = 0.0f;
+            if(!project(line.p0, a, depthA) || !project(line.p1, b, depthB)) {
+                continue;
+            }
+            const cv::Scalar color = toScalar(line.color);
+            cv::line(canvas, a, b, cv::Scalar(8, 8, 8), 5, cv::LINE_AA);
+            cv::line(canvas, a, b, color, 2, cv::LINE_AA);
+        }
+    }
+
     void stopAllPipelines() {
         gtWorker_.stop();
+        egoTagWorker_.stop();
+        if(egoRecorder_.isSessionActive()) {
+            std::string err;
+            (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
+        }
+        egoRecorder_.stop();
         fisheyeRecorder_.stop();
         for(auto &rt: devices_) {
             try {
@@ -2040,6 +2796,9 @@ private:
     }
 
     StreamMode computeDesiredStreamMode() const {
+        if(showEgoAprilTags_) {
+            return StreamMode::DepthColor;
+        }
         if(showGtJoints_) {
             return StreamMode::DepthColor;
         }
@@ -2609,6 +3368,7 @@ private:
         cv::Mat canvas(viewState.height, viewState.width, CV_8UC3, cv::Scalar(0, 0, 0));
         std::vector<float> zbuf(static_cast<size_t>(viewState.width) * static_cast<size_t>(viewState.height), std::numeric_limits<float>::infinity());
         const GtInferenceResult gtResult = showGtJoints_ ? gtWorker_.latestResult() : GtInferenceResult{};
+        const EgoAprilTagResult egoTagResult = showEgoAprilTags_ ? egoTagWorker_.latestResult() : EgoAprilTagResult{};
 
         cv::Vec3f right, up, forward, camPos;
         computeCameraBasis(viewState, right, up, forward, camPos);
@@ -2817,11 +3577,19 @@ private:
         if(showGtJoints_ && !gtResult.hands.empty()) {
             drawGtJointsOnCanvas(canvas, zbuf, gtResult, right, up, forward, camPos, fx, fy, cx, cy);
         }
+        if(showEgoAprilTags_ && !egoTagResult.lines.empty()) {
+            drawEgoAprilTagsOnCanvas(canvas, egoTagResult, right, up, forward, camPos, fx, fy, cx, cy);
+        }
 
         cv::putText(canvas, "LMB: rotate  RMB: pan  Wheel/Ctrl+/-: zoom", cv::Point(12, 28), cv::FONT_HERSHEY_DUPLEX, 0.6, cv::Scalar(255, 255, 255), 1,
                     cv::LINE_AA);
+        int statusY = 54;
         if(showGtJoints_) {
-            cv::putText(canvas, buildGtStatusLine(), cv::Point(12, 54), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            cv::putText(canvas, buildGtStatusLine(), cv::Point(12, statusY), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            statusY += 26;
+        }
+        if(showEgoAprilTags_) {
+            cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(12, statusY), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         }
         return canvas;
     }
@@ -3020,16 +3788,24 @@ private:
             setGtVisualizationEnabled(!showGtJoints_);
             outStreamsDirty = true;
         }
+        const cv::Rect egoToggle(layout_.ctlRect.x + 760, y + 30, 260, 28);
+        if(uiCheckbox(canvas, egoToggle, showEgoAprilTags_, "Visualize ego AprilTags", ms)) {
+            setEgoAprilTagOverlayEnabled(!showEgoAprilTags_);
+            outStreamsDirty = true;
+        }
 
-        cv::putText(canvas, "LMB rotate | RMB pan | Wheel/Ctrl+/- zoom", cv::Point(layout_.ctlRect.x + 1010, y + 18), cv::FONT_HERSHEY_DUPLEX, 0.5,
+        cv::putText(canvas, "LMB rotate | RMB pan | Wheel/Ctrl+/- zoom", cv::Point(layout_.ctlRect.x + 1040, y + 18), cv::FONT_HERSHEY_DUPLEX, 0.5,
                     cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 58), cv::FONT_HERSHEY_DUPLEX, 0.52,
+        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 1040, y + 46), cv::FONT_HERSHEY_DUPLEX, 0.52,
                     showGtJoints_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
+        cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(layout_.ctlRect.x + 1040, y + 74), cv::FONT_HERSHEY_DUPLEX, 0.52,
+                    showEgoAprilTags_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
         return false;
     }
 
 private:
     static constexpr int gtWorkerMaxImageSide_ = 384;
+    static constexpr int egoTagWorkerMaxImageSide_ = 640;
     static constexpr size_t kMaxAlignedFrameQueueSize_ = 8;
 
     AppConfig cfg_;
@@ -3052,6 +3828,13 @@ private:
     std::unordered_map<std::string, ExtrinsicCamToWorld> depthExtrinsicsCamToWorld_;
     std::unordered_map<std::string, ExtrinsicCamToWorld> rgbExtrinsicsCamToWorld_;
     LiveGtJointWorker gtWorker_;
+    LiveEgoAprilTagWorker egoTagWorker_;
+    EgoRecorder egoRecorder_;
+    fs::path egoPreviewEpisodeDir_;
+    fs::path egoVideoPath_;
+    fs::path egoCameraParamsPath_;
+    std::optional<EgoFrame> latestEgoFrame_;
+    std::string egoTagStatusLine_ = "Ego tags off";
     FisheyeRecorder fisheyeRecorder_;
     std::vector<uint8_t> fisheyeVisible_;
     std::vector<std::string> fisheyeLabels_;
@@ -3065,6 +3848,8 @@ private:
     ImageType imageType_ = ImageType::Depth;
     int imageScrollY_ = 0;
     bool showGtJoints_ = false;
+    bool showEgoAprilTags_ = false;
+    uint64_t lastEgoTagSubmitUs_ = 0;
 };
 
 InteractiveExit run_interactive_visualization(const AppConfig &cfg, const std::atomic_bool *cancel) {

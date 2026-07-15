@@ -73,6 +73,8 @@ install(FILES
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/config.json
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/extrinsic_health_check.py
     ${CMAKE_CURRENT_LIST_DIR}/src/sync/hand_joint_gt_worker.py
+    ${CMAKE_CURRENT_LIST_DIR}/src/sync/ego_apriltag_overlay_worker.py
+    ${CMAKE_CURRENT_LIST_DIR}/estimate_pico_ego_extrinsics.py
     DESTINATION bin
 )
 install(TARGETS orbbec RUNTIME DESTINATION bin)
