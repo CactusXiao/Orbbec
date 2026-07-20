@@ -4256,7 +4256,7 @@ private:
         cJSON_Delete(root);
     }
 
-    struct ExtrinsicHealthMaxResidual {
+    struct ExtrinsicHealthJudgedResidual {
         double transM = 0.0;
         double rotDeg = 0.0;
         double reprojPx = 0.0;
@@ -4272,10 +4272,6 @@ private:
         }
         out = item->valuedouble;
         return true;
-    }
-
-    static bool readMetricWithFallback(cJSON *obj, const char *primary, const char *fallback, double &out) {
-        return readJsonNumber(obj, primary, out) || readJsonNumber(obj, fallback, out);
     }
 
     static std::string formatMetric(double value, int precision) {
@@ -4336,7 +4332,7 @@ private:
 
     static void collectExtrinsicHealthDetailLines(cJSON *root, std::vector<std::string> &detailLines) {
         appendExtrinsicHealthCameraStatusLine(root, detailLines);
-        std::map<std::string, ExtrinsicHealthMaxResidual> byCamera;
+        std::map<std::string, ExtrinsicHealthJudgedResidual> byCamera;
         cJSON *samplesObj = cJSON_GetObjectItemCaseSensitive(root, "samples");
         if(!samplesObj || !cJSON_IsArray(samplesObj)) {
             return;
@@ -4358,15 +4354,15 @@ private:
                 }
                 auto &acc = byCamera[cameraObj->string];
                 double value = 0.0;
-                if(readMetricWithFallback(cameraObj, "max_trans_m", "median_trans_m", value)) {
+                if(readJsonNumber(cameraObj, "median_trans_m", value)) {
                     acc.transM = acc.hasTrans ? std::max(acc.transM, value) : value;
                     acc.hasTrans = true;
                 }
-                if(readMetricWithFallback(cameraObj, "max_rot_deg", "median_rot_deg", value)) {
+                if(readJsonNumber(cameraObj, "median_rot_deg", value)) {
                     acc.rotDeg = acc.hasRot ? std::max(acc.rotDeg, value) : value;
                     acc.hasRot = true;
                 }
-                if(readMetricWithFallback(cameraObj, "max_reproj_px", "median_reproj_px", value)) {
+                if(readJsonNumber(cameraObj, "median_reproj_px", value)) {
                     acc.reprojPx = acc.hasReproj ? std::max(acc.reprojPx, value) : value;
                     acc.hasReproj = true;
                 }
@@ -4376,12 +4372,12 @@ private:
         if(byCamera.empty()) {
             return;
         }
-        detailLines.push_back("Extrinsic max residuals by camera:");
+        detailLines.push_back("Extrinsic judged median residuals by camera:");
         for(const auto &kv: byCamera) {
             const auto &r = kv.second;
             std::ostringstream oss;
             oss << "cam" << kv.first
-                << " max reproj=" << (r.hasReproj ? formatMetric(r.reprojPx, 3) : "n/a") << "px"
+                << " median reproj=" << (r.hasReproj ? formatMetric(r.reprojPx, 3) : "n/a") << "px"
                 << " trans=" << (r.hasTrans ? formatMetric(r.transM, 4) : "n/a") << "m"
                 << " rot=" << (r.hasRot ? formatMetric(r.rotDeg, 3) : "n/a") << "deg";
             detailLines.push_back(oss.str());
