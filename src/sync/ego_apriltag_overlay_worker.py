@@ -251,7 +251,8 @@ def solve_tag_pose(corners_px: np.ndarray, K: np.ndarray, dist: np.ndarray, loca
             return None
         candidates.append((project_rmse(object_pts, image_pts, T, K, dist), T))
 
-    return min(candidates, key=lambda item: item[0])
+    rmse, transform = min(candidates, key=lambda item: item[0])
+    return transform, rmse
 
 
 def detect_apriltags(image: np.ndarray | None, detector: Any) -> tuple[list[tuple[int, np.ndarray]], str]:
