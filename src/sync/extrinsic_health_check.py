@@ -537,6 +537,15 @@ def project_residual_px(T_camera_from_world: np.ndarray, T_world_from_tag: np.nd
     return float(np.sqrt(np.mean(err * err)))
 
 
+def pose_to_json(T: np.ndarray) -> dict[str, Any]:
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    return {
+        "rotation": T[:3, :3].tolist(),
+        "translation": T[:3, 3].tolist(),
+        "matrix": T.tolist(),
+    }
+
+
 def median(values: list[float]) -> float:
     if not values:
         return float("inf")
@@ -659,6 +668,29 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
     camera_counts = status_counts(list(camera_statuses.values()))
     camera_counts["total"] = len(camera_statuses)
 
+    tag_results: dict[str, Any] = {}
+    for tag_id, observations in sorted(observations_by_tag.items()):
+        fused = fused_by_tag.get(tag_id)
+        inlier_cameras = set(fused.get("inlier_cameras", [])) if fused is not None else set()
+        tag_results[str(tag_id)] = {
+            "observation_count": len(observations),
+            "fused": {
+                "pose": pose_to_json(fused["pose"]),
+                "inlier_cameras": fused.get("inlier_cameras", []),
+                "candidate_count": int(fused.get("candidate_count", len(observations))),
+            } if fused is not None else None,
+            "observations": [
+                {
+                    "camera_id": obs["camera_id"],
+                    "rmse_px": float(obs["rmse"]),
+                    "inlier": obs["camera_id"] in inlier_cameras,
+                    "T_camera_from_tag": pose_to_json(obs["T_camera_from_tag"]),
+                    "T_world_from_tag": pose_to_json(obs["T_world_from_tag"]),
+                }
+                for obs in observations
+            ],
+        }
+
     return {
         "sample_index": sample.get("index"),
         "status": status,
@@ -673,6 +705,7 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
         "camera_counts": camera_counts,
         "camera_statuses": dict(sorted(camera_statuses.items())),
         "fused_tag_count": len(fused_by_tag),
+        "tags": tag_results,
         "detected_by_camera": detected_by_camera,
         "cameras": camera_results,
     }

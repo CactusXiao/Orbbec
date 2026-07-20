@@ -5,10 +5,14 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <unordered_set>
+#include <utility>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -164,6 +168,69 @@ struct CachedFrameBundle {
     std::shared_ptr<ob::IRFrame> ir;
     std::string sn;
     std::string camIndex;
+};
+
+struct ExtrinsicHealthPose {
+    bool      valid = false;
+    cv::Matx33f R   = cv::Matx33f::eye();
+    cv::Vec3f   t   = cv::Vec3f(0.0f, 0.0f, 0.0f);
+};
+
+struct ExtrinsicHealthTagObservation {
+    std::string          cameraId;
+    int                  deviceIndex = -1;
+    double               rmsePx = 0.0;
+    bool                 inlier = false;
+    ExtrinsicHealthPose  worldFromTag;
+};
+
+struct ExtrinsicHealthTagResult {
+    int                                      tagId = -1;
+    std::vector<ExtrinsicHealthTagObservation> observations;
+    ExtrinsicHealthPose                     fusedWorldFromTag;
+    bool                                     hasFused = false;
+    std::vector<std::string>                 fusedInlierCameras;
+};
+
+struct ExtrinsicHealthSampleResult {
+    bool                                      valid = false;
+    std::string                               status;
+    std::string                               summary;
+    std::string                               debugDir;
+    std::vector<std::string>                  detailLines;
+    std::map<int, ExtrinsicHealthTagResult>   tags;
+};
+
+enum class ExtrinsicHealthVizMode {
+    AllTags,
+    SingleTag
+};
+
+struct ExtrinsicHealthCameraRequest {
+    int                         deviceIndex = -1;
+    std::string                 sn;
+    std::string                 camIndex;
+    std::shared_ptr<ob::Device> device;
+    std::shared_ptr<ob::DepthFrame> depth;
+    std::shared_ptr<ob::ColorFrame> color;
+    OBCameraParam               rgbDepthParam{};
+    bool                        rgbDepthParamValid = false;
+    uint64_t                    tsUs = 0;
+};
+
+struct ExtrinsicHealthCapturedCamera {
+    int           deviceIndex = -1;
+    std::string   sn;
+    std::string   camIndex;
+    cv::Mat       bgr;
+    cv::Mat       depthAlignedRgb16;
+    OBCameraParam rgbDepthParam{};
+    bool          rgbDepthParamValid = false;
+    uint64_t      rgbTsUs = 0;
+    uint64_t      depthTsUs = 0;
+    float         depthValueScaleMm = 1.0f;
+    OBFormat      colorFormat = OB_FORMAT_UNKNOWN;
+    OBFormat      depthFormat = OB_FORMAT_UNKNOWN;
 };
 
 static uint64_t interactiveAlignedMaxAbsDiffUs(uint64_t stepUs) {
@@ -340,6 +407,28 @@ static const typename MapT::mapped_type *findByCamKeyVariants(const MapT &m, con
         }
     }
     return nullptr;
+}
+
+static bool containsCamKeyVariant(const std::unordered_set<std::string> &items, const std::string &camKey) {
+    if(items.find(camKey) != items.end()) {
+        return true;
+    }
+    const std::string stripped = stripLeadingZeros(camKey);
+    if(items.find(stripped) != items.end()) {
+        return true;
+    }
+    if(isDigits(camKey)) {
+        if(items.find(padLeftZeros(stripped, 2)) != items.end()) {
+            return true;
+        }
+        if(items.find(padLeftZeros(stripped, 3)) != items.end()) {
+            return true;
+        }
+        if(items.find(padLeftZeros(stripped, 4)) != items.end()) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static size_t matByteSize(const cv::Mat &m) {
@@ -1657,6 +1746,167 @@ static std::string jsonStringLocal(const std::string &s) {
     return "\"" + jsonEscapeLocal(s) + "\"";
 }
 
+static bool readTextFileLocal(const fs::path &p, std::string &out) {
+    std::ifstream ifs(p, std::ios::in | std::ios::binary);
+    if(!ifs) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static bool writeTextFileLocal(const fs::path &p, const std::string &content) {
+    std::ofstream ofs(p, std::ios::out | std::ios::binary);
+    if(!ofs) {
+        return false;
+    }
+    ofs << content;
+    return static_cast<bool>(ofs);
+}
+
+static std::string shellQuoteLocal(const std::string &s) {
+    std::string out = "'";
+    for(char c : s) {
+        if(c == '\'') {
+            out += "'\\''";
+        }
+        else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+static int runCommandCaptureLocal(const std::string &command, std::string &output) {
+    output.clear();
+#if defined(_WIN32)
+    FILE *pipe = _popen(command.c_str(), "r");
+#else
+    FILE *pipe = popen(command.c_str(), "r");
+#endif
+    if(!pipe) {
+        return -1;
+    }
+    char buf[512];
+    while(true) {
+        const size_t n = fread(buf, 1, sizeof(buf), pipe);
+        if(n > 0) {
+            output.append(buf, n);
+        }
+        if(n < sizeof(buf)) {
+            break;
+        }
+    }
+#if defined(_WIN32)
+    const int status = _pclose(pipe);
+    return status == 0 ? 0 : -1;
+#else
+    const int status = pclose(pipe);
+    if(status == -1) {
+        return -1;
+    }
+    if(WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return status == 0 ? 0 : -1;
+#endif
+}
+
+static std::string sanitizePathComponentLocal(std::string value) {
+    value = trimString(std::move(value));
+    if(value.empty()) {
+        return "item";
+    }
+    std::string out;
+    out.reserve(value.size());
+    for(char ch : value) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if(std::isalnum(c) || ch == '-' || ch == '_' || ch == '.') {
+            out.push_back(ch);
+        }
+        else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? "item" : out;
+}
+
+static std::string formatFrameIndexLocal(size_t i) {
+    std::ostringstream oss;
+    oss << std::setw(5) << std::setfill('0') << i;
+    return oss.str();
+}
+
+static uint64_t frameTimestampUsLocal(const std::shared_ptr<ob::Frame> &frame) {
+    if(!frame) {
+        return 0;
+    }
+    uint64_t ts = 0;
+    try {
+        ts = frame->globalTimeStampUs();
+    }
+    catch(...) {
+    }
+    if(ts == 0) {
+        try {
+            ts = frame->timeStampUs();
+        }
+        catch(...) {
+        }
+    }
+    return ts;
+}
+
+static void jsonAddNumberLocal(cJSON *obj, const char *key, double v) {
+    cJSON_AddItemToObject(obj, key, cJSON_CreateNumber(v));
+}
+
+static void jsonAddStringLocal(cJSON *obj, const char *key, const std::string &v) {
+    cJSON_AddItemToObject(obj, key, cJSON_CreateString(v.c_str()));
+}
+
+static void jsonAddIntrinsicLocal(cJSON *obj, const OBCameraIntrinsic &in) {
+    jsonAddNumberLocal(obj, "fx", in.fx);
+    jsonAddNumberLocal(obj, "fy", in.fy);
+    jsonAddNumberLocal(obj, "cx", in.cx);
+    jsonAddNumberLocal(obj, "cy", in.cy);
+    jsonAddNumberLocal(obj, "width", in.width);
+    jsonAddNumberLocal(obj, "height", in.height);
+}
+
+static void jsonAddDistortionLocal(cJSON *obj, const OBCameraDistortion &d) {
+    jsonAddNumberLocal(obj, "k1", d.k1);
+    jsonAddNumberLocal(obj, "k2", d.k2);
+    jsonAddNumberLocal(obj, "k3", d.k3);
+    jsonAddNumberLocal(obj, "k4", d.k4);
+    jsonAddNumberLocal(obj, "k5", d.k5);
+    jsonAddNumberLocal(obj, "k6", d.k6);
+    jsonAddNumberLocal(obj, "p1", d.p1);
+    jsonAddNumberLocal(obj, "p2", d.p2);
+    jsonAddNumberLocal(obj, "model", static_cast<int>(d.model));
+}
+
+static void jsonAddExtrinsicLocal(cJSON *obj, const float rot[9], const float trans[3]) {
+    cJSON *rotArr = cJSON_CreateArray();
+    for(int r = 0; r < 3; ++r) {
+        cJSON *row = cJSON_CreateArray();
+        for(int c = 0; c < 3; ++c) {
+            cJSON_AddItemToArray(row, cJSON_CreateNumber(rot[r * 3 + c]));
+        }
+        cJSON_AddItemToArray(rotArr, row);
+    }
+    cJSON_AddItemToObject(obj, "rotation", rotArr);
+
+    cJSON *tArr = cJSON_CreateArray();
+    for(int i = 0; i < 3; ++i) {
+        cJSON_AddItemToArray(tArr, cJSON_CreateNumber(trans[i]));
+    }
+    cJSON_AddItemToObject(obj, "translation", tArr);
+}
+
 static bool parseVec3(cJSON *arr, cv::Vec3f &out) {
     if(!arr || !cJSON_IsArray(arr) || cJSON_GetArraySize(arr) != 3) {
         return false;
@@ -1719,6 +1969,21 @@ static bool parseExtrinsicObject(cJSON *obj, cv::Matx33f &R, cv::Vec3f &t) {
     auto *rotArr = cJSON_GetObjectItemCaseSensitive(obj, "rotation");
     auto *tArr = cJSON_GetObjectItemCaseSensitive(obj, "translation");
     return parseMat3(rotArr, R) && parseVec3(tArr, t);
+}
+
+static bool parseExtrinsicHealthPose(cJSON *obj, ExtrinsicHealthPose &out) {
+    if(!obj || !cJSON_IsObject(obj)) {
+        return false;
+    }
+    cv::Matx33f R = cv::Matx33f::eye();
+    cv::Vec3f t(0.0f, 0.0f, 0.0f);
+    if(!parseExtrinsicObject(obj, R, t)) {
+        return false;
+    }
+    out.R = R;
+    out.t = t;
+    out.valid = true;
+    return true;
 }
 
 static void invertRigid(const cv::Matx33f &R, const cv::Vec3f &t, cv::Matx33f &Rinv, cv::Vec3f &tinv) {
@@ -2184,6 +2449,7 @@ public:
             if(streamsDirty || keyZoomed || lastRenderUs == 0 || loopNowUs - lastRenderUs >= viewerIntervalUs_) {
                 lastRenderUs = loopNowUs;
                 auto frameSnapshot = snapshotProcessingFrames();
+                maybeStartPendingExtrinsicHealthCheck(frameSnapshot);
                 submitGtInferenceIfNeeded(frameSnapshot, loopNowUs);
                 submitEgoAprilTagsIfNeeded(frameSnapshot, loopNowUs);
                 ivizSetStage("loop_render_pointcloud");
@@ -2448,6 +2714,757 @@ private:
         egoTagWorker_.ensureRunning();
         setEgoAprilTagStatus("Starting PICO AprilTag overlay");
         (void)ensureEgoAprilTagPreviewSession(0);
+    }
+
+    fs::path resolveInteractionExtrinsicHealthRoot() const {
+        fs::path base = cfg_.outputDir.empty() ? fs::current_path() : cfg_.outputDir;
+        if(base.is_relative()) {
+            base = (fs::current_path() / base).lexically_normal();
+        }
+        return base / ".interaction_extrinsic_health";
+    }
+
+    void setExtrinsicHealthStatus(const std::string &status) {
+        std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+        extrinsicHealthStatusLine_ = status;
+    }
+
+    bool isExtrinsicHealthRunning() const {
+        std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+        return extrinsicHealthRunning_;
+    }
+
+    void joinCompletedExtrinsicHealthThreadIfNeeded() {
+        bool shouldJoin = false;
+        {
+            std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+            shouldJoin = extrinsicHealthThread_.joinable() && !extrinsicHealthRunning_;
+        }
+        if(shouldJoin) {
+            extrinsicHealthThread_.join();
+        }
+    }
+
+    ExtrinsicHealthSampleResult latestExtrinsicHealthResult() const {
+        std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+        return latestExtrinsicHealthResult_;
+    }
+
+    std::string buildExtrinsicHealthStatusLine() const {
+        std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+        if(extrinsicHealthStatusLine_.empty()) {
+            return cfg_.extrinsicHealth.enabled ? "Extrinsic check idle" : "Extrinsic check disabled";
+        }
+        return extrinsicHealthStatusLine_;
+    }
+
+    void requestExtrinsicHealthCheck() {
+        joinCompletedExtrinsicHealthThreadIfNeeded();
+        const auto &health = cfg_.extrinsicHealth;
+        if(!health.enabled) {
+            setExtrinsicHealthStatus("Extrinsic check disabled in config");
+            return;
+        }
+        if(cfg_.initExtrinsicPath.empty()) {
+            setExtrinsicHealthStatus("Extrinsic check needs init_extrinsic_path");
+            return;
+        }
+        if(health.scriptPath.empty() || !fs::exists(health.scriptPath)) {
+            setExtrinsicHealthStatus("Extrinsic check script not found: " + health.scriptPath.string());
+            return;
+        }
+        if(isExtrinsicHealthRunning()) {
+            setExtrinsicHealthStatus("Extrinsic check already running");
+            return;
+        }
+        extrinsicHealthForceColor_ = true;
+        extrinsicHealthPending_ = true;
+        setExtrinsicHealthStatus("Extrinsic check pending RGB/depth sample");
+    }
+
+    bool buildExtrinsicHealthCameraRequests(const std::unordered_map<int, CachedFrameBundle> &frames,
+                                            std::vector<ExtrinsicHealthCameraRequest> &requests,
+                                            std::string &message) const {
+        requests.clear();
+        for(const auto &kv : frames) {
+            const int deviceIndex = kv.first;
+            const auto &cached = kv.second;
+            if(!isCameraEnabled(deviceIndex) || !cached.depth || !cached.color) {
+                continue;
+            }
+
+            auto itValid = rgbDepthParamsValid_.find(deviceIndex);
+            auto itParam = rgbDepthParamsByDevice_.find(deviceIndex);
+            if(itValid == rgbDepthParamsValid_.end() || itParam == rgbDepthParamsByDevice_.end() || !itValid->second) {
+                continue;
+            }
+            if(!(itParam->second.rgbIntrinsic.fx > 0.0f) || !(itParam->second.rgbIntrinsic.fy > 0.0f)
+               || !(itParam->second.depthIntrinsic.fx > 0.0f) || !(itParam->second.depthIntrinsic.fy > 0.0f)) {
+                continue;
+            }
+            if(cached.camIndex.empty()) {
+                continue;
+            }
+
+            const DeviceRuntime *rt = findDeviceRuntimeByIndex(deviceIndex);
+            if(!rt || !rt->dev) {
+                continue;
+            }
+
+            ExtrinsicHealthCameraRequest req;
+            req.deviceIndex = deviceIndex;
+            req.sn = cached.sn;
+            req.camIndex = cached.camIndex;
+            req.device = rt->dev;
+            req.depth = cached.depth;
+            req.color = cached.color;
+            req.rgbDepthParam = itParam->second;
+            req.rgbDepthParamValid = true;
+            req.tsUs = cached.tsUs;
+            requests.push_back(std::move(req));
+        }
+
+        std::sort(requests.begin(), requests.end(), [](const auto &a, const auto &b) {
+            if(a.camIndex == b.camIndex) {
+                return a.deviceIndex < b.deviceIndex;
+            }
+            return a.camIndex < b.camIndex;
+        });
+
+        if(requests.size() < 2) {
+            message = "Extrinsic check needs at least 2 calibrated RGB/depth cameras";
+            return false;
+        }
+        message.clear();
+        return true;
+    }
+
+    void maybeStartPendingExtrinsicHealthCheck(const std::unordered_map<int, CachedFrameBundle> &frames) {
+        joinCompletedExtrinsicHealthThreadIfNeeded();
+        if(!extrinsicHealthPending_ || isExtrinsicHealthRunning()) {
+            return;
+        }
+
+        std::vector<ExtrinsicHealthCameraRequest> requests;
+        std::string message;
+        if(!buildExtrinsicHealthCameraRequests(frames, requests, message)) {
+            if(!message.empty()) {
+                setExtrinsicHealthStatus(message);
+            }
+            return;
+        }
+
+        extrinsicHealthPending_ = false;
+        startExtrinsicHealthCheck(std::move(requests));
+    }
+
+    void startExtrinsicHealthCheck(std::vector<ExtrinsicHealthCameraRequest> requests) {
+        joinCompletedExtrinsicHealthThreadIfNeeded();
+        {
+            std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+            if(extrinsicHealthRunning_) {
+                extrinsicHealthStatusLine_ = "Extrinsic check already running";
+                return;
+            }
+            extrinsicHealthRunning_ = true;
+            extrinsicHealthStatusLine_ = "Extrinsic check running";
+        }
+        extrinsicHealthThread_ = std::thread([this, requests = std::move(requests)]() mutable {
+            try {
+                runExtrinsicHealthCheckOnce(std::move(requests));
+            }
+            catch(const std::exception &ex) {
+                finishExtrinsicHealthError(std::string("unexpected failure: ") + ex.what());
+            }
+            catch(...) {
+                finishExtrinsicHealthError("unexpected failure");
+            }
+        });
+    }
+
+    bool writeInteractionExtrinsicHealthConfigJson(const fs::path &path) const {
+        const auto &h = cfg_.extrinsicHealth;
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "tagFamily", h.tagFamily.c_str());
+        cJSON_AddNumberToObject(root, "tagSizeM", h.tagSizeM);
+        cJSON_AddStringToObject(root, "rotationMethod", h.rotationMethod.c_str());
+        cJSON_AddBoolToObject(root, "requireAllCameras", h.requireAllCameras);
+        cJSON_AddNumberToObject(root, "minSharedCamerasPerTag", h.minSharedCamerasPerTag);
+        cJSON_AddNumberToObject(root, "minTagInlierObservations", h.minTagInlierObservations);
+        cJSON_AddNumberToObject(root, "minCheckedCameras", h.minCheckedCameras);
+        cJSON_AddNumberToObject(root, "minTagsPerCamera", h.minTagsPerCamera);
+        cJSON_AddNumberToObject(root, "minPassingSnapshots", 1);
+        cJSON_AddNumberToObject(root, "minFailingSnapshots", 1);
+        cJSON_AddNumberToObject(root, "singleTagReprojLimitPx", h.singleTagReprojLimitPx);
+        cJSON_AddNumberToObject(root, "fusionTransThreshM", h.fusionTransThreshM);
+        cJSON_AddNumberToObject(root, "fusionRotThreshDeg", h.fusionRotThreshDeg);
+        cJSON_AddNumberToObject(root, "warnTransThreshM", h.warnTransThreshM);
+        cJSON_AddNumberToObject(root, "warnRotThreshDeg", h.warnRotThreshDeg);
+        cJSON_AddNumberToObject(root, "warnReprojThreshPx", h.warnReprojThreshPx);
+        cJSON_AddNumberToObject(root, "failTransThreshM", h.failTransThreshM);
+        cJSON_AddNumberToObject(root, "failRotThreshDeg", h.failRotThreshDeg);
+        cJSON_AddNumberToObject(root, "failReprojThreshPx", h.failReprojThreshPx);
+        char *printed = cJSON_Print(root);
+        bool ok = false;
+        if(printed) {
+            ok = writeTextFileLocal(path, printed);
+            cJSON_free(printed);
+        }
+        cJSON_Delete(root);
+        return ok;
+    }
+
+    bool writeInteractionCameraParamsJson(const fs::path &dest,
+                                          const std::vector<ExtrinsicHealthCapturedCamera> &cameras,
+                                          std::string &message) const {
+        cJSON *root = cJSON_CreateObject();
+        cJSON *viewerObj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(viewerObj, "colorCloudRgbFrameOffset", cfg_.colorCloudRgbFrameOffset);
+        cJSON_AddItemToObject(root, "viewer", viewerObj);
+
+        for(const auto &cam : cameras) {
+            cJSON *camObj = cJSON_CreateObject();
+            jsonAddStringLocal(camObj, "sn", cam.sn);
+
+            cJSON *rgbObj = cJSON_CreateObject();
+            jsonAddStringLocal(rgbObj, "storageEncoding", "image");
+            jsonAddStringLocal(rgbObj, "filePattern", "%05d.jpg");
+            jsonAddNumberLocal(rgbObj, "width", cam.bgr.cols);
+            jsonAddNumberLocal(rgbObj, "height", cam.bgr.rows);
+            jsonAddNumberLocal(rgbObj, "fps", cfg_.viewerFps > 0 ? cfg_.viewerFps : 30);
+            jsonAddNumberLocal(rgbObj, "format", static_cast<int>(cam.colorFormat));
+            cJSON *rgbIntr = cJSON_CreateObject();
+            jsonAddIntrinsicLocal(rgbIntr, cam.rgbDepthParam.rgbIntrinsic);
+            cJSON_AddItemToObject(rgbObj, "intrinsic", rgbIntr);
+            cJSON *rgbDist = cJSON_CreateObject();
+            jsonAddDistortionLocal(rgbDist, cam.rgbDepthParam.rgbDistortion);
+            cJSON_AddItemToObject(rgbObj, "distortion", rgbDist);
+            cJSON_AddItemToObject(camObj, "RGB", rgbObj);
+
+            cJSON *depthObj = cJSON_CreateObject();
+            jsonAddStringLocal(depthObj, "storageEncoding", "png");
+            jsonAddStringLocal(depthObj, "filePattern", "%05d.png");
+            jsonAddNumberLocal(depthObj, "width", cam.depthAlignedRgb16.cols);
+            jsonAddNumberLocal(depthObj, "height", cam.depthAlignedRgb16.rows);
+            jsonAddNumberLocal(depthObj, "fps", cfg_.viewerFps > 0 ? cfg_.viewerFps : 30);
+            jsonAddNumberLocal(depthObj, "format", static_cast<int>(cam.depthFormat));
+            cJSON *depthIntr = cJSON_CreateObject();
+            jsonAddIntrinsicLocal(depthIntr, cam.rgbDepthParam.depthIntrinsic);
+            cJSON_AddItemToObject(depthObj, "intrinsic", depthIntr);
+            cJSON *depthDist = cJSON_CreateObject();
+            jsonAddDistortionLocal(depthDist, cam.rgbDepthParam.depthDistortion);
+            cJSON_AddItemToObject(depthObj, "distortion", depthDist);
+            cJSON_AddItemToObject(camObj, "Depth", depthObj);
+
+            if(cam.rgbDepthParamValid) {
+                cJSON *rgbDepthObj = cJSON_CreateObject();
+                cJSON *depthIntr2 = cJSON_CreateObject();
+                jsonAddIntrinsicLocal(depthIntr2, cam.rgbDepthParam.depthIntrinsic);
+                cJSON_AddItemToObject(rgbDepthObj, "depth_intrinsic", depthIntr2);
+                cJSON *depthDist2 = cJSON_CreateObject();
+                jsonAddDistortionLocal(depthDist2, cam.rgbDepthParam.depthDistortion);
+                cJSON_AddItemToObject(rgbDepthObj, "depth_distortion", depthDist2);
+                cJSON *rgbIntr2 = cJSON_CreateObject();
+                jsonAddIntrinsicLocal(rgbIntr2, cam.rgbDepthParam.rgbIntrinsic);
+                cJSON_AddItemToObject(rgbDepthObj, "rgb_intrinsic", rgbIntr2);
+                cJSON *rgbDist2 = cJSON_CreateObject();
+                jsonAddDistortionLocal(rgbDist2, cam.rgbDepthParam.rgbDistortion);
+                cJSON_AddItemToObject(rgbDepthObj, "rgb_distortion", rgbDist2);
+
+                cJSON *d2cObj = cJSON_CreateObject();
+                jsonAddExtrinsicLocal(d2cObj, cam.rgbDepthParam.transform.rot, cam.rgbDepthParam.transform.trans);
+                cJSON_AddItemToObject(rgbDepthObj, "d2c_extrinsic", d2cObj);
+
+                float rct[9];
+                float tct[3];
+                for(int r = 0; r < 3; ++r) {
+                    for(int c = 0; c < 3; ++c) {
+                        rct[c * 3 + r] = cam.rgbDepthParam.transform.rot[r * 3 + c];
+                    }
+                }
+                for(int r = 0; r < 3; ++r) {
+                    float v = 0.0f;
+                    for(int c = 0; c < 3; ++c) {
+                        v += rct[r * 3 + c] * cam.rgbDepthParam.transform.trans[c];
+                    }
+                    tct[r] = -v;
+                }
+                cJSON *c2dObj = cJSON_CreateObject();
+                jsonAddExtrinsicLocal(c2dObj, rct, tct);
+                cJSON_AddItemToObject(rgbDepthObj, "c2d_extrinsic", c2dObj);
+                cJSON_AddItemToObject(camObj, "rgb_to_depth", rgbDepthObj);
+            }
+
+            cJSON_AddItemToObject(root, cam.camIndex.c_str(), camObj);
+        }
+
+        char *printed = cJSON_Print(root);
+        bool ok = false;
+        if(printed) {
+            ok = writeTextFileLocal(dest / "camera_params.json", printed);
+            cJSON_free(printed);
+        }
+        cJSON_Delete(root);
+        if(!ok) {
+            message = "failed to write camera_params.json";
+        }
+        return ok;
+    }
+
+    bool writeInteractionExtrinsicsJson(const fs::path &dest, std::string &message) const {
+        if(cfg_.initExtrinsicPath.empty()) {
+            message = "init_extrinsic_path is empty";
+            return false;
+        }
+        std::string content;
+        if(!readTextFileLocal(fs::path(cfg_.initExtrinsicPath), content)) {
+            message = "failed to read init extrinsics: " + cfg_.initExtrinsicPath;
+            return false;
+        }
+        cJSON *root = cJSON_Parse(content.c_str());
+        if(!root) {
+            message = "invalid init extrinsics json";
+            return false;
+        }
+        char *printed = cJSON_Print(root);
+        bool ok = false;
+        if(printed) {
+            ok = writeTextFileLocal(dest / "extrinsics.json", printed);
+            cJSON_free(printed);
+        }
+        cJSON_Delete(root);
+        if(!ok) {
+            message = "failed to write extrinsics.json";
+        }
+        return ok;
+    }
+
+    bool writeInteractionExtrinsicHealthManifest(const fs::path &checkDir,
+                                                 const std::vector<ExtrinsicHealthCapturedCamera> &cameras,
+                                                 std::string &message) const {
+        const std::string sampleName = "sample_" + formatFrameIndexLocal(0);
+        const fs::path sampleDir = checkDir / sampleName;
+        try {
+            fs::create_directories(sampleDir);
+        }
+        catch(const std::exception &ex) {
+            message = "cannot create sample directory: " + std::string(ex.what());
+            return false;
+        }
+
+        cJSON *manifest = cJSON_CreateObject();
+        cJSON_AddStringToObject(manifest, "camera_params_json", "camera_params.json");
+        cJSON_AddStringToObject(manifest, "extrinsics_json", "extrinsics.json");
+        cJSON *samples = cJSON_CreateArray();
+        cJSON *sampleObj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(sampleObj, "index", 0);
+        cJSON *camArray = cJSON_CreateArray();
+
+        const int jpegQuality = std::max(1, std::min(100, cfg_.extrinsicHealth.jpegQuality));
+        int writtenCameras = 0;
+        for(const auto &cam : cameras) {
+            const std::string fileName = cam.camIndex + ".jpg";
+            const std::string depthFileName = cam.camIndex + ".depth.png";
+            const fs::path imagePath = sampleDir / fileName;
+            const fs::path depthPath = sampleDir / depthFileName;
+            const std::vector<int> jpgParams = { cv::IMWRITE_JPEG_QUALITY, jpegQuality };
+            if(!cv::imwrite(imagePath.string(), cam.bgr, jpgParams)) {
+                continue;
+            }
+            if(!cv::imwrite(depthPath.string(), cam.depthAlignedRgb16)) {
+                continue;
+            }
+
+            cJSON *camObj = cJSON_CreateObject();
+            cJSON_AddStringToObject(camObj, "id", cam.camIndex.c_str());
+            cJSON_AddStringToObject(camObj, "sn", cam.sn.c_str());
+            cJSON_AddStringToObject(camObj, "image", (sampleName + "/" + fileName).c_str());
+            cJSON_AddStringToObject(camObj, "depth", (sampleName + "/" + depthFileName).c_str());
+            cJSON_AddBoolToObject(camObj, "depth_aligned_to_rgb", true);
+            cJSON_AddNumberToObject(camObj, "timestamp_us", static_cast<double>(cam.rgbTsUs));
+            cJSON_AddNumberToObject(camObj, "depth_timestamp_us", static_cast<double>(cam.depthTsUs));
+            cJSON_AddNumberToObject(camObj, "age_ms", 0.0);
+            cJSON_AddNumberToObject(camObj, "depth_age_ms", 0.0);
+            cJSON_AddNumberToObject(camObj, "depth_value_scale_mm", cam.depthValueScaleMm);
+            cJSON_AddItemToArray(camArray, camObj);
+            writtenCameras++;
+        }
+        cJSON_AddItemToObject(sampleObj, "cameras", camArray);
+        cJSON_AddItemToArray(samples, sampleObj);
+        cJSON_AddItemToObject(manifest, "samples", samples);
+        if(writtenCameras < 2) {
+            cJSON_Delete(manifest);
+            message = "failed to write enough extrinsic check sample images";
+            return false;
+        }
+
+        char *printed = cJSON_Print(manifest);
+        bool ok = false;
+        if(printed) {
+            ok = writeTextFileLocal(checkDir / "manifest.json", printed);
+            cJSON_free(printed);
+        }
+        cJSON_Delete(manifest);
+        if(!ok) {
+            message = "failed to write manifest.json";
+        }
+        return ok;
+    }
+
+    static std::string readJsonStringDefault(cJSON *obj, const char *name) {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, name);
+        if(item && cJSON_IsString(item) && item->valuestring) {
+            return item->valuestring;
+        }
+        return "";
+    }
+
+    static double readJsonNumberDefault(cJSON *obj, const char *name, double fallback = 0.0) {
+        cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, name);
+        if(item && cJSON_IsNumber(item)) {
+            return item->valuedouble;
+        }
+        return fallback;
+    }
+
+    static int readJsonIntDefault(cJSON *obj, const char *name, int fallback = 0) {
+        return static_cast<int>(std::llround(readJsonNumberDefault(obj, name, static_cast<double>(fallback))));
+    }
+
+    static std::vector<std::string> readJsonStringArray(cJSON *obj, const char *name) {
+        std::vector<std::string> out;
+        cJSON *arr = cJSON_GetObjectItemCaseSensitive(obj, name);
+        if(!arr || !cJSON_IsArray(arr)) {
+            return out;
+        }
+        cJSON *item = nullptr;
+        cJSON_ArrayForEach(item, arr) {
+            if(item && cJSON_IsString(item) && item->valuestring) {
+                out.emplace_back(item->valuestring);
+            }
+        }
+        return out;
+    }
+
+    static std::string joinStrings(const std::vector<std::string> &items, const std::string &sep) {
+        std::ostringstream oss;
+        for(size_t i = 0; i < items.size(); ++i) {
+            if(i > 0) {
+                oss << sep;
+            }
+            oss << items[i];
+        }
+        return oss.str();
+    }
+
+    static void collectExtrinsicHealthResultDetails(cJSON *root, ExtrinsicHealthSampleResult &result) {
+        cJSON *counts = cJSON_GetObjectItemCaseSensitive(root, "camera_counts");
+        if(counts && cJSON_IsObject(counts)) {
+            std::ostringstream oss;
+            oss << "Extrinsic camera status:"
+                << " total=" << readJsonIntDefault(counts, "total")
+                << " pass=" << readJsonIntDefault(counts, "pass")
+                << " warn=" << readJsonIntDefault(counts, "warn")
+                << " fail=" << readJsonIntDefault(counts, "fail")
+                << " inconclusive=" << readJsonIntDefault(counts, "inconclusive");
+            result.detailLines.push_back(oss.str());
+        }
+        const auto fail = readJsonStringArray(root, "fail_cameras");
+        const auto warn = readJsonStringArray(root, "warn_cameras");
+        const auto inconclusive = readJsonStringArray(root, "inconclusive_cameras");
+        if(!fail.empty()) {
+            result.detailLines.push_back("fail cameras: " + joinStrings(fail, ","));
+        }
+        if(!warn.empty()) {
+            result.detailLines.push_back("warn cameras: " + joinStrings(warn, ","));
+        }
+        if(!inconclusive.empty()) {
+            result.detailLines.push_back("inconclusive cameras: " + joinStrings(inconclusive, ","));
+        }
+    }
+
+    static bool parseInteractionExtrinsicHealthResult(const fs::path &path,
+                                                      const std::unordered_map<std::string, int> &deviceIndexByCamera,
+                                                      const std::string &debugDir,
+                                                      ExtrinsicHealthSampleResult &result) {
+        std::string content;
+        if(!readTextFileLocal(path, content)) {
+            return false;
+        }
+        cJSON *root = cJSON_Parse(content.c_str());
+        if(!root || !cJSON_IsObject(root)) {
+            if(root) {
+                cJSON_Delete(root);
+            }
+            return false;
+        }
+
+        result = ExtrinsicHealthSampleResult{};
+        result.valid = true;
+        result.debugDir = debugDir;
+        result.status = readJsonStringDefault(root, "status");
+        result.summary = readJsonStringDefault(root, "summary_line");
+        collectExtrinsicHealthResultDetails(root, result);
+
+        cJSON *samples = cJSON_GetObjectItemCaseSensitive(root, "samples");
+        cJSON *sample = (samples && cJSON_IsArray(samples) && cJSON_GetArraySize(samples) > 0) ? cJSON_GetArrayItem(samples, 0) : nullptr;
+        cJSON *tags = sample ? cJSON_GetObjectItemCaseSensitive(sample, "tags") : nullptr;
+        if(tags && cJSON_IsObject(tags)) {
+            for(cJSON *tagObj = tags->child; tagObj != nullptr; tagObj = tagObj->next) {
+                if(!tagObj || !tagObj->string || !cJSON_IsObject(tagObj)) {
+                    continue;
+                }
+                int tagId = -1;
+                try {
+                    tagId = std::stoi(tagObj->string);
+                }
+                catch(...) {
+                    continue;
+                }
+
+                ExtrinsicHealthTagResult tag;
+                tag.tagId = tagId;
+                cJSON *fused = cJSON_GetObjectItemCaseSensitive(tagObj, "fused");
+                if(fused && cJSON_IsObject(fused)) {
+                    cJSON *pose = cJSON_GetObjectItemCaseSensitive(fused, "pose");
+                    if(parseExtrinsicHealthPose(pose, tag.fusedWorldFromTag)) {
+                        tag.hasFused = true;
+                    }
+                    tag.fusedInlierCameras = readJsonStringArray(fused, "inlier_cameras");
+                }
+
+                cJSON *observations = cJSON_GetObjectItemCaseSensitive(tagObj, "observations");
+                if(observations && cJSON_IsArray(observations)) {
+                    cJSON *obsObj = nullptr;
+                    cJSON_ArrayForEach(obsObj, observations) {
+                        if(!obsObj || !cJSON_IsObject(obsObj)) {
+                            continue;
+                        }
+                        ExtrinsicHealthTagObservation obs;
+                        obs.cameraId = readJsonStringDefault(obsObj, "camera_id");
+                        obs.rmsePx = readJsonNumberDefault(obsObj, "rmse_px");
+                        cJSON *inlierItem = cJSON_GetObjectItemCaseSensitive(obsObj, "inlier");
+                        obs.inlier = inlierItem && cJSON_IsBool(inlierItem) ? (inlierItem->valueint != 0) : false;
+                        auto itDevice = findByCamKeyVariants(deviceIndexByCamera, obs.cameraId);
+                        if(itDevice) {
+                            obs.deviceIndex = *itDevice;
+                        }
+                        cJSON *worldPose = cJSON_GetObjectItemCaseSensitive(obsObj, "T_world_from_tag");
+                        if(!parseExtrinsicHealthPose(worldPose, obs.worldFromTag)) {
+                            continue;
+                        }
+                        tag.observations.push_back(std::move(obs));
+                    }
+                }
+                result.tags[tagId] = std::move(tag);
+            }
+        }
+
+        cJSON_Delete(root);
+        return !result.status.empty();
+    }
+
+    std::unordered_map<std::string, int> buildCameraDeviceIndexMap() const {
+        std::unordered_map<std::string, int> out;
+        for(const auto &rt : devices_) {
+            out[rt.cfg.index] = rt.deviceIndex;
+        }
+        return out;
+    }
+
+    std::vector<ExtrinsicHealthCapturedCamera> captureExtrinsicHealthCameras(std::vector<ExtrinsicHealthCameraRequest> requests,
+                                                                             std::string &message) const {
+        std::vector<ExtrinsicHealthCapturedCamera> out;
+        out.reserve(requests.size());
+        for(auto &req : requests) {
+            cv::Mat bgr = visualizeObFrame(req.color);
+            if(bgr.empty()) {
+                continue;
+            }
+
+            cv::Mat depthAligned = buildDepthAlignedToRgbViaSdk(req.device, req.depth, bgr.cols, bgr.rows);
+            if(depthAligned.empty() && req.rgbDepthParamValid) {
+                depthAligned = buildDepthAlignedToRgb(req.depth, req.rgbDepthParam, bgr.cols, bgr.rows);
+            }
+            if(depthAligned.empty() || depthAligned.type() != CV_16UC1 || depthAligned.size() != bgr.size()) {
+                continue;
+            }
+
+            ExtrinsicHealthCapturedCamera cam;
+            cam.deviceIndex = req.deviceIndex;
+            cam.sn = req.sn;
+            cam.camIndex = req.camIndex;
+            cam.bgr = std::move(bgr);
+            cam.depthAlignedRgb16 = std::move(depthAligned);
+            cam.rgbDepthParam = req.rgbDepthParam;
+            cam.rgbDepthParamValid = req.rgbDepthParamValid;
+            cam.rgbTsUs = frameTimestampUsLocal(std::static_pointer_cast<ob::Frame>(req.color));
+            if(cam.rgbTsUs == 0) {
+                cam.rgbTsUs = req.tsUs;
+            }
+            cam.depthTsUs = frameTimestampUsLocal(std::static_pointer_cast<ob::Frame>(req.depth));
+            if(cam.depthTsUs == 0) {
+                cam.depthTsUs = req.tsUs;
+            }
+            try {
+                cam.depthValueScaleMm = req.depth ? req.depth->getValueScale() : 1.0f;
+            }
+            catch(...) {
+                cam.depthValueScaleMm = 1.0f;
+            }
+            try {
+                cam.colorFormat = req.color ? req.color->getFormat() : OB_FORMAT_UNKNOWN;
+            }
+            catch(...) {
+                cam.colorFormat = OB_FORMAT_UNKNOWN;
+            }
+            try {
+                cam.depthFormat = req.depth ? req.depth->getFormat() : OB_FORMAT_UNKNOWN;
+            }
+            catch(...) {
+                cam.depthFormat = OB_FORMAT_UNKNOWN;
+            }
+            out.push_back(std::move(cam));
+        }
+
+        if(out.size() < 2) {
+            message = "Extrinsic check could not capture enough RGB/depth samples";
+        }
+        else {
+            message.clear();
+        }
+        return out;
+    }
+
+    void finishExtrinsicHealthCheck(const ExtrinsicHealthSampleResult &result, const std::string &statusLine, bool running = false) {
+        std::lock_guard<std::mutex> lock(extrinsicHealthMtx_);
+        latestExtrinsicHealthResult_ = result;
+        extrinsicHealthStatusLine_ = statusLine;
+        extrinsicHealthRunning_ = running;
+    }
+
+    void finishExtrinsicHealthError(const std::string &message) {
+        ExtrinsicHealthSampleResult result;
+        result.valid = false;
+        result.status = "error";
+        result.summary = message;
+        finishExtrinsicHealthCheck(result, "Extrinsic check error: " + message, false);
+        std::cerr << "[interaction][extrinsic_check] error " << message << std::endl;
+    }
+
+    void runExtrinsicHealthCheckOnce(std::vector<ExtrinsicHealthCameraRequest> requests) {
+        std::string message;
+        auto cameras = captureExtrinsicHealthCameras(std::move(requests), message);
+        if(cameras.size() < 2) {
+            finishExtrinsicHealthError(message.empty() ? "not enough RGB/depth samples" : message);
+            return;
+        }
+
+        const auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::system_clock::now());
+        const auto nowMs = now.time_since_epoch().count();
+        const fs::path checkDir = resolveInteractionExtrinsicHealthRoot()
+                                / ("sample_" + sanitizePathComponentLocal(std::to_string(nowMs)));
+        try {
+            fs::create_directories(checkDir);
+        }
+        catch(const std::exception &ex) {
+            finishExtrinsicHealthError("cannot create debug directory: " + std::string(ex.what()));
+            return;
+        }
+
+        if(!writeInteractionCameraParamsJson(checkDir, cameras, message)
+           || !writeInteractionExtrinsicsJson(checkDir, message)
+           || !writeInteractionExtrinsicHealthConfigJson(checkDir / "health_config.json")
+           || !writeInteractionExtrinsicHealthManifest(checkDir, cameras, message)) {
+            finishExtrinsicHealthError(message.empty() ? "failed to write snapshot files" : message);
+            return;
+        }
+
+        const fs::path resultJson = checkDir / "result.json";
+        const auto &health = cfg_.extrinsicHealth;
+        const std::string command = shellQuoteLocal(health.pythonExecutable)
+                                  + " " + shellQuoteLocal(health.scriptPath.string())
+                                  + " --snapshot-dir " + shellQuoteLocal(checkDir.string())
+                                  + " --config-json " + shellQuoteLocal((checkDir / "health_config.json").string())
+                                  + " --result-json " + shellQuoteLocal(resultJson.string())
+                                  + " 2>&1";
+
+        std::string output;
+        const int exitCode = runCommandCaptureLocal(command, output);
+        ExtrinsicHealthSampleResult result;
+        const bool parsed = parseInteractionExtrinsicHealthResult(resultJson, buildCameraDeviceIndexMap(), checkDir.string(), result);
+        if(!parsed) {
+            result.valid = false;
+            result.status = "error";
+            result.summary = trimString(output);
+            if(result.summary.empty()) {
+                result.summary = "exit_code=" + std::to_string(exitCode);
+            }
+            result.debugDir = checkDir.string();
+        }
+        if(result.summary.empty()) {
+            result.summary = trimString(output);
+        }
+        if(result.summary.empty()) {
+            result.summary = "exit_code=" + std::to_string(exitCode);
+        }
+
+        bool keepDebug = health.keepDebugSnapshots || result.status == "fail" || result.status == "error" || !parsed;
+        if(!keepDebug) {
+            try {
+                fs::remove_all(checkDir);
+                result.debugDir.clear();
+            }
+            catch(...) {
+            }
+        }
+
+        std::string statusLine = "Extrinsic check " + result.summary;
+        if(!result.debugDir.empty()) {
+            statusLine += " debug=" + result.debugDir;
+        }
+        finishExtrinsicHealthCheck(result, statusLine, false);
+        std::cerr << "[interaction][extrinsic_check] status=" << (result.status.empty() ? "(missing)" : result.status)
+                  << " exit=" << exitCode
+                  << " dir=" << checkDir
+                  << " summary=" << result.summary << std::endl;
+    }
+
+    std::vector<int> extrinsicHealthTagIds(const ExtrinsicHealthSampleResult &result) const {
+        std::vector<int> ids;
+        ids.reserve(result.tags.size());
+        for(const auto &kv : result.tags) {
+            ids.push_back(kv.first);
+        }
+        return ids;
+    }
+
+    int selectedExtrinsicTagId(const ExtrinsicHealthSampleResult &result) {
+        const auto ids = extrinsicHealthTagIds(result);
+        if(ids.empty()) {
+            selectedExtrinsicTagId_ = -1;
+            return -1;
+        }
+        if(std::find(ids.begin(), ids.end(), selectedExtrinsicTagId_) == ids.end()) {
+            selectedExtrinsicTagId_ = ids.front();
+        }
+        return selectedExtrinsicTagId_;
+    }
+
+    void stepSelectedExtrinsicTag(int delta) {
+        auto result = latestExtrinsicHealthResult();
+        auto ids = extrinsicHealthTagIds(result);
+        if(ids.empty()) {
+            selectedExtrinsicTagId_ = -1;
+            return;
+        }
+        auto it = std::find(ids.begin(), ids.end(), selectedExtrinsicTagId_);
+        int index = it == ids.end() ? 0 : static_cast<int>(std::distance(ids.begin(), it));
+        index = (index + delta) % static_cast<int>(ids.size());
+        if(index < 0) {
+            index += static_cast<int>(ids.size());
+        }
+        selectedExtrinsicTagId_ = ids[static_cast<size_t>(index)];
     }
 
     GtInferenceRequest buildGtInferenceRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
@@ -2821,7 +3838,172 @@ private:
         }
     }
 
+    static cv::Vec3b extrinsicHealthObservationColor(int deviceIndex, int order) {
+        static const std::vector<cv::Vec3b> palette = {
+            cv::Vec3b(0, 80, 255),
+            cv::Vec3b(0, 220, 90),
+            cv::Vec3b(255, 110, 0),
+            cv::Vec3b(230, 220, 40),
+            cv::Vec3b(255, 60, 230),
+            cv::Vec3b(0, 220, 255),
+            cv::Vec3b(180, 120, 255),
+            cv::Vec3b(80, 255, 220),
+        };
+        const int idx = deviceIndex >= 0 ? deviceIndex : order;
+        return palette[static_cast<size_t>(std::max(0, idx)) % palette.size()];
+    }
+
+    bool projectWorldPoint(const cv::Vec3f &p,
+                           const cv::Vec3f &right,
+                           const cv::Vec3f &up,
+                           const cv::Vec3f &forward,
+                           const cv::Vec3f &camPos,
+                           float fx,
+                           float fy,
+                           float cx,
+                           float cy,
+                           const cv::Size &size,
+                           cv::Point &pt) const {
+        const cv::Vec3f v = p - camPos;
+        const float xc = v.dot(right);
+        const float yc = v.dot(up);
+        const float zc = v.dot(forward);
+        if(zc <= 0.05f) {
+            return false;
+        }
+        const int u = static_cast<int>(fx * (xc / zc) + cx);
+        const int vpx = static_cast<int>(fy * (-yc / zc) + cy);
+        if(u < 0 || u >= size.width || vpx < 0 || vpx >= size.height) {
+            return false;
+        }
+        pt = cv::Point(u, vpx);
+        return true;
+    }
+
+    cv::Vec3f transformExtrinsicHealthPosePoint(const ExtrinsicHealthPose &pose, const cv::Vec3f &local) const {
+        return pose.R * local + pose.t;
+    }
+
+    void drawExtrinsicHealthPose(cv::Mat &canvas,
+                                 const ExtrinsicHealthPose &pose,
+                                 int tagId,
+                                 const std::string &labelSuffix,
+                                 const cv::Vec3b &color,
+                                 bool fused,
+                                 const cv::Vec3f &right,
+                                 const cv::Vec3f &up,
+                                 const cv::Vec3f &forward,
+                                 const cv::Vec3f &camPos,
+                                 float fx,
+                                 float fy,
+                                 float cx,
+                                 float cy) const {
+        if(!pose.valid) {
+            return;
+        }
+        const float tagSize = static_cast<float>(std::max(0.001, cfg_.extrinsicHealth.tagSizeM));
+        const float h = tagSize * 0.5f;
+        const float axisLen = std::max(0.035f, tagSize * 0.75f);
+        const std::array<cv::Vec3f, 4> localCorners = {
+            cv::Vec3f(-h, -h, 0.0f),
+            cv::Vec3f( h, -h, 0.0f),
+            cv::Vec3f( h,  h, 0.0f),
+            cv::Vec3f(-h,  h, 0.0f),
+        };
+
+        std::array<cv::Point, 4> projectedCorners{};
+        std::array<bool, 4> cornerVisible{};
+        for(size_t i = 0; i < localCorners.size(); ++i) {
+            const cv::Vec3f pw = transformExtrinsicHealthPosePoint(pose, localCorners[i]);
+            cornerVisible[i] = projectWorldPoint(pw, right, up, forward, camPos, fx, fy, cx, cy, canvas.size(), projectedCorners[i]);
+        }
+
+        const cv::Scalar outline = toScalar(color);
+        const int thickness = fused ? 3 : 2;
+        for(size_t i = 0; i < projectedCorners.size(); ++i) {
+            const size_t j = (i + 1) % projectedCorners.size();
+            if(cornerVisible[i] && cornerVisible[j]) {
+                cv::line(canvas, projectedCorners[i], projectedCorners[j], cv::Scalar(8, 8, 8), thickness + 3, cv::LINE_AA);
+                cv::line(canvas, projectedCorners[i], projectedCorners[j], outline, thickness, cv::LINE_AA);
+            }
+        }
+
+        cv::Point originPt;
+        const cv::Vec3f origin = transformExtrinsicHealthPosePoint(pose, cv::Vec3f(0.0f, 0.0f, 0.0f));
+        const bool originVisible = projectWorldPoint(origin, right, up, forward, camPos, fx, fy, cx, cy, canvas.size(), originPt);
+        if(originVisible) {
+            const std::array<std::pair<cv::Vec3f, cv::Scalar>, 3> axes = {
+                std::make_pair(cv::Vec3f(axisLen, 0.0f, 0.0f), cv::Scalar(60, 60, 255)),
+                std::make_pair(cv::Vec3f(0.0f, axisLen, 0.0f), cv::Scalar(60, 255, 60)),
+                std::make_pair(cv::Vec3f(0.0f, 0.0f, axisLen), cv::Scalar(255, 120, 60)),
+            };
+            for(const auto &axis : axes) {
+                cv::Point axisPt;
+                const cv::Vec3f axisWorld = transformExtrinsicHealthPosePoint(pose, axis.first);
+                if(projectWorldPoint(axisWorld, right, up, forward, camPos, fx, fy, cx, cy, canvas.size(), axisPt)) {
+                    cv::line(canvas, originPt, axisPt, cv::Scalar(5, 5, 5), thickness + 3, cv::LINE_AA);
+                    cv::line(canvas, originPt, axisPt, axis.second, thickness, cv::LINE_AA);
+                }
+            }
+
+            cv::circle(canvas, originPt, fused ? 5 : 4, cv::Scalar(8, 8, 8), cv::FILLED, cv::LINE_AA);
+            cv::circle(canvas, originPt, fused ? 4 : 3, outline, cv::FILLED, cv::LINE_AA);
+            const std::string label = "tag " + std::to_string(tagId) + labelSuffix;
+            cv::putText(canvas, label, originPt + cv::Point(7, -7), cv::FONT_HERSHEY_DUPLEX, fused ? 0.46 : 0.40,
+                        cv::Scalar(8, 8, 8), 3, cv::LINE_AA);
+            cv::putText(canvas, label, originPt + cv::Point(7, -7), cv::FONT_HERSHEY_DUPLEX, fused ? 0.46 : 0.40,
+                        fused ? cv::Scalar(255, 255, 255) : outline, 1, cv::LINE_AA);
+        }
+    }
+
+    void drawExtrinsicHealthOnCanvas(cv::Mat &canvas,
+                                     ExtrinsicHealthSampleResult &result,
+                                     const cv::Vec3f &right,
+                                     const cv::Vec3f &up,
+                                     const cv::Vec3f &forward,
+                                     const cv::Vec3f &camPos,
+                                     float fx,
+                                     float fy,
+                                     float cx,
+                                     float cy) {
+        if(!showExtrinsicHealthOverlay_ || !result.valid || result.tags.empty()) {
+            return;
+        }
+
+        if(extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag) {
+            const int tagId = selectedExtrinsicTagId(result);
+            auto it = result.tags.find(tagId);
+            if(it == result.tags.end()) {
+                return;
+            }
+            int order = 0;
+            for(const auto &obs : it->second.observations) {
+                const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
+                drawExtrinsicHealthPose(canvas, obs.worldFromTag, tagId, " " + obs.cameraId, color, false,
+                                        right, up, forward, camPos, fx, fy, cx, cy);
+            }
+            if(it->second.hasFused) {
+                drawExtrinsicHealthPose(canvas, it->second.fusedWorldFromTag, tagId, " fused", cv::Vec3b(255, 255, 255), true,
+                                        right, up, forward, camPos, fx, fy, cx, cy);
+            }
+            return;
+        }
+
+        int order = 0;
+        for(const auto &kv : result.tags) {
+            for(const auto &obs : kv.second.observations) {
+                const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
+                drawExtrinsicHealthPose(canvas, obs.worldFromTag, kv.first, " " + obs.cameraId, color, false,
+                                        right, up, forward, camPos, fx, fy, cx, cy);
+            }
+        }
+    }
+
     void stopAllPipelines() {
+        extrinsicHealthPending_ = false;
+        if(extrinsicHealthThread_.joinable()) {
+            extrinsicHealthThread_.join();
+        }
         gtWorker_.stop();
         egoTagWorker_.stop();
         if(egoRecorder_.isSessionActive()) {
@@ -2870,6 +4052,9 @@ private:
     }
 
     StreamMode computeDesiredStreamMode() const {
+        if(extrinsicHealthForceColor_ || extrinsicHealthPending_ || showExtrinsicHealthOverlay_) {
+            return StreamMode::DepthColor;
+        }
         if(showEgoAprilTags_) {
             return StreamMode::DepthColor;
         }
@@ -3443,6 +4628,20 @@ private:
         std::vector<float> zbuf(static_cast<size_t>(viewState.width) * static_cast<size_t>(viewState.height), std::numeric_limits<float>::infinity());
         const GtInferenceResult gtResult = showGtJoints_ ? gtWorker_.latestResult() : GtInferenceResult{};
         const EgoAprilTagResult egoTagResult = showEgoAprilTags_ ? egoTagWorker_.latestResult() : EgoAprilTagResult{};
+        ExtrinsicHealthSampleResult extrinsicResult = showExtrinsicHealthOverlay_ ? latestExtrinsicHealthResult() : ExtrinsicHealthSampleResult{};
+        const bool showExtrinsicResult = showExtrinsicHealthOverlay_ && extrinsicResult.valid && !extrinsicResult.tags.empty();
+        std::unordered_set<std::string> extrinsicSingleTagCameraIds;
+        if(showExtrinsicResult && extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag) {
+            const int tagId = selectedExtrinsicTagId(extrinsicResult);
+            auto itTag = extrinsicResult.tags.find(tagId);
+            if(itTag != extrinsicResult.tags.end()) {
+                for(const auto &obs : itTag->second.observations) {
+                    if(!obs.cameraId.empty()) {
+                        extrinsicSingleTagCameraIds.insert(obs.cameraId);
+                    }
+                }
+            }
+        }
 
         cv::Vec3f right, up, forward, camPos;
         computeCameraBasis(viewState, right, up, forward, camPos);
@@ -3465,6 +4664,13 @@ private:
             }
             if(!isCameraEnabled(deviceIndex)) {
                 continue;
+            }
+            const bool extrinsicSingleTagMode = showExtrinsicResult
+                                             && extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag;
+            if(extrinsicSingleTagMode) {
+                if(cached.camIndex.empty() || !containsCamKeyVariant(extrinsicSingleTagCameraIds, cached.camIndex)) {
+                    continue;
+                }
             }
 
             std::shared_ptr<ob::Frame> depthForPc = cached.depth;
@@ -3551,7 +4757,8 @@ private:
             }
 
             const cv::Vec3b color = cfg_.differentColor ? palette[static_cast<size_t>(deviceIndex) % palette.size()] : cv::Vec3b(255, 255, 255);
-            const bool useColorCloud = cfg_.colorfulCloudPoints && !!cached.color;
+            const bool forceColorCloud = extrinsicSingleTagMode;
+            const bool useColorCloud = (cfg_.colorfulCloudPoints || forceColorCloud) && !!cached.color;
             cv::Mat rgbImg;
             OBCameraParam rgbDepthParam{};
             bool rgbDepthParamValid = false;
@@ -3565,6 +4772,9 @@ private:
                         rgbDepthParamValid = true;
                     }
                 }
+            }
+            if(forceColorCloud && (!useColorCloud || !rgbDepthParamValid || rgbImg.empty())) {
+                continue;
             }
 
             cv::Matx33f Rcam = cv::Matx33f::eye();
@@ -3654,6 +4864,9 @@ private:
         if(showEgoAprilTags_ && !egoTagResult.lines.empty()) {
             drawEgoAprilTagsOnCanvas(canvas, egoTagResult, right, up, forward, camPos, fx, fy, cx, cy);
         }
+        if(showExtrinsicResult) {
+            drawExtrinsicHealthOnCanvas(canvas, extrinsicResult, right, up, forward, camPos, fx, fy, cx, cy);
+        }
 
         cv::putText(canvas, "LMB: rotate  RMB: pan  Wheel/Ctrl+/-: zoom", cv::Point(12, 28), cv::FONT_HERSHEY_DUPLEX, 0.6, cv::Scalar(255, 255, 255), 1,
                     cv::LINE_AA);
@@ -3664,6 +4877,11 @@ private:
         }
         if(showEgoAprilTags_) {
             cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(12, statusY), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            statusY += 26;
+        }
+        if(showExtrinsicHealthOverlay_) {
+            cv::putText(canvas, buildExtrinsicHealthStatusLine(), cv::Point(12, statusY), cv::FONT_HERSHEY_DUPLEX, 0.52,
+                        showExtrinsicResult ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
         }
         return canvas;
     }
@@ -3741,6 +4959,88 @@ private:
                             cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
             }
             by += 26;
+        }
+
+        by += 14;
+        if(by + 22 <= layout_.camsRect.y + layout_.camsRect.height) {
+            cv::putText(canvas, "Extrinsic Check", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        }
+        by += 34;
+        {
+            const cv::Rect row(bx, by, bw, 32);
+            if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                const std::string label = isExtrinsicHealthRunning() ? "Checking..." : "Sample Extrinsic";
+                if(uiButton(canvas, row, label, ms)) {
+                    requestExtrinsicHealthCheck();
+                    typeChanged = true;
+                }
+            }
+            by += 38;
+        }
+        {
+            const std::string status = ellipsizeTextToWidth(buildExtrinsicHealthStatusLine(),
+                                                            bw - 8,
+                                                            cv::FONT_HERSHEY_DUPLEX,
+                                                            0.42,
+                                                            1);
+            if(!status.empty() && by + 20 <= layout_.camsRect.y + layout_.camsRect.height) {
+                cv::putText(canvas, status, cv::Point(bx + 4, by + 16), cv::FONT_HERSHEY_DUPLEX, 0.42,
+                            cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
+                by += 24;
+            }
+        }
+        {
+            const cv::Rect row(bx, by, bw, 30);
+            if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                if(uiCheckbox(canvas, row, showExtrinsicHealthOverlay_, "Visualize Extrinsic", ms)) {
+                    showExtrinsicHealthOverlay_ = !showExtrinsicHealthOverlay_;
+                    if(showExtrinsicHealthOverlay_) {
+                        extrinsicHealthForceColor_ = true;
+                    }
+                    typeChanged = true;
+                }
+            }
+            by += 34;
+        }
+        if(showExtrinsicHealthOverlay_) {
+            const int halfW = (bw - 8) / 2;
+            const cv::Rect allBtn(bx, by, halfW, 30);
+            const cv::Rect oneBtn(bx + halfW + 8, by, bw - halfW - 8, 30);
+            if(oneBtn.y + oneBtn.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                if(uiButton(canvas, allBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::AllTags ? "All Tags*" : "All Tags", ms)) {
+                    extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::AllTags;
+                    typeChanged = true;
+                }
+                if(uiButton(canvas, oneBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag ? "One Tag*" : "One Tag", ms)) {
+                    extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::SingleTag;
+                    typeChanged = true;
+                }
+            }
+            by += 36;
+            if(extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag) {
+                auto result = latestExtrinsicHealthResult();
+                const int tagId = selectedExtrinsicTagId(result);
+                const std::string tagLabel = tagId >= 0 ? ("Tag " + std::to_string(tagId)) : "No Tag";
+                const int sideW = 54;
+                const cv::Rect prevBtn(bx, by, sideW, 30);
+                const cv::Rect labelRect(bx + sideW + 6, by, bw - 2 * sideW - 12, 30);
+                const cv::Rect nextBtn(bx + bw - sideW, by, sideW, 30);
+                if(nextBtn.y + nextBtn.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                    if(uiButton(canvas, prevBtn, "<", ms)) {
+                        stepSelectedExtrinsicTag(-1);
+                        typeChanged = true;
+                    }
+                    cv::rectangle(canvas, labelRect, cv::Scalar(28, 28, 28), cv::FILLED);
+                    cv::rectangle(canvas, labelRect, cv::Scalar(100, 100, 100), 1);
+                    cv::putText(canvas, tagLabel, cv::Point(labelRect.x + 8, labelRect.y + 20), cv::FONT_HERSHEY_DUPLEX, 0.5,
+                                cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+                    if(uiButton(canvas, nextBtn, ">", ms)) {
+                        stepSelectedExtrinsicTag(1);
+                        typeChanged = true;
+                    }
+                }
+                by += 36;
+            }
         }
 
         by += 18;
@@ -3896,10 +5196,12 @@ private:
 
         cv::putText(canvas, "LMB rotate | RMB pan | Wheel/Ctrl+/- zoom", cv::Point(layout_.ctlRect.x + 760, y + 18), cv::FONT_HERSHEY_DUPLEX, 0.5,
                     cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 46), cv::FONT_HERSHEY_DUPLEX, 0.52,
+        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 42), cv::FONT_HERSHEY_DUPLEX, 0.52,
                     showGtJoints_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
-        cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 74), cv::FONT_HERSHEY_DUPLEX, 0.52,
+        cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 64), cv::FONT_HERSHEY_DUPLEX, 0.52,
                     showEgoAprilTags_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
+        cv::putText(canvas, buildExtrinsicHealthStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 86), cv::FONT_HERSHEY_DUPLEX, 0.48,
+                    showExtrinsicHealthOverlay_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
         return false;
     }
 
@@ -3949,6 +5251,16 @@ private:
     int imageScrollY_ = 0;
     bool showGtJoints_ = false;
     bool showEgoAprilTags_ = false;
+    bool showExtrinsicHealthOverlay_ = false;
+    bool extrinsicHealthForceColor_ = false;
+    bool extrinsicHealthPending_ = false;
+    ExtrinsicHealthVizMode extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::AllTags;
+    int selectedExtrinsicTagId_ = -1;
+    mutable std::mutex extrinsicHealthMtx_;
+    std::thread extrinsicHealthThread_;
+    bool extrinsicHealthRunning_ = false;
+    std::string extrinsicHealthStatusLine_ = "Extrinsic check idle";
+    ExtrinsicHealthSampleResult latestExtrinsicHealthResult_;
     uint64_t lastEgoTagSubmitUs_ = 0;
     uint64_t lastEgoSessionAttemptUs_ = 0;
 };
