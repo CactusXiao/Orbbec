@@ -127,6 +127,28 @@ static bool uiCheckbox(cv::Mat &img, const cv::Rect &r, bool checked, const std:
     return false;
 }
 
+static std::string ellipsizeTextToWidth(const std::string &text, int maxWidthPx, int fontFace, double fontScale, int thickness) {
+    if(maxWidthPx <= 0 || text.empty()) {
+        return "";
+    }
+    int baseline = 0;
+    if(cv::getTextSize(text, fontFace, fontScale, thickness, &baseline).width <= maxWidthPx) {
+        return text;
+    }
+    const std::string suffix = "...";
+    if(cv::getTextSize(suffix, fontFace, fontScale, thickness, &baseline).width > maxWidthPx) {
+        return "";
+    }
+    std::string clipped = text;
+    while(!clipped.empty()) {
+        clipped.pop_back();
+        if(cv::getTextSize(clipped + suffix, fontFace, fontScale, thickness, &baseline).width <= maxWidthPx) {
+            return clipped + suffix;
+        }
+    }
+    return suffix;
+}
+
 struct ExtrinsicCamToWorld {
     bool      valid = false;
     cv::Matx33f R   = cv::Matx33f::eye();
@@ -2315,6 +2337,88 @@ private:
         return base / "interaction_ego_preview";
     }
 
+    EgoModuleConfig buildInteractionEgoConfig() const {
+        EgoModuleConfig egoCfg = cfg_.ego;
+        egoCfg.enabled = true;
+        if(egoCfg.maxBufferedFrames == 0) {
+            egoCfg.maxBufferedFrames = 4096;
+        }
+        return egoCfg;
+    }
+
+    std::string picoServerListeningStatus() const {
+        std::ostringstream oss;
+        oss << "PICO server listening on " << cfg_.ego.host << ":" << cfg_.ego.port
+            << "; start/connect PICO ego client";
+        return oss.str();
+    }
+
+    void setEgoAprilTagStatus(const std::string &status, bool clearResult = true) {
+        egoTagStatusLine_ = status;
+        egoTagWorker_.setIdleStatus(status, clearResult);
+    }
+
+    bool ensureEgoAprilTagPreviewSession(uint64_t nowUs) {
+        if(!showEgoAprilTags_) {
+            return false;
+        }
+        if(!cfg_.ego.enabled) {
+            setEgoAprilTagStatus("PICO ego is disabled in config");
+            return false;
+        }
+
+        std::string err;
+        if(!egoRecorder_.isRunning()) {
+            const EgoModuleConfig egoCfg = buildInteractionEgoConfig();
+            if(!egoRecorder_.start(egoCfg, &err)) {
+                setEgoAprilTagStatus("PICO server start failed: " + err);
+                return false;
+            }
+            setEgoAprilTagStatus(picoServerListeningStatus());
+        }
+
+        if(!egoRecorder_.isConnected()) {
+            setEgoAprilTagStatus(picoServerListeningStatus());
+            return false;
+        }
+
+        if(egoRecorder_.isSessionActive()) {
+            return true;
+        }
+
+        if(lastEgoSessionAttemptUs_ != 0 && nowUs > lastEgoSessionAttemptUs_ && nowUs - lastEgoSessionAttemptUs_ < 1000000) {
+            setEgoAprilTagStatus("PICO connected; waiting to start preview session");
+            return false;
+        }
+        const uint64_t attemptUs = nowUs != 0
+            ? nowUs
+            : static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now().time_since_epoch())
+                                        .count());
+        lastEgoSessionAttemptUs_ = attemptUs;
+        setEgoAprilTagStatus("PICO connected; starting preview session");
+
+        egoPreviewEpisodeDir_ = resolveEgoPreviewEpisodeDir();
+        try {
+            fs::create_directories(egoPreviewEpisodeDir_);
+        }
+        catch(const std::exception &ex) {
+            setEgoAprilTagStatus(std::string("PICO preview dir failed: ") + ex.what());
+            return false;
+        }
+        if(!egoRecorder_.beginSession(egoPreviewEpisodeDir_, "interaction_preview", &err)) {
+            setEgoAprilTagStatus("PICO preview session failed: " + err);
+            return false;
+        }
+
+        egoVideoPath_ = egoPreviewEpisodeDir_ / "ego" / "RGB" / "rgb.h265";
+        egoCameraParamsPath_ = egoPreviewEpisodeDir_ / "ego" / "camera_params.json";
+        latestEgoFrame_.reset();
+        lastEgoTagSubmitUs_ = 0;
+        setEgoAprilTagStatus("PICO preview session active; waiting for RGB frames");
+        return true;
+    }
+
     void setEgoAprilTagOverlayEnabled(bool enabled) {
         if(showEgoAprilTags_ == enabled) {
             return;
@@ -2329,54 +2433,21 @@ private:
             egoRecorder_.stop();
             latestEgoFrame_.reset();
             lastEgoTagSubmitUs_ = 0;
+            lastEgoSessionAttemptUs_ = 0;
             egoTagStatusLine_ = "PICO tags off";
             return;
         }
 
-        if(!cfg_.ego.enabled) {
-            egoTagStatusLine_ = "Enable ego in config first";
-            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
-            return;
-        }
-
-        std::string err;
-        if(!egoRecorder_.isRunning()) {
-            if(!egoRecorder_.start(cfg_.ego, &err)) {
-                egoTagStatusLine_ = "Ego start failed: " + err;
-                egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
-                return;
-            }
-        }
-        if(!egoRecorder_.waitUntilReady(std::chrono::seconds(2))) {
-            egoTagStatusLine_ = "Waiting for PICO ego client";
-            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
-            return;
-        }
-
-        egoPreviewEpisodeDir_ = resolveEgoPreviewEpisodeDir();
-        try {
-            fs::create_directories(egoPreviewEpisodeDir_);
-        }
-        catch(const std::exception &ex) {
-            egoTagStatusLine_ = std::string("Ego preview dir failed: ") + ex.what();
-            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
-            return;
-        }
-        if(!egoRecorder_.beginSession(egoPreviewEpisodeDir_, "interaction_preview", &err)) {
-            egoTagStatusLine_ = "Ego session failed: " + err;
-            egoTagWorker_.setIdleStatus(egoTagStatusLine_, true);
-            return;
-        }
-
-        egoVideoPath_ = egoPreviewEpisodeDir_ / "ego" / "RGB" / "rgb.h265";
-        egoCameraParamsPath_ = egoPreviewEpisodeDir_ / "ego" / "camera_params.json";
+        showEgoAprilTags_ = true;
+        egoVideoPath_.clear();
+        egoCameraParamsPath_.clear();
         latestEgoFrame_.reset();
         lastEgoTagSubmitUs_ = 0;
-        showEgoAprilTags_ = true;
+        lastEgoSessionAttemptUs_ = 0;
         egoTagWorker_.setScriptPath(resolveEgoAprilTagWorkerScriptPath());
         egoTagWorker_.ensureRunning();
-        egoTagWorker_.setIdleStatus("PICO tags waiting for frames", true);
-        egoTagStatusLine_ = "PICO tags waiting for frames";
+        setEgoAprilTagStatus("Starting PICO AprilTag overlay");
+        (void)ensureEgoAprilTagPreviewSession(0);
     }
 
     GtInferenceRequest buildGtInferenceRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
@@ -2531,6 +2602,9 @@ private:
         if(!showEgoAprilTags_) {
             return;
         }
+        if(!ensureEgoAprilTagPreviewSession(frameId)) {
+            return;
+        }
         pollEgoFrames();
         if(egoTagWorker_.hasPendingRequest()) {
             return;
@@ -2539,21 +2613,21 @@ private:
             return;
         }
         if(!latestEgoFrame_.has_value()) {
-            egoTagWorker_.setIdleStatus("PICO tags waiting for PICO frames", true);
+            setEgoAprilTagStatus("PICO preview session active; waiting for PICO RGB frames");
             return;
         }
         if(latestEgoFrame_->videoFrameIndex < 0) {
-            egoTagWorker_.setIdleStatus("PICO tags waiting for mapped video frame", true);
+            setEgoAprilTagStatus("PICO RGB received; waiting for H265 video frame");
             return;
         }
         if(egoVideoPath_.empty() || egoCameraParamsPath_.empty()) {
-            egoTagWorker_.setIdleStatus("PICO tags missing preview paths", true);
+            setEgoAprilTagStatus("PICO tags missing preview paths");
             return;
         }
 
         EgoAprilTagRequest req = buildEgoAprilTagRequest(frames, frameId);
         if(req.cameras.empty()) {
-            egoTagWorker_.setIdleStatus("PICO tags need calibrated Orbbec RGB", true);
+            setEgoAprilTagStatus("PICO tags need calibrated Orbbec RGB");
             return;
         }
         lastEgoTagSubmitUs_ = frameId;
@@ -3656,6 +3730,18 @@ private:
             }
             by += 34;
         }
+        if(showEgoAprilTags_ && by + 20 <= layout_.camsRect.y + layout_.camsRect.height) {
+            const std::string status = ellipsizeTextToWidth(buildEgoAprilTagStatusLine(),
+                                                            bw - 8,
+                                                            cv::FONT_HERSHEY_DUPLEX,
+                                                            0.42,
+                                                            1);
+            if(!status.empty()) {
+                cv::putText(canvas, status, cv::Point(bx + 4, by + 16), cv::FONT_HERSHEY_DUPLEX, 0.42,
+                            cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
+            }
+            by += 26;
+        }
 
         by += 18;
         cv::putText(canvas, "Cameras", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
@@ -3864,6 +3950,7 @@ private:
     bool showGtJoints_ = false;
     bool showEgoAprilTags_ = false;
     uint64_t lastEgoTagSubmitUs_ = 0;
+    uint64_t lastEgoSessionAttemptUs_ = 0;
 };
 
 InteractiveExit run_interactive_visualization(const AppConfig &cfg, const std::atomic_bool *cancel) {
