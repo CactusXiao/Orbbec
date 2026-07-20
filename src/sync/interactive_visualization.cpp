@@ -1026,7 +1026,7 @@ public:
         stopRequested_ = false;
         hasPendingRequest_ = false;
         latestResult_ = EgoAprilTagResult{};
-        statusLine_ = "Ego tags worker starting";
+        statusLine_ = "PICO tags worker starting";
         workerThread_ = std::thread([this]() { workerLoop(); });
     }
 
@@ -1044,7 +1044,7 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             stopRequested_ = false;
             latestResult_ = EgoAprilTagResult{};
-            statusLine_ = "Ego tags off";
+            statusLine_ = "PICO tags off";
         }
     }
 
@@ -1091,7 +1091,7 @@ private:
         }
         if(scriptPath.empty() || !fs::exists(scriptPath)) {
             std::lock_guard<std::mutex> lock(mtx_);
-            statusLine_ = "Ego tags worker script not found";
+            statusLine_ = "PICO tags worker script not found";
             return false;
         }
 
@@ -1111,7 +1111,7 @@ private:
                 ::close(stdoutPipe[1]);
             }
             std::lock_guard<std::mutex> lock(mtx_);
-            statusLine_ = "Ego tags worker pipe creation failed";
+            statusLine_ = "PICO tags worker pipe creation failed";
             return false;
         }
 
@@ -1122,7 +1122,7 @@ private:
             ::close(stdoutPipe[0]);
             ::close(stdoutPipe[1]);
             std::lock_guard<std::mutex> lock(mtx_);
-            statusLine_ = "Ego tags worker fork failed";
+            statusLine_ = "PICO tags worker fork failed";
             return false;
         }
 
@@ -1145,7 +1145,7 @@ private:
         childStdoutFd_ = stdoutPipe[0];
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            statusLine_ = "Ego tags worker ready";
+            statusLine_ = "PICO tags worker ready";
         }
         return true;
     }
@@ -1341,7 +1341,7 @@ private:
     void workerLoop() {
 #if defined(_WIN32)
         std::lock_guard<std::mutex> lock(mtx_);
-        statusLine_ = "Ego tags worker unsupported on Windows";
+        statusLine_ = "PICO tags worker unsupported on Windows";
 #else
         for(;;) {
             EgoAprilTagRequest req;
@@ -1366,9 +1366,9 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(mtx_);
                     latestResult_ = EgoAprilTagResult{};
-                    latestResult_.status = "Ego tags worker disconnected";
+                    latestResult_.status = "PICO tags worker disconnected";
                     latestResult_.workerFps = smoothedFps_;
-                    statusLine_ = "Ego tags worker disconnected";
+                    statusLine_ = "PICO tags worker disconnected";
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(80));
                 continue;
@@ -1387,7 +1387,7 @@ private:
                 lastResponseTime_ = now;
                 response.workerFps = response.workerFps > 0.0 ? response.workerFps : smoothedFps_;
                 latestResult_ = std::move(response);
-                statusLine_ = latestResult_.status.empty() ? "Ego tags worker ready" : latestResult_.status;
+                statusLine_ = latestResult_.status.empty() ? "PICO tags worker ready" : latestResult_.status;
             }
         }
 
@@ -1401,7 +1401,7 @@ private:
     bool                    hasPendingRequest_ = false;
     EgoAprilTagRequest      pendingRequest_;
     EgoAprilTagResult       latestResult_;
-    std::string             statusLine_ = "Ego tags off";
+    std::string             statusLine_ = "PICO tags off";
     fs::path                scriptPath_;
     std::thread             workerThread_;
     double                  smoothedFps_ = 0.0;
@@ -2149,11 +2149,9 @@ public:
             bool streamsDirty = false;
             streamsDirty |= drawLeftPanel(canvas, frameMs);
             streamsDirty |= drawImagePanel(canvas, frameMs);
-            bool controlsDirty = false;
-            if(drawControls(canvas, frameMs, viewState, exitReason, controlsDirty)) {
+            if(drawControls(canvas, frameMs, viewState, exitReason)) {
                 running = false;
             }
-            streamsDirty |= controlsDirty;
 
             if(streamsDirty) {
                 ivizSetStage("loop_refreshPipelines");
@@ -2331,7 +2329,7 @@ private:
             egoRecorder_.stop();
             latestEgoFrame_.reset();
             lastEgoTagSubmitUs_ = 0;
-            egoTagStatusLine_ = "Ego tags off";
+            egoTagStatusLine_ = "PICO tags off";
             return;
         }
 
@@ -2377,8 +2375,8 @@ private:
         showEgoAprilTags_ = true;
         egoTagWorker_.setScriptPath(resolveEgoAprilTagWorkerScriptPath());
         egoTagWorker_.ensureRunning();
-        egoTagWorker_.setIdleStatus("Ego tags waiting for frames", true);
-        egoTagStatusLine_ = "Ego tags waiting for frames";
+        egoTagWorker_.setIdleStatus("PICO tags waiting for frames", true);
+        egoTagStatusLine_ = "PICO tags waiting for frames";
     }
 
     GtInferenceRequest buildGtInferenceRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
@@ -2541,21 +2539,21 @@ private:
             return;
         }
         if(!latestEgoFrame_.has_value()) {
-            egoTagWorker_.setIdleStatus("Ego tags waiting for ego frames", true);
+            egoTagWorker_.setIdleStatus("PICO tags waiting for ego frames", true);
             return;
         }
         if(latestEgoFrame_->videoFrameIndex < 0) {
-            egoTagWorker_.setIdleStatus("Ego tags waiting for mapped video frame", true);
+            egoTagWorker_.setIdleStatus("PICO tags waiting for mapped video frame", true);
             return;
         }
         if(egoVideoPath_.empty() || egoCameraParamsPath_.empty()) {
-            egoTagWorker_.setIdleStatus("Ego tags missing preview paths", true);
+            egoTagWorker_.setIdleStatus("PICO tags missing preview paths", true);
             return;
         }
 
         EgoAprilTagRequest req = buildEgoAprilTagRequest(frames, frameId);
         if(req.cameras.empty()) {
-            egoTagWorker_.setIdleStatus("Ego tags need calibrated Orbbec RGB", true);
+            egoTagWorker_.setIdleStatus("PICO tags need calibrated Orbbec RGB", true);
             return;
         }
         lastEgoTagSubmitUs_ = frameId;
@@ -2592,14 +2590,14 @@ private:
 
     std::string buildEgoAprilTagStatusLine() const {
         if(!showEgoAprilTags_) {
-            return egoTagStatusLine_.empty() ? "Ego tags off" : egoTagStatusLine_;
+            return egoTagStatusLine_.empty() ? "PICO tags off" : egoTagStatusLine_;
         }
         const auto result = egoTagWorker_.latestResult();
         const std::string workerStatus = egoTagWorker_.statusLine();
         std::ostringstream oss;
         oss.setf(std::ios::fixed);
         oss << std::setprecision(1);
-        oss << "Ego tags";
+        oss << "PICO tags";
         if(result.referenceTagCount > 0 || result.tagCount > 0) {
             oss << " " << result.tagCount << " | ref " << result.referenceTagCount;
         }
@@ -3635,6 +3633,31 @@ private:
         }
 
         by += 18;
+        cv::putText(canvas, "Overlays", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        by += 34;
+
+        {
+            const cv::Rect row(bx, by, bw, 30);
+            if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                if(uiCheckbox(canvas, row, showGtJoints_, "Visualize GT hand", ms)) {
+                    setGtVisualizationEnabled(!showGtJoints_);
+                    typeChanged = true;
+                }
+            }
+            by += 34;
+        }
+        {
+            const cv::Rect row(bx, by, bw, 30);
+            if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                if(uiCheckbox(canvas, row, showEgoAprilTags_, "Visualize PICO AprilTags", ms)) {
+                    setEgoAprilTagOverlayEnabled(!showEgoAprilTags_);
+                    typeChanged = true;
+                }
+            }
+            by += 34;
+        }
+
+        by += 18;
         cv::putText(canvas, "Cameras", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         by += 34;
 
@@ -3765,7 +3788,7 @@ private:
         return false;
     }
 
-    bool drawControls(cv::Mat &canvas, CvMouseState &ms, InteractiveViewState &viewState, InteractiveExit &out, bool &outStreamsDirty) {
+    bool drawControls(cv::Mat &canvas, CvMouseState &ms, InteractiveViewState &viewState, InteractiveExit &out) {
         cv::rectangle(canvas, layout_.ctlRect, cv::Scalar(16, 16, 16), cv::FILLED);
         cv::rectangle(canvas, layout_.ctlRect, cv::Scalar(60, 60, 60), 1);
 
@@ -3785,22 +3808,11 @@ private:
             viewState.resetView();
         }
 
-        const cv::Rect gtToggle(layout_.ctlRect.x + 760, y - 2, 230, 28);
-        if(uiCheckbox(canvas, gtToggle, showGtJoints_, "Visualize GT hand", ms)) {
-            setGtVisualizationEnabled(!showGtJoints_);
-            outStreamsDirty = true;
-        }
-        const cv::Rect egoToggle(layout_.ctlRect.x + 760, y + 30, 260, 28);
-        if(uiCheckbox(canvas, egoToggle, showEgoAprilTags_, "Visualize ego AprilTags", ms)) {
-            setEgoAprilTagOverlayEnabled(!showEgoAprilTags_);
-            outStreamsDirty = true;
-        }
-
-        cv::putText(canvas, "LMB rotate | RMB pan | Wheel/Ctrl+/- zoom", cv::Point(layout_.ctlRect.x + 1040, y + 18), cv::FONT_HERSHEY_DUPLEX, 0.5,
+        cv::putText(canvas, "LMB rotate | RMB pan | Wheel/Ctrl+/- zoom", cv::Point(layout_.ctlRect.x + 760, y + 18), cv::FONT_HERSHEY_DUPLEX, 0.5,
                     cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 1040, y + 46), cv::FONT_HERSHEY_DUPLEX, 0.52,
+        cv::putText(canvas, buildGtStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 46), cv::FONT_HERSHEY_DUPLEX, 0.52,
                     showGtJoints_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
-        cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(layout_.ctlRect.x + 1040, y + 74), cv::FONT_HERSHEY_DUPLEX, 0.52,
+        cv::putText(canvas, buildEgoAprilTagStatusLine(), cv::Point(layout_.ctlRect.x + 760, y + 74), cv::FONT_HERSHEY_DUPLEX, 0.52,
                     showEgoAprilTags_ ? cv::Scalar(230, 230, 230) : cv::Scalar(170, 170, 170), 1, cv::LINE_AA);
         return false;
     }
@@ -3836,7 +3848,7 @@ private:
     fs::path egoVideoPath_;
     fs::path egoCameraParamsPath_;
     std::optional<EgoFrame> latestEgoFrame_;
-    std::string egoTagStatusLine_ = "Ego tags off";
+    std::string egoTagStatusLine_ = "PICO tags off";
     FisheyeRecorder fisheyeRecorder_;
     std::vector<uint8_t> fisheyeVisible_;
     std::vector<std::string> fisheyeLabels_;
