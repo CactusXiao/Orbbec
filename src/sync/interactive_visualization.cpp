@@ -2539,7 +2539,7 @@ private:
             return;
         }
         if(!latestEgoFrame_.has_value()) {
-            egoTagWorker_.setIdleStatus("PICO tags waiting for ego frames", true);
+            egoTagWorker_.setIdleStatus("PICO tags waiting for PICO frames", true);
             return;
         }
         if(latestEgoFrame_->videoFrameIndex < 0) {
