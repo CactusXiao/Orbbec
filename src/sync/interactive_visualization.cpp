@@ -4151,6 +4151,59 @@ private:
         }
     }
 
+    static int clampPropertyValue(int v, const OBIntPropertyRange &r) {
+        const int step = (r.step > 0) ? r.step : 1;
+        int out = std::max(r.min, std::min(r.max, v));
+        out = r.min + ((out - r.min) / step) * step;
+        return std::max(r.min, std::min(r.max, out));
+    }
+
+    void applyColorExposure(DeviceRuntime &rt, bool colorEnabled) {
+        if(!colorEnabled || !rt.dev) {
+            return;
+        }
+
+        const bool manualExposure = cfg_.colorExposureMs > 0.0f;
+        try {
+            if(rt.dev->isPropertySupported(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, OB_PERMISSION_READ_WRITE)) {
+                rt.dev->setBoolProperty(OB_PROP_COLOR_AUTO_EXPOSURE_BOOL, !manualExposure);
+                std::cerr << "[interaction] color auto exposure sn=" << rt.cfg.sn
+                          << " value=" << (!manualExposure ? "true" : "false") << std::endl;
+            }
+        }
+        catch(...) {
+        }
+
+        if(!manualExposure) {
+            return;
+        }
+
+        try {
+            const bool canRead = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_READ);
+            const bool canWrite = rt.dev->isPropertySupported(OB_PROP_COLOR_EXPOSURE_INT, OB_PERMISSION_WRITE);
+            if(canRead && canWrite) {
+                const auto range = rt.dev->getIntPropertyRange(OB_PROP_COLOR_EXPOSURE_INT);
+                const int targetUsRaw = static_cast<int>(cfg_.colorExposureMs * 1000.0f + 0.5f);
+                const int targetUs = clampPropertyValue(targetUsRaw, range);
+                rt.dev->setIntProperty(OB_PROP_COLOR_EXPOSURE_INT, targetUs);
+                const int appliedUs = rt.dev->getIntProperty(OB_PROP_COLOR_EXPOSURE_INT);
+                std::cerr << "[interaction] set color exposure sn=" << rt.cfg.sn
+                          << " target_us=" << targetUs
+                          << " applied_us=" << appliedUs << std::endl;
+            }
+            else {
+                std::cerr << "[interaction] color exposure property not writable sn=" << rt.cfg.sn << std::endl;
+            }
+        }
+        catch(const std::exception &e) {
+            std::cerr << "[interaction] set color exposure failed sn=" << rt.cfg.sn
+                      << " error=" << e.what() << std::endl;
+        }
+        catch(...) {
+            std::cerr << "[interaction] set color exposure failed sn=" << rt.cfg.sn << std::endl;
+        }
+    }
+
     StreamMode startPipeline(DeviceRuntime &rt, StreamMode desiredMode) {
         auto config = std::make_shared<ob::Config>();
         std::unordered_set<OBSensorType> enabledSensors;
@@ -4264,6 +4317,7 @@ private:
         const auto camIndex    = rt.cfg.index;
         const auto deviceIndex = rt.deviceIndex;
         try {
+            applyColorExposure(rt, actualMode == StreamMode::DepthColor);
             if(cfg_.enableSync && enabledSensors.size() > 1) {
                 try {
                     rt.pipe->enableFrameSync();

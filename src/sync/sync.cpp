@@ -8,6 +8,8 @@
 #include "collection.hpp"
 #include "calibration.hpp"
 
+#include <cmath>
+
 namespace sync_app {
 
 struct CvMouseState {
@@ -128,6 +130,26 @@ static float parseFloatOr(const std::string &s, float fallback) {
     }
 }
 
+static float parseExposureMsOrAuto(const std::string &s, float fallback) {
+    const std::string trimmed = trimString(s);
+    if(trimmed.empty()) {
+        return 0.0f;
+    }
+    try {
+        const float v = std::stof(trimmed);
+        if(!std::isfinite(v)) {
+            return fallback;
+        }
+        if(v <= 0.0f) {
+            return 0.0f;
+        }
+        return std::max(0.05f, std::min(100.0f, v));
+    }
+    catch(...) {
+        return fallback;
+    }
+}
+
 static void applyPointCloudResolution(AppConfig &cfg, int w, int h, int fps) {
     for(auto &d: cfg.devices) {
         for(auto &s: d.streams) {
@@ -164,6 +186,7 @@ struct InteractionConfigUi {
     std::string maxDepth;
     bool differentColor = false;
     bool colorfulCloudPoints = false;
+    std::string exposureMs;
     std::string pcWidth;
     std::string pcHeight;
     std::string pcFps;
@@ -193,6 +216,7 @@ struct InteractionConfigUi {
         maxDepth = toStringFloat(cfg.maxDepth);
         differentColor = cfg.differentColor;
         colorfulCloudPoints = cfg.colorfulCloudPoints;
+        exposureMs = cfg.colorExposureMs > 0.0f ? toStringFloat(cfg.colorExposureMs) : std::string();
         deskCrop = cfg.filters.deskCrop;
         pcDecimation = toStringInt(cfg.filters.pointCloudDecimationFactor);
         confThreshold = toStringFloat(static_cast<float>(cfg.filters.confThreshold));
@@ -240,6 +264,7 @@ struct InteractionConfigUi {
         cfg.maxDepth = std::max(0.1f, parseFloatOr(maxDepth, cfg.maxDepth));
         cfg.differentColor = differentColor;
         cfg.colorfulCloudPoints = colorfulCloudPoints;
+        cfg.colorExposureMs = parseExposureMsOrAuto(exposureMs, cfg.colorExposureMs);
         cfg.filters.deskCrop = deskCrop;
         cfg.filters.pointCloudDecimationFactor = std::max(0, parseIntOr(pcDecimation, cfg.filters.pointCloudDecimationFactor));
         cfg.filters.confThreshold = std::max(0.0, std::min(1.0, static_cast<double>(parseFloatOr(confThreshold, static_cast<float>(cfg.filters.confThreshold)))));
@@ -395,7 +420,7 @@ int main(int argc, char **argv) {
                     cfgUi.scrollY -= rowH;
                 }
 
-                const int rowsCount = cfgUi.showAdvanced ? 18 : 7;
+                const int rowsCount = cfgUi.showAdvanced ? 19 : 8;
                 const int contentH = rowsCount * rowH + 120;
                 const int maxScroll = std::max(0, contentH - scrollArea.height);
                 cfgUi.scrollY = std::max(0, std::min(maxScroll, cfgUi.scrollY));
@@ -425,41 +450,44 @@ int main(int argc, char **argv) {
                 if(uiTextField(ui, rowRect(6), "conf_threshold (0~1)", cfgUi.confThreshold, cfgUi.activeField == "conf", fm)) {
                     cfgUi.activeField = "conf";
                 }
+                if(uiTextField(ui, rowRect(7), "exposure_ms (blank/0 auto)", cfgUi.exposureMs, cfgUi.activeField == "exp", fm)) {
+                    cfgUi.activeField = "exp";
+                }
 
                 if(cfgUi.showAdvanced) {
-                    if(uiTextField(ui, rowRect(7), "decimation_filter_scale", cfgUi.decimationFilterScale, cfgUi.activeField == "dec_scale", fm)) {
+                    if(uiTextField(ui, rowRect(8), "decimation_filter_scale", cfgUi.decimationFilterScale, cfgUi.activeField == "dec_scale", fm)) {
                         cfgUi.activeField = "dec_scale";
                     }
-                    if(uiTextField(ui, rowRect(8), "noise_removal_filter_max_size", cfgUi.noiseRemovalMaxSize, cfgUi.activeField == "nr_max", fm)) {
+                    if(uiTextField(ui, rowRect(9), "noise_removal_filter_max_size", cfgUi.noiseRemovalMaxSize, cfgUi.activeField == "nr_max", fm)) {
                         cfgUi.activeField = "nr_max";
                     }
-                    if(uiTextField(ui, rowRect(9), "noise_removal_filter_min_diff", cfgUi.noiseRemovalMinDiff, cfgUi.activeField == "nr_min", fm)) {
+                    if(uiTextField(ui, rowRect(10), "noise_removal_filter_min_diff", cfgUi.noiseRemovalMinDiff, cfgUi.activeField == "nr_min", fm)) {
                         cfgUi.activeField = "nr_min";
                     }
 
-                    if(uiTextField(ui, rowRect(10), "spatial_filter_alpha", cfgUi.spatialAlpha, cfgUi.activeField == "sp_a", fm)) {
+                    if(uiTextField(ui, rowRect(11), "spatial_filter_alpha", cfgUi.spatialAlpha, cfgUi.activeField == "sp_a", fm)) {
                         cfgUi.activeField = "sp_a";
                     }
-                    if(uiTextField(ui, rowRect(11), "spatial_filter_disp_diff", cfgUi.spatialDispDiff, cfgUi.activeField == "sp_d", fm)) {
+                    if(uiTextField(ui, rowRect(12), "spatial_filter_disp_diff", cfgUi.spatialDispDiff, cfgUi.activeField == "sp_d", fm)) {
                         cfgUi.activeField = "sp_d";
                     }
-                    if(uiTextField(ui, rowRect(12), "spatial_filter_magnitude", cfgUi.spatialMagnitude, cfgUi.activeField == "sp_m", fm)) {
+                    if(uiTextField(ui, rowRect(13), "spatial_filter_magnitude", cfgUi.spatialMagnitude, cfgUi.activeField == "sp_m", fm)) {
                         cfgUi.activeField = "sp_m";
                     }
-                    if(uiTextField(ui, rowRect(13), "spatial_filter_radius", cfgUi.spatialRadius, cfgUi.activeField == "sp_r", fm)) {
+                    if(uiTextField(ui, rowRect(14), "spatial_filter_radius", cfgUi.spatialRadius, cfgUi.activeField == "sp_r", fm)) {
                         cfgUi.activeField = "sp_r";
                     }
 
-                    if(uiTextField(ui, rowRect(14), "smooth_threshold", cfgUi.smoothThreshold, cfgUi.activeField == "smooth", fm)) {
+                    if(uiTextField(ui, rowRect(15), "smooth_threshold", cfgUi.smoothThreshold, cfgUi.activeField == "smooth", fm)) {
                         cfgUi.activeField = "smooth";
                     }
-                    if(uiTextField(ui, rowRect(15), "temporal_filter_diff_scale", cfgUi.temporalDiffScale, cfgUi.activeField == "t_d", fm)) {
+                    if(uiTextField(ui, rowRect(16), "temporal_filter_diff_scale", cfgUi.temporalDiffScale, cfgUi.activeField == "t_d", fm)) {
                         cfgUi.activeField = "t_d";
                     }
-                    if(uiTextField(ui, rowRect(16), "temporal_filter_weight", cfgUi.temporalWeight, cfgUi.activeField == "t_w", fm)) {
+                    if(uiTextField(ui, rowRect(17), "temporal_filter_weight", cfgUi.temporalWeight, cfgUi.activeField == "t_w", fm)) {
                         cfgUi.activeField = "t_w";
                     }
-                    if(uiTextField(ui, rowRect(17), "hole_filling_filter_mode", cfgUi.holeFillingMode, cfgUi.activeField == "hf", fm)) {
+                    if(uiTextField(ui, rowRect(18), "hole_filling_filter_mode", cfgUi.holeFillingMode, cfgUi.activeField == "hf", fm)) {
                         cfgUi.activeField = "hf";
                     }
                 }
@@ -548,6 +576,9 @@ int main(int argc, char **argv) {
                     }
                     else if(cfgUi.activeField == "conf") {
                         handleTextInput(cfgUi.confThreshold, key);
+                    }
+                    else if(cfgUi.activeField == "exp") {
+                        handleTextInput(cfgUi.exposureMs, key);
                     }
                     else if(cfgUi.activeField == "dec_scale") {
                         handleTextInput(cfgUi.decimationFilterScale, key);
