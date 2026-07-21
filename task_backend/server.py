@@ -1440,19 +1440,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Orbbec collection task backend")
     parser.add_argument("--host", default="127.0.0.1", help="bind host, default: 127.0.0.1")
     parser.add_argument("--port", default=8765, type=int, help="bind port, default: 8765")
-    parser.add_argument("--data-root", type=Path, help="backend-owned setup and instance state directory")
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        help="backend-owned setup and instance state directory, default: ./task_backend_state",
+    )
     parser.add_argument("--save-root", type=Path, help="deprecated alias for --data-root")
     parser.add_argument("--task-file", type=Path, help="seed task.json/tasks.json file for the setup page")
     parser.add_argument("--state-file", type=Path, help="legacy state file used for the seeded default instance")
-    args = parser.parse_args(argv)
-    if args.data_root is None and args.save_root is None:
-        parser.error("--data-root is required (or legacy --save-root)")
-    return args
+    return parser.parse_args(argv)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    data_root_arg = args.data_root if args.data_root is not None else args.save_root
+    data_root_arg = args.data_root if args.data_root is not None else (args.save_root or Path("./task_backend_state"))
     if args.data_root is None and args.save_root is not None:
         print("[task-backend] warning: --save-root is deprecated; use --data-root", file=sys.stderr)
     data_root = data_root_arg.expanduser().resolve()

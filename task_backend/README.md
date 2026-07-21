@@ -15,15 +15,20 @@ local data on the capture machine as:
 From the repository root:
 
 ```bash
-python3 task_backend/server.py \
-  --data-root ./task_backend_state \
-  --host 0.0.0.0 \
-  --port 8765
+python3 task_backend/server.py
 ```
 
-Use `--host 127.0.0.1` only when the frontend runs on the same machine. For a
-separate backend machine, bind to an address reachable by the capture machine
-such as `0.0.0.0`, and point the frontend `baseUrl` to the backend machine's IP.
+By default this stores setup and instance state in `./task_backend_state`, binds
+to `127.0.0.1`, and uses port `8765`.
+
+If the capture frontend runs on another machine, bind to an address reachable by
+the capture machine:
+
+```bash
+python3 task_backend/server.py --host 0.0.0.0
+```
+
+Then point the frontend `baseUrl` to the backend machine's IP.
 
 After the process starts, open `http://<backend-host>:8765/` in a browser. The
 server first shows a setup page. Select one registered `tasks.json` and one
