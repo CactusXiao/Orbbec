@@ -2271,6 +2271,7 @@ public:
             cameraEnabled_.assign(devices_.size(), 1);
             frameCountByDevice_.assign(devices_.size(), 0);
         }
+        extrinsicCameraTagPoseVisible_.assign(devices_.size(), 1);
         ivizSetStage("loadInitExtrinsics");
         loadInitExtrinsicsIfNeeded();
         ivizSetStage("loadInitExtrinsics_ok");
@@ -3838,6 +3839,16 @@ private:
         }
     }
 
+    bool isExtrinsicCameraTagPoseVisible(int deviceIndex) const {
+        if(!showExtrinsicCameraTagPoses_) {
+            return false;
+        }
+        if(deviceIndex < 0 || deviceIndex >= static_cast<int>(extrinsicCameraTagPoseVisible_.size())) {
+            return true;
+        }
+        return extrinsicCameraTagPoseVisible_[static_cast<size_t>(deviceIndex)] != 0;
+    }
+
     static cv::Vec3b extrinsicHealthObservationColor(int deviceIndex, int order) {
         static const std::vector<cv::Vec3b> palette = {
             cv::Vec3b(0, 80, 255),
@@ -3970,19 +3981,28 @@ private:
             return;
         }
 
+        if(!showExtrinsicCameraTagPoses_ && !showExtrinsicFusedTagPoses_) {
+            return;
+        }
+
         if(extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag) {
             const int tagId = selectedExtrinsicTagId(result);
             auto it = result.tags.find(tagId);
             if(it == result.tags.end()) {
                 return;
             }
-            int order = 0;
-            for(const auto &obs : it->second.observations) {
-                const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
-                drawExtrinsicHealthPose(canvas, obs.worldFromTag, tagId, " " + obs.cameraId, color, false,
-                                        right, up, forward, camPos, fx, fy, cx, cy);
+            if(showExtrinsicCameraTagPoses_) {
+                int order = 0;
+                for(const auto &obs : it->second.observations) {
+                    if(!isExtrinsicCameraTagPoseVisible(obs.deviceIndex)) {
+                        continue;
+                    }
+                    const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
+                    drawExtrinsicHealthPose(canvas, obs.worldFromTag, tagId, " " + obs.cameraId, color, false,
+                                            right, up, forward, camPos, fx, fy, cx, cy);
+                }
             }
-            if(it->second.hasFused) {
+            if(showExtrinsicFusedTagPoses_ && it->second.hasFused) {
                 drawExtrinsicHealthPose(canvas, it->second.fusedWorldFromTag, tagId, " fused", cv::Vec3b(255, 255, 255), true,
                                         right, up, forward, camPos, fx, fy, cx, cy);
             }
@@ -3991,9 +4011,18 @@ private:
 
         int order = 0;
         for(const auto &kv : result.tags) {
-            for(const auto &obs : kv.second.observations) {
-                const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
-                drawExtrinsicHealthPose(canvas, obs.worldFromTag, kv.first, " " + obs.cameraId, color, false,
+            if(showExtrinsicCameraTagPoses_) {
+                for(const auto &obs : kv.second.observations) {
+                    if(!isExtrinsicCameraTagPoseVisible(obs.deviceIndex)) {
+                        continue;
+                    }
+                    const cv::Vec3b color = extrinsicHealthObservationColor(obs.deviceIndex, order++);
+                    drawExtrinsicHealthPose(canvas, obs.worldFromTag, kv.first, " " + obs.cameraId, color, false,
+                                            right, up, forward, camPos, fx, fy, cx, cy);
+                }
+            }
+            if(showExtrinsicFusedTagPoses_ && kv.second.hasFused) {
+                drawExtrinsicHealthPose(canvas, kv.second.fusedWorldFromTag, kv.first, " fused", cv::Vec3b(255, 255, 255), true,
                                         right, up, forward, camPos, fx, fy, cx, cy);
             }
         }
@@ -5017,6 +5046,42 @@ private:
                 }
             }
             by += 36;
+            {
+                const cv::Rect row(bx, by, bw, 30);
+                if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                    if(uiCheckbox(canvas, row, showExtrinsicCameraTagPoses_, "Camera tag poses", ms)) {
+                        showExtrinsicCameraTagPoses_ = !showExtrinsicCameraTagPoses_;
+                        typeChanged = true;
+                    }
+                }
+                by += 34;
+            }
+            {
+                const cv::Rect row(bx, by, bw, 30);
+                if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
+                    if(uiCheckbox(canvas, row, showExtrinsicFusedTagPoses_, "Fused tag poses", ms)) {
+                        showExtrinsicFusedTagPoses_ = !showExtrinsicFusedTagPoses_;
+                        typeChanged = true;
+                    }
+                }
+                by += 34;
+            }
+            if(showExtrinsicCameraTagPoses_) {
+                for(size_t i = 0; i < devices_.size() && i < extrinsicCameraTagPoseVisible_.size(); ++i) {
+                    const cv::Rect row(bx + 16, by, std::max(20, bw - 16), 28);
+                    if(row.y + row.height > layout_.camsRect.y + layout_.camsRect.height) {
+                        break;
+                    }
+                    const bool visible = extrinsicCameraTagPoseVisible_[i] != 0;
+                    const std::string label = "Pose " + devices_[i].cfg.index;
+                    if(uiCheckbox(canvas, row, visible, label, ms)) {
+                        extrinsicCameraTagPoseVisible_[i] = visible ? 0 : 1;
+                        typeChanged = true;
+                    }
+                    by += 30;
+                }
+                by += 4;
+            }
             if(extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag) {
                 auto result = latestExtrinsicHealthResult();
                 const int tagId = selectedExtrinsicTagId(result);
@@ -5252,6 +5317,9 @@ private:
     bool showGtJoints_ = false;
     bool showEgoAprilTags_ = false;
     bool showExtrinsicHealthOverlay_ = false;
+    bool showExtrinsicCameraTagPoses_ = true;
+    bool showExtrinsicFusedTagPoses_ = true;
+    std::vector<uint8_t> extrinsicCameraTagPoseVisible_;
     bool extrinsicHealthForceColor_ = false;
     bool extrinsicHealthPending_ = false;
     ExtrinsicHealthVizMode extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::AllTags;
