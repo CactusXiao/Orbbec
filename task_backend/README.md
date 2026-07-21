@@ -18,17 +18,33 @@ From the repository root:
 python3 task_backend/server.py
 ```
 
-By default this stores setup and instance state in `./task_backend_state`, binds
-to `127.0.0.1`, and uses port `8765`.
+Startup configuration is read from `.env` by default. If `.env` is absent, the
+backend falls back to `./task_backend_state`, `127.0.0.1`, and port `8765`.
+
+Supported `.env` keys:
+
+```dotenv
+ORBBEC_TASK_BACKEND_HOST=127.0.0.1
+ORBBEC_TASK_BACKEND_PORT=8765
+ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
+
+# Optional seed file for the setup page:
+# ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
+# ORBBEC_TASK_BACKEND_STATE_FILE=./task_backend_state/progress_state.json
+```
 
 If the capture frontend runs on another machine, bind to an address reachable by
-the capture machine:
+the capture machine in `.env`:
 
-```bash
-python3 task_backend/server.py --host 0.0.0.0
+```dotenv
+ORBBEC_TASK_BACKEND_HOST=0.0.0.0
 ```
 
 Then point the frontend `baseUrl` to the backend machine's IP.
+
+Command-line flags such as `--host`, `--port`, `--data-root`, `--task-file`,
+and `--state-file` are still accepted for temporary overrides. Use `--env-file`
+to load a different env file.
 
 After the process starts, open `http://<backend-host>:8765/` in a browser. The
 server first shows a setup page. Select one registered `tasks.json` and one

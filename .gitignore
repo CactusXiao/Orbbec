@@ -11,6 +11,7 @@ __pycache__/
 *.dll
 *.exe
 .DS_Store
+.env
 .vscode/
 error.log
 log.txt

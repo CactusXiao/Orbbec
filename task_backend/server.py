@@ -123,6 +123,84 @@ def default_task_file(data_root: Path) -> Path:
     return candidates[0]
 
 
+def strip_env_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if ch == "#" and not in_single and not in_double:
+            if idx == 0 or value[idx - 1].isspace():
+                return value[:idx].rstrip()
+    return value.strip()
+
+
+def unquote_env_value(value: str) -> str:
+    value = strip_env_comment(value.strip())
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = inner.replace(r"\\", "\\").replace(r"\"", '"')
+        return inner
+    return value
+
+
+def load_env_file(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    result: Dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                raise ValueError(f"invalid .env line {line_no}: missing '='")
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                raise ValueError(f"invalid .env line {line_no}: invalid key {key!r}")
+            result[key] = unquote_env_value(value)
+    return result
+
+
+def env_get(env: Dict[str, str], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = env.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def env_path(env: Dict[str, str], *keys: str) -> Optional[Path]:
+    value = env_get(env, *keys)
+    return Path(value) if value is not None else None
+
+
+def env_int(env: Dict[str, str], default: int, *keys: str) -> int:
+    value = env_get(env, *keys)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        joined = ", ".join(keys)
+        raise ValueError(f"invalid integer in .env for {joined}: {value!r}") from exc
+
+
 def slugify(value: str, fallback: str = "item") -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-._")
     slug = re.sub(r"-{2,}", "-", slug)
@@ -1437,30 +1515,52 @@ class TaskHTTPServer(ThreadingHTTPServer):
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    env_parser = argparse.ArgumentParser(add_help=False)
+    env_parser.add_argument("--env-file", type=Path, default=Path(".env"))
+    env_args, _ = env_parser.parse_known_args(argv)
+    env_file = env_args.env_file.expanduser()
+    if not env_file.is_absolute():
+        env_file = Path.cwd() / env_file
+    try:
+        env_values = load_env_file(env_file.resolve())
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
     parser = argparse.ArgumentParser(description="Run the Orbbec collection task backend")
-    parser.add_argument("--host", default="127.0.0.1", help="bind host, default: 127.0.0.1")
-    parser.add_argument("--port", default=8765, type=int, help="bind port, default: 8765")
+    parser.add_argument("--env-file", type=Path, default=env_file, help="path to backend .env config, default: ./.env")
+    parser.add_argument("--host", help="bind host; overrides ORBBEC_TASK_BACKEND_HOST")
+    parser.add_argument("--port", type=int, help="bind port; overrides ORBBEC_TASK_BACKEND_PORT")
     parser.add_argument(
         "--data-root",
         type=Path,
-        help="backend-owned setup and instance state directory, default: ./task_backend_state",
+        help="backend-owned setup and instance state directory; overrides ORBBEC_TASK_BACKEND_DATA_ROOT",
     )
     parser.add_argument("--save-root", type=Path, help="deprecated alias for --data-root")
-    parser.add_argument("--task-file", type=Path, help="seed task.json/tasks.json file for the setup page")
-    parser.add_argument("--state-file", type=Path, help="legacy state file used for the seeded default instance")
-    return parser.parse_args(argv)
+    parser.add_argument("--task-file", type=Path, help="seed task.json/tasks.json file; overrides ORBBEC_TASK_BACKEND_TASK_FILE")
+    parser.add_argument("--state-file", type=Path, help="legacy state file; overrides ORBBEC_TASK_BACKEND_STATE_FILE")
+    args = parser.parse_args(argv)
+    args.env_file = env_file.resolve()
+    args.env_values = env_values
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    data_root_arg = args.data_root if args.data_root is not None else (args.save_root or Path("./task_backend_state"))
-    if args.data_root is None and args.save_root is not None:
+    env = args.env_values
+    host = args.host or env_get(env, "ORBBEC_TASK_BACKEND_HOST", "TASK_BACKEND_HOST") or "127.0.0.1"
+    port = args.port if args.port is not None else env_int(env, 8765, "ORBBEC_TASK_BACKEND_PORT", "TASK_BACKEND_PORT")
+    data_root_env = env_path(env, "ORBBEC_TASK_BACKEND_DATA_ROOT", "TASK_BACKEND_DATA_ROOT")
+    save_root_env = env_path(env, "ORBBEC_TASK_BACKEND_SAVE_ROOT", "TASK_BACKEND_SAVE_ROOT")
+    data_root_arg = args.data_root if args.data_root is not None else (data_root_env or args.save_root or save_root_env or Path("./task_backend_state"))
+    if args.data_root is None and (args.save_root is not None or (data_root_env is None and save_root_env is not None)):
         print("[task-backend] warning: --save-root is deprecated; use --data-root", file=sys.stderr)
     data_root = data_root_arg.expanduser().resolve()
     seed_task_files: List[Tuple[Path, Optional[Path]]] = []
-    seed_state_file = args.state_file.expanduser().resolve() if args.state_file else None
-    if args.task_file:
-        task_file = args.task_file.expanduser().resolve()
+    state_file_arg = args.state_file or env_path(env, "ORBBEC_TASK_BACKEND_STATE_FILE", "TASK_BACKEND_STATE_FILE")
+    task_file_arg = args.task_file or env_path(env, "ORBBEC_TASK_BACKEND_TASK_FILE", "TASK_BACKEND_TASK_FILE")
+    seed_state_file = state_file_arg.expanduser().resolve() if state_file_arg else None
+    if task_file_arg:
+        task_file = task_file_arg.expanduser().resolve()
         if task_file.exists():
             seed_task_files.append((task_file, seed_state_file))
         else:
@@ -1472,13 +1572,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
     runtime = BackendRuntime(registry)
-    host_info = socket.getfqdn(args.host) if args.host not in ("", "0.0.0.0", "::") else args.host
+    host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
+    if args.env_file.exists():
+        print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
-    print(f"[task-backend] listening http://{args.host}:{args.port} ({host_info})", file=sys.stderr)
+    print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)
 
-    server = TaskHTTPServer((args.host, args.port), RequestHandler, runtime)
+    server = TaskHTTPServer((host, port), RequestHandler, runtime)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
