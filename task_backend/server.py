@@ -12,9 +12,11 @@ import argparse
 import html
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -32,6 +34,7 @@ except ImportError:  # pragma: no cover - non-Linux fallback
 
 Task = Dict[str, Any]
 State = Dict[str, Any]
+Registry = Dict[str, Any]
 
 
 def now_iso() -> str:
@@ -118,6 +121,281 @@ def default_task_file(data_root: Path) -> Path:
         if candidate.exists():
             return candidate
     return candidates[0]
+
+
+def slugify(value: str, fallback: str = "item") -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-._")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug or fallback
+
+
+def unique_slug(base: str, existing: Iterable[str], fallback: str = "item") -> str:
+    used = set(existing)
+    stem = slugify(base, fallback)
+    if stem not in used:
+        return stem
+    idx = 2
+    while f"{stem}-{idx}" in used:
+        idx += 1
+    return f"{stem}-{idx}"
+
+
+def path_from_user(value: str) -> Path:
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path.resolve()
+
+
+def relative_to_root(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
+def state_path_from_instance(data_root: Path, instance: Dict[str, Any]) -> Path:
+    stored = str(instance.get("state_file", "")).strip()
+    if not stored:
+        stored = "progress_state.json"
+    path = Path(stored).expanduser()
+    if not path.is_absolute():
+        path = data_root / path
+    return path.resolve()
+
+
+class TaskInstanceRegistry:
+    """Persistent setup registry for task files and their independent instances."""
+
+    def __init__(self,
+                 data_root: Path,
+                 seed_task_files: Iterable[Tuple[Path, Optional[Path]]] = ()):
+        self.data_root = data_root
+        self.registry_file = data_root / "task_backend_registry.json"
+        self.lock_file = self.registry_file.with_suffix(self.registry_file.suffix + ".lock")
+        self.data_root.mkdir(parents=True, exist_ok=True)
+        self.ensure_initialized(seed_task_files)
+
+    @contextmanager
+    def locked_registry(self):
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_file.open("a+", encoding="utf-8") as lock_f:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                registry = self._read_unlocked()
+                yield registry
+                self._write_unlocked(registry)
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def ensure_initialized(self, seed_task_files: Iterable[Tuple[Path, Optional[Path]]]) -> None:
+        with self.locked_registry() as registry:
+            changed = False
+            for task_path, state_file in seed_task_files:
+                if not task_path.exists():
+                    continue
+                _, added = self._add_task_file_unlocked(
+                    registry,
+                    task_path.resolve(),
+                    task_path.name,
+                    seed_default=True,
+                    default_state_file=state_file.resolve() if state_file else None,
+                )
+                changed = changed or added
+            if changed:
+                registry["updated_at"] = now_iso()
+
+    def _read_unlocked(self) -> Registry:
+        if not self.registry_file.exists():
+            return {"version": 1, "task_files": [], "created_at": now_iso(), "updated_at": now_iso()}
+        with self.registry_file.open("r", encoding="utf-8") as f:
+            try:
+                registry = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise BackendError(HTTPStatus.INTERNAL_SERVER_ERROR, f"invalid registry file: {exc}") from exc
+        if not isinstance(registry, dict):
+            raise BackendError(HTTPStatus.INTERNAL_SERVER_ERROR, "registry file root must be an object")
+        registry.setdefault("version", 1)
+        registry.setdefault("task_files", [])
+        registry.setdefault("created_at", now_iso())
+        registry.setdefault("updated_at", now_iso())
+        if not isinstance(registry["task_files"], list):
+            registry["task_files"] = []
+        return registry
+
+    def _write_unlocked(self, registry: Registry) -> None:
+        self.registry_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self.registry_file.name + ".",
+            suffix=".tmp",
+            dir=str(self.registry_file.parent),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(registry, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.registry_file)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    def snapshot(self) -> Registry:
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_file.open("a+", encoding="utf-8") as lock_f:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_SH)
+            try:
+                registry = self._read_unlocked()
+                return json.loads(json.dumps(registry, ensure_ascii=False))
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _add_task_file_unlocked(self,
+                                registry: Registry,
+                                task_path: Path,
+                                label: str,
+                                seed_default: bool,
+                                default_state_file: Optional[Path] = None) -> Tuple[Dict[str, Any], bool]:
+        task_path = task_path.resolve()
+        for entry in registry.get("task_files", []):
+            if isinstance(entry, dict) and str(entry.get("path", "")) == str(task_path):
+                entry.setdefault("instances", [])
+                if seed_default and not entry["instances"]:
+                    self._add_instance_unlocked(entry, "default", default_state_file)
+                return entry, False
+
+        existing_ids = [str(entry.get("id", "")) for entry in registry.get("task_files", []) if isinstance(entry, dict)]
+        file_id = unique_slug(task_path.stem, existing_ids, "tasks")
+        entry = {
+            "id": file_id,
+            "label": label.strip() or task_path.name,
+            "path": str(task_path),
+            "created_at": now_iso(),
+            "instances": [],
+        }
+        if seed_default:
+            self._add_instance_unlocked(entry, "default", default_state_file)
+        registry.setdefault("task_files", []).append(entry)
+        return entry, True
+
+    def _add_instance_unlocked(self,
+                               task_file: Dict[str, Any],
+                               label: str,
+                               state_file: Optional[Path] = None) -> Dict[str, Any]:
+        instances = task_file.setdefault("instances", [])
+        existing_ids = [str(item.get("id", "")) for item in instances if isinstance(item, dict)]
+        instance_id = unique_slug(label, existing_ids, "instance")
+        if state_file is None:
+            state_file = self.data_root / "instances" / str(task_file["id"]) / instance_id / "progress_state.json"
+        instance = {
+            "id": instance_id,
+            "label": label.strip() or instance_id,
+            "state_file": relative_to_root(state_file, self.data_root),
+            "created_at": now_iso(),
+        }
+        instances.append(instance)
+        return instance
+
+    def add_task_file(self, task_path: Path, label: str = "") -> Dict[str, Any]:
+        if not task_path.exists():
+            raise BackendError(HTTPStatus.BAD_REQUEST, f"task file not found: {task_path}")
+        if not task_path.is_file():
+            raise BackendError(HTTPStatus.BAD_REQUEST, f"task file is not a file: {task_path}")
+        load_task_file(task_path)
+        with self.locked_registry() as registry:
+            entry, added = self._add_task_file_unlocked(
+                registry,
+                task_path,
+                label or task_path.name,
+                seed_default=True,
+            )
+            if added:
+                registry["updated_at"] = now_iso()
+            return json.loads(json.dumps(entry, ensure_ascii=False))
+
+    def add_instance(self, task_file_id: str, label: str) -> Dict[str, Any]:
+        label = label.strip()
+        if not label:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "instance name is required")
+        with self.locked_registry() as registry:
+            entry = self._find_task_file_unlocked(registry, task_file_id)
+            instance = self._add_instance_unlocked(entry, label)
+            registry["updated_at"] = now_iso()
+            return json.loads(json.dumps(instance, ensure_ascii=False))
+
+    def _find_task_file_unlocked(self, registry: Registry, task_file_id: str) -> Dict[str, Any]:
+        for entry in registry.get("task_files", []):
+            if isinstance(entry, dict) and str(entry.get("id", "")) == task_file_id:
+                return entry
+        raise BackendError(HTTPStatus.NOT_FOUND, f"unknown task file: {task_file_id}")
+
+    def resolve(self, task_file_id: str, instance_id: str) -> Dict[str, Any]:
+        registry = self.snapshot()
+        entry = self._find_task_file_unlocked(registry, task_file_id)
+        for instance in entry.get("instances", []):
+            if isinstance(instance, dict) and str(instance.get("id", "")) == instance_id:
+                task_path = path_from_user(str(entry.get("path", "")))
+                if not task_path.exists():
+                    raise BackendError(HTTPStatus.BAD_REQUEST, f"task file not found: {task_path}")
+                load_task_file(task_path)
+                state_file = state_path_from_instance(self.data_root, instance)
+                instance_dir = state_file.parent
+                return {
+                    "task_file": entry,
+                    "instance": instance,
+                    "task_path": task_path,
+                    "state_file": state_file,
+                    "instance_dir": instance_dir,
+                }
+        raise BackendError(HTTPStatus.NOT_FOUND, f"unknown instance: {instance_id}")
+
+
+class BackendRuntime:
+    def __init__(self, registry: TaskInstanceRegistry):
+        self.registry = registry
+        self.lock = threading.RLock()
+        self.backend: Optional[TaskBackend] = None
+        self.active_selection: Optional[Dict[str, Any]] = None
+
+    def is_started(self) -> bool:
+        with self.lock:
+            return self.backend is not None
+
+    def start(self, task_file_id: str, instance_id: str) -> Dict[str, Any]:
+        with self.lock:
+            if self.backend is not None:
+                raise BackendError(
+                    HTTPStatus.CONFLICT,
+                    "task backend is already started; restart the process to choose another instance",
+                )
+            resolved = self.registry.resolve(task_file_id, instance_id)
+            info = {
+                "task_file_id": str(resolved["task_file"].get("id", "")),
+                "task_file_label": str(resolved["task_file"].get("label", "")),
+                "task_file": str(resolved["task_path"]),
+                "instance_id": str(resolved["instance"].get("id", "")),
+                "instance_label": str(resolved["instance"].get("label", "")),
+                "state_file": str(resolved["state_file"]),
+                "started_at": now_iso(),
+            }
+            self.backend = TaskBackend(
+                data_root=resolved["instance_dir"],
+                task_file=resolved["task_path"],
+                state_file=resolved["state_file"],
+                runtime_info=info,
+            )
+            self.active_selection = info
+            return dict(info)
 
 
 def new_state() -> State:
@@ -266,13 +544,18 @@ class BackendError(Exception):
 
 
 class TaskBackend:
-    def __init__(self, data_root: Path, task_file: Path, state_file: Optional[Path] = None):
+    def __init__(self,
+                 data_root: Path,
+                 task_file: Path,
+                 state_file: Optional[Path] = None,
+                 runtime_info: Optional[Dict[str, Any]] = None):
         self.data_root = data_root
         self.task_file = task_file
         self.state_file = state_file or (data_root / "progress_state.json")
         self.lock_file = self.state_file.with_suffix(self.state_file.suffix + ".lock")
         self.tasks = load_task_file(task_file)
         self.tasks_by_name = {task["task_name"]: task for task in self.tasks}
+        self.runtime_info = runtime_info or {}
         self.data_root.mkdir(parents=True, exist_ok=True)
 
     @contextmanager
@@ -384,6 +667,7 @@ class TaskBackend:
             "reservation_count": len(reservations),
             "state_file": str(self.state_file),
             "task_file": str(self.task_file),
+            "runtime_info": self.runtime_info,
         }
 
     def task_detail_model(self, task_name: str) -> Dict[str, Any]:
@@ -624,11 +908,41 @@ def render_layout(title: str, body: str) -> str:
     .kv div {{ padding: 10px 12px; border-bottom: 1px solid var(--line); }}
     .kv div:nth-child(odd) {{ color: var(--muted); background: #fbfcfd; }}
     .empty {{ padding: 16px; color: var(--muted); }}
+    .notice {{ margin-bottom: 14px; padding: 12px 14px; border-radius: 6px; border: 1px solid var(--line); background: #ffffff; }}
+    .notice.warn {{ border-color: #f0d09b; background: #fff8ea; color: var(--warn); }}
+    .notice.bad {{ border-color: #e4a6af; background: #fff0f2; color: var(--bad); }}
+    form {{ margin: 0; }}
+    .form-grid {{ display: grid; grid-template-columns: minmax(180px, 260px) minmax(260px, 1fr); gap: 12px 16px; padding: 16px; align-items: center; }}
+    label {{ color: var(--muted); font-weight: 650; }}
+    input[type="text"], select {{
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }}
+    input[type="radio"] {{ margin-right: 8px; }}
+    button {{
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      padding: 9px 14px;
+      border-radius: 5px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }}
+    button.secondary {{ background: #fff; color: var(--accent); }}
+    .actions {{ padding: 0 16px 16px; display: flex; gap: 10px; flex-wrap: wrap; }}
     @media (max-width: 760px) {{
       main {{ padding: 18px 14px 28px; }}
       header {{ padding: 16px; }}
       .wide {{ overflow-x: auto; }}
       .kv {{ grid-template-columns: 1fr; }}
+      .form-grid {{ grid-template-columns: 1fr; }}
       .kv div:nth-child(odd) {{ padding-bottom: 2px; }}
       .kv div:nth-child(even) {{ padding-top: 2px; }}
     }}
@@ -655,6 +969,101 @@ def render_status_badge(status: str) -> str:
     return f"<span class=\"badge {status_class(status)}\">{html_escape(status or 'unknown')}</span>"
 
 
+def render_setup_page(registry: Registry, data_root: Path, message: str = "", error: str = "") -> str:
+    task_files = [entry for entry in registry.get("task_files", []) if isinstance(entry, dict)]
+    notices = ""
+    if message:
+        notices += f"<div class=\"notice\">{html_escape(message)}</div>"
+    if error:
+        notices += f"<div class=\"notice bad\">{html_escape(error)}</div>"
+
+    file_rows = []
+    start_rows = []
+    task_options = []
+    for entry in task_files:
+        file_id = str(entry.get("id", ""))
+        label = str(entry.get("label", file_id))
+        path = str(entry.get("path", ""))
+        task_count: Any = "-"
+        validation = "OK"
+        try:
+            task_count = len(load_task_file(path_from_user(path)))
+        except Exception as exc:
+            validation = str(exc)
+        instances = [item for item in entry.get("instances", []) if isinstance(item, dict)]
+        task_options.append(f"<option value=\"{html_escape(file_id)}\">{html_escape(label)} - {html_escape(path)}</option>")
+        file_rows.append(
+            "<tr>"
+            f"<td>{html_escape(label)}<div class=\"muted mono\">{html_escape(file_id)}</div></td>"
+            f"<td class=\"mono\">{html_escape(path)}</td>"
+            f"<td class=\"num\">{html_escape(task_count)}</td>"
+            f"<td class=\"num\">{html_escape(len(instances))}</td>"
+            f"<td>{html_escape(validation)}</td>"
+            "</tr>"
+        )
+        for instance in instances:
+            instance_id = str(instance.get("id", ""))
+            instance_label = str(instance.get("label", instance_id))
+            state_file = state_path_from_instance(data_root, instance)
+            value = f"{file_id}::{instance_id}"
+            start_rows.append(
+                "<tr>"
+                f"<td><label><input type=\"radio\" name=\"selection\" value=\"{html_escape(value)}\" required>"
+                f"{html_escape(label)}</label><div class=\"muted mono\">{html_escape(path)}</div></td>"
+                f"<td>{html_escape(instance_label)}<div class=\"muted mono\">{html_escape(instance_id)}</div></td>"
+                f"<td class=\"mono\">{html_escape(state_file)}</td>"
+                "</tr>"
+            )
+
+    if not file_rows:
+        file_rows.append("<tr><td colspan=\"5\" class=\"empty\">No task files registered yet. Add a tasks.json below.</td></tr>")
+    if not start_rows:
+        start_rows.append("<tr><td colspan=\"3\" class=\"empty\">No instances available yet.</td></tr>")
+    if not task_options:
+        task_options.append("<option value=\"\">No task files registered</option>")
+
+    start_disabled = "" if task_files else " disabled"
+    body = (
+        "<div class=\"crumbs\">Task backend / Setup</div>"
+        + notices
+        + "<div class=\"notice warn\">Select a task file and one isolated instance before starting the API. "
+        "After the backend starts, this process is locked to that instance; restart the process to change it.</div>"
+        "<section><h2>Registered Task Files</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Name</th><th>Path</th><th class=\"num\">Tasks</th><th class=\"num\">Instances</th><th>Status</th></tr></thead><tbody>"
+        + "\n".join(file_rows)
+        + "</tbody></table></div></section>"
+        "<section><h2>Start Existing Instance</h2>"
+        "<form method=\"post\" action=\"/setup/start\"><div class=\"wide\"><table>"
+        "<thead><tr><th>Task file</th><th>Instance</th><th>State file</th></tr></thead><tbody>"
+        + "\n".join(start_rows)
+        + "</tbody></table></div><div class=\"actions\">"
+        f"<button type=\"submit\"{start_disabled}>Start Selected Instance</button>"
+        "</div></form></section>"
+        "<section><h2>Create Instance And Start</h2>"
+        "<form method=\"post\" action=\"/setup/start\">"
+        "<input type=\"hidden\" name=\"mode\" value=\"new_instance\">"
+        "<div class=\"form-grid\">"
+        "<label for=\"task_file_id\">Task file</label>"
+        f"<select id=\"task_file_id\" name=\"task_file_id\">{''.join(task_options)}</select>"
+        "<label for=\"instance_label\">New instance name</label>"
+        "<input id=\"instance_label\" name=\"instance_label\" type=\"text\" placeholder=\"debug-run-1\" required>"
+        "</div><div class=\"actions\">"
+        f"<button type=\"submit\"{start_disabled}>Create And Start</button>"
+        "</div></form></section>"
+        "<section><h2>Add Task File</h2>"
+        "<form method=\"post\" action=\"/setup/task-files\">"
+        "<div class=\"form-grid\">"
+        "<label for=\"task_path\">tasks.json path</label>"
+        "<input id=\"task_path\" name=\"task_path\" type=\"text\" placeholder=\"./tasks.json\" required>"
+        "<label for=\"task_label\">Display name</label>"
+        "<input id=\"task_label\" name=\"task_label\" type=\"text\" placeholder=\"optional\">"
+        "</div><div class=\"actions\">"
+        "<button type=\"submit\" class=\"secondary\">Add Task File</button>"
+        "</div></form></section>"
+    )
+    return render_layout("Task Backend Setup", body)
+
+
 def render_dashboard(model: Dict[str, Any]) -> str:
     task_rows = []
     totals = {"reserved": 0, "confirmed": 0, "released": 0, "other": 0}
@@ -678,8 +1087,13 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         )
     table_body = "\n".join(task_rows) if task_rows else "<tr><td colspan=\"7\" class=\"empty\">No tasks loaded.</td></tr>"
     subject_note = ", ".join(model["subjects"]) if model["subjects"] else "No subjects yet"
+    runtime_info = model.get("runtime_info") or {}
+    instance_label = runtime_info.get("instance_label") or "-"
+    task_file_label = runtime_info.get("task_file_label") or "-"
     body = (
-        "<div class=\"crumbs\">Task backend / Overview</div>"
+        f"<div class=\"crumbs\">Task backend / Overview / {html_escape(instance_label)}</div>"
+        "<div class=\"notice warn\">This backend process is locked to the selected task file and instance. "
+        "Restart the process to choose another instance.</div>"
         "<div class=\"summary\">"
         + render_metric("Tasks", len(model["tasks"]), "from task file")
         + render_metric("Subjects", len(model["subjects"]), subject_note)
@@ -694,8 +1108,11 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         + table_body
         + "</tbody></table></div></section>"
         "<section><h2>Backend Files</h2><div class=\"kv\">"
+        f"<div>Task file selection</div><div>{html_escape(task_file_label)}</div>"
+        f"<div>Instance</div><div>{html_escape(instance_label)}</div>"
         f"<div>Task file</div><div class=\"mono\">{html_escape(model['task_file'])}</div>"
         f"<div>State file</div><div class=\"mono\">{html_escape(model['state_file'])}</div>"
+        f"<div>Started at</div><div class=\"mono\">{html_escape(runtime_info.get('started_at') or '-')}</div>"
         "</div></section>"
     )
     return render_layout("Task Dashboard", body)
@@ -827,8 +1244,19 @@ class RequestHandler(BaseHTTPRequestHandler):
     server_version = "OrbbecTaskBackend/1.0"
 
     @property
+    def runtime(self) -> BackendRuntime:
+        return self.server.runtime  # type: ignore[attr-defined]
+
+    @property
     def backend(self) -> TaskBackend:
-        return self.server.backend  # type: ignore[attr-defined]
+        with self.runtime.lock:
+            backend = self.runtime.backend
+        if backend is None:
+            raise BackendError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "task backend instance is not started; open the setup page and choose a task file instance",
+            )
+        return backend
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (now_iso(), fmt % args))
@@ -851,6 +1279,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _redirect(self, location: str) -> None:
+        self.send_response(int(HTTPStatus.SEE_OTHER))
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
     def _read_json(self) -> Dict[str, Any]:
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -867,11 +1302,42 @@ class RequestHandler(BaseHTTPRequestHandler):
             raise BackendError(HTTPStatus.BAD_REQUEST, "JSON body must be an object")
         return parsed
 
+    def _read_form(self) -> Dict[str, str]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "invalid Content-Length")
+        raw = self.rfile.read(max(0, length))
+        try:
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        except UnicodeDecodeError as exc:
+            raise BackendError(HTTPStatus.BAD_REQUEST, f"invalid form body: {exc}") from exc
+        return {key: values[0].strip() if values else "" for key, values in parsed.items()}
+
+    def _setup_page(self, message: str = "", error: str = "") -> str:
+        return render_setup_page(self.runtime.registry.snapshot(), self.runtime.registry.data_root, message, error)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
-            if parsed.path == "/api/v1/tasks":
+            if not self.runtime.is_started():
+                if parsed.path in ("", "/", "/setup"):
+                    self._html_response(HTTPStatus.OK, self._setup_page())
+                    return
+                if is_api:
+                    raise BackendError(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        "task backend instance is not started; choose a task file and instance on the setup page",
+                    )
+                raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+
+            if parsed.path == "/setup":
+                raise BackendError(
+                    HTTPStatus.CONFLICT,
+                    "task backend is already started; restart the process to choose another instance",
+                )
+            elif parsed.path == "/api/v1/tasks":
                 query = parse_qs(parsed.query)
                 subject_id = (query.get("subject_id") or [""])[0].strip()
                 if not subject_id:
@@ -908,6 +1374,35 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
+            if parsed.path.startswith("/setup/"):
+                if self.runtime.is_started():
+                    raise BackendError(
+                        HTTPStatus.CONFLICT,
+                        "task backend is already started; restart the process to choose another instance",
+                    )
+                form = self._read_form()
+                if parsed.path == "/setup/task-files":
+                    task_path = path_from_user(form.get("task_path", ""))
+                    label = form.get("task_label", "")
+                    entry = self.runtime.registry.add_task_file(task_path, label)
+                    message = "Added task file: " + str(entry.get("label", task_path.name))
+                    self._html_response(HTTPStatus.OK, self._setup_page(message=message))
+                    return
+                if parsed.path == "/setup/start":
+                    if form.get("mode") == "new_instance":
+                        task_file_id = form.get("task_file_id", "")
+                        instance = self.runtime.registry.add_instance(task_file_id, form.get("instance_label", ""))
+                        instance_id = str(instance.get("id", ""))
+                    else:
+                        selection = form.get("selection", "")
+                        if "::" not in selection:
+                            raise BackendError(HTTPStatus.BAD_REQUEST, "select an existing task file instance")
+                        task_file_id, instance_id = selection.split("::", 1)
+                    self.runtime.start(task_file_id, instance_id)
+                    self._redirect("/")
+                    return
+                raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+
             body = self._read_json()
             if parsed.path == "/api/v1/episodes/reserve":
                 self._json_response(HTTPStatus.OK, self.backend.reserve(body))
@@ -918,28 +1413,37 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 raise BackendError(HTTPStatus.NOT_FOUND, "not found")
         except BackendError as exc:
-            self._json_response(exc.status, {"error": exc.message})
+            if parsed.path.startswith("/setup/"):
+                self._html_response(exc.status, self._setup_page(error=exc.message))
+            else:
+                self._json_response(exc.status, {"error": exc.message})
         except Exception as exc:  # pragma: no cover - defensive server boundary
-            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+            if parsed.path.startswith("/setup/"):
+                self._html_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    self._setup_page(error=str(exc)),
+                )
+            else:
+                self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
 
 class TaskHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, server_address: Tuple[str, int], handler_cls: Any, backend: TaskBackend):
+    def __init__(self, server_address: Tuple[str, int], handler_cls: Any, runtime: BackendRuntime):
+        self.runtime = runtime
         super().__init__(server_address, handler_cls)
-        self.backend = backend
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Orbbec collection task backend")
     parser.add_argument("--host", default="127.0.0.1", help="bind host, default: 127.0.0.1")
     parser.add_argument("--port", default=8765, type=int, help="bind port, default: 8765")
-    parser.add_argument("--data-root", type=Path, help="backend-owned state directory; progress_state.json is stored here")
+    parser.add_argument("--data-root", type=Path, help="backend-owned setup and instance state directory")
     parser.add_argument("--save-root", type=Path, help="deprecated alias for --data-root")
-    parser.add_argument("--task-file", type=Path, help="task.json/tasks.json file; defaults to data-root/task.json, data-root/tasks.json, then cwd/tasks.json")
-    parser.add_argument("--state-file", type=Path, help="override progress_state.json path")
+    parser.add_argument("--task-file", type=Path, help="seed task.json/tasks.json file for the setup page")
+    parser.add_argument("--state-file", type=Path, help="legacy state file used for the seeded default instance")
     args = parser.parse_args(argv)
     if args.data_root is None and args.save_root is None:
         parser.error("--data-root is required (or legacy --save-root)")
@@ -952,20 +1456,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.data_root is None and args.save_root is not None:
         print("[task-backend] warning: --save-root is deprecated; use --data-root", file=sys.stderr)
     data_root = data_root_arg.expanduser().resolve()
-    task_file = (args.task_file.expanduser().resolve() if args.task_file else default_task_file(data_root).resolve())
-    if not task_file.exists():
-        print(f"task file not found: {task_file}", file=sys.stderr)
-        return 2
+    seed_task_files: List[Tuple[Path, Optional[Path]]] = []
+    seed_state_file = args.state_file.expanduser().resolve() if args.state_file else None
+    if args.task_file:
+        task_file = args.task_file.expanduser().resolve()
+        if task_file.exists():
+            seed_task_files.append((task_file, seed_state_file))
+        else:
+            print(f"[task-backend] warning: seed task file not found: {task_file}", file=sys.stderr)
+    else:
+        task_file = default_task_file(data_root).resolve()
+        if task_file.exists():
+            seed_task_files.append((task_file, seed_state_file))
 
-    state_file = args.state_file.expanduser().resolve() if args.state_file else None
-    backend = TaskBackend(data_root=data_root, task_file=task_file, state_file=state_file)
+    registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
+    runtime = BackendRuntime(registry)
     host_info = socket.getfqdn(args.host) if args.host not in ("", "0.0.0.0", "::") else args.host
-    print(f"[task-backend] tasks={len(backend.tasks)} task_file={task_file}", file=sys.stderr)
-    print(f"[task-backend] data_root={backend.data_root}", file=sys.stderr)
-    print(f"[task-backend] state_file={backend.state_file}", file=sys.stderr)
+    print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
+    print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{args.host}:{args.port} ({host_info})", file=sys.stderr)
+    print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)
 
-    server = TaskHTTPServer((args.host, args.port), RequestHandler, backend)
+    server = TaskHTTPServer((args.host, args.port), RequestHandler, runtime)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
