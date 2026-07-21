@@ -37,6 +37,7 @@
         "scriptPath": "extrinsic_health_check.py",
         "tagFamily": "tag36h11",
         "tagSizeM": 0.096,
+        "rotationMethod": "pnp",
         "sampleCount": 5,
         "sampleIntervalMs": 200,
         "maxSnapshotAgeMs": 1000,

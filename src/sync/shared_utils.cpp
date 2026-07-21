@@ -168,6 +168,14 @@ static std::string normalizeDepthEncodingConfig(std::string s) {
     return "png";
 }
 
+static std::string normalizeExtrinsicHealthRotationMethod(std::string s) {
+    s = normalizePresetKey(std::move(s));
+    if(s == "depthplane" || s == "depth" || s == "plane" || s == "depthfit" || s == "depthsampling") {
+        return "depth_plane";
+    }
+    return "pnp";
+}
+
 static std::string readFileAll(const fs::path &path) {
     std::ifstream file(path, std::ios::binary);
     if(!file.is_open()) {
@@ -373,6 +381,15 @@ AppConfig loadConfig(const fs::path &configPath) {
             }
             if(auto v = getDouble(healthObj, "tagSizeM")) {
                 cfg.extrinsicHealth.tagSizeM = std::max(0.001, *v);
+            }
+            if(auto v = getString(healthObj, "rotationMethod")) {
+                cfg.extrinsicHealth.rotationMethod = normalizeExtrinsicHealthRotationMethod(*v);
+            }
+            else if(auto v = getString(healthObj, "rotation_method")) {
+                cfg.extrinsicHealth.rotationMethod = normalizeExtrinsicHealthRotationMethod(*v);
+            }
+            else if(auto v = getString(healthObj, "planeAngleMethod")) {
+                cfg.extrinsicHealth.rotationMethod = normalizeExtrinsicHealthRotationMethod(*v);
             }
             if(auto v = getInt(healthObj, "sampleCount")) {
                 cfg.extrinsicHealth.sampleCount = std::max(1, std::min(30, *v));

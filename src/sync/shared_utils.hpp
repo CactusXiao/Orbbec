@@ -103,6 +103,7 @@ struct ExtrinsicHealthConfig {
     fs::path scriptPath;
     std::string tagFamily = "tag36h11";
     double tagSizeM = 0.096;
+    std::string rotationMethod = "pnp";
     int sampleCount = 5;
     int sampleIntervalMs = 200;
     int maxSnapshotAgeMs = 1000;

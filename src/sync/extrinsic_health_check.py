@@ -235,7 +235,7 @@ def sample_tag_depth_points(
     dist: np.ndarray,
     tag_size_m: float,
     cfg: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     grid_n = cfg_int(cfg, "depthSampleGridSize", 11, 3, 31)
     inset = cfg_float(cfg, "depthSampleInsetFrac", 0.18, 0.0, 0.45)
     radius_px = cfg_int(cfg, "depthSampleWindowRadiusPx", 2, 0, 8)
@@ -269,7 +269,7 @@ def sample_tag_depth_points(
     rays = cv2.undistortPoints(pixel_arr, K, dist).reshape(-1, 2)
     z_arr = np.asarray(zs, dtype=np.float64)
     points_camera = np.column_stack([rays[:, 0] * z_arr, rays[:, 1] * z_arr, z_arr])
-    return np.asarray(local_xy, dtype=np.float64), points_camera
+    return np.asarray(local_xy, dtype=np.float64), points_camera, rays
 
 
 def fit_plane_inliers(points: np.ndarray, cfg: dict[str, Any]) -> np.ndarray | None:
@@ -324,56 +324,149 @@ def fit_plane_inliers(points: np.ndarray, cfg: dict[str, Any]) -> np.ndarray | N
     return best_mask
 
 
-def fit_depth_tag_pose(local_xy: np.ndarray, points_camera: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, float] | None:
+def fit_plane_from_inliers(points: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if points.shape[0] < 3:
+        return None
+    center = np.mean(points, axis=0)
+    _, _, vt = np.linalg.svd(points - center, full_matrices=False)
+    normal = vt[-1]
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-9:
+        return None
+    return center, normal / norm
+
+
+def intersect_rays_with_plane(rays_xy: np.ndarray, plane_center: np.ndarray, plane_normal: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    directions = np.column_stack([rays_xy[:, 0], rays_xy[:, 1], np.ones(rays_xy.shape[0], dtype=np.float64)])
+    denom = directions @ plane_normal
+    numer = float(plane_center @ plane_normal)
+    valid = np.abs(denom) > 1e-9
+    lambdas = np.full(rays_xy.shape[0], np.nan, dtype=np.float64)
+    lambdas[valid] = numer / denom[valid]
+    valid &= np.isfinite(lambdas) & (lambdas > 0.0)
+    points = directions * lambdas[:, None]
+    return points, valid
+
+
+def solve_pnp_rotation(corners_px: np.ndarray, K: np.ndarray, dist: np.ndarray, object_pts: np.ndarray) -> np.ndarray | None:
+    ok, rvec, _tvec = cv2.solvePnP(object_pts, corners_px.astype(np.float32), K, dist, flags=cv2.SOLVEPNP_IPPE)
+    if not ok:
+        return None
+    R, _ = cv2.Rodrigues(rvec)
+    return R
+
+
+def rotation_method(cfg: dict[str, Any]) -> str:
+    raw = cfg.get("rotationMethod", cfg.get("rotation_method", cfg.get("planeAngleMethod", "pnp")))
+    key = "".join(ch for ch in str(raw).strip().lower() if ch not in " _-")
+    if key in {"depthplane", "depth", "plane", "depthfit", "depthsampling"}:
+        return "depth_plane"
+    return "pnp"
+
+
+def rigid_transform_from_points(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+    if source.shape[0] < 3 or target.shape[0] != source.shape[0]:
+        return None
+    source_center = np.mean(source, axis=0)
+    target_center = np.mean(target, axis=0)
+    source_zero = source - source_center
+    target_zero = target - target_center
+    H = source_zero.T @ target_zero
+    try:
+        U, _, vt = np.linalg.svd(H)
+    except np.linalg.LinAlgError:
+        return None
+    R = vt.T @ U.T
+    if float(np.linalg.det(R)) < 0.0:
+        vt[-1, :] *= -1.0
+        R = vt.T @ U.T
+    t = target_center - R @ source_center
+    return R, t
+
+
+def fit_depth_tag_pose(local_xy: np.ndarray, points_camera: np.ndarray, rays_xy: np.ndarray, rotation: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, float] | None:
     plane_mask = fit_plane_inliers(points_camera, cfg)
     if plane_mask is None:
         return None
 
     min_inliers = cfg_int(cfg, "depthMinPoseInliers", 18, 3, int(points_camera.shape[0]))
     thresh_m = cfg_float(cfg, "depthPoseInlierThreshM", 0.012, 0.001, 0.08)
-    mask = plane_mask.copy()
-    coeff = None
+
+    plane = fit_plane_from_inliers(points_camera[plane_mask])
+    if plane is None:
+        return None
+    plane_center, plane_normal = plane
+    target_points, ray_valid = intersect_rays_with_plane(rays_xy, plane_center, plane_normal)
+
+    source_points = np.column_stack([local_xy[:, 0], local_xy[:, 1], np.zeros(local_xy.shape[0], dtype=np.float64)])
+    mask = plane_mask & ray_valid
     residuals = None
+    t = None
+    R = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     for _ in range(3):
         if int(np.count_nonzero(mask)) < min_inliers:
             return None
-        A = np.column_stack([local_xy[mask, 0], local_xy[mask, 1], np.ones(int(np.count_nonzero(mask)))])
-        coeff, *_ = np.linalg.lstsq(A, points_camera[mask], rcond=None)
-        pred_all = np.column_stack([local_xy[:, 0], local_xy[:, 1], np.ones(local_xy.shape[0])]) @ coeff
-        residuals = np.linalg.norm(pred_all - points_camera, axis=1)
+        t = np.mean(target_points[mask] - (R @ source_points[mask].T).T, axis=0)
+        pred_all = (R @ source_points.T).T + t
+        residuals = np.linalg.norm(pred_all - target_points, axis=1)
         inlier_residuals = residuals[mask]
         med = float(np.median(inlier_residuals))
         mad = float(np.median(np.abs(inlier_residuals - med)))
         robust_thresh = max(thresh_m, med + 3.0 * 1.4826 * mad)
-        mask = plane_mask & (residuals <= robust_thresh)
+        mask = plane_mask & ray_valid & (residuals <= robust_thresh)
 
-    if coeff is None or residuals is None or int(np.count_nonzero(mask)) < min_inliers:
+    if t is None or residuals is None or int(np.count_nonzero(mask)) < min_inliers:
+        return None
+    t = np.mean(target_points[mask] - (R @ source_points[mask].T).T, axis=0)
+    pred_all = (R @ source_points.T).T + t
+    residuals = np.linalg.norm(pred_all - target_points, axis=1)
+    T = make_transform(R, t)
+    fit_rmse_m = float(np.sqrt(np.mean(residuals[mask] * residuals[mask]))) if np.count_nonzero(mask) else float("inf")
+    return T, fit_rmse_m
+
+
+def fit_depth_plane_tag_pose(local_xy: np.ndarray, points_camera: np.ndarray, rays_xy: np.ndarray, cfg: dict[str, Any]) -> tuple[np.ndarray, float] | None:
+    plane_mask = fit_plane_inliers(points_camera, cfg)
+    if plane_mask is None:
         return None
 
-    A = np.column_stack([local_xy[mask, 0], local_xy[mask, 1], np.ones(int(np.count_nonzero(mask)))])
-    coeff, *_ = np.linalg.lstsq(A, points_camera[mask], rcond=None)
-    x_vec = coeff[0]
-    y_vec = coeff[1]
-    origin = coeff[2]
-    x_norm = float(np.linalg.norm(x_vec))
-    if x_norm < 1e-9:
+    min_inliers = cfg_int(cfg, "depthMinPoseInliers", 18, 3, int(points_camera.shape[0]))
+    thresh_m = cfg_float(cfg, "depthPoseInlierThreshM", 0.012, 0.001, 0.08)
+
+    plane = fit_plane_from_inliers(points_camera[plane_mask])
+    if plane is None:
         return None
-    x_axis = x_vec / x_norm
-    y_vec = y_vec - x_axis * float(np.dot(x_axis, y_vec))
-    y_norm = float(np.linalg.norm(y_vec))
-    if y_norm < 1e-9:
+    plane_center, plane_normal = plane
+    target_points, ray_valid = intersect_rays_with_plane(rays_xy, plane_center, plane_normal)
+
+    source_points = np.column_stack([local_xy[:, 0], local_xy[:, 1], np.zeros(local_xy.shape[0], dtype=np.float64)])
+    mask = plane_mask & ray_valid
+    residuals = None
+    fitted = None
+    for _ in range(3):
+        if int(np.count_nonzero(mask)) < min_inliers:
+            return None
+        fitted = rigid_transform_from_points(source_points[mask], target_points[mask])
+        if fitted is None:
+            return None
+        R, t = fitted
+        pred_all = (R @ source_points.T).T + t
+        residuals = np.linalg.norm(pred_all - target_points, axis=1)
+        inlier_residuals = residuals[mask]
+        med = float(np.median(inlier_residuals))
+        mad = float(np.median(np.abs(inlier_residuals - med)))
+        robust_thresh = max(thresh_m, med + 3.0 * 1.4826 * mad)
+        mask = plane_mask & ray_valid & (residuals <= robust_thresh)
+
+    if fitted is None or residuals is None or int(np.count_nonzero(mask)) < min_inliers:
         return None
-    y_axis = y_vec / y_norm
-    z_axis = np.cross(x_axis, y_axis)
-    z_norm = float(np.linalg.norm(z_axis))
-    if z_norm < 1e-9:
+    fitted = rigid_transform_from_points(source_points[mask], target_points[mask])
+    if fitted is None:
         return None
-    z_axis = z_axis / z_norm
-    R = np.column_stack([x_axis, y_axis, z_axis])
-    if float(np.linalg.det(R)) < 0.0:
-        z_axis = -z_axis
-        R = np.column_stack([x_axis, y_axis, z_axis])
-    T = make_transform(R, origin)
+    R, t = fitted
+    pred_all = (R @ source_points.T).T + t
+    residuals = np.linalg.norm(pred_all - target_points, axis=1)
+    T = make_transform(R, t)
     fit_rmse_m = float(np.sqrt(np.mean(residuals[mask] * residuals[mask]))) if np.count_nonzero(mask) else float("inf")
     return T, fit_rmse_m
 
@@ -390,8 +483,14 @@ def estimate_single_tag_from_depth(
     sampled = sample_tag_depth_points(corners_px, depth16, depth_scale_m, K, dist, float(cfg["tagSizeM"]), cfg)
     if sampled is None:
         return None
-    local_xy, points_camera = sampled
-    fitted = fit_depth_tag_pose(local_xy, points_camera, cfg)
+    local_xy, points_camera, rays_xy = sampled
+    if rotation_method(cfg) == "depth_plane":
+        fitted = fit_depth_plane_tag_pose(local_xy, points_camera, rays_xy, cfg)
+    else:
+        R_pnp = solve_pnp_rotation(corners_px, K, dist, object_pts)
+        if R_pnp is None:
+            return None
+        fitted = fit_depth_tag_pose(local_xy, points_camera, rays_xy, R_pnp, cfg)
     if fitted is None:
         return None
     T_camera_from_tag, _fit_rmse_m = fitted
@@ -436,6 +535,15 @@ def project_residual_px(T_camera_from_world: np.ndarray, T_world_from_tag: np.nd
     proj, _ = cv2.projectPoints(object_pts, rvec, tvec, K, dist)
     err = np.linalg.norm(proj.reshape(-1, 2) - image_pts.reshape(-1, 2), axis=1)
     return float(np.sqrt(np.mean(err * err)))
+
+
+def pose_to_json(T: np.ndarray) -> dict[str, Any]:
+    T = np.asarray(T, dtype=np.float64).reshape(4, 4)
+    return {
+        "rotation": T[:3, :3].tolist(),
+        "translation": T[:3, 3].tolist(),
+        "matrix": T.tolist(),
+    }
 
 
 def median(values: list[float]) -> float:
@@ -560,6 +668,29 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
     camera_counts = status_counts(list(camera_statuses.values()))
     camera_counts["total"] = len(camera_statuses)
 
+    tag_results: dict[str, Any] = {}
+    for tag_id, observations in sorted(observations_by_tag.items()):
+        fused = fused_by_tag.get(tag_id)
+        inlier_cameras = set(fused.get("inlier_cameras", [])) if fused is not None else set()
+        tag_results[str(tag_id)] = {
+            "observation_count": len(observations),
+            "fused": {
+                "pose": pose_to_json(fused["pose"]),
+                "inlier_cameras": fused.get("inlier_cameras", []),
+                "candidate_count": int(fused.get("candidate_count", len(observations))),
+            } if fused is not None else None,
+            "observations": [
+                {
+                    "camera_id": obs["camera_id"],
+                    "rmse_px": float(obs["rmse"]),
+                    "inlier": obs["camera_id"] in inlier_cameras,
+                    "T_camera_from_tag": pose_to_json(obs["T_camera_from_tag"]),
+                    "T_world_from_tag": pose_to_json(obs["T_world_from_tag"]),
+                }
+                for obs in observations
+            ],
+        }
+
     return {
         "sample_index": sample.get("index"),
         "status": status,
@@ -574,6 +705,7 @@ def evaluate_sample(snapshot_dir: Path, sample: dict[str, Any], cameras: dict[st
         "camera_counts": camera_counts,
         "camera_statuses": dict(sorted(camera_statuses.items())),
         "fused_tag_count": len(fused_by_tag),
+        "tags": tag_results,
         "detected_by_camera": detected_by_camera,
         "cameras": camera_results,
     }
