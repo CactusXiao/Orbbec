@@ -9858,7 +9858,6 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     const double maxDiff = recorder.lastAlignedMaxDiffMs();
                     if(confirmReservationWithBackend()) {
-                        announce("confirm", "confirm");
                         if(maxDiff > 0.0) {
                             std::ostringstream oss;
                             oss.setf(std::ios::fixed);
@@ -9869,14 +9868,17 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                            && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)])) {
                             capUi.msg = "Task complete";
                             pushUiLog("Confirm OK. Selected task complete.");
+                            announce("task_complete", "selected task episodes complete");
                         }
                         else if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
                             capUi.msg = "Capture confirmed";
                             pushUiLog("Confirm OK. Same task next backend episode will be reserved on Start.");
+                            announce("confirm", "confirm");
                         }
                         else {
                             capUi.msg = "Capture confirmed";
                             pushUiLog("Confirm OK. Select a task.");
+                            announce("confirm", "confirm");
                         }
                         recorder.clearStatus();
                         captureState = CaptureState::IDLE;

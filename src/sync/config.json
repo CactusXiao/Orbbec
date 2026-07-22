@@ -97,6 +97,7 @@
             "start_failed": "start failed",
             "stop": "stop",
             "confirm": "confirm",
+            "task_complete": "selected task episodes complete",
             "confirm_failed": "confirm failed",
             "reset": "reset",
             "reset_select": "reset select",
