@@ -283,6 +283,14 @@ static int jsonInt(cJSON *obj, const char *key, int fallback = 0) {
     return fallback;
 }
 
+static bool jsonBool(cJSON *obj, const char *key, bool fallback = false) {
+    auto *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if(item && cJSON_IsBool(item)) {
+        return cJSON_IsTrue(item);
+    }
+    return fallback;
+}
+
 static std::string backendErrorFromBody(const std::string &body) {
     cJSON *root = cJSON_Parse(body.c_str());
     if(!root) {
@@ -339,6 +347,8 @@ static bool parseTasksPayload(const std::string &body,
         task.descriptionEn = jsonString(item, "description_en");
         task.completed = std::max(0, jsonInt(item, "completed", 0));
         task.total = std::max(0, jsonInt(item, "total", 0));
+        task.claimedBySubject = jsonString(item, "claimed_by_subject");
+        task.claimedByOther = jsonBool(item, "claimed_by_other", false);
         if(!task.taskName.empty()) {
             parsed.push_back(std::move(task));
         }

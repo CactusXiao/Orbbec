@@ -499,20 +499,42 @@ def confirmed_reservations(subject: Dict[str, Any], task_name: str) -> List[Dict
     return result
 
 
-def task_progress(subject: Dict[str, Any], task: Task) -> Dict[str, Any]:
+def task_claim_owner(state: State, task_name: str) -> str:
+    subjects = state.get("subjects", {})
+    if not isinstance(subjects, dict):
+        return ""
+    for subject_id in sorted(str(key) for key in subjects.keys()):
+        subject = subjects.get(subject_id, {})
+        if not isinstance(subject, dict):
+            continue
+        reservations = subject.get("reservations", {})
+        if not isinstance(reservations, dict):
+            continue
+        for item in reservations.values():
+            if not isinstance(item, dict):
+                continue
+            if item.get("task_name") == task_name and item.get("status") != "released":
+                return str(item.get("subject_id", subject_id))
+    return ""
+
+
+def task_progress(subject_id: str, subject: Dict[str, Any], task: Task, state: State) -> Dict[str, Any]:
     completed = len(confirmed_reservations(subject, task["task_name"]))
     total = int(task["total"])
+    owner = task_claim_owner(state, str(task["task_name"]))
     return {
         "task_name": task["task_name"],
         "description_cn": task["description_cn"],
         "description_en": task["description_en"],
         "completed": min(completed, total),
         "total": total,
+        "claimed_by_subject": owner,
+        "claimed_by_other": bool(owner and owner != subject_id),
     }
 
 
-def progress_payload(subject: Dict[str, Any], tasks: Iterable[Task]) -> Dict[str, Any]:
-    return {"tasks": [task_progress(subject, task) for task in tasks]}
+def progress_payload(subject_id: str, subject: Dict[str, Any], tasks: Iterable[Task], state: State) -> Dict[str, Any]:
+    return {"tasks": [task_progress(subject_id, subject, task, state) for task in tasks]}
 
 
 def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
@@ -1013,7 +1035,7 @@ class TaskBackend:
     def get_tasks(self, subject_id: str) -> Dict[str, Any]:
         with self.locked_state() as state:
             subject = ensure_subject(state, subject_id)
-            return progress_payload(subject, self.tasks)
+            return progress_payload(subject_id, subject, self.tasks, state)
 
     def reserve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
@@ -1027,6 +1049,9 @@ class TaskBackend:
 
         with self.locked_state() as state:
             subject = ensure_subject(state, subject_id)
+            owner = task_claim_owner(state, task_name)
+            if owner and owner != subject_id:
+                raise BackendError(HTTPStatus.CONFLICT, f"task already claimed by subject: {owner}")
             completed = len(confirmed_reservations(subject, task_name))
             if completed >= int(task["total"]):
                 raise BackendError(HTTPStatus.CONFLICT, f"task already complete: {task_name}")
@@ -1073,7 +1098,7 @@ class TaskBackend:
                 reservation = subject["reservations"].get(reservation_id)
                 if reservation is None:
                     raise BackendError(HTTPStatus.NOT_FOUND, "reservation not found for idempotency_key")
-                return progress_payload(subject, self.tasks)
+                return progress_payload(subject_id, subject, self.tasks, state)
 
             reservation = subject["reservations"].get(reservation_id)
             if reservation is None:
@@ -1089,7 +1114,7 @@ class TaskBackend:
                 if previous_key and previous_key != idempotency_key:
                     raise BackendError(HTTPStatus.CONFLICT, "reservation already confirmed with another idempotency_key")
                 subject["idempotency"][idempotency_key] = reservation_id
-                return progress_payload(subject, self.tasks)
+                return progress_payload(subject_id, subject, self.tasks, state)
 
             reservation["status"] = "confirmed"
             reservation["confirmed_at"] = now_iso()
@@ -1103,7 +1128,7 @@ class TaskBackend:
             if frame_count is not None:
                 reservation["frame_count"] = frame_count
             subject["idempotency"][idempotency_key] = reservation_id
-            return progress_payload(subject, self.tasks)
+            return progress_payload(subject_id, subject, self.tasks, state)
 
     def release(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         reservation_id = str(payload.get("reservation_id", "")).strip()
@@ -1116,7 +1141,7 @@ class TaskBackend:
             subject = ensure_subject(state, subject_id)
             reservation = subject["reservations"].get(reservation_id)
             if reservation is None:
-                return {"released": False, "reason": "not_found", **progress_payload(subject, self.tasks)}
+                return {"released": False, "reason": "not_found", **progress_payload(subject_id, subject, self.tasks, state)}
             if task_name and reservation.get("task_name") != task_name:
                 raise BackendError(HTTPStatus.CONFLICT, "reservation does not match task")
             if reservation.get("status") == "reserved":
@@ -1126,7 +1151,7 @@ class TaskBackend:
                 released = True
             else:
                 released = False
-            return {"released": released, **progress_payload(subject, self.tasks)}
+            return {"released": released, **progress_payload(subject_id, subject, self.tasks, state)}
 
 
 def render_layout(title: str, body: str) -> str:

@@ -7982,6 +7982,8 @@ struct TaskInfo {
     int         repeat_times = 1;
     int         completed = 0;
     int         total = 1;
+    std::string claimedBySubject;
+    bool        claimedByOther = false;
 };
 
 struct TaskProgress {
@@ -8167,6 +8169,8 @@ static TaskInfo taskInfoFromBackend(const TaskBackendTask &src) {
     out.repeat_times = std::max(1, src.total);
     out.total = std::max(1, src.total);
     out.completed = std::max(0, std::min(src.completed, out.total));
+    out.claimedBySubject = src.claimedBySubject;
+    out.claimedByOther = src.claimedByOther;
     return out;
 }
 
@@ -8181,6 +8185,10 @@ static int findTaskIndexByName(const std::vector<TaskInfo> &tasks, const std::st
 
 static bool isTaskComplete(const TaskInfo &task) {
     return task.completed >= task.total;
+}
+
+static bool isTaskSelectable(const TaskInfo &task) {
+    return !task.claimedByOther && !isTaskComplete(task);
 }
 
 static std::string makeCollectionClientId() {
@@ -8569,6 +8577,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         }
 
         capUi.currentTaskIdx = keep.empty() ? -1 : findTaskIndexByName(capUi.tasks, keep);
+        if(capUi.currentTaskIdx >= 0 && !isTaskSelectable(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)])) {
+            capUi.currentTaskIdx = -1;
+        }
         if(capUi.currentTaskIdx >= 0) {
             const auto &task = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)];
             capUi.currentEpisode = isTaskComplete(task) ? task.total : task.completed + 1;
@@ -8996,22 +9007,26 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                                        listPanel.width - 20, rowH - 6);
                 const bool selected = taskIdx == capUi.currentTaskIdx;
                 const bool complete = isTaskComplete(task);
+                const bool claimedByOther = task.claimedByOther;
                 const bool hover = rowRect.contains(cv::Point(fm.x, fm.y));
                 cv::Scalar bg = selected ? cv::Scalar(62, 58, 34)
                               : (hover ? cv::Scalar(44, 44, 48) : cv::Scalar(32, 32, 35));
+                if(claimedByOther && !selected) {
+                    bg = hover ? cv::Scalar(45, 35, 35) : cv::Scalar(34, 28, 28);
+                }
                 if(complete && !selected) {
                     bg = hover ? cv::Scalar(38, 50, 38) : cv::Scalar(28, 38, 28);
                 }
                 cv::rectangle(ui, rowRect, bg, cv::FILLED);
                 cv::rectangle(ui, rowRect, selected ? cv::Scalar(255, 220, 80) : cv::Scalar(68, 68, 72), 1);
 
-                const std::string progress = std::to_string(task.completed) + "/" + std::to_string(task.total);
+                const std::string progress = claimedByOther ? "claimed" : (std::to_string(task.completed) + "/" + std::to_string(task.total));
                 int baseline = 0;
                 const auto progSz = cv::getTextSize(progress, cv::FONT_HERSHEY_DUPLEX, 0.58, 1, &baseline);
                 cv::putText(ui, progress,
                             cv::Point(rowRect.x + rowRect.width - progSz.width - 10, rowRect.y + 24),
                             cv::FONT_HERSHEY_DUPLEX, 0.58,
-                            complete ? cv::Scalar(120, 220, 120) : cv::Scalar(220, 220, 220),
+                            claimedByOther ? cv::Scalar(150, 150, 170) : (complete ? cv::Scalar(120, 220, 120) : cv::Scalar(220, 220, 220)),
                             1, cv::LINE_AA);
 
                 std::string label = task.name;
@@ -9025,11 +9040,18 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 }
                 cv::putText(ui, label, cv::Point(rowRect.x + 10, rowRect.y + 24),
                             cv::FONT_HERSHEY_DUPLEX, 0.55,
-                            selected ? cv::Scalar(255, 235, 130) : cv::Scalar(235, 235, 235),
+                            claimedByOther ? cv::Scalar(155, 155, 165) : (selected ? cv::Scalar(255, 235, 130) : cv::Scalar(235, 235, 235)),
                             1, cv::LINE_AA);
 
                 if(!exitConfirmActive && fm.clicked && rowRect.contains(cv::Point(fm.clickX, fm.clickY))) {
                     fm.clicked = false;
+                    if(claimedByOther) {
+                        capUi.msg = task.claimedBySubject.empty()
+                                        ? "Task already claimed by another subject"
+                                        : ("Task already claimed by subject " + task.claimedBySubject);
+                        pushUiLog(capUi.msg + ": " + task.name);
+                        continue;
+                    }
                     capUi.currentTaskIdx = taskIdx;
                     capUi.currentEpisode = complete ? task.total : task.completed + 1;
                     capUi.msg = complete ? "Selected task is complete" : "Task selected";
@@ -9043,6 +9065,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
             const bool taskSelected = capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size());
             const bool selectedTaskComplete = taskSelected && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
+            const bool selectedTaskClaimedByOther = taskSelected && capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].claimedByOther;
+            const bool selectedTaskSelectable = taskSelected && isTaskSelectable(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
             if(taskSelected) {
                 const auto &task = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)];
                 auto nameLines = wrapTextToWidth(task.name, detailPanel.width - 32,
@@ -9055,9 +9079,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                                 2, cv::LINE_AA);
                     y += 36;
                 }
+                std::string ownerLabel = task.claimedBySubject.empty() ? std::string("another subject") : task.claimedBySubject;
+                if(ownerLabel.size() > 24) {
+                    ownerLabel = ownerLabel.substr(0, 21) + "...";
+                }
                 const std::string progressLine = "Progress " + std::to_string(task.completed)
                                                + " / " + std::to_string(task.total)
-                                               + (selectedTaskComplete ? "  complete" : "  ready to capture");
+                                               + (selectedTaskClaimedByOther
+                                                      ? ("  claimed by " + ownerLabel)
+                                                      : (selectedTaskComplete ? "  complete" : "  ready to capture"));
                 cv::putText(ui, progressLine, cv::Point(detailPanel.x + 16, y + 8),
                             cv::FONT_HERSHEY_DUPLEX, 0.68, cv::Scalar(210, 210, 210), 1, cv::LINE_AA);
 
@@ -9098,7 +9128,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             cv::Rect bMenu(margin + 184, btnY, 150, btnH);
             cv::Rect bRefresh(winW - margin - 380, btnY, 160, btnH);
             cv::Rect bContinue(winW - margin - 204, btnY, 204, btnH);
-            const bool allowContinue = !exitConfirmActive && taskSelected && !selectedTaskComplete;
+            const bool allowContinue = !exitConfirmActive && selectedTaskSelectable;
             bool doConfig = uiButtonEx(ui, bConfig, "Back Config", fm, !exitConfirmActive);
             bool doMenu = uiButtonEx(ui, bMenu, "Menu", fm, !exitConfirmActive);
             bool doRefresh = uiButtonEx(ui, bRefresh, "Refresh", fm, !exitConfirmActive);
@@ -9220,8 +9250,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const auto cameraReadiness = recorder.cameraStreamReadiness();
             const bool taskSelected = capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size());
             const bool selectedTaskComplete = taskSelected && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
+            const bool selectedTaskClaimedByOther = taskSelected && capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].claimedByOther;
+            const bool selectedTaskSelectable = taskSelected && isTaskSelectable(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
-               && taskSelected && !selectedTaskComplete && !extrinsicReadyChecked) {
+               && selectedTaskSelectable && !extrinsicReadyChecked) {
                 collectionSetStage("ui_extrinsic_ready_check");
                 pushUiLog("Checking camera extrinsics before READY...");
 
@@ -9241,8 +9273,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 }
             }
             const bool readyForStart = cameraReadiness.allReady
-                                    && taskSelected
-                                    && !selectedTaskComplete
+                                    && selectedTaskSelectable
                                     && (extrinsicReadyChecked && extrinsicReadyPassed);
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady) {
                 if(readyForStart && !cameraReadyAnnounced) {
@@ -9307,13 +9338,19 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 for(size_t i = 0; i < nameLines.size() && i < 3; ++i) {
                     cv::putText(ui, nameLines[i], cv::Point(taskPanel.x + 20, y),
                                 cv::FONT_HERSHEY_DUPLEX, 1.08,
-                                isTaskComplete(task) ? cv::Scalar(120, 220, 120) : cv::Scalar(255, 220, 50),
+                                selectedTaskClaimedByOther ? cv::Scalar(150, 150, 170) : (isTaskComplete(task) ? cv::Scalar(120, 220, 120) : cv::Scalar(255, 220, 50)),
                                 2, cv::LINE_AA);
                     y += 40;
                 }
+                std::string ownerLabel = task.claimedBySubject.empty() ? std::string("another subject") : task.claimedBySubject;
+                if(ownerLabel.size() > 24) {
+                    ownerLabel = ownerLabel.substr(0, 21) + "...";
+                }
                 const std::string progressLine = "Progress " + std::to_string(task.completed)
                                                + " / " + std::to_string(task.total)
-                                               + (isTaskComplete(task) ? "  complete" : "  next episode after reserve");
+                                               + (selectedTaskClaimedByOther
+                                                      ? ("  claimed by " + ownerLabel)
+                                                      : (isTaskComplete(task) ? "  complete" : "  next episode after reserve"));
                 cv::putText(ui, progressLine, cv::Point(taskPanel.x + 20, y + 8),
                             cv::FONT_HERSHEY_DUPLEX, 0.72, cv::Scalar(205, 205, 205), 1, cv::LINE_AA);
 
@@ -9363,6 +9400,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     sd = {"SELECT TASK", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
                     stateEmphasisLine = "Choose one task from the backend task list";
                     stateFootnoteLine = cameraReadiness.message;
+                }
+                else if(selectedTaskClaimedByOther) {
+                    sd = {"TASK CLAIMED", cv::Scalar(170, 170, 190), cv::Scalar(48, 35, 35)};
+                    stateEmphasisLine = "Selected task belongs to another subject";
+                    stateFootnoteLine = "Return to Tasks and select an available task";
                 }
                 else if(selectedTaskComplete) {
                     sd = {"TASK COMPLETE", cv::Scalar(120, 220, 120), cv::Scalar(30, 60, 30)};
@@ -9554,7 +9596,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
             std::string startLabel = "Start  [Ctrl+1]";
             if(!allowStart && captureState == CaptureState::IDLE && taskSelected) {
-                if(selectedTaskComplete) {
+                if(selectedTaskClaimedByOther) {
+                    startLabel = "Start (claimed)";
+                }
+                else if(selectedTaskComplete) {
                     startLabel = "Start (task complete)";
                 }
                 else if(!cameraReadiness.allReady) {

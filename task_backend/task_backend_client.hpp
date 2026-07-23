@@ -11,6 +11,8 @@ struct TaskBackendTask {
     std::string descriptionEn;
     int completed = 0;
     int total = 0;
+    std::string claimedBySubject;
+    bool claimedByOther = false;
 };
 
 struct TaskEpisodeReservation {
