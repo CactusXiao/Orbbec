@@ -415,6 +415,8 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
                                        const std::string &taskName,
                                        int episodeNumber,
                                        const std::string &localPath,
+                                       double durationSeconds,
+                                       int frameCount,
                                        const std::string &idempotencyKey,
                                        std::vector<TaskBackendTask> &tasksOut,
                                        std::string *errorMessage) const {
@@ -424,6 +426,12 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
     cJSON_AddStringToObject(root, "task_name", taskName.c_str());
     cJSON_AddNumberToObject(root, "episode_number", episodeNumber);
     cJSON_AddStringToObject(root, "local_path", localPath.c_str());
+    if(durationSeconds > 0.0) {
+        cJSON_AddNumberToObject(root, "duration_seconds", durationSeconds);
+    }
+    if(frameCount > 0) {
+        cJSON_AddNumberToObject(root, "frame_count", frameCount);
+    }
     cJSON_AddStringToObject(root, "idempotency_key", idempotencyKey.c_str());
     const std::string body = printJson(root);
     cJSON_Delete(root);

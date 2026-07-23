@@ -1150,6 +1150,11 @@ static void replaceAllInPlace(std::string &s, const std::string &needle, const s
 }
 
 class VoiceAnnouncer {
+    struct VoiceMessage {
+        std::string key;
+        std::string text;
+    };
+
 public:
     explicit VoiceAnnouncer(VoiceFeedbackConfig cfg)
         : cfg_(std::move(cfg)) {
@@ -1177,9 +1182,19 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            queue_.push_back(std::move(text));
+            queue_.push_back(VoiceMessage{ messageKey, std::move(text) });
         }
         cv_.notify_one();
+    }
+
+    void clearPending(const std::string &messageKey) {
+        if(!cfg_.enabled) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx_);
+        queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+                                    [&](const VoiceMessage &message) { return message.key == messageKey; }),
+                     queue_.end());
     }
 
     void stop() {
@@ -1234,7 +1249,7 @@ private:
                 if(stopping_ && queue_.empty()) {
                     return;
                 }
-                text = std::move(queue_.front());
+                text = std::move(queue_.front().text);
                 queue_.pop_front();
             }
 
@@ -1253,7 +1268,7 @@ private:
     VoiceFeedbackConfig       cfg_;
     std::mutex                mtx_;
     std::condition_variable   cv_;
-    std::deque<std::string>   queue_;
+    std::deque<VoiceMessage>  queue_;
     std::thread               worker_;
     bool                      stopping_ = false;
     bool                      warnedFailure_ = false;
@@ -2678,6 +2693,18 @@ public:
     double lastRecordedSeconds() const {
         std::lock_guard<std::mutex> lock(mtx_);
         return lastRecordedSeconds_;
+    }
+
+    int currentSessionFrameCount() const {
+        std::lock_guard<std::mutex> lock(coordMtx_);
+        if(!session_.active) {
+            return 0;
+        }
+        const size_t actualFrames = session_.fullAligned > 0 ? session_.fullAligned : session_.nextFrameIndex;
+        if(actualFrames > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            return std::numeric_limits<int>::max();
+        }
+        return static_cast<int>(actualFrames);
     }
 
     bool autoStopIfTimeout() {
@@ -8113,6 +8140,8 @@ struct EpisodeReservationUi {
     int         episodeNumber = 0;
     fs::path    localPath;
     std::string idempotencyKey;
+    double      durationSeconds = 0.0;
+    int         frameCount = 0;
     bool        localFinalized = false;
     bool        countedComplete = false;
 
@@ -8123,6 +8152,8 @@ struct EpisodeReservationUi {
         episodeNumber = 0;
         localPath.clear();
         idempotencyKey.clear();
+        durationSeconds = 0.0;
+        frameCount = 0;
         localFinalized = false;
         countedComplete = false;
     }
@@ -8474,6 +8505,38 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         voice.say(messageKey, fallbackText);
     };
 
+    bool recordTickActive = false;
+    std::chrono::steady_clock::time_point nextRecordTick{};
+    auto startRecordingTick = [&]() {
+        recordTickActive = true;
+        nextRecordTick = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    };
+    auto stopRecordingTick = [&]() {
+        recordTickActive = false;
+        nextRecordTick = {};
+        voice.clearPending("record_tick");
+    };
+    auto updateRecordingTick = [&]() {
+        if(captureState != CaptureState::RECORDING || !recorder.isRecording()) {
+            if(recordTickActive) {
+                stopRecordingTick();
+            }
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if(!recordTickActive) {
+            recordTickActive = true;
+            nextRecordTick = now + std::chrono::seconds(1);
+            return;
+        }
+        if(now >= nextRecordTick) {
+            announce("record_tick", "di");
+            do {
+                nextRecordTick += std::chrono::seconds(1);
+            } while(now >= nextRecordTick + std::chrono::milliseconds(200));
+        }
+    };
+
     auto resetCameraReadyAnnouncement = [&]() {
         cameraReadyAnnounced = false;
         extrinsicReadyChecked = false;
@@ -8582,6 +8645,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                                          currentReservation.taskName,
                                          currentReservation.episodeNumber,
                                          currentReservation.localPath.string(),
+                                         currentReservation.durationSeconds,
+                                         currentReservation.frameCount,
                                          currentReservation.idempotencyKey,
                                          refreshedTasks,
                                          &error)) {
@@ -8652,6 +8717,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         }
         else {
             if(recorder.isRecording()) {
+                stopRecordingTick();
                 recorder.stopRecording();
             }
             if(recorder.hasCurrentSession()) {
@@ -9141,6 +9207,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     pushUiLog(fault->message);
                     announce("camera_fault", "camera error");
                     if(captureState == CaptureState::RECORDING) {
+                        stopRecordingTick();
                         recorder.stopRecording();
                         captureState = recorder.isDrainComplete() ? CaptureState::STOPPED_READY : CaptureState::DRAINING;
                         pushUiLog("Camera fault fuse tripped. Recording stopped.");
@@ -9785,6 +9852,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     captureState = CaptureState::RECORDING;
                     pendingResetAfterDrain = false;
                     capUi.msg.clear();
+                    startRecordingTick();
                     announce("start", "start");
                     pushUiLog("Recording: " + currentReservation.taskName
                               + " ep" + std::to_string(capUi.currentEpisode));
@@ -9804,6 +9872,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
             if(doStop) {
                 collectionSetStage("ui_capture_stop");
+                stopRecordingTick();
                 recorder.stopRecording();
                 announce("stop", "stop");
                 if(recorder.isDrainComplete()) {
@@ -9819,6 +9888,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 collectionSetStage("ui_capture_reset");
                 announce("reset", "reset");
                 if(captureState == CaptureState::RECORDING) {
+                    stopRecordingTick();
                     recorder.stopRecording();
                     pendingResetAfterDrain = true;
                     if(recorder.isDrainComplete()) {
@@ -9844,10 +9914,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(doSave) {
                 collectionSetStage("ui_capture_save");
                 bool localConfirmed = currentReservation.localFinalized;
+                const double sessionDurationSeconds = recorder.lastRecordedSeconds();
+                const int sessionFrameCount = recorder.currentSessionFrameCount();
                 if(!localConfirmed) {
                     localConfirmed = recorder.confirmCurrentSession();
                     if(localConfirmed) {
                         currentReservation.localFinalized = true;
+                        currentReservation.durationSeconds = sessionDurationSeconds;
+                        currentReservation.frameCount = sessionFrameCount;
                     }
                 }
                 if(!localConfirmed) {
@@ -9927,6 +10001,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
             // --- 超时自动停止 ---
             if(captureState == CaptureState::RECORDING && recorder.autoStopIfTimeout()) {
+                stopRecordingTick();
                 if(recorder.isDrainComplete()) {
                     updateReadyState();
                     capUi.msg = "Auto-stopped by max duration";
@@ -9937,6 +10012,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 }
                 pushUiLog("Auto stop by max duration");
             }
+
+            updateRecordingTick();
 
             // --- 消息显示 ---
             if(!capUi.msg.empty()) {

@@ -94,6 +94,7 @@
             "enter": "enter",
             "enter_failed": "enter failed",
             "start": "start",
+            "record_tick": "di",
             "start_failed": "start failed",
             "stop": "stop",
             "confirm": "confirm",

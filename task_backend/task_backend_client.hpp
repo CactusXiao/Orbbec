@@ -40,6 +40,8 @@ public:
                         const std::string &taskName,
                         int episodeNumber,
                         const std::string &localPath,
+                        double durationSeconds,
+                        int frameCount,
                         const std::string &idempotencyKey,
                         std::vector<TaskBackendTask> &tasksOut,
                         std::string *errorMessage = nullptr) const;

@@ -9,8 +9,10 @@ on a capture host without extra packages.
 from __future__ import annotations
 
 import argparse
+import csv
 import html
 import json
+import math
 import os
 import re
 import socket
@@ -574,6 +576,198 @@ def count_statuses(items: Iterable[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def parse_nonnegative_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    return parsed
+
+
+def parse_nonnegative_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return parsed
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 60.0:
+        return f"{seconds:.2f} s"
+    total = int(seconds + 0.5)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
+
+
+def format_bytes(size: Optional[int]) -> str:
+    if size is None:
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(max(0, size))
+    unit = units[0]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{int(value)} B"
+    return f"{value:.2f} {unit}"
+
+
+def safe_local_path(value: Any) -> Optional[Path]:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return None
+    try:
+        return path_from_user(text)
+    except (OSError, RuntimeError):
+        return None
+
+
+def directory_size_bytes(path: Path) -> Optional[int]:
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        if not path.is_dir():
+            return None
+    except OSError:
+        return None
+
+    total = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def timestamp_csv_stats(episode_dir: Path) -> Dict[str, Optional[float]]:
+    path = episode_dir / "timestamps.csv"
+    if not path.exists():
+        return {"frame_count": None, "duration_seconds": None}
+    frame_count = 0
+    first_ref_us: Optional[int] = None
+    last_ref_us: Optional[int] = None
+    try:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            ref_idx = header.index("ref_timestamp_us") if "ref_timestamp_us" in header else -1
+            for row in reader:
+                if not any(cell.strip() for cell in row):
+                    continue
+                frame_count += 1
+                if ref_idx >= 0 and ref_idx < len(row):
+                    try:
+                        ref_us = int(row[ref_idx])
+                    except (TypeError, ValueError):
+                        continue
+                    if first_ref_us is None:
+                        first_ref_us = ref_us
+                    last_ref_us = ref_us
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return {"frame_count": None, "duration_seconds": None}
+    duration_seconds: Optional[float] = None
+    if first_ref_us is not None and last_ref_us is not None and last_ref_us >= first_ref_us:
+        duration_seconds = (last_ref_us - first_ref_us) / 1000000.0
+    return {"frame_count": frame_count, "duration_seconds": duration_seconds}
+
+
+def reservation_duration_seconds(item: Dict[str, Any]) -> Optional[float]:
+    for key in ("duration_seconds", "capture_duration_seconds", "duration_sec"):
+        parsed = parse_nonnegative_float(item.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def reservation_frame_count(item: Dict[str, Any]) -> Optional[int]:
+    for key in ("frame_count", "total_frames", "frames"):
+        parsed = parse_nonnegative_int(item.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def episode_stats(item: Dict[str, Any]) -> Dict[str, Any]:
+    duration_seconds = reservation_duration_seconds(item)
+    frame_count = reservation_frame_count(item)
+    local_path = safe_local_path(item.get("local_path"))
+    storage_bytes: Optional[int] = None
+    path_exists = False
+    if local_path is not None:
+        try:
+            path_exists = local_path.exists()
+        except OSError:
+            path_exists = False
+        if path_exists:
+            storage_bytes = directory_size_bytes(local_path)
+            csv_stats = timestamp_csv_stats(local_path)
+            if frame_count is None:
+                frame_value = csv_stats.get("frame_count")
+                frame_count = int(frame_value) if frame_value is not None else None
+            if duration_seconds is None:
+                duration_seconds = csv_stats.get("duration_seconds")
+    return {
+        "duration_seconds": duration_seconds,
+        "duration_label": format_duration(duration_seconds),
+        "frame_count": frame_count,
+        "frame_count_label": str(frame_count) if frame_count is not None else "-",
+        "storage_bytes": storage_bytes,
+        "storage_label": format_bytes(storage_bytes),
+        "local_path_exists": path_exists,
+    }
+
+
+def with_episode_stats(item: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(item)
+    out["stats"] = episode_stats(out)
+    return out
+
+
+def sum_duration_seconds(items: Iterable[Dict[str, Any]]) -> float:
+    total = 0.0
+    for item in items:
+        value = item.get("stats", {}).get("duration_seconds")
+        if isinstance(value, (int, float)):
+            total += float(value)
+    return total
+
+
+def sum_storage_bytes(items: Iterable[Dict[str, Any]]) -> int:
+    total = 0
+    for item in items:
+        value = item.get("stats", {}).get("storage_bytes")
+        if isinstance(value, int):
+            total += value
+    return total
+
+
 def status_class(status: str) -> str:
     if status == "confirmed":
         return "ok"
@@ -721,7 +915,7 @@ class TaskBackend:
 
     def dashboard_model(self) -> Dict[str, Any]:
         state = self.state_snapshot()
-        reservations = self.reservation_list(state)
+        reservations = [with_episode_stats(item) for item in self.reservation_list(state)]
         subjects_obj = state.get("subjects", {})
         subjects = sorted(str(key) for key in subjects_obj.keys()) if isinstance(subjects_obj, dict) else []
         summaries = []
@@ -730,6 +924,7 @@ class TaskBackend:
             related = [item for item in reservations if item.get("task_name") == task_name]
             counts = count_statuses(related)
             task_subjects = sorted({str(item.get("subject_id", "")) for item in related if item.get("subject_id")})
+            confirmed = [item for item in related if item.get("status") == "confirmed"]
             summaries.append(
                 {
                     "task": task,
@@ -737,12 +932,17 @@ class TaskBackend:
                     "subjects": task_subjects,
                     "latest_at": latest_timestamp(related),
                     "reservation_count": len(related),
+                    "duration_seconds": sum_duration_seconds(confirmed),
+                    "storage_bytes": sum_storage_bytes(confirmed),
                 }
             )
+        confirmed_reservations = [item for item in reservations if item.get("status") == "confirmed"]
         return {
             "tasks": summaries,
             "subjects": subjects,
             "reservation_count": len(reservations),
+            "duration_seconds": sum_duration_seconds(confirmed_reservations),
+            "storage_bytes": sum_storage_bytes(confirmed_reservations),
             "state_file": str(self.state_file),
             "task_file": str(self.task_file),
             "runtime_info": self.runtime_info,
@@ -754,17 +954,20 @@ class TaskBackend:
             raise BackendError(HTTPStatus.NOT_FOUND, f"unknown task: {task_name}")
         state = self.state_snapshot()
         reservations = [
-            item
+            with_episode_stats(item)
             for item in self.reservation_list(state)
             if item.get("task_name") == task_name
         ]
         subjects = sorted({str(item.get("subject_id", "")) for item in reservations if item.get("subject_id")})
+        confirmed = [item for item in reservations if item.get("status") == "confirmed"]
         return {
             "task": task,
             "reservations": reservations,
             "subjects": subjects,
             "counts": count_statuses(reservations),
             "latest_at": latest_timestamp(reservations),
+            "duration_seconds": sum_duration_seconds(confirmed),
+            "storage_bytes": sum_storage_bytes(confirmed),
         }
 
     def episode_detail_model(self, reservation_id: str) -> Dict[str, Any]:
@@ -773,9 +976,37 @@ class TaskBackend:
             if item.get("reservation_id") == reservation_id:
                 task = self.tasks_by_name.get(str(item.get("task_name", "")))
                 return {
-                    "reservation": item,
+                    "reservation": with_episode_stats(item),
                     "task": task,
                     "metadata_pairs": metadata_pairs(task) if task is not None else [],
+                }
+        raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
+
+    def delete_episode(self, reservation_id: str) -> Dict[str, Any]:
+        reservation_id = reservation_id.strip()
+        if not reservation_id:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "reservation_id is required")
+        with self.locked_state() as state:
+            subjects = state.get("subjects", {})
+            if not isinstance(subjects, dict):
+                raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
+            for subject_id, subject in subjects.items():
+                if not isinstance(subject, dict):
+                    continue
+                reservations = subject.get("reservations", {})
+                if not isinstance(reservations, dict) or reservation_id not in reservations:
+                    continue
+                reservation = reservations.pop(reservation_id)
+                idempotency = subject.get("idempotency", {})
+                if isinstance(idempotency, dict):
+                    for key, value in list(idempotency.items()):
+                        if value == reservation_id:
+                            del idempotency[key]
+                return {
+                    "deleted": True,
+                    "reservation_id": reservation_id,
+                    "subject_id": str(subject_id),
+                    "task_name": str(reservation.get("task_name", "")) if isinstance(reservation, dict) else "",
                 }
         raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
 
@@ -865,6 +1096,12 @@ class TaskBackend:
             reservation["updated_at"] = now_iso()
             reservation["idempotency_key"] = idempotency_key
             reservation["local_path"] = local_path
+            duration_seconds = parse_nonnegative_float(payload.get("duration_seconds", payload.get("duration_sec")))
+            if duration_seconds is not None:
+                reservation["duration_seconds"] = round(duration_seconds, 3)
+            frame_count = parse_nonnegative_int(payload.get("frame_count", payload.get("total_frames")))
+            if frame_count is not None:
+                reservation["frame_count"] = frame_count
             subject["idempotency"][idempotency_key] = reservation_id
             return progress_payload(subject, self.tasks)
 
@@ -1014,6 +1251,7 @@ def render_layout(title: str, body: str) -> str:
       cursor: pointer;
     }}
     button.secondary {{ background: #fff; color: var(--accent); }}
+    button.danger {{ background: var(--bad); border-color: var(--bad); }}
     .actions {{ padding: 0 16px 16px; display: flex; gap: 10px; flex-wrap: wrap; }}
     @media (max-width: 760px) {{
       main {{ padding: 18px 14px 28px; }}
@@ -1159,11 +1397,13 @@ def render_dashboard(model: Dict[str, Any]) -> str:
             f"<td class=\"num\">{html_escape(counts.get('confirmed', 0))}</td>"
             f"<td class=\"num\">{html_escape(counts.get('reserved', 0))}</td>"
             f"<td class=\"num\">{html_escape(counts.get('released', 0))}</td>"
+            f"<td class=\"num\">{html_escape(format_duration(summary.get('duration_seconds')))}</td>"
+            f"<td class=\"num\">{html_escape(format_bytes(summary.get('storage_bytes')))}</td>"
             f"<td>{html_escape(', '.join(subjects) if subjects else '-')}</td>"
             f"<td class=\"muted mono\">{html_escape(summary.get('latest_at') or '-')}</td>"
             "</tr>"
         )
-    table_body = "\n".join(task_rows) if task_rows else "<tr><td colspan=\"7\" class=\"empty\">No tasks loaded.</td></tr>"
+    table_body = "\n".join(task_rows) if task_rows else "<tr><td colspan=\"9\" class=\"empty\">No tasks loaded.</td></tr>"
     subject_note = ", ".join(model["subjects"]) if model["subjects"] else "No subjects yet"
     runtime_info = model.get("runtime_info") or {}
     instance_label = runtime_info.get("instance_label") or "-"
@@ -1177,11 +1417,14 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         + render_metric("Subjects", len(model["subjects"]), subject_note)
         + render_metric("Episodes", model["reservation_count"], "all reservations")
         + render_metric("Confirmed", totals["confirmed"], "completed episodes")
+        + render_metric("Total Duration", format_duration(model.get("duration_seconds")), "confirmed episodes")
+        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed local paths")
         + "</div>"
         "<section><h2>Task Summary</h2><div class=\"wide\"><table>"
         "<thead><tr>"
         "<th>Task</th><th class=\"num\">Required / Subject</th><th class=\"num\">Confirmed</th>"
-        "<th class=\"num\">Reserved</th><th class=\"num\">Released</th><th>Subjects</th><th>Latest Update</th>"
+        "<th class=\"num\">Reserved</th><th class=\"num\">Released</th><th class=\"num\">Duration</th>"
+        "<th class=\"num\">Storage</th><th>Subjects</th><th>Latest Update</th>"
         "</tr></thead><tbody>"
         + table_body
         + "</tbody></table></div></section>"
@@ -1204,18 +1447,22 @@ def render_task_detail(model: Dict[str, Any]) -> str:
     for item in model["reservations"]:
         reservation_id = str(item.get("reservation_id", ""))
         status = str(item.get("status", "unknown"))
+        stats = item.get("stats", {})
         rows.append(
             "<tr>"
             f"<td><a class=\"mono\" href=\"/episodes/{url_part(reservation_id)}\">{html_escape(reservation_id[:8])}</a></td>"
             f"<td>{html_escape(item.get('subject_id', ''))}</td>"
             f"<td class=\"num\">{html_escape(item.get('episode_number', ''))}</td>"
             f"<td>{render_status_badge(status)}</td>"
+            f"<td class=\"num\">{html_escape(stats.get('duration_label', '-'))}</td>"
+            f"<td class=\"num\">{html_escape(stats.get('frame_count_label', '-'))}</td>"
+            f"<td class=\"num\">{html_escape(stats.get('storage_label', '-'))}</td>"
             f"<td class=\"mono\">{html_escape(item.get('client_id', '-'))}</td>"
             f"<td class=\"muted mono\">{html_escape(item.get('updated_at') or item.get('created_at') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(item.get('local_path') or '-')}</td>"
             "</tr>"
         )
-    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"7\" class=\"empty\">No episodes reserved yet.</td></tr>"
+    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"10\" class=\"empty\">No episodes reserved yet.</td></tr>"
     meta_rows = []
     for key, value in metadata_pairs(task):
         meta_rows.append(f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>")
@@ -1229,6 +1476,8 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + render_metric("Confirmed", counts.get("confirmed", 0))
         + render_metric("Reserved", counts.get("reserved", 0))
         + render_metric("Released", counts.get("released", 0))
+        + render_metric("Total Duration", format_duration(model.get("duration_seconds")), "confirmed episodes")
+        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed local paths")
         + "</div>"
         "<section><h2>Task Description</h2>"
         f"<div class=\"empty desc\">{html_escape(description or 'No description.')}</div></section>"
@@ -1239,6 +1488,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + "</div></section>"
         "<section><h2>Episodes</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Episode</th><th>Subject</th><th class=\"num\">No.</th><th>Status</th>"
+        "<th class=\"num\">Duration</th><th class=\"num\">Frames</th><th class=\"num\">Storage</th>"
         "<th>Client</th><th>Updated</th><th>Local Path</th></tr></thead><tbody>"
         + episode_rows
         + "</tbody></table></div></section>"
@@ -1252,12 +1502,16 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     task_name = str(item.get("task_name", ""))
     reservation_id = str(item.get("reservation_id", ""))
     status = str(item.get("status", "unknown"))
+    stats = item.get("stats", {})
     fields = [
         ("Reservation ID", reservation_id),
         ("Task", task_name),
         ("Subject", item.get("subject_id", "")),
         ("Episode number", item.get("episode_number", "")),
         ("Status", status),
+        ("Total duration", stats.get("duration_label", "-")),
+        ("Total frames", stats.get("frame_count_label", "-")),
+        ("Storage size", stats.get("storage_label", "-")),
         ("Client ID", item.get("client_id", "")),
         ("Local capture path", item.get("local_path") or "-"),
         ("Idempotency key", item.get("idempotency_key") or "-"),
@@ -1280,15 +1534,17 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         "Capture data is still stored on the capture host. NAS-backed file indexing "
         "and quality results can be attached here later."
     )
+    raw_item = dict(item)
+    raw_item.pop("stats", None)
     body = (
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / "
         f"<a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a> / "
         f"{html_escape(reservation_id[:8])}</div>"
         "<div class=\"summary\">"
         + render_metric("Status", status)
-        + render_metric("Subject", item.get("subject_id", ""))
-        + render_metric("Episode", item.get("episode_number", ""))
-        + render_metric("QA", "Pending", "quality module not connected")
+        + render_metric("Duration", stats.get("duration_label", "-"))
+        + render_metric("Frames", stats.get("frame_count_label", "-"))
+        + render_metric("Storage", stats.get("storage_label", "-"))
         + "</div>"
         "<section><h2>Episode Details</h2><div class=\"kv\">"
         + field_html
@@ -1301,8 +1557,14 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         "<section><h2>Task Metadata Snapshot</h2><div class=\"kv\">"
         + meta_html
         + "</div></section>"
+        "<section><h2>Backend Management</h2>"
+        "<div class=\"empty\">Delete removes this episode from backend progress only. Local capture files are not removed.</div>"
+        f"<form method=\"post\" action=\"/episodes/{url_part(reservation_id)}/delete\" "
+        "onsubmit=\"return confirm('Delete this episode from backend only? Local files will not be removed.');\">"
+        "<div class=\"actions\"><button type=\"submit\" class=\"danger\">Delete Episode From Backend</button></div></form>"
+        "</section>"
         "<section><h2>Raw Reservation JSON</h2>"
-        f"<div class=\"empty\"><pre class=\"mono\">{html_escape(json.dumps(item, ensure_ascii=False, indent=2, sort_keys=True))}</pre></div>"
+        f"<div class=\"empty\"><pre class=\"mono\">{html_escape(json.dumps(raw_item, ensure_ascii=False, indent=2, sort_keys=True))}</pre></div>"
         "</section>"
     )
     return render_layout("Episode " + reservation_id[:8], body)
@@ -1451,6 +1713,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        is_episode_html_post = parsed.path.startswith("/episodes/")
         try:
             if parsed.path.startswith("/setup/"):
                 if self.runtime.is_started():
@@ -1481,6 +1744,14 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 raise BackendError(HTTPStatus.NOT_FOUND, "not found")
 
+            if parsed.path.startswith("/episodes/") and parsed.path.endswith("/delete"):
+                raw_id = parsed.path[len("/episodes/"):-len("/delete")]
+                reservation_id = unquote(raw_id.strip("/")).strip()
+                result = self.backend.delete_episode(reservation_id)
+                task_name = str(result.get("task_name", ""))
+                self._redirect(f"/tasks/{url_part(task_name)}" if task_name else "/")
+                return
+
             body = self._read_json()
             if parsed.path == "/api/v1/episodes/reserve":
                 self._json_response(HTTPStatus.OK, self.backend.reserve(body))
@@ -1493,6 +1764,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         except BackendError as exc:
             if parsed.path.startswith("/setup/"):
                 self._html_response(exc.status, self._setup_page(error=exc.message))
+            elif is_episode_html_post:
+                self._html_response(exc.status, render_error_page(exc.status, exc.message))
             else:
                 self._json_response(exc.status, {"error": exc.message})
         except Exception as exc:  # pragma: no cover - defensive server boundary
@@ -1500,6 +1773,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._html_response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     self._setup_page(error=str(exc)),
+                )
+            elif is_episode_html_post:
+                self._html_response(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    render_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc)),
                 )
             else:
                 self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
