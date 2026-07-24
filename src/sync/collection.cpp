@@ -718,8 +718,8 @@ static std::string presetLabel(int w, int h, int fps) {
     return std::to_string(w) + "x" + std::to_string(h) + "@" + std::to_string(fps);
 }
 
-static constexpr int kCollectionFixedWidth = 1280;
-static constexpr int kCollectionFixedHeight = 800;
+static constexpr int kCollectionFixedWidth = 640;
+static constexpr int kCollectionFixedHeight = 400;
 static constexpr int kCollectionFixedFps = 30;
 static constexpr int kCollectionFixedMaxDurationSec = 120;
 
@@ -969,10 +969,10 @@ static std::shared_ptr<ob::VideoStreamProfile> pickVideoProfile(const std::share
 
         std::vector<std::pair<int, int>> fallbacks;
         if(sensorType == OB_SENSOR_DEPTH || sensorType == OB_SENSOR_IR || sensorType == OB_SENSOR_IR_LEFT || sensorType == OB_SENSOR_IR_RIGHT) {
-            fallbacks = { { 1280, 800 }, { 640, 400 }, { 320, 200 } };
+            fallbacks = { { 640, 400 }, { 1280, 800 }, { 320, 200 } };
         }
         else if(sensorType == OB_SENSOR_COLOR) {
-            fallbacks = { { 1280, 800 }, { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
+            fallbacks = { { 640, 400 }, { 1280, 800 }, { 1280, 720 }, { 1920, 1080 }, { 640, 480 }, { 640, 360 } };
         }
         for(const auto &fallback: fallbacks) {
             if(fallback.first == width && fallback.second == height) {

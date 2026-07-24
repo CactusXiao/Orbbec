@@ -1149,10 +1149,10 @@ std::shared_ptr<ob::VideoStreamProfile> pickDepthProfileForPointCloud(const std:
         }
     }
 
-    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 1280, 800, 30)) {
+    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 640, 400, 30)) {
         return profile;
     }
-    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 640, 400, 30)) {
+    if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 1280, 800, 30)) {
         return profile;
     }
     if(auto profile = pickBestVideoProfile(list, OB_SENSOR_DEPTH, 320, 200, 30)) {
@@ -1173,6 +1173,9 @@ std::shared_ptr<ob::VideoStreamProfile> pickDefaultVideoProfile(const std::share
         return nullptr;
     }
     if(sensorType == OB_SENSOR_COLOR) {
+        if(auto profile = pickBestVideoProfile(list, sensorType, 640, 400, 30)) {
+            return profile;
+        }
         if(auto profile = pickBestVideoProfile(list, sensorType, 1280, 800, 30)) {
             return profile;
         }
@@ -1187,10 +1190,10 @@ std::shared_ptr<ob::VideoStreamProfile> pickDefaultVideoProfile(const std::share
         }
     }
     if(sensorType == OB_SENSOR_DEPTH) {
-        if(auto profile = pickBestVideoProfile(list, sensorType, 1280, 800, 30)) {
+        if(auto profile = pickBestVideoProfile(list, sensorType, 640, 400, 30)) {
             return profile;
         }
-        if(auto profile = pickBestVideoProfile(list, sensorType, 640, 400, 30)) {
+        if(auto profile = pickBestVideoProfile(list, sensorType, 1280, 800, 30)) {
             return profile;
         }
         if(auto profile = pickBestVideoProfile(list, sensorType, 320, 200, 30)) {

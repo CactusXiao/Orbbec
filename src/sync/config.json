@@ -195,24 +195,24 @@
             "streams": [
                 {
                     "type": "RGB",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true
@@ -234,24 +234,24 @@
             "streams": [
                 {
                     "type": "RGB",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true
@@ -273,24 +273,24 @@
             "streams": [
                 {
                     "type": "RGB",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "MJPG",
                     "enable": false
                 },
                 {
                     "type": "DEPTH",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "Y14",
                     "enable": false
                 },
                 {
                     "type": "POINT_CLOUD",
-                    "width": 1280,
-                    "height": 800,
+                    "width": 640,
+                    "height": 400,
                     "fps": 30,
                     "format": "PLY",
                     "enable": true
