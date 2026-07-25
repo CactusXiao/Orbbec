@@ -242,4 +242,8 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr removeDominantPlaneRansac(const pcl::PointCl
 
 cv::Mat visualizeObFrame(const std::shared_ptr<const ob::Frame> &frame);
 
+bool launchManualLabelFrontend(const std::string &backendUrl,
+                               const std::string &operatorHint,
+                               std::string *errorMessage = nullptr);
+
 }  // namespace sync_app

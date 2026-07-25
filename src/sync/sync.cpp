@@ -301,6 +301,28 @@ static void handleTextInput(std::string &fieldValue, int key) {
     }
 }
 
+static std::string ellipsizeTextToWidth(const std::string &text, int maxWidthPx, int fontFace, double fontScale, int thickness) {
+    if(maxWidthPx <= 0 || text.empty()) {
+        return "";
+    }
+    int baseline = 0;
+    if(cv::getTextSize(text, fontFace, fontScale, thickness, &baseline).width <= maxWidthPx) {
+        return text;
+    }
+    const std::string suffix = "...";
+    if(cv::getTextSize(suffix, fontFace, fontScale, thickness, &baseline).width > maxWidthPx) {
+        return "";
+    }
+    std::string clipped = text;
+    while(!clipped.empty()) {
+        clipped.pop_back();
+        if(cv::getTextSize(clipped + suffix, fontFace, fontScale, thickness, &baseline).width <= maxWidthPx) {
+            return clipped + suffix;
+        }
+    }
+    return suffix;
+}
+
 }  // namespace sync_app
 
 int main(int argc, char **argv) {
@@ -335,6 +357,8 @@ int main(int argc, char **argv) {
 
         std::atomic_bool modeCancel{ false };
         std::thread modeThread;
+        std::string menuNotice;
+        std::string menuError;
 
         auto stopPlaceholderMode = [&]() {
             modeCancel.store(true);
@@ -358,14 +382,19 @@ int main(int argc, char **argv) {
 
             if(page == AppPage::Menu) {
                 cv::putText(ui, "Sync Menu", cv::Point(24, 48), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
-                cv::Rect b1(60, 110, 780, 90);
-                cv::Rect b2(60, 220, 780, 90);
-                cv::Rect b3(60, 330, 780, 90);
-                cv::Rect b4(60, 440, 780, 90);
+                cv::Rect b1(60, 92, 780, 76);
+                cv::Rect b2(60, 182, 780, 76);
+                cv::Rect b3(60, 272, 780, 76);
+                cv::Rect b4(60, 362, 780, 76);
+                cv::Rect b5(60, 452, 780, 76);
                 if(uiButton(ui, b1, "Interaction", fm)) {
+                    menuNotice.clear();
+                    menuError.clear();
                     page = AppPage::InteractionConfig;
                 }
                 if(uiButton(ui, b2, "Viewer", fm)) {
+                    menuNotice.clear();
+                    menuError.clear();
                     stopPlaceholderMode();
                     page = AppPage::Placeholder;
                     placeholderMode = PlaceholderMode::Viewer;
@@ -376,6 +405,8 @@ int main(int argc, char **argv) {
                     });
                 }
                 if(uiButton(ui, b3, "Collection", fm)) {
+                    menuNotice.clear();
+                    menuError.clear();
                     stopPlaceholderMode();
                     AppConfig cfg = baseCfg;
                     cfg.mode      = "collection";
@@ -387,6 +418,8 @@ int main(int argc, char **argv) {
                     cv::setMouseCallback(winName, mouseThunk, &ms);
                 }
                 if(uiButton(ui, b4, "Calibration", fm)) {
+                    menuNotice.clear();
+                    menuError.clear();
                     stopPlaceholderMode();
                     page = AppPage::Menu;
                     AppConfig cfg = baseCfg;
@@ -398,6 +431,26 @@ int main(int argc, char **argv) {
                     cv::resizeWindow(winName, 900, 640);
                     cv::setMouseCallback(winName, mouseThunk, &ms);
                     continue;
+                }
+                if(uiButton(ui, b5, "Label", fm)) {
+                    stopPlaceholderMode();
+                    std::string detail;
+                    if(launchManualLabelFrontend(baseCfg.taskBackend.baseUrl, "", &detail)) {
+                        menuError.clear();
+                        menuNotice = "Label frontend opened. Log: " + detail;
+                    }
+                    else {
+                        menuNotice.clear();
+                        menuError = "Label frontend failed: " + detail;
+                    }
+                }
+                if(!menuError.empty()) {
+                    const std::string line = ellipsizeTextToWidth(menuError, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 2);
+                    cv::putText(ui, line, cv::Point(60, 575), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(70, 70, 255), 2, cv::LINE_AA);
+                }
+                else if(!menuNotice.empty()) {
+                    const std::string line = ellipsizeTextToWidth(menuNotice, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 1);
+                    cv::putText(ui, line, cv::Point(60, 575), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(90, 210, 90), 1, cv::LINE_AA);
                 }
             }
             else if(page == AppPage::InteractionConfig) {

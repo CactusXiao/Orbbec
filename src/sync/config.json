@@ -1,5 +1,5 @@
 {
-    "_comment": "avaliable mode: viewer,interaction,collection,calibration",
+    "_comment": "avaliable mode: viewer,interaction,collection,calibration,label",
     "mode": "interaction",
     "viewer_fps": 30,
     "init_extrinsic_path": "extrinsic.json",

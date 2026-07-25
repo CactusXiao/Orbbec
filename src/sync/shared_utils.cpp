@@ -129,6 +129,103 @@ std::string trimString(std::string s) {
     return s.substr(begin, end - begin);
 }
 
+static std::string shellQuote(const std::string &s) {
+    std::string out = "'";
+    for(char c: s) {
+        if(c == '\'') {
+            out += "'\\''";
+        }
+        else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+static std::optional<fs::path> findManualLabelRepoRoot() {
+    std::vector<fs::path> seeds;
+    try {
+        seeds.push_back(fs::current_path());
+    }
+    catch(...) {
+    }
+    seeds.push_back(fs::path("."));
+    seeds.push_back(fs::path(".."));
+    seeds.push_back(fs::path("../.."));
+
+    for(auto seed: seeds) {
+        try {
+            seed = fs::absolute(seed);
+        }
+        catch(...) {
+        }
+        for(fs::path cur = seed; !cur.empty(); cur = cur.parent_path()) {
+            if(fs::exists(cur / "label" / "main.py")) {
+                return cur;
+            }
+            if(cur == cur.root_path()) {
+                break;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool launchManualLabelFrontend(const std::string &backendUrl,
+                               const std::string &operatorHint,
+                               std::string *errorMessage) {
+    const auto repoRoot = findManualLabelRepoRoot();
+    if(!repoRoot.has_value()) {
+        if(errorMessage) {
+            *errorMessage = "label/main.py not found from current working directory";
+        }
+        return false;
+    }
+
+    const char *pythonEnv = std::getenv("ORBBEC_LABEL_PYTHON");
+    const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
+    const char *mountsEnv = std::getenv("ORBBEC_LABEL_MOUNTS_JSON");
+    const std::string mounts = mountsEnv ? mountsEnv : "{}";
+    const char *operatorEnv = std::getenv("ORBBEC_LABEL_OPERATOR_ID");
+    std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
+    if(operatorId.empty()) {
+        operatorId = trimString(operatorHint);
+    }
+    if(operatorId.empty()) {
+        operatorId = "labeler_01";
+    }
+
+    fs::path logPath;
+    try {
+        logPath = fs::temp_directory_path() / "orbbec_manual_label.log";
+    }
+    catch(...) {
+        logPath = "orbbec_manual_label.log";
+    }
+
+    std::ostringstream cmd;
+    cmd << "cd " << shellQuote(repoRoot->string())
+        << " && ORBBEC_TASK_BACKEND_URL=" << shellQuote(trimString(backendUrl))
+        << " ORBBEC_LABEL_OPERATOR_ID=" << shellQuote(operatorId)
+        << " ORBBEC_LABEL_MOUNTS_JSON=" << shellQuote(mounts)
+        << " nohup " << shellQuote(python)
+        << " -m label.main >> " << shellQuote(logPath.string())
+        << " 2>&1 &";
+
+    const int rc = std::system(cmd.str().c_str());
+    if(rc != 0) {
+        if(errorMessage) {
+            *errorMessage = "failed to start manual label frontend; log: " + logPath.string();
+        }
+        return false;
+    }
+    if(errorMessage) {
+        *errorMessage = logPath.string();
+    }
+    return true;
+}
+
 std::string normalizePresetKey(std::string s) {
     s = trimString(std::move(s));
     std::string out;
@@ -932,8 +1029,8 @@ AppConfig loadConfig(const fs::path &configPath) {
         }
     }
 
-    if(cfg.mode != "viewer" && cfg.mode != "interaction" && cfg.mode != "collection" && cfg.mode != "calibration") {
-        throw std::runtime_error("Invalid mode in config: " + cfg.mode + ", expected viewer/interaction/collection/calibration");
+    if(cfg.mode != "viewer" && cfg.mode != "interaction" && cfg.mode != "collection" && cfg.mode != "calibration" && cfg.mode != "label") {
+        throw std::runtime_error("Invalid mode in config: " + cfg.mode + ", expected viewer/interaction/collection/calibration/label");
     }
     return cfg;
 }
