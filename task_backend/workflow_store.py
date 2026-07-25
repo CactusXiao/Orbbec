@@ -232,6 +232,40 @@ class WorkflowStore:
             )
             return self._get_episode_unlocked(conn, episode_id) or episode
 
+    def update_episode_storage(
+        self,
+        episode_id: str,
+        *,
+        data_uri: str = "",
+        local_capture_path: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
+        with self.connect() as conn:
+            episode = self._get_episode_unlocked(conn, episode_id)
+            if episode is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+            merged_metadata = dict(episode.get("metadata", {}))
+            if metadata:
+                merged_metadata.update(metadata)
+            conn.execute(
+                """
+                UPDATE episodes
+                SET data_uri = ?, local_capture_path = ?, metadata_json = ?, updated_at = ?
+                WHERE episode_id = ?
+                """,
+                (
+                    str(data_uri or episode.get("data_uri") or ""),
+                    str(local_capture_path or episode.get("local_capture_path") or ""),
+                    _json_dumps(merged_metadata),
+                    now_iso(),
+                    episode_id,
+                ),
+            )
+            return self._get_episode_unlocked(conn, episode_id) or episode
+
     def register_artifact(
         self,
         *,
@@ -311,6 +345,22 @@ class WorkflowStore:
         with self.connect() as conn:
             return self._get_job_unlocked(conn, job_id)
 
+    def jobs_for_episode(self, episode_id: str, job_type: str = "") -> List[Dict[str, Any]]:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            return []
+        params: Tuple[Any, ...]
+        query = "SELECT * FROM jobs WHERE episode_id = ?"
+        params = (episode_id,)
+        if job_type:
+            job_type = require_job_type(job_type)
+            query += " AND type = ?"
+            params = (episode_id, job_type)
+        query += " ORDER BY created_at, job_id"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
     def lease_job(self, *, job_type: str, lease_owner: str, lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
         job_type = require_job_type(job_type)
         lease_owner = str(lease_owner or "").strip()
@@ -378,6 +428,35 @@ class WorkflowStore:
                 WHERE job_id = ?
                 """,
                 (next_status, _future_iso(max(1, int(lease_seconds or 300))), now_iso(), job_id),
+            )
+            return self._get_job_unlocked(conn, job_id) or job
+
+    def update_job_progress(
+        self,
+        *,
+        job_id: str,
+        progress: Dict[str, Any],
+        status: str = "running",
+    ) -> Dict[str, Any]:
+        status = require_job_status(status)
+        if status in TERMINAL_JOB_STATUSES or status not in {"queued", "leased", "running"}:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "progress status must be queued, leased, or running")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self._get_job_unlocked(conn, job_id)
+            if job is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+            if str(job["status"]) in TERMINAL_JOB_STATUSES:
+                return job
+            merged = dict(job.get("result") or {})
+            merged.update(progress or {})
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, result_json = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (status, _json_dumps(merged), now_iso(), job_id),
             )
             return self._get_job_unlocked(conn, job_id) or job
 

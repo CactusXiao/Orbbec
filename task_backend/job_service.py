@@ -221,6 +221,54 @@ class JobService:
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
         return self.enrich_job(job)
 
+    def upload_status(self, episode_id: str) -> Dict[str, Any]:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+        jobs = self.store.jobs_for_episode(episode_id, "upload")
+        upload_job = jobs[-1] if jobs else None
+        artifacts = self.store.artifacts_for_episode(episode_id)
+        upload_artifacts = [item for item in artifacts if item.get("kind") == "nas_episode"]
+        result = dict(upload_job.get("result") or {}) if upload_job else {}
+        status = str(upload_job.get("status") or "missing") if upload_job else "missing"
+        total_bytes = _optional_int(result.get("total_bytes")) or 0
+        copied_bytes = _optional_int(result.get("copied_bytes")) or 0
+        percent = result.get("percent")
+        try:
+            percent_value = float(percent)
+        except (TypeError, ValueError):
+            percent_value = 100.0 if status == "succeeded" and total_bytes == 0 else 0.0
+            if total_bytes > 0:
+                percent_value = min(100.0, max(0.0, copied_bytes * 100.0 / total_bytes))
+        nas_uri = str(result.get("nas_uri") or "")
+        if not nas_uri and upload_artifacts:
+            nas_uri = str(upload_artifacts[-1].get("uri") or "")
+        if not nas_uri and str(episode.get("data_uri") or "").startswith("nas://"):
+            nas_uri = str(episode.get("data_uri") or "")
+        return {
+            "episode": episode,
+            "upload": {
+                "available": upload_job is not None,
+                "job_id": str(upload_job.get("job_id") or "") if upload_job else "",
+                "status": status,
+                "phase": str(result.get("phase") or ("complete" if status == "succeeded" else status)),
+                "percent": round(percent_value, 2),
+                "copied_bytes": copied_bytes,
+                "total_bytes": total_bytes,
+                "files_done": _optional_int(result.get("files_done")) or 0,
+                "files_total": _optional_int(result.get("files_total")) or 0,
+                "nas_uri": nas_uri,
+                "local_path": str(result.get("local_path") or episode.get("local_capture_path") or ""),
+                "error": str(result.get("error") or ""),
+                "updated_at": str(upload_job.get("updated_at") or "") if upload_job else "",
+                "result": result,
+            },
+            "artifacts": upload_artifacts,
+        }
+
     def heartbeat_job(self, job_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
         lease_seconds = _optional_int(body.get("lease_seconds")) or 300
@@ -363,6 +411,23 @@ class JobService:
             self._register_artifact_from_payload(episode_id, artifact)
 
         if job_type == "upload":
+            nas_uri = str(result.get("nas_uri") or result.get("data_uri") or "")
+            for artifact in artifacts:
+                if str(artifact.get("kind") or "") == "nas_episode" and str(artifact.get("uri") or ""):
+                    nas_uri = str(artifact.get("uri"))
+                    break
+            if nas_uri:
+                episode = self.store.get_episode(episode_id)
+                self.store.update_episode_storage(
+                    episode_id,
+                    data_uri=nas_uri,
+                    local_capture_path=str((episode or {}).get("local_capture_path") or payload.get("local_capture_path") or ""),
+                    metadata={
+                        "nas_uri": nas_uri,
+                        "upload_job_id": job.get("job_id"),
+                        "uploaded_at": result.get("completed_at") or result.get("finished_at") or "",
+                    },
+                )
             self.store.update_episode_status(episode_id, "uploaded")
         elif job_type == "auto_label":
             if not artifacts and payload.get("data_uri"):

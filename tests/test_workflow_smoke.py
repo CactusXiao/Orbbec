@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from task_backend.job_service import JobService
+from task_backend.virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader
 from task_backend.workflow_models import WorkflowError
 from task_backend.workflow_store import WorkflowStore
 
@@ -102,6 +103,54 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(released["job"]["status"], "queued")
             leased_after_release = service.lease_job({"operator_id": "labeler_03"}, forced_type="manual_label")
             self.assertEqual(leased_after_release["job"]["job_id"], release_job_id)
+
+    def test_virtual_nas_uploader_completes_collection_upload_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
+            (source / "00" / "RGB").mkdir(parents=True)
+            (source / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
+            (source / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
+
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            service.record_collection_confirm(
+                {
+                    "reservation_id": "reservation_001",
+                    "subject_id": "S001",
+                    "task_name": "pick_object",
+                    "episode_number": 1,
+                    "client_id": "smoke",
+                    "idempotency_key": "smoke:reservation_001",
+                    "local_path": str(source),
+                    "frame_count": 1,
+                }
+            )
+
+            status_before = service.upload_status("reservation_001")
+            self.assertEqual(status_before["upload"]["status"], "queued")
+
+            uploader = VirtualNasUploader(
+                service,
+                VirtualNasUploadConfig(
+                    root=tmp_path / "virtual_nas",
+                    uri_prefix="nas://orbbec-virtual-test",
+                    worker_id="smoke_uploader",
+                ),
+            )
+            self.assertTrue(uploader.process_one())
+
+            status_after = service.upload_status("reservation_001")
+            self.assertEqual(status_after["upload"]["status"], "succeeded")
+            self.assertEqual(status_after["upload"]["percent"], 100.0)
+            self.assertTrue(status_after["upload"]["nas_uri"].startswith("nas://orbbec-virtual-test/"))
+            episode = store.get_episode("reservation_001")
+            self.assertIsNotNone(episode)
+            self.assertEqual(episode["status"], "uploaded")  # type: ignore[index]
+            self.assertEqual(episode["data_uri"], status_after["upload"]["nas_uri"])  # type: ignore[index]
+            nas_path = tmp_path / "virtual_nas" / "S001" / "pick_object" / "reservation_001"
+            self.assertTrue((nas_path / "00" / "RGB" / "00001.png").exists())
+            self.assertTrue((nas_path / ".orbbec_upload_manifest.json").exists())
 
 
 if __name__ == "__main__":

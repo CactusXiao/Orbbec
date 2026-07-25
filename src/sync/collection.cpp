@@ -341,6 +341,24 @@ static std::vector<std::string> wrapTextToWidth(const std::string &text, int max
     return out;
 }
 
+static std::string elideTextToWidth(std::string text, int maxWidthPx, int fontFace, double fontScale, int thickness) {
+    if(text.empty() || maxWidthPx <= 0) {
+        return text;
+    }
+    auto widthOf = [&](const std::string &s) {
+        int baseline = 0;
+        return cv::getTextSize(s, fontFace, fontScale, thickness, &baseline).width;
+    };
+    if(widthOf(text) <= maxWidthPx) {
+        return text;
+    }
+    const std::string suffix = "...";
+    while(!text.empty() && widthOf(text + suffix) > maxWidthPx) {
+        text.pop_back();
+    }
+    return text.empty() ? suffix : text + suffix;
+}
+
 // ---- UTF-8 / 中文文本渲染支持 ----
 // OpenCV内置的Hershey字体仅支持ASCII字符，中文字符会显示为"?"。
 // 当编译时检测到 opencv_freetype 模块，则使用FreeType2渲染中文；否则退回英文。
@@ -8162,6 +8180,63 @@ struct EpisodeReservationUi {
     }
 };
 
+struct TrackedUploadUi {
+    std::string episodeId;
+    std::string taskName;
+    int         episodeNumber = 0;
+    TaskUploadStatus status;
+    bool        terminalLogged = false;
+    bool        pollErrorLogged = false;
+    std::chrono::steady_clock::time_point nextPoll{};
+};
+
+static bool uploadStatusTerminal(const std::string &status) {
+    return status == "succeeded" || status == "failed" || status == "canceled";
+}
+
+static std::string formatUploadBytes(uint64_t bytes) {
+    const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = static_cast<double>(bytes);
+    size_t unit = 0;
+    while(value >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+        value /= 1024.0;
+        unit++;
+    }
+    std::ostringstream oss;
+    if(unit == 0) {
+        oss << static_cast<uint64_t>(value) << " " << units[unit];
+    }
+    else {
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(value >= 100.0 ? 0 : 1) << value << " " << units[unit];
+    }
+    return oss.str();
+}
+
+static std::string uploadStatusLine(const TrackedUploadUi &tracked) {
+    const auto &st = tracked.status;
+    const std::string task = tracked.taskName.empty() ? std::string("episode") : tracked.taskName;
+    std::ostringstream oss;
+    oss.setf(std::ios::fixed);
+    oss << "NAS " << task << " ep" << tracked.episodeNumber << ": ";
+    if(!st.available) {
+        oss << "queued";
+        return oss.str();
+    }
+    oss << (st.jobStatus.empty() ? std::string("unknown") : st.jobStatus);
+    if(!st.phase.empty()) {
+        oss << " " << st.phase;
+    }
+    oss << " " << std::setprecision(1) << st.percent << "%";
+    if(st.totalBytes > 0) {
+        oss << " (" << formatUploadBytes(st.copiedBytes) << "/" << formatUploadBytes(st.totalBytes) << ")";
+    }
+    if(!st.error.empty()) {
+        oss << " error: " << st.error;
+    }
+    return oss.str();
+}
+
 static TaskInfo taskInfoFromBackend(const TaskBackendTask &src) {
     TaskInfo out;
     out.name = src.taskName;
@@ -8475,6 +8550,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     EpisodeReservationUi currentReservation;
     VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
+    std::deque<TrackedUploadUi> trackedUploads;
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
@@ -8611,6 +8687,73 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         return true;
     };
 
+    auto upsertTrackedUpload = [&](const std::string &episodeId,
+                                   const std::string &taskName,
+                                   int episodeNumber) {
+        if(episodeId.empty()) {
+            return;
+        }
+        for(auto &tracked: trackedUploads) {
+            if(tracked.episodeId == episodeId) {
+                tracked.taskName = taskName;
+                tracked.episodeNumber = episodeNumber;
+                tracked.nextPoll = std::chrono::steady_clock::now();
+                return;
+            }
+        }
+        TrackedUploadUi tracked;
+        tracked.episodeId = episodeId;
+        tracked.taskName = taskName;
+        tracked.episodeNumber = episodeNumber;
+        tracked.nextPoll = std::chrono::steady_clock::now();
+        trackedUploads.push_front(std::move(tracked));
+        while(trackedUploads.size() > 8) {
+            trackedUploads.pop_back();
+        }
+    };
+
+    auto pollTrackedUploads = [&](bool force) {
+        const auto now = std::chrono::steady_clock::now();
+        for(auto &tracked: trackedUploads) {
+            if(!force && uploadStatusTerminal(tracked.status.jobStatus)) {
+                continue;
+            }
+            if(!force && tracked.nextPoll.time_since_epoch().count() != 0 && now < tracked.nextPoll) {
+                continue;
+            }
+            tracked.nextPoll = now + std::chrono::seconds(1);
+            TaskUploadStatus status;
+            std::string error;
+            if(!backendClient.getUploadStatus(tracked.episodeId, status, &error)) {
+                tracked.status.available = false;
+                tracked.status.jobStatus = "poll-error";
+                tracked.status.phase = "poll";
+                tracked.status.error = error;
+                if(!tracked.pollErrorLogged) {
+                    pushUiLog("NAS upload status unavailable: " + error);
+                    tracked.pollErrorLogged = true;
+                }
+                continue;
+            }
+            tracked.status = std::move(status);
+            tracked.pollErrorLogged = false;
+            if(uploadStatusTerminal(tracked.status.jobStatus) && !tracked.terminalLogged) {
+                pushUiLog(uploadStatusLine(tracked));
+                if(tracked.status.jobStatus == "succeeded" && !tracked.status.nasUri.empty()) {
+                    pushUiLog("NAS URI: " + tracked.status.nasUri);
+                }
+                tracked.terminalLogged = true;
+            }
+        }
+    };
+
+    auto latestUploadLine = [&]() -> std::string {
+        if(trackedUploads.empty()) {
+            return "";
+        }
+        return uploadStatusLine(trackedUploads.front());
+    };
+
     auto requestExit = [&](PendingExitAction action, bool deleteFaultEpisode) {
         exitConfirmActive = true;
         pendingExitAction = action;
@@ -8674,6 +8817,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         }
         pushUiLog("Backend confirm OK: " + currentReservation.taskName
                   + " ep" + std::to_string(currentReservation.episodeNumber));
+        upsertTrackedUpload(currentReservation.reservationId,
+                             currentReservation.taskName,
+                             currentReservation.episodeNumber);
+        pollTrackedUploads(true);
+        {
+            const std::string line = latestUploadLine();
+            if(!line.empty()) {
+                pushUiLog(line);
+            }
+        }
         currentReservation.clear();
         return true;
     };
@@ -8802,6 +8955,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
         }
         auto fm = beginFrame(ms);
+        pollTrackedUploads(false);
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
             if(exitConfirmActive) {
@@ -9475,6 +9629,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 stateFootnoteLine = cameraFaultRestartBlocked ? "waiting for current episode to finish saving"
                                                               : "choose exit or delete + restart";
             }
+            {
+                const std::string uploadLine = latestUploadLine();
+                if(!uploadLine.empty()
+                   && captureState != CaptureState::RECORDING
+                   && captureState != CaptureState::DRAINING
+                   && captureState != CaptureState::DELETE_CONFIRM
+                   && !cameraFaultActive) {
+                    stateFootnoteLine = uploadLine;
+                }
+            }
             cv::rectangle(ui, statusRect, sd.bgColor, cv::FILLED);
             cv::rectangle(ui, statusRect, sd.color, 2);
             {
@@ -9493,6 +9657,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             }
             if(!stateFootnoteLine.empty()) {
                 int baseline = 0;
+                stateFootnoteLine = elideTextToWidth(stateFootnoteLine, std::max(1, statusRect.width - 20),
+                                                     cv::FONT_HERSHEY_DUPLEX, 0.55, 1);
                 const auto textSz = cv::getTextSize(stateFootnoteLine, cv::FONT_HERSHEY_DUPLEX, 0.55, 1, &baseline);
                 cv::Point textOrg(statusRect.x + (statusRect.width - textSz.width) / 2,
                                   statusRect.y + statusRect.height - 14);
@@ -9538,6 +9704,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                         }
                     }
                     else {
+                        const std::string uploadLine = latestUploadLine();
+                        if(!uploadLine.empty()) {
+                            head = uploadLine;
+                        }
+                    }
+                    if(head.empty()) {
                         const double lastSec = recorder.lastRecordedSeconds();
                         if(lastSec > 0.0) {
                             std::ostringstream oss;

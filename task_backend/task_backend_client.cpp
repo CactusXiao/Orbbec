@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cctype>
+#include <cstdint>
 #include <cstring>
 #include <sstream>
 
@@ -291,6 +292,22 @@ static bool jsonBool(cJSON *obj, const char *key, bool fallback = false) {
     return fallback;
 }
 
+static double jsonDouble(cJSON *obj, const char *key, double fallback = 0.0) {
+    auto *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if(item && cJSON_IsNumber(item)) {
+        return item->valuedouble;
+    }
+    return fallback;
+}
+
+static uint64_t jsonUint64(cJSON *obj, const char *key, uint64_t fallback = 0) {
+    auto *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if(item && cJSON_IsNumber(item) && item->valuedouble > 0.0) {
+        return static_cast<uint64_t>(item->valuedouble);
+    }
+    return fallback;
+}
+
 static std::string backendErrorFromBody(const std::string &body) {
     cJSON *root = cJSON_Parse(body.c_str());
     if(!root) {
@@ -355,6 +372,41 @@ static bool parseTasksPayload(const std::string &body,
     }
     cJSON_Delete(root);
     tasksOut = std::move(parsed);
+    return true;
+}
+
+static bool parseUploadStatusPayload(const std::string &body,
+                                     TaskUploadStatus &statusOut,
+                                     std::string *errorMessage) {
+    cJSON *root = cJSON_Parse(body.c_str());
+    if(!root) {
+        setError(errorMessage, "Task backend upload status returned invalid JSON");
+        return false;
+    }
+    auto *episode = cJSON_GetObjectItemCaseSensitive(root, "episode");
+    auto *upload = cJSON_GetObjectItemCaseSensitive(root, "upload");
+    if(!upload || !cJSON_IsObject(upload)) {
+        cJSON_Delete(root);
+        setError(errorMessage, "Task backend upload status response missing upload object");
+        return false;
+    }
+    TaskUploadStatus parsed;
+    parsed.available = jsonBool(upload, "available", false);
+    parsed.episodeId = (episode && cJSON_IsObject(episode)) ? jsonString(episode, "episode_id") : "";
+    parsed.jobId = jsonString(upload, "job_id");
+    parsed.jobStatus = jsonString(upload, "status");
+    parsed.phase = jsonString(upload, "phase");
+    parsed.percent = jsonDouble(upload, "percent", 0.0);
+    parsed.copiedBytes = jsonUint64(upload, "copied_bytes", 0);
+    parsed.totalBytes = jsonUint64(upload, "total_bytes", 0);
+    parsed.filesDone = jsonInt(upload, "files_done", 0);
+    parsed.filesTotal = jsonInt(upload, "files_total", 0);
+    parsed.localPath = jsonString(upload, "local_path");
+    parsed.nasUri = jsonString(upload, "nas_uri");
+    parsed.error = jsonString(upload, "error");
+    parsed.updatedAt = jsonString(upload, "updated_at");
+    statusOut = std::move(parsed);
+    cJSON_Delete(root);
     return true;
 }
 
@@ -472,6 +524,20 @@ bool TaskBackendClient::releaseEpisode(const std::string &reservationId,
         return false;
     }
     return ensureSuccess(response, errorMessage);
+}
+
+bool TaskBackendClient::getUploadStatus(const std::string &episodeId,
+                                        TaskUploadStatus &statusOut,
+                                        std::string *errorMessage) const {
+    HttpResponse response;
+    const std::string path = "/api/v1/episodes/" + urlEncode(episodeId) + "/upload";
+    if(!httpRequest(baseUrl_, timeoutMs_, "GET", path, "", response, errorMessage)) {
+        return false;
+    }
+    if(!ensureSuccess(response, errorMessage)) {
+        return false;
+    }
+    return parseUploadStatusPayload(response.body, statusOut, errorMessage);
 }
 
 }  // namespace sync_app

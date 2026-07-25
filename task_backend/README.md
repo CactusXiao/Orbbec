@@ -16,11 +16,18 @@ extension of `task_backend/server.py`: the original collection API and JSON
 progress state remain compatible, while new workflow state is stored in
 `<dataRoot>/workflow.sqlite3` with Python's standard `sqlite3` module.
 
-NAS storage, automatic labeling, and automatic QC are intentionally decoupled at
-this stage. The server stores abstract URIs such as `local:///data/episode_001`
-or `nas://orbbec-dataset/S001/...`, job status, and artifact registrations, but
-it does not mount NAS, import model code, or run QC/model inference. Future
-workers should connect through the job API below.
+NAS storage is represented by a built-in virtual NAS uploader for development
+and system validation. Collection still saves the episode locally first. After
+the frontend confirms the local save, the backend creates an `upload` job and a
+background worker copies that local episode directory into a backend-local
+virtual NAS directory. The server records upload progress, verifies copied file
+and byte counts, then switches the episode `data_uri` from `local://...` to
+`nas://...` only after the copy succeeds.
+
+Automatic labeling and automatic QC remain decoupled worker stages. The server
+stores abstract URIs such as `local:///data/episode_001` or
+`nas://orbbec-virtual/S001/...`, job status, and artifact registrations, but it
+does not import model code or run QC/model inference itself.
 
 ## Start The Backend
 
@@ -41,6 +48,11 @@ ORBBEC_TASK_BACKEND_PORT=8765
 ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # Optional workflow SQLite override:
 # ORBBEC_WORKFLOW_DB=./task_backend_state/workflow.sqlite3
+
+# Optional virtual NAS override:
+# ORBBEC_VIRTUAL_NAS_ENABLED=1
+# ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state/virtual_nas
+# ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
 
 # Optional seed file for the setup page:
 # ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
@@ -115,11 +127,10 @@ The same service exposes a lightweight browser dashboard:
 - `http://127.0.0.1:8765/tasks/<task_name>` shows one task and its episodes.
 - `http://127.0.0.1:8765/episodes/<reservation_id>` shows one episode detail page.
 
-The current detail pages use backend-owned metadata only: task definitions,
-subject IDs, reservation IDs, episode numbers, status, timestamps, idempotency
-keys, and the local capture path reported by the capture host. NAS-backed file
-indexes and quality inspection results can be added to the episode detail model
-later without changing the collection API.
+The current detail pages show backend-owned metadata plus workflow state:
+task definitions, subject IDs, reservation IDs, episode numbers, status,
+timestamps, idempotency keys, local capture paths, upload job status, upload
+percentage, copied bytes/files, NAS URI, and upload errors.
 
 ## Task File Format
 
@@ -199,13 +210,19 @@ have to match any path on the backend machine.
 6. Local capture writes to `captureSaveRoot/subjectId/taskName/episode_N`.
 7. Confirm finalizes local data, then confirms the reservation with an
    idempotency key.
-8. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
+8. Backend confirm creates an `upload` job. The virtual NAS uploader copies the
+   already-saved local episode asynchronously and records progress in the
+   workflow database.
+9. The collection UI returns to READY/IDLE after backend confirm succeeds. It
+   keeps polling upload progress by reservation ID and displays the latest NAS
+   status without blocking the next capture.
+10. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
    uses the same reservation and idempotency key.
-9. Reset/Delete deletes local episode data and releases the reservation; it does
+11. Reset/Delete deletes local episode data and releases the reservation; it does
    not increase `completed`.
-10. The capture page has a `Tasks` button for returning to the standalone task
+12. The capture page has a `Tasks` button for returning to the standalone task
    selection page; task selection is not mixed into the capture view.
-11. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
+13. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
     dialog before stopping cameras or leaving collection when applicable.
 
 The backend confirm endpoint is idempotent: repeating the same
@@ -233,8 +250,20 @@ POST /api/v1/collection/episodes/release
 ```
 
 When collection confirms an episode, the workflow sidecar records an Episode
-with status `captured` and queues an `upload` job. The upload job is only a
-status placeholder until a real upload worker exists.
+with status `captured` and queues an `upload` job. The built-in virtual NAS
+uploader leases this job, copies local data to the virtual NAS, updates progress,
+registers a `nas_episode` artifact, and marks the episode `uploaded` only after
+the verified copy completes.
+
+Upload status can be read by reservation/episode ID:
+
+```text
+GET /api/v1/episodes/<reservation_id>/upload
+GET /api/v1/collection/episodes/<reservation_id>/upload
+```
+
+The response includes the upload job status, phase, percentage, byte and file
+counts, local path, NAS URI, and error string.
 
 ## Workflow And Label APIs
 

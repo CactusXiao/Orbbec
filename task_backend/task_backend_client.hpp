@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 
 namespace sync_app {
 
@@ -19,6 +20,23 @@ struct TaskEpisodeReservation {
     std::string reservationId;
     std::string taskName;
     int episodeNumber = 0;
+};
+
+struct TaskUploadStatus {
+    bool        available = false;
+    std::string episodeId;
+    std::string jobId;
+    std::string jobStatus;
+    std::string phase;
+    double      percent = 0.0;
+    uint64_t    copiedBytes = 0;
+    uint64_t    totalBytes = 0;
+    int         filesDone = 0;
+    int         filesTotal = 0;
+    std::string localPath;
+    std::string nasUri;
+    std::string error;
+    std::string updatedAt;
 };
 
 class TaskBackendClient {
@@ -52,6 +70,10 @@ public:
                         const std::string &subjectId,
                         const std::string &taskName,
                         std::string *errorMessage = nullptr) const;
+
+    bool getUploadStatus(const std::string &episodeId,
+                         TaskUploadStatus &statusOut,
+                         std::string *errorMessage = nullptr) const;
 
 private:
     std::string baseUrl_;

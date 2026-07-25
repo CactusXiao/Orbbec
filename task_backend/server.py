@@ -30,10 +30,12 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     from .job_service import JobService
+    from .virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader
     from .workflow_models import WorkflowError
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
+    from virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader  # type: ignore
     from workflow_models import WorkflowError  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
@@ -210,6 +212,19 @@ def env_int(env: Dict[str, str], default: int, *keys: str) -> int:
     except ValueError as exc:
         joined = ", ".join(keys)
         raise ValueError(f"invalid integer in .env for {joined}: {value!r}") from exc
+
+
+def env_bool(env: Dict[str, str], default: bool, *keys: str) -> bool:
+    value = env_get(env, *keys)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    joined = ", ".join(keys)
+    raise ValueError(f"invalid boolean in .env for {joined}: {value!r}")
 
 
 def slugify(value: str, fallback: str = "item") -> str:
@@ -1019,10 +1034,17 @@ class TaskBackend:
         for item in self.reservation_list(state):
             if item.get("reservation_id") == reservation_id:
                 task = self.tasks_by_name.get(str(item.get("task_name", "")))
+                workflow: Dict[str, Any] = {}
+                if self.workflow_service is not None:
+                    try:
+                        workflow = self.workflow_service.upload_status(reservation_id)
+                    except Exception as exc:
+                        workflow = {"error": str(exc)}
                 return {
                     "reservation": with_episode_stats(item),
                     "task": task,
                     "metadata_pairs": metadata_pairs(task) if task is not None else [],
+                    "workflow": workflow,
                 }
         raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
 
@@ -1554,6 +1576,22 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     reservation_id = str(item.get("reservation_id", ""))
     status = str(item.get("status", "unknown"))
     stats = item.get("stats", {})
+    workflow = model.get("workflow") or {}
+    upload = workflow.get("upload") if isinstance(workflow.get("upload"), dict) else {}
+    upload_available = bool(upload.get("available")) if isinstance(upload, dict) else False
+    upload_status = str(upload.get("status") or ("queued" if upload_available else "not queued")) if isinstance(upload, dict) else "not queued"
+    upload_phase = str(upload.get("phase") or "-") if isinstance(upload, dict) else "-"
+    upload_percent = upload.get("percent", 0) if isinstance(upload, dict) else 0
+    try:
+        upload_percent_label = f"{float(upload_percent):.1f}%"
+    except (TypeError, ValueError):
+        upload_percent_label = "-"
+    upload_copied = int(upload.get("copied_bytes") or 0) if isinstance(upload, dict) else 0
+    upload_total = int(upload.get("total_bytes") or 0) if isinstance(upload, dict) else 0
+    upload_files_done = int(upload.get("files_done") or 0) if isinstance(upload, dict) else 0
+    upload_files_total = int(upload.get("files_total") or 0) if isinstance(upload, dict) else 0
+    upload_nas_uri = str(upload.get("nas_uri") or "") if isinstance(upload, dict) else ""
+    upload_error = str(upload.get("error") or workflow.get("error") or "") if isinstance(upload, dict) else str(workflow.get("error") or "")
     fields = [
         ("Reservation ID", reservation_id),
         ("Task", task_name),
@@ -1596,12 +1634,20 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + render_metric("Duration", stats.get("duration_label", "-"))
         + render_metric("Frames", stats.get("frame_count_label", "-"))
         + render_metric("Storage", stats.get("storage_label", "-"))
+        + render_metric("NAS Upload", upload_status, upload_percent_label if upload_available else "waiting for upload job")
         + "</div>"
         "<section><h2>Episode Details</h2><div class=\"kv\">"
         + field_html
         + "</div></section>"
         "<section><h2>Storage And Quality</h2><div class=\"kv\">"
         f"<div>Storage status</div><div>{html_escape('Local path recorded' if item.get('local_path') else 'Waiting for confirm')}</div>"
+        f"<div>Upload job</div><div class=\"mono\">{html_escape(upload.get('job_id') or '-' if isinstance(upload, dict) else '-')}</div>"
+        f"<div>Upload status</div><div>{render_status_badge(upload_status)}"
+        f" <span class=\"muted mono\">{html_escape(upload_phase)} {html_escape(upload_percent_label)}</span></div>"
+        f"<div>Upload bytes</div><div class=\"mono\">{html_escape(format_bytes(upload_copied))} / {html_escape(format_bytes(upload_total))}</div>"
+        f"<div>Upload files</div><div class=\"mono\">{html_escape(upload_files_done)} / {html_escape(upload_files_total)}</div>"
+        f"<div>NAS URI</div><div class=\"mono\">{html_escape(upload_nas_uri or '-')}</div>"
+        f"<div>Upload error</div><div class=\"mono\">{html_escape(upload_error or '-')}</div>"
         f"<div>Backend file access</div><div class=\"muted\">{html_escape(storage_note)}</div>"
         f"<div>Quality status</div><div class=\"muted\">Not integrated yet.</div>"
         + "</div></section>"
@@ -1726,11 +1772,33 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            if parsed.path.startswith("/api/v1/jobs/"):
+                job_id = unquote(parsed.path[len("/api/v1/jobs/"):].strip("/")).strip()
+                if not job_id or "/" in job_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "job not found")
+                self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
+                return
+
             if parsed.path.startswith("/api/v1/label/jobs/"):
                 job_id = unquote(parsed.path[len("/api/v1/label/jobs/"):].strip("/")).strip()
                 if not job_id or "/" in job_id:
                     raise BackendError(HTTPStatus.NOT_FOUND, "label job not found")
                 self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
+                return
+
+            collection_upload_prefix = "/api/v1/collection/episodes/"
+            upload_prefix = "/api/v1/episodes/"
+            if parsed.path.startswith(collection_upload_prefix) and parsed.path.endswith("/upload"):
+                episode_id = unquote(parsed.path[len(collection_upload_prefix):-len("/upload")].strip("/")).strip()
+                if not episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                self._json_response(HTTPStatus.OK, self.workflow.upload_status(episode_id))
+                return
+            if parsed.path.startswith(upload_prefix) and parsed.path.endswith("/upload"):
+                episode_id = unquote(parsed.path[len(upload_prefix):-len("/upload")].strip("/")).strip()
+                if not episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                self._json_response(HTTPStatus.OK, self.workflow.upload_status(episode_id))
                 return
 
             if not self.runtime.is_started():
@@ -1964,6 +2032,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
     workflow_store = WorkflowStore(workflow_db)
     workflow_service = JobService(workflow_store)
+    virtual_nas_enabled = env_bool(env, True, "ORBBEC_VIRTUAL_NAS_ENABLED", "TASK_BACKEND_VIRTUAL_NAS_ENABLED")
+    virtual_nas_root_env = env_path(env, "ORBBEC_VIRTUAL_NAS_ROOT", "TASK_BACKEND_VIRTUAL_NAS_ROOT")
+    virtual_nas_root = (virtual_nas_root_env or (data_root / "virtual_nas")).expanduser().resolve()
+    virtual_nas_uri_prefix = env_get(env, "ORBBEC_VIRTUAL_NAS_URI_PREFIX", "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX") or "nas://orbbec-virtual"
+    virtual_nas_uploader = VirtualNasUploader(
+        workflow_service,
+        VirtualNasUploadConfig(
+            enabled=virtual_nas_enabled,
+            root=virtual_nas_root,
+            uri_prefix=virtual_nas_uri_prefix,
+        ),
+    )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
     runtime = BackendRuntime(registry, workflow_service)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
@@ -1971,16 +2051,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
+    print(f"[task-backend] virtual_nas={'enabled' if virtual_nas_enabled else 'disabled'} root={virtual_nas_root} uri={virtual_nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)
 
     server = TaskHTTPServer((host, port), RequestHandler, runtime)
     try:
+        virtual_nas_uploader.start()
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[task-backend] stopping", file=sys.stderr)
     finally:
+        virtual_nas_uploader.stop()
         server.server_close()
     return 0
 
