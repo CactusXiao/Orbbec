@@ -2030,8 +2030,24 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     workflow_db_env = env_path(env, "ORBBEC_WORKFLOW_DB", "TASK_BACKEND_WORKFLOW_DB")
     workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
+    auto_label_after_upload = env_bool(
+        env,
+        True,
+        "ORBBEC_AUTO_LABEL_AFTER_UPLOAD",
+        "TASK_BACKEND_AUTO_LABEL_AFTER_UPLOAD",
+    )
+    auto_label_batch_size = env_int(
+        env,
+        200,
+        "ORBBEC_AUTO_LABEL_BATCH_SIZE",
+        "TASK_BACKEND_AUTO_LABEL_BATCH_SIZE",
+    )
     workflow_store = WorkflowStore(workflow_db)
-    workflow_service = JobService(workflow_store)
+    workflow_service = JobService(
+        workflow_store,
+        auto_label_after_upload=auto_label_after_upload,
+        auto_label_batch_size=auto_label_batch_size,
+    )
     virtual_nas_enabled = env_bool(env, True, "ORBBEC_VIRTUAL_NAS_ENABLED", "TASK_BACKEND_VIRTUAL_NAS_ENABLED")
     virtual_nas_root_env = env_path(env, "ORBBEC_VIRTUAL_NAS_ROOT", "TASK_BACKEND_VIRTUAL_NAS_ROOT")
     virtual_nas_root = (virtual_nas_root_env or (data_root / "virtual_nas")).expanduser().resolve()
@@ -2051,6 +2067,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
+    print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} batch_size={auto_label_batch_size}", file=sys.stderr)
     print(f"[task-backend] virtual_nas={'enabled' if virtual_nas_enabled else 'disabled'} root={virtual_nas_root} uri={virtual_nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)

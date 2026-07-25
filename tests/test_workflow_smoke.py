@@ -110,10 +110,11 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
             (source / "00" / "RGB").mkdir(parents=True)
             (source / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
+            (source / "00" / "RGB" / "00002.png").write_bytes(b"rgb2")
             (source / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, auto_label_batch_size=1)
             service.record_collection_confirm(
                 {
                     "reservation_id": "reservation_001",
@@ -123,7 +124,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "client_id": "smoke",
                     "idempotency_key": "smoke:reservation_001",
                     "local_path": str(source),
-                    "frame_count": 1,
+                    "frame_count": 2,
                 }
             )
 
@@ -148,8 +149,14 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertIsNotNone(episode)
             self.assertEqual(episode["status"], "uploaded")  # type: ignore[index]
             self.assertEqual(episode["data_uri"], status_after["upload"]["nas_uri"])  # type: ignore[index]
+            auto_label_jobs = store.jobs_for_episode("reservation_001", "auto_label")
+            self.assertEqual(len(auto_label_jobs), 2)
+            self.assertEqual(auto_label_jobs[0]["status"], "queued")
+            self.assertEqual(auto_label_jobs[0]["payload"]["frames"], [1])
+            self.assertEqual(auto_label_jobs[1]["payload"]["frames"], [2])
             nas_path = tmp_path / "virtual_nas" / "S001" / "pick_object" / "reservation_001"
             self.assertTrue((nas_path / "00" / "RGB" / "00001.png").exists())
+            self.assertTrue((nas_path / "00" / "RGB" / "00002.png").exists())
             self.assertTrue((nas_path / ".orbbec_upload_manifest.json").exists())
 
 

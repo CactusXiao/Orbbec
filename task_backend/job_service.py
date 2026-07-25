@@ -4,7 +4,7 @@ import re
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
     from .storage_resolver import local_uri_from_path, path_from_local_uri, uri_join
@@ -22,6 +22,11 @@ _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
 def _new_id(prefix: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_]+", "_", str(prefix or "item").strip().lower()).strip("_")
     return f"{clean or 'item'}_{uuid.uuid4().hex[:12]}"
+
+
+def _stable_id_part(value: Any, fallback: str = "item") -> str:
+    clean = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip().lower()).strip("_")
+    return clean or fallback
 
 
 def _as_str_list(value: Any) -> List[str]:
@@ -102,8 +107,16 @@ def _infer_subject_task_episode(path: Optional[Path]) -> Tuple[str, str, str]:
 
 
 class JobService:
-    def __init__(self, store: WorkflowStore):
+    def __init__(
+        self,
+        store: WorkflowStore,
+        *,
+        auto_label_after_upload: bool = True,
+        auto_label_batch_size: int = 200,
+    ):
         self.store = store
+        self.auto_label_after_upload = bool(auto_label_after_upload)
+        self.auto_label_batch_size = max(1, int(auto_label_batch_size or 200))
 
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload_in = dict(body or {})
@@ -429,6 +442,8 @@ class JobService:
                     },
                 )
             self.store.update_episode_status(episode_id, "uploaded")
+            if self.auto_label_after_upload:
+                self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
             if not artifacts and payload.get("data_uri"):
                 self.store.register_artifact(
@@ -454,6 +469,81 @@ class JobService:
                     metadata={"source_job_id": job.get("job_id")},
                 )
             self.store.update_episode_status(episode_id, "manual_labeled")
+
+    def _create_auto_label_jobs_from_upload(
+        self,
+        episode_id: str,
+        upload_payload: Dict[str, Any],
+        upload_result: Dict[str, Any],
+        nas_uri: str,
+    ) -> None:
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            return
+        data_uri = str(nas_uri or upload_result.get("nas_uri") or episode.get("data_uri") or "")
+        if not data_uri:
+            return
+        local_path = str(
+            upload_result.get("local_path")
+            or upload_payload.get("local_capture_path")
+            or episode.get("local_capture_path")
+            or ""
+        )
+        episode_path = _local_episode_path(str(episode.get("data_uri") or ""), local_path)
+        cameras = (
+            _as_str_list(upload_payload.get("cameras"))
+            or _as_str_list(episode.get("cameras"))
+            or _discover_cameras(episode_path)
+        )
+        frames = _as_int_list(upload_payload.get("frames")) or _discover_frames(episode_path, cameras)
+        if not frames:
+            frame_count = _optional_int(episode.get("frame_count")) or _optional_int(upload_payload.get("frame_count"))
+            if frame_count:
+                frames = list(range(frame_count))
+
+        batches = self._frame_batches(frames, self.auto_label_batch_size)
+        if not batches:
+            batches = [[]]
+        batch_count = len(batches)
+        base_id = _stable_id_part(episode_id, "episode")
+        for index, batch_frames in enumerate(batches, 1):
+            job_id = f"auto_label_{base_id}_b{index:04d}"
+            payload = {
+                "job_id": job_id,
+                "episode_id": episode_id,
+                "subject_id": episode.get("subject_id"),
+                "task_name": episode.get("task_name"),
+                "data_uri": data_uri,
+                "local_capture_path": local_path,
+                "cameras": cameras,
+                "frames": batch_frames,
+                "batch_index": index,
+                "batch_count": batch_count,
+                "batch_size": self.auto_label_batch_size,
+                "rgb_path_template": str(upload_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
+                "prediction_dir": str(upload_payload.get("prediction_dir") or "pred_2d"),
+                "correction_dir": str(upload_payload.get("correction_dir") or "corrected_2d"),
+                "reason": "upload_succeeded",
+            }
+            self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload=payload)
+
+        self.store.update_episode_status(
+            episode_id,
+            "uploaded",
+            {
+                "auto_label_after_upload": True,
+                "auto_label_batch_count": batch_count,
+                "auto_label_batch_size": self.auto_label_batch_size,
+            },
+        )
+
+    @staticmethod
+    def _frame_batches(frames: Sequence[int], batch_size: int) -> List[List[int]]:
+        clean_frames = [int(frame) for frame in frames if not isinstance(frame, bool)]
+        if not clean_frames:
+            return []
+        size = max(1, int(batch_size or 1))
+        return [clean_frames[i : i + size] for i in range(0, len(clean_frames), size)]
 
     def _create_manual_label_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
         episode = self.store.get_episode(episode_id)

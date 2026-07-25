@@ -229,6 +229,27 @@ def load_label_tasks(path: Path, limit: int = 0) -> List[LabelTask]:
     return tasks
 
 
+def task_with_frames(task: LabelTask, frames: Sequence[int]) -> LabelTask:
+    return LabelTask(
+        root=task.root,
+        subject=task.subject,
+        task=task.task,
+        episode=task.episode,
+        cameras=list(task.cameras),
+        frames=[int(frame) for frame in frames],
+        rgb_path_template=task.rgb_path_template,
+        prediction_dir=task.prediction_dir,
+        correction_dir=task.correction_dir,
+    )
+
+
+def split_task_frames(task: LabelTask, frames_per_job: int = 0) -> List[LabelTask]:
+    size = int(frames_per_job or 0)
+    if size <= 0 or len(task.frames) <= size:
+        return [task]
+    return [task_with_frames(task, task.frames[i : i + size]) for i in range(0, len(task.frames), size)]
+
+
 def write_placeholder_ppm(path: Path, width: int = 64, height: int = 48) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     header = f"P6\n{width} {height}\n255\n".encode("ascii")
@@ -467,26 +488,43 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
     client = BackendClient(args.backend_url, timeout=args.timeout)
     nas = NasSimulator(args.nas_root, args.nas_uri_prefix)
     count = 0
+    stop = False
     for task in load_label_tasks(args.jsonl, args.limit):
-        if args.use_nas:
-            data_uri = nas.materialize_task(task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
-            local_path = ""
-        else:
-            data_uri = local_uri_from_path(task.episode_dir)
-            local_path = str(task.episode_dir)
-        job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}"
-        body = payload_from_task(task, data_uri, job_id, "seeded_from_label_jsonl")
-        if local_path:
-            body["local_path"] = local_path
-        result = client.create_manual_label_job(body)
-        count += 1
-        print_event(
-            "manual_label_seeded",
-            job_id=result.get("job", {}).get("job_id", job_id),
-            episode_id=task.episode_id,
-            data_uri=data_uri,
-            status=result.get("job", {}).get("status"),
-        )
+        batches = split_task_frames(task, args.frames_per_job)
+        for batch_index, batch_task in enumerate(batches, 1):
+            if args.max_jobs and count >= args.max_jobs:
+                stop = True
+                break
+            if args.use_nas:
+                data_uri = nas.materialize_task(batch_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
+                local_path = ""
+            else:
+                data_uri = local_uri_from_path(task.episode_dir)
+                local_path = str(task.episode_dir)
+            suffix = f"_b{batch_index:04d}" if len(batches) > 1 else ""
+            job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}{suffix}"
+            body = payload_from_task(batch_task, data_uri, job_id, "seeded_from_label_jsonl")
+            body["payload"] = {
+                "batch_index": batch_index,
+                "batch_count": len(batches),
+                "frames_per_job": int(args.frames_per_job or 0),
+            }
+            if local_path:
+                body["local_path"] = local_path
+            result = client.create_manual_label_job(body)
+            count += 1
+            print_event(
+                "manual_label_seeded",
+                job_id=result.get("job", {}).get("job_id", job_id),
+                episode_id=task.episode_id,
+                data_uri=data_uri,
+                frames=len(batch_task.frames),
+                batch_index=batch_index,
+                batch_count=len(batches),
+                status=result.get("job", {}).get("status"),
+            )
+        if stop:
+            break
     print_event("manual_label_seed_done", count=count)
     return 0
 
@@ -568,22 +606,15 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
         },
         artifacts=[{"kind": "nas_episode", "uri": nas_uri, "metadata": {"worker_id": owner}}],
     )
-    auto_job_id = f"auto_label_{clean_id(str(payload.get('episode_id') or episode.get('episode_id')))}"
-    auto_payload = {
-        "job_id": auto_job_id,
-        "episode_id": payload.get("episode_id") or episode.get("episode_id"),
-        "subject_id": payload.get("subject_id") or episode.get("subject_id"),
-        "task_name": payload.get("task_name") or episode.get("task_name"),
-        "data_uri": nas_uri,
-        "cameras": cameras,
-        "frames": frames,
-        "rgb_path_template": payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.ppm",
-        "prediction_dir": payload.get("prediction_dir") or "pred_2d",
-        "correction_dir": payload.get("correction_dir") or "corrected_2d",
-        "reason": "upload_completed_by_virtual_nas",
-    }
-    client.create_dev_job("auto_label", str(auto_payload["episode_id"]), auto_payload)
-    print_event("upload_completed", job_id=job["job_id"], episode_id=auto_payload["episode_id"], nas_uri=nas_uri, next_job=auto_job_id)
+    print_event(
+        "upload_completed",
+        job_id=job["job_id"],
+        episode_id=payload.get("episode_id") or episode.get("episode_id"),
+        nas_uri=nas_uri,
+        auto_label="queued_by_backend",
+        cameras=len(cameras),
+        frames=len(frames),
+    )
     return True
 
 
@@ -771,6 +802,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(seed_label)
     seed_label.add_argument("--jsonl", type=Path, default=Path("label/task.jsonl"))
     seed_label.add_argument("--limit", type=int, default=0)
+    seed_label.add_argument("--max-jobs", type=int, default=0, help="Stop after seeding this many manual label jobs.")
+    seed_label.add_argument("--frames-per-job", type=int, default=0, help="Split each JSONL task into batches of N frames. 0 keeps one job per task.")
     seed_label.add_argument("--job-prefix", default="seeded_manual")
     seed_label.add_argument("--use-nas", action="store_true", help="Materialize tasks under the virtual NAS and use nas:// URIs.")
     seed_label.add_argument("--copy-source", action="store_true", help="Copy real source episode folders when they exist.")

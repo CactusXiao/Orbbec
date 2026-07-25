@@ -17,3 +17,4 @@ error.log
 log.txt
 timestamps.csv
 collection_data/
+task_backend_state/

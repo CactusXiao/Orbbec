@@ -54,6 +54,10 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state/virtual_nas
 # ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
 
+# Upload success automatically queues batched auto_label jobs:
+# ORBBEC_AUTO_LABEL_AFTER_UPLOAD=1
+# ORBBEC_AUTO_LABEL_BATCH_SIZE=200
+
 # Optional seed file for the setup page:
 # ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
 # ORBBEC_TASK_BACKEND_STATE_FILE=./task_backend_state/progress_state.json
@@ -213,16 +217,18 @@ have to match any path on the backend machine.
 8. Backend confirm creates an `upload` job. The virtual NAS uploader copies the
    already-saved local episode asynchronously and records progress in the
    workflow database.
-9. The collection UI returns to READY/IDLE after backend confirm succeeds. It
+9. Upload success marks the episode `uploaded` and queues batched `auto_label`
+   jobs according to `ORBBEC_AUTO_LABEL_BATCH_SIZE`.
+10. The collection UI returns to READY/IDLE after backend confirm succeeds. It
    keeps polling upload progress by reservation ID and displays the latest NAS
    status without blocking the next capture.
-10. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
+11. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
    uses the same reservation and idempotency key.
-11. Reset/Delete deletes local episode data and releases the reservation; it does
+12. Reset/Delete deletes local episode data and releases the reservation; it does
    not increase `completed`.
-12. The capture page has a `Tasks` button for returning to the standalone task
+13. The capture page has a `Tasks` button for returning to the standalone task
    selection page; task selection is not mixed into the capture view.
-13. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
+14. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
     dialog before stopping cameras or leaving collection when applicable.
 
 The backend confirm endpoint is idempotent: repeating the same
@@ -253,7 +259,9 @@ When collection confirms an episode, the workflow sidecar records an Episode
 with status `captured` and queues an `upload` job. The built-in virtual NAS
 uploader leases this job, copies local data to the virtual NAS, updates progress,
 registers a `nas_episode` artifact, and marks the episode `uploaded` only after
-the verified copy completes.
+the verified copy completes. The same completion path creates queued
+`auto_label` jobs in frame batches. Manual labeling completion stops at
+`manual_labeled`; any later review or return flow is left to a future policy.
 
 Upload status can be read by reservation/episode ID:
 

@@ -12,7 +12,7 @@ modify the existing `task_backend` or `label` modules.
 - A local NAS, stored under `.virtual_nas` by default, exposed as
   `nas://orbbec-virtual/...`.
 - Upload workers that copy or materialize a captured episode into the virtual
-  NAS, then enqueue an `auto_label` job.
+  NAS. The backend queues batched `auto_label` jobs when upload completes.
 - Auto-label workers that write placeholder 2D prediction `.npy` files, then
   enqueue a `qc` job.
 - QC workers that randomly pass or fail. Failed QC creates a queued
@@ -40,6 +40,8 @@ creates queued `manual_label` jobs through `/api/v1/dev/label/jobs`.
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
   --jsonl label/task.jsonl \
   --use-nas \
+  --frames-per-job 32 \
+  --max-jobs 3 \
   --limit 1
 ```
 
@@ -96,6 +98,8 @@ manual label simulation together.
 
 - `--nas-root PATH`: local directory for the virtual NAS.
 - `--nas-uri-prefix URI`: NAS URI prefix, default `nas://orbbec-virtual`.
+- `seed-label --frames-per-job N`: split one JSONL task into frame batches.
+- `seed-label --max-jobs N`: seed only the first N manual-label batches.
 - `--copy-source`: copy real episode folders if they exist.
 - `--max-materialized-frames N`: limit generated placeholder frames for faster
   tests. `0` means all frames listed in the input payload.
