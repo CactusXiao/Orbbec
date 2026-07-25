@@ -10,6 +10,18 @@ local data on the capture machine as:
 
 `N` is always the episode number returned by the backend reserve API.
 
+The same process also owns a lightweight workflow/job store for downstream
+upload, auto-label, QC, review, and manual labeling work. This is an incremental
+extension of `task_backend/server.py`: the original collection API and JSON
+progress state remain compatible, while new workflow state is stored in
+`<dataRoot>/workflow.sqlite3` with Python's standard `sqlite3` module.
+
+NAS storage, automatic labeling, and automatic QC are intentionally decoupled at
+this stage. The server stores abstract URIs such as `local:///data/episode_001`
+or `nas://orbbec-dataset/S001/...`, job status, and artifact registrations, but
+it does not mount NAS, import model code, or run QC/model inference. Future
+workers should connect through the job API below.
+
 ## Start The Backend
 
 From the repository root:
@@ -27,6 +39,8 @@ Supported `.env` keys:
 ORBBEC_TASK_BACKEND_HOST=127.0.0.1
 ORBBEC_TASK_BACKEND_PORT=8765
 ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
+# Optional workflow SQLite override:
+# ORBBEC_WORKFLOW_DB=./task_backend_state/workflow.sqlite3
 
 # Optional seed file for the setup page:
 # ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
@@ -197,3 +211,154 @@ have to match any path on the backend machine.
 The backend confirm endpoint is idempotent: repeating the same
 `idempotency_key` for the same reservation returns current progress without
 double-counting the episode.
+
+## Collection API Compatibility
+
+Existing collection clients can keep using:
+
+```text
+GET  /api/v1/tasks
+POST /api/v1/episodes/reserve
+POST /api/v1/episodes/confirm
+POST /api/v1/episodes/release
+```
+
+The server also exposes aliases for newer clients:
+
+```text
+GET  /api/v1/collection/tasks
+POST /api/v1/collection/episodes/reserve
+POST /api/v1/collection/episodes/confirm
+POST /api/v1/collection/episodes/release
+```
+
+When collection confirms an episode, the workflow sidecar records an Episode
+with status `captured` and queues an `upload` job. The upload job is only a
+status placeholder until a real upload worker exists.
+
+## Workflow And Label APIs
+
+Generic workers lease jobs by type:
+
+```text
+POST /api/v1/jobs/lease
+POST /api/v1/jobs/{job_id}/heartbeat
+POST /api/v1/jobs/{job_id}/complete
+POST /api/v1/jobs/{job_id}/fail
+POST /api/v1/jobs/{job_id}/release
+```
+
+`POST /api/v1/jobs/lease` accepts JSON like:
+
+```json
+{"type":"auto_label","worker_id":"auto_label_stub_01","lease_seconds":300}
+```
+
+Manual labeling uses a narrower API:
+
+```text
+POST /api/v1/label/jobs/lease
+GET  /api/v1/label/jobs/{job_id}
+POST /api/v1/label/jobs/{job_id}/heartbeat
+POST /api/v1/label/jobs/{job_id}/complete
+POST /api/v1/label/jobs/{job_id}/release
+```
+
+Lease semantics:
+
+- only `queued` jobs, or jobs with an expired lease, can be leased;
+- lease writes `lease_owner`, `lease_until`, and `status=leased`;
+- heartbeat extends the lease and may mark the job `running`;
+- complete is idempotent;
+- fail records an error and increments `attempt`;
+- release clears the lease and returns unfinished work to `queued`.
+
+`manual_label` lease moves the Episode to `manual_labeling`; successful
+completion moves it to `manual_labeled` and can register a `corrected_2d`
+artifact.
+
+## Development Manual Label Jobs
+
+Until QC can create manual work automatically, use this temporary development
+endpoint:
+
+```text
+POST /api/v1/dev/label/jobs
+```
+
+Example with local data:
+
+```bash
+curl -s http://127.0.0.1:8765/api/v1/dev/label/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "local_path": "/Users/cactusxiao/data/S001/pick_object/episode_000456",
+    "subject_id": "S001",
+    "task_name": "pick_object",
+    "episode_id": "episode_000456",
+    "cameras": ["camera_01", "camera_02"],
+    "frames": [120, 121, 122, 123],
+    "rgb_path_template": "{camera}/RGB/{frame:05d}.png",
+    "prediction_dir": "pred_2d",
+    "correction_dir": "corrected_2d"
+  }'
+```
+
+The endpoint converts `local_path` to a `local://` data URI. It is for local
+smoke tests and should be replaced by QC/worker-generated jobs later.
+
+There is also a development-only generic helper for stubbing `upload`,
+`auto_label`, `qc`, or `review` jobs:
+
+```text
+POST /api/v1/dev/jobs
+```
+
+QC stub completion can create a manual label job by completing a `qc` job with
+`{"result":{"passed":false}}`.
+
+## Label Frontend
+
+The label GUI now defaults to server-driven work. On the home page enter:
+
+```json
+{
+  "backend_url": "http://127.0.0.1:8765",
+  "operator_id": "labeler_01",
+  "mounts": {
+    "nas://orbbec-dataset": "/Volumes/orbbec-dataset"
+  }
+}
+```
+
+Click `Get Next Task` to lease the next `manual_label` job from
+`/api/v1/label/jobs/lease`. Legacy JSONL remains available for debugging, but it
+is no longer the default task source.
+
+For local smoke tests, a payload with
+`"data_uri":"local:///Users/cactusxiao/data/S001/pick_object/episode_000456"`
+requires no mount mapping. A NAS-style URI such as
+`nas://orbbec-dataset/S001/pick_object/episode_000456` resolves through the
+configured mount prefix.
+
+Label confirmation still writes corrected 2D arrays to:
+
+```text
+corrected_2d/<camera>/<frame:05d>.npy
+```
+
+After all frames in the leased job are complete, the GUI calls the backend
+complete endpoint and registers a `corrected_2d` artifact. The local progress
+CSV is retained only as a temporary cache/legacy aid.
+
+## Artifact Kinds
+
+Current artifact kind names:
+
+- `pred_2d`: automatic or manual pre-label 2D output.
+- `corrected_2d`: human-corrected 2D output.
+- `kp3d`: 3D output.
+- `qc_report`: quality-control report.
+
+If an existing auto-label pipeline emits `kp2d`, adapt it at the artifact
+boundary to `pred_2d`; do not couple model internals into the server.

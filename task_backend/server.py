@@ -29,6 +29,15 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
+    from .job_service import JobService
+    from .workflow_models import WorkflowError
+    from .workflow_store import WorkflowStore
+except ImportError:  # pragma: no cover - script execution fallback
+    from job_service import JobService  # type: ignore
+    from workflow_models import WorkflowError  # type: ignore
+    from workflow_store import WorkflowStore  # type: ignore
+
+try:
     import fcntl  # type: ignore
 except ImportError:  # pragma: no cover - non-Linux fallback
     fcntl = None
@@ -441,8 +450,9 @@ class TaskInstanceRegistry:
 
 
 class BackendRuntime:
-    def __init__(self, registry: TaskInstanceRegistry):
+    def __init__(self, registry: TaskInstanceRegistry, workflow_service: JobService):
         self.registry = registry
+        self.workflow_service = workflow_service
         self.lock = threading.RLock()
         self.backend: Optional[TaskBackend] = None
         self.active_selection: Optional[Dict[str, Any]] = None
@@ -473,6 +483,7 @@ class BackendRuntime:
                 task_file=resolved["task_path"],
                 state_file=resolved["state_file"],
                 runtime_info=info,
+                workflow_service=self.workflow_service,
             )
             self.active_selection = info
             return dict(info)
@@ -842,7 +853,8 @@ class TaskBackend:
                  data_root: Path,
                  task_file: Path,
                  state_file: Optional[Path] = None,
-                 runtime_info: Optional[Dict[str, Any]] = None):
+                 runtime_info: Optional[Dict[str, Any]] = None,
+                 workflow_service: Optional[JobService] = None):
         self.data_root = data_root
         self.task_file = task_file
         self.state_file = state_file or (data_root / "progress_state.json")
@@ -850,7 +862,17 @@ class TaskBackend:
         self.tasks = load_task_file(task_file)
         self.tasks_by_name = {task["task_name"]: task for task in self.tasks}
         self.runtime_info = runtime_info or {}
+        self.workflow_service = workflow_service
         self.data_root.mkdir(parents=True, exist_ok=True)
+
+    def _workflow_hook(self, method_name: str, payload: Dict[str, Any]) -> None:
+        if self.workflow_service is None:
+            return
+        try:
+            method = getattr(self.workflow_service, method_name)
+            method(dict(payload))
+        except Exception as exc:
+            print(f"[task-backend] workflow hook {method_name} failed: {exc}", file=sys.stderr)
 
     @contextmanager
     def locked_state(self):
@@ -1058,7 +1080,7 @@ class TaskBackend:
 
             reservation_id = str(uuid.uuid4())
             episode_number = next_episode_number(subject, task_name)
-            subject["reservations"][reservation_id] = {
+            reservation = {
                 "reservation_id": reservation_id,
                 "client_id": client_id,
                 "subject_id": subject_id,
@@ -1068,6 +1090,8 @@ class TaskBackend:
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
+            subject["reservations"][reservation_id] = reservation
+            self._workflow_hook("record_collection_reservation", reservation)
             return {
                 "reservation_id": reservation_id,
                 "task_name": task_name,
@@ -1128,6 +1152,7 @@ class TaskBackend:
             if frame_count is not None:
                 reservation["frame_count"] = frame_count
             subject["idempotency"][idempotency_key] = reservation_id
+            self._workflow_hook("record_collection_confirm", reservation)
             return progress_payload(subject_id, subject, self.tasks, state)
 
     def release(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1149,6 +1174,7 @@ class TaskBackend:
                 reservation["released_at"] = now_iso()
                 reservation["updated_at"] = now_iso()
                 released = True
+                self._workflow_hook("record_collection_release", reservation)
             else:
                 released = False
             return {"released": released, **progress_payload(subject_id, subject, self.tasks, state)}
@@ -1623,6 +1649,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             )
         return backend
 
+    @property
+    def workflow(self) -> JobService:
+        return self.runtime.workflow_service
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (now_iso(), fmt % args))
 
@@ -1682,10 +1712,27 @@ class RequestHandler(BaseHTTPRequestHandler):
     def _setup_page(self, message: str = "", error: str = "") -> str:
         return render_setup_page(self.runtime.registry.snapshot(), self.runtime.registry.data_root, message, error)
 
+    @staticmethod
+    def _path_job_action(path: str, prefix: str) -> Optional[Tuple[str, str]]:
+        if not path.startswith(prefix + "/"):
+            return None
+        rest = path[len(prefix) + 1:].strip("/")
+        parts = rest.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        return unquote(parts[0]), parts[1]
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            if parsed.path.startswith("/api/v1/label/jobs/"):
+                job_id = unquote(parsed.path[len("/api/v1/label/jobs/"):].strip("/")).strip()
+                if not job_id or "/" in job_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "label job not found")
+                self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
+                return
+
             if not self.runtime.is_started():
                 if parsed.path in ("", "/", "/setup"):
                     self._html_response(HTTPStatus.OK, self._setup_page())
@@ -1702,7 +1749,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CONFLICT,
                     "task backend is already started; restart the process to choose another instance",
                 )
-            elif parsed.path == "/api/v1/tasks":
+            elif parsed.path in ("/api/v1/tasks", "/api/v1/collection/tasks"):
                 query = parse_qs(parsed.query)
                 subject_id = (query.get("subject_id") or [""])[0].strip()
                 if not subject_id:
@@ -1723,6 +1770,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             else:
                 raise BackendError(HTTPStatus.NOT_FOUND, "not found")
         except BackendError as exc:
+            if is_api:
+                self._json_response(exc.status, {"error": exc.message})
+            else:
+                self._html_response(exc.status, render_error_page(exc.status, exc.message))
+        except WorkflowError as exc:
             if is_api:
                 self._json_response(exc.status, {"error": exc.message})
             else:
@@ -1778,14 +1830,47 @@ class RequestHandler(BaseHTTPRequestHandler):
                 return
 
             body = self._read_json()
-            if parsed.path == "/api/v1/episodes/reserve":
-                self._json_response(HTTPStatus.OK, self.backend.reserve(body))
-            elif parsed.path == "/api/v1/episodes/confirm":
-                self._json_response(HTTPStatus.OK, self.backend.confirm(body))
-            elif parsed.path == "/api/v1/episodes/release":
-                self._json_response(HTTPStatus.OK, self.backend.release(body))
+            if parsed.path == "/api/v1/dev/label/jobs":
+                self._json_response(HTTPStatus.OK, self.workflow.create_manual_label_job(body))
+            elif parsed.path == "/api/v1/dev/jobs":
+                self._json_response(HTTPStatus.OK, self.workflow.create_dev_job(body))
+            elif parsed.path == "/api/v1/jobs/lease":
+                self._json_response(HTTPStatus.OK, self.workflow.lease_job(body))
+            elif parsed.path == "/api/v1/label/jobs/lease":
+                self._json_response(HTTPStatus.OK, self.workflow.lease_job(body, forced_type="manual_label"))
             else:
-                raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+                label_action = self._path_job_action(parsed.path, "/api/v1/label/jobs")
+                job_action = self._path_job_action(parsed.path, "/api/v1/jobs")
+                if label_action is not None:
+                    job_id, action = label_action
+                    if action == "heartbeat":
+                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_job(job_id, body))
+                    elif action == "complete":
+                        self._json_response(HTTPStatus.OK, self.workflow.complete_job(job_id, body))
+                    elif action == "release":
+                        self._json_response(HTTPStatus.OK, self.workflow.release_job(job_id, body))
+                    else:
+                        raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+                elif job_action is not None:
+                    job_id, action = job_action
+                    if action == "heartbeat":
+                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_job(job_id, body))
+                    elif action == "complete":
+                        self._json_response(HTTPStatus.OK, self.workflow.complete_job(job_id, body))
+                    elif action == "fail":
+                        self._json_response(HTTPStatus.OK, self.workflow.fail_job(job_id, body))
+                    elif action == "release":
+                        self._json_response(HTTPStatus.OK, self.workflow.release_job(job_id, body))
+                    else:
+                        raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+                elif parsed.path in ("/api/v1/episodes/reserve", "/api/v1/collection/episodes/reserve"):
+                    self._json_response(HTTPStatus.OK, self.backend.reserve(body))
+                elif parsed.path in ("/api/v1/episodes/confirm", "/api/v1/collection/episodes/confirm"):
+                    self._json_response(HTTPStatus.OK, self.backend.confirm(body))
+                elif parsed.path in ("/api/v1/episodes/release", "/api/v1/collection/episodes/release"):
+                    self._json_response(HTTPStatus.OK, self.backend.release(body))
+                else:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "not found")
         except BackendError as exc:
             if parsed.path.startswith("/setup/"):
                 self._html_response(exc.status, self._setup_page(error=exc.message))
@@ -1793,6 +1878,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._html_response(exc.status, render_error_page(exc.status, exc.message))
             else:
                 self._json_response(exc.status, {"error": exc.message})
+        except WorkflowError as exc:
+            self._json_response(exc.status, {"error": exc.message})
         except Exception as exc:  # pragma: no cover - defensive server boundary
             if parsed.path.startswith("/setup/"):
                 self._html_response(
@@ -1873,12 +1960,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if task_file.exists():
             seed_task_files.append((task_file, seed_state_file))
 
+    workflow_db_env = env_path(env, "ORBBEC_WORKFLOW_DB", "TASK_BACKEND_WORKFLOW_DB")
+    workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
+    workflow_store = WorkflowStore(workflow_db)
+    workflow_service = JobService(workflow_store)
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
-    runtime = BackendRuntime(registry)
+    runtime = BackendRuntime(registry, workflow_service)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
     if args.env_file.exists():
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
+    print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)
