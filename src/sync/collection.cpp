@@ -733,6 +733,7 @@ struct CollectionConfigUi {
     std::string brightness;
     std::string activeField;
     std::string error;
+    std::string notice;
 
     void enforceRules() {}
 
@@ -1089,6 +1090,88 @@ static std::string shellQuote(const std::string &s) {
     }
     out += "'";
     return out;
+}
+
+static std::optional<fs::path> findManualLabelRepoRoot() {
+    std::vector<fs::path> seeds;
+    try {
+        seeds.push_back(fs::current_path());
+    }
+    catch(...) {
+    }
+    seeds.push_back(fs::path("."));
+    seeds.push_back(fs::path(".."));
+    seeds.push_back(fs::path("../.."));
+
+    for(auto seed: seeds) {
+        try {
+            seed = fs::absolute(seed);
+        }
+        catch(...) {
+        }
+        for(fs::path cur = seed; !cur.empty(); cur = cur.parent_path()) {
+            if(fs::exists(cur / "label" / "main.py")) {
+                return cur;
+            }
+            if(cur == cur.root_path()) {
+                break;
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+static bool launchManualLabelFrontend(const std::string &backendUrl,
+                                      const std::string &operatorHint,
+                                      std::string *errorMessage) {
+    const auto repoRoot = findManualLabelRepoRoot();
+    if(!repoRoot.has_value()) {
+        if(errorMessage) {
+            *errorMessage = "label/main.py not found from current working directory";
+        }
+        return false;
+    }
+
+    const char *pythonEnv = std::getenv("ORBBEC_LABEL_PYTHON");
+    const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
+    const char *mountsEnv = std::getenv("ORBBEC_LABEL_MOUNTS_JSON");
+    const std::string mounts = mountsEnv ? mountsEnv : "{}";
+    const char *operatorEnv = std::getenv("ORBBEC_LABEL_OPERATOR_ID");
+    std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
+    if(operatorId.empty()) {
+        operatorId = trimString(operatorHint);
+    }
+    if(operatorId.empty()) {
+        operatorId = "labeler_01";
+    }
+
+    fs::path logPath;
+    try {
+        logPath = fs::temp_directory_path() / "orbbec_manual_label.log";
+    }
+    catch(...) {
+        logPath = "orbbec_manual_label.log";
+    }
+    std::ostringstream cmd;
+    cmd << "cd " << shellQuote(repoRoot->string())
+        << " && ORBBEC_TASK_BACKEND_URL=" << shellQuote(trimString(backendUrl))
+        << " ORBBEC_LABEL_OPERATOR_ID=" << shellQuote(operatorId)
+        << " ORBBEC_LABEL_MOUNTS_JSON=" << shellQuote(mounts)
+        << " nohup " << shellQuote(python)
+        << " -m label.main >> " << shellQuote(logPath.string())
+        << " 2>&1 &";
+
+    const int rc = std::system(cmd.str().c_str());
+    if(rc != 0) {
+        if(errorMessage) {
+            *errorMessage = "failed to start manual label frontend; log: " + logPath.string();
+        }
+        return false;
+    }
+    if(errorMessage) {
+        *errorMessage = logPath.string();
+    }
+    return true;
 }
 
 static int runCommandCapture(const std::string &command, std::string &output) {
@@ -8610,6 +8693,29 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         return true;
     };
 
+    auto launchManualLabel = [&](std::string *messageOut) {
+        if(!cfg.taskBackend.enabled) {
+            if(messageOut) {
+                *messageOut = "Task backend is disabled in config";
+            }
+            return false;
+        }
+        std::string detail;
+        const bool ok = launchManualLabelFrontend(backendClient.baseUrl(), trimString(cfgUi.subjectId), &detail);
+        if(ok) {
+            if(messageOut) {
+                *messageOut = "Manual label frontend opened";
+            }
+            pushUiLog("Manual label frontend opened. Log: " + detail);
+            return true;
+        }
+        if(messageOut) {
+            *messageOut = detail.empty() ? "Failed to open manual label frontend" : detail;
+        }
+        pushUiLog("Manual label launch failed: " + (detail.empty() ? std::string("unknown error") : detail));
+        return false;
+    };
+
     auto requestExit = [&](PendingExitAction action, bool deleteFaultEpisode) {
         exitConfirmActive = true;
         pendingExitAction = action;
@@ -8872,17 +8978,34 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             if(!cfgUi.error.empty()) {
                 cv::putText(ui, cfgUi.error, cv::Point(left, tuneTop + rowH + 46), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(60, 60, 255), 2, cv::LINE_AA);
             }
+            else if(!cfgUi.notice.empty()) {
+                cv::putText(ui, cfgUi.notice, cv::Point(left, tuneTop + rowH + 46), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(80, 200, 80), 2, cv::LINE_AA);
+            }
 
             cv::Rect bBack(60, fieldsTop + 3 * rowH, 220, 60);
             cv::Rect bEnter(340, fieldsTop + 3 * rowH, 260, 60);
+            cv::Rect bLabel(620, fieldsTop + 3 * rowH, 260, 60);
             if(!exitConfirmActive && uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
                 announce("menu", "menu");
                 requestExit(PendingExitAction::ExitCollection, false);
             }
+            if(!exitConfirmActive && uiButton(ui, bLabel, "Manual Label", fm)) {
+                std::string message;
+                if(launchManualLabel(&message)) {
+                    cfgUi.error.clear();
+                    cfgUi.notice = message;
+                }
+                else {
+                    cfgUi.notice.clear();
+                    cfgUi.error = "Manual label failed: " + message;
+                    announce("enter_failed", "enter failed");
+                }
+            }
             if(!exitConfirmActive && uiButton(ui, bEnter, "Load Tasks", fm)) {
                 collectionSetStage("ui_enter_capture");
                 cfgUi.enforceRules();
+                cfgUi.notice.clear();
                 if(!cfgUi.hasSelectedCaptureType()) {
                     cfgUi.error = "Select at least one capture type";
                     announce("enter_failed", "enter failed");
@@ -9126,12 +9249,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             const int btnH = 42;
             cv::Rect bConfig(margin, btnY, 170, btnH);
             cv::Rect bMenu(margin + 184, btnY, 150, btnH);
-            cv::Rect bRefresh(winW - margin - 380, btnY, 160, btnH);
+            cv::Rect bRefresh(winW - margin - 580, btnY, 160, btnH);
+            cv::Rect bLabel(winW - margin - 404, btnY, 190, btnH);
             cv::Rect bContinue(winW - margin - 204, btnY, 204, btnH);
             const bool allowContinue = !exitConfirmActive && selectedTaskSelectable;
             bool doConfig = uiButtonEx(ui, bConfig, "Back Config", fm, !exitConfirmActive);
             bool doMenu = uiButtonEx(ui, bMenu, "Menu", fm, !exitConfirmActive);
             bool doRefresh = uiButtonEx(ui, bRefresh, "Refresh", fm, !exitConfirmActive);
+            bool doLabel = uiButtonEx(ui, bLabel, "Manual Label", fm, !exitConfirmActive);
             bool doContinue = uiButtonEx(ui, bContinue, "Enter Capture", fm, allowContinue);
 
             if(key > 0 && !exitConfirmActive) {
@@ -9150,6 +9275,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                     }
                     else if(baseKey == '4') {
                         doMenu = true;
+                    }
+                    else if(baseKey == '5') {
+                        doLabel = true;
                     }
                 }
             }
@@ -9172,6 +9300,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 else {
                     capUi.msg = "Task refresh failed: " + error;
                     pushUiLog(capUi.msg);
+                    announce("enter_failed", "enter failed");
+                }
+            }
+            if(doLabel) {
+                std::string message;
+                if(launchManualLabel(&message)) {
+                    capUi.msg = message;
+                }
+                else {
+                    capUi.msg = "Manual label failed: " + message;
                     announce("enter_failed", "enter failed");
                 }
             }

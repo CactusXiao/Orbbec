@@ -335,6 +335,13 @@ Click `Get Next Task` to lease the next `manual_label` job from
 `/api/v1/label/jobs/lease`. Legacy JSONL remains available for debugging, but it
 is no longer the default task source.
 
+The collection frontend also exposes a `Manual Label` button on the Collection
+Config page and the Task Select page. It launches the same `python3 -m
+label.main` GUI as a separate window and pre-fills the backend URL from the
+collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
+`subject_id` as the operator hint; set `ORBBEC_LABEL_MOUNTS_JSON` when a
+NAS-style URI needs a local mount mapping.
+
 For local smoke tests, a payload with
 `"data_uri":"local:///Users/cactusxiao/data/S001/pick_object/episode_000456"`
 requires no mount mapping. A NAS-style URI such as
