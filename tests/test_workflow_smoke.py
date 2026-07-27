@@ -145,6 +145,9 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(status_after["upload"]["status"], "succeeded")
             self.assertEqual(status_after["upload"]["percent"], 100.0)
             self.assertTrue(status_after["upload"]["nas_uri"].startswith("nas://orbbec-virtual-test/"))
+            self.assertEqual(status_after["workflow"]["status"], "uploaded")
+            self.assertGreaterEqual(status_after["workflow"]["job_count"], 3)
+            self.assertTrue(any(job["type"] == "auto_label" for job in status_after["jobs"]))
             episode = store.get_episode("reservation_001")
             self.assertIsNotNone(episode)
             self.assertEqual(episode["status"], "uploaded")  # type: ignore[index]

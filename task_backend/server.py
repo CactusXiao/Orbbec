@@ -817,11 +817,26 @@ def sum_storage_bytes(items: Iterable[Dict[str, Any]]) -> int:
 
 
 def status_class(status: str) -> str:
-    if status == "confirmed":
+    status = str(status or "").strip()
+    if status in {"confirmed", "uploaded", "auto_labeled", "qc_passed", "review_passed", "manual_labeled", "finalized", "succeeded", "complete"}:
         return "ok"
-    if status == "reserved":
+    if status in {
+        "reserved",
+        "reserved_for_collection",
+        "captured",
+        "queued",
+        "leased",
+        "running",
+        "auto_labeling",
+        "qc_running",
+        "review_pending",
+        "manual_label_pending",
+        "manual_labeling",
+    }:
         return "warn"
-    if status == "released":
+    if status in {"failed", "canceled", "qc_failed"}:
+        return "bad"
+    if status in {"released", "planned", "missing", "not queued", "-"}:
         return "muted"
     return "neutral"
 
@@ -1017,6 +1032,8 @@ class TaskBackend:
             for item in self.reservation_list(state)
             if item.get("task_name") == task_name
         ]
+        for item in reservations:
+            item["workflow_summary"] = self._workflow_summary(str(item.get("reservation_id") or ""))
         subjects = sorted({str(item.get("subject_id", "")) for item in reservations if item.get("subject_id")})
         confirmed = [item for item in reservations if item.get("status") == "confirmed"]
         return {
@@ -1027,6 +1044,24 @@ class TaskBackend:
             "latest_at": latest_timestamp(reservations),
             "duration_seconds": sum_duration_seconds(confirmed),
             "storage_bytes": sum_storage_bytes(confirmed),
+        }
+
+    def _workflow_summary(self, reservation_id: str) -> Dict[str, Any]:
+        if self.workflow_service is None:
+            return {"status": "-", "active_job": "", "job_count": 0}
+        try:
+            workflow = self.workflow_service.upload_status(reservation_id)
+        except Exception as exc:
+            return {"status": "missing", "active_job": "", "job_count": 0, "error": str(exc)}
+        summary = workflow.get("workflow") if isinstance(workflow.get("workflow"), dict) else {}
+        active_type = str(summary.get("active_job_type") or "")
+        active_status = str(summary.get("active_job_status") or "")
+        active_job = (active_type + ":" + active_status).strip(":") if active_type or active_status else ""
+        return {
+            "status": str(summary.get("status") or "-"),
+            "active_job": active_job,
+            "active_job_id": str(summary.get("active_job_id") or ""),
+            "job_count": int(summary.get("job_count") or 0),
         }
 
     def episode_detail_model(self, reservation_id: str) -> Dict[str, Any]:
@@ -1289,6 +1324,7 @@ def render_layout(title: str, body: str) -> str:
     }}
     .badge.ok {{ color: #0f5f46; background: #e5f5ed; border-color: #b7e0cc; }}
     .badge.warn {{ color: var(--warn); background: #fff3dc; border-color: #f0d09b; }}
+    .badge.bad {{ color: var(--bad); background: #fff0f2; border-color: #e4a6af; }}
     .badge.muted {{ color: #596675; background: #eef1f4; border-color: #d4dae1; }}
     .badge.neutral {{ color: #535f6d; background: #eef2f7; border-color: #d5dde8; }}
     .desc {{ max-width: 760px; white-space: pre-wrap; }}
@@ -1521,12 +1557,17 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         reservation_id = str(item.get("reservation_id", ""))
         status = str(item.get("status", "unknown"))
         stats = item.get("stats", {})
+        workflow_summary = item.get("workflow_summary") if isinstance(item.get("workflow_summary"), dict) else {}
+        workflow_status = str(workflow_summary.get("status") or "-")
+        active_job = str(workflow_summary.get("active_job") or "")
+        workflow_note = f"<div class=\"muted mono\">{html_escape(active_job)}</div>" if active_job else ""
         rows.append(
             "<tr>"
             f"<td><a class=\"mono\" href=\"/episodes/{url_part(reservation_id)}\">{html_escape(reservation_id[:8])}</a></td>"
             f"<td>{html_escape(item.get('subject_id', ''))}</td>"
             f"<td class=\"num\">{html_escape(item.get('episode_number', ''))}</td>"
             f"<td>{render_status_badge(status)}</td>"
+            f"<td>{render_status_badge(workflow_status)}{workflow_note}</td>"
             f"<td class=\"num\">{html_escape(stats.get('duration_label', '-'))}</td>"
             f"<td class=\"num\">{html_escape(stats.get('frame_count_label', '-'))}</td>"
             f"<td class=\"num\">{html_escape(stats.get('storage_label', '-'))}</td>"
@@ -1535,7 +1576,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
             f"<td class=\"mono\">{html_escape(item.get('local_path') or '-')}</td>"
             "</tr>"
         )
-    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"10\" class=\"empty\">No episodes reserved yet.</td></tr>"
+    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"11\" class=\"empty\">No episodes reserved yet.</td></tr>"
     meta_rows = []
     for key, value in metadata_pairs(task):
         meta_rows.append(f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>")
@@ -1560,7 +1601,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + f"<div>Latest update</div><div class=\"mono\">{html_escape(model.get('latest_at') or '-')}</div>"
         + "</div></section>"
         "<section><h2>Episodes</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>Episode</th><th>Subject</th><th class=\"num\">No.</th><th>Status</th>"
+        "<thead><tr><th>Episode</th><th>Subject</th><th class=\"num\">No.</th><th>Status</th><th>Workflow</th>"
         "<th class=\"num\">Duration</th><th class=\"num\">Frames</th><th class=\"num\">Storage</th>"
         "<th>Client</th><th>Updated</th><th>Local Path</th></tr></thead><tbody>"
         + episode_rows
@@ -1592,12 +1633,46 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     upload_files_total = int(upload.get("files_total") or 0) if isinstance(upload, dict) else 0
     upload_nas_uri = str(upload.get("nas_uri") or "") if isinstance(upload, dict) else ""
     upload_error = str(upload.get("error") or workflow.get("error") or "") if isinstance(upload, dict) else str(workflow.get("error") or "")
+    workflow_info = workflow.get("workflow") if isinstance(workflow.get("workflow"), dict) else {}
+    workflow_status = str(workflow_info.get("status") or "-")
+    active_job_type = str(workflow_info.get("active_job_type") or "")
+    active_job_status = str(workflow_info.get("active_job_status") or "")
+    active_job_id = str(workflow_info.get("active_job_id") or "")
+    active_job = (active_job_type + ":" + active_job_status).strip(":") if active_job_type or active_job_status else "-"
+    workflow_job_count = int(workflow_info.get("job_count") or 0)
+    jobs = workflow.get("jobs") if isinstance(workflow.get("jobs"), list) else []
+    job_rows = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        batch_index = job.get("batch_index")
+        batch_count = job.get("batch_count")
+        batch_label = "-"
+        if batch_index is not None and batch_count is not None:
+            batch_label = f"{batch_index}/{batch_count}"
+        frames = job.get("frames")
+        frames_label = str(frames) if frames is not None else "-"
+        error = str(job.get("error") or "")
+        job_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{html_escape(job.get('job_id') or '-')}</td>"
+            f"<td>{html_escape(job.get('type') or '-')}</td>"
+            f"<td>{render_status_badge(str(job.get('status') or '-'))}</td>"
+            f"<td class=\"num\">{html_escape(batch_label)}</td>"
+            f"<td class=\"num\">{html_escape(frames_label)}</td>"
+            f"<td class=\"mono\">{html_escape(job.get('lease_owner') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(job.get('updated_at') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(error or '-')}</td>"
+            "</tr>"
+        )
+    workflow_jobs_html = "\n".join(job_rows) if job_rows else "<tr><td colspan=\"8\" class=\"empty\">No workflow jobs yet.</td></tr>"
     fields = [
         ("Reservation ID", reservation_id),
         ("Task", task_name),
         ("Subject", item.get("subject_id", "")),
         ("Episode number", item.get("episode_number", "")),
         ("Status", status),
+        ("Workflow status", workflow_status),
         ("Total duration", stats.get("duration_label", "-")),
         ("Total frames", stats.get("frame_count_label", "-")),
         ("Storage size", stats.get("storage_label", "-")),
@@ -1634,6 +1709,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + render_metric("Duration", stats.get("duration_label", "-"))
         + render_metric("Frames", stats.get("frame_count_label", "-"))
         + render_metric("Storage", stats.get("storage_label", "-"))
+        + render_metric("Workflow", workflow_status, active_job if active_job != "-" else "")
         + render_metric("NAS Upload", upload_status, upload_percent_label if upload_available else "waiting for upload job")
         + "</div>"
         "<section><h2>Episode Details</h2><div class=\"kv\">"
@@ -1641,6 +1717,10 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + "</div></section>"
         "<section><h2>Storage And Quality</h2><div class=\"kv\">"
         f"<div>Storage status</div><div>{html_escape('Local path recorded' if item.get('local_path') else 'Waiting for confirm')}</div>"
+        f"<div>Workflow status</div><div>{render_status_badge(workflow_status)}</div>"
+        f"<div>Active job</div><div class=\"mono\">{html_escape(active_job)}"
+        f"{html_escape(' / ' + active_job_id if active_job_id else '')}</div>"
+        f"<div>Workflow jobs</div><div class=\"mono\">{html_escape(workflow_job_count)}</div>"
         f"<div>Upload job</div><div class=\"mono\">{html_escape(upload.get('job_id') or '-' if isinstance(upload, dict) else '-')}</div>"
         f"<div>Upload status</div><div>{render_status_badge(upload_status)}"
         f" <span class=\"muted mono\">{html_escape(upload_phase)} {html_escape(upload_percent_label)}</span></div>"
@@ -1649,8 +1729,12 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         f"<div>NAS URI</div><div class=\"mono\">{html_escape(upload_nas_uri or '-')}</div>"
         f"<div>Upload error</div><div class=\"mono\">{html_escape(upload_error or '-')}</div>"
         f"<div>Backend file access</div><div class=\"muted\">{html_escape(storage_note)}</div>"
-        f"<div>Quality status</div><div class=\"muted\">Not integrated yet.</div>"
         + "</div></section>"
+        "<section><h2>Workflow Jobs</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Job</th><th>Type</th><th>Status</th><th class=\"num\">Batch</th>"
+        "<th class=\"num\">Frames</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
+        + workflow_jobs_html
+        + "</tbody></table></div></section>"
         "<section><h2>Task Metadata Snapshot</h2><div class=\"kv\">"
         + meta_html
         + "</div></section>"

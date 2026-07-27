@@ -63,6 +63,27 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(job.get("payload") or {})
+    result = dict(job.get("result") or {})
+    out = {
+        "job_id": str(job.get("job_id") or ""),
+        "type": str(job.get("type") or ""),
+        "status": str(job.get("status") or ""),
+        "lease_owner": str(job.get("lease_owner") or ""),
+        "lease_until": str(job.get("lease_until") or ""),
+        "attempt": _optional_int(job.get("attempt")) or 0,
+        "created_at": str(job.get("created_at") or ""),
+        "updated_at": str(job.get("updated_at") or ""),
+        "batch_index": _optional_int(payload.get("batch_index")),
+        "batch_count": _optional_int(payload.get("batch_count")),
+        "frames": len(payload.get("frames") or []) if isinstance(payload.get("frames"), list) else None,
+    }
+    if result.get("error"):
+        out["error"] = str(result.get("error") or "")
+    return out
+
+
 def _discover_cameras(episode_dir: Optional[Path]) -> List[str]:
     if episode_dir is None or not episode_dir.exists():
         return []
@@ -241,8 +262,9 @@ class JobService:
         episode = self.store.get_episode(episode_id)
         if episode is None:
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
-        jobs = self.store.jobs_for_episode(episode_id, "upload")
-        upload_job = jobs[-1] if jobs else None
+        all_jobs = self.store.jobs_for_episode(episode_id)
+        upload_jobs = [job for job in all_jobs if job.get("type") == "upload"]
+        upload_job = upload_jobs[-1] if upload_jobs else None
         artifacts = self.store.artifacts_for_episode(episode_id)
         upload_artifacts = [item for item in artifacts if item.get("kind") == "nas_episode"]
         result = dict(upload_job.get("result") or {}) if upload_job else {}
@@ -261,8 +283,27 @@ class JobService:
             nas_uri = str(upload_artifacts[-1].get("uri") or "")
         if not nas_uri and str(episode.get("data_uri") or "").startswith("nas://"):
             nas_uri = str(episode.get("data_uri") or "")
+        workflow_status = str(episode.get("status") or "planned")
+        active_jobs = [
+            job for job in all_jobs
+            if str(job.get("status") or "") not in {"succeeded", "failed", "canceled"}
+        ]
+        active_job = active_jobs[-1] if active_jobs else None
+        job_counts: Dict[str, int] = {}
+        for job in all_jobs:
+            key = str(job.get("type") or "job") + ":" + str(job.get("status") or "unknown")
+            job_counts[key] = job_counts.get(key, 0) + 1
         return {
             "episode": episode,
+            "workflow": {
+                "status": workflow_status,
+                "active_job_id": str(active_job.get("job_id") or "") if active_job else "",
+                "active_job_type": str(active_job.get("type") or "") if active_job else "",
+                "active_job_status": str(active_job.get("status") or "") if active_job else "",
+                "job_count": len(all_jobs),
+                "job_counts": job_counts,
+                "updated_at": str(episode.get("updated_at") or ""),
+            },
             "upload": {
                 "available": upload_job is not None,
                 "job_id": str(upload_job.get("job_id") or "") if upload_job else "",
@@ -280,6 +321,7 @@ class JobService:
                 "result": result,
             },
             "artifacts": upload_artifacts,
+            "jobs": [_compact_job(job) for job in all_jobs],
         }
 
     def heartbeat_job(self, job_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
