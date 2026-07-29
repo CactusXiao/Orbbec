@@ -487,24 +487,40 @@ class WorkflowStore:
             return True
         return bool(self.get_stage_control(job_type).get("lease_enabled"))
 
-    def lease_job(self, *, job_type: str, lease_owner: str, lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
+    def lease_job(
+        self,
+        *,
+        job_type: str,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        task_name: str = "",
+        subject_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
         job_type = require_job_type(job_type)
         lease_owner = str(lease_owner or "").strip()
         if not lease_owner:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "lease_owner is required")
+        task_name = str(task_name or "").strip()
+        subject_id = str(subject_id or "").strip()
         lease_seconds = max(1, int(lease_seconds or 300))
         now = now_iso()
         lease_until = _future_iso(lease_seconds)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                """
-                SELECT * FROM jobs
-                WHERE type = ? AND status NOT IN ('succeeded', 'failed', 'canceled')
-                ORDER BY created_at, job_id
-                """,
-                (job_type,),
-            ).fetchall()
+            params: List[Any] = [job_type]
+            query = """
+                SELECT jobs.* FROM jobs
+                LEFT JOIN episodes ON episodes.episode_id = jobs.episode_id
+                WHERE jobs.type = ? AND jobs.status NOT IN ('succeeded', 'failed', 'canceled')
+            """
+            if task_name:
+                query += " AND episodes.task_name = ?"
+                params.append(task_name)
+            if subject_id:
+                query += " AND episodes.subject_id = ?"
+                params.append(subject_id)
+            query += " ORDER BY jobs.created_at, jobs.job_id"
+            rows = conn.execute(query, tuple(params)).fetchall()
             selected: Optional[sqlite3.Row] = None
             for row in rows:
                 status = str(row["status"])

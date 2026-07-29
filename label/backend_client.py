@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Set
 from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
@@ -74,11 +74,22 @@ class LabelBackendClient:
     def create_dev_label_job(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/api/v1/dev/label/jobs", payload)
 
-    def lease_label_job(self, operator_id: str, *, lease_seconds: int = 600) -> Dict[str, Any]:
+    def lease_label_job(self, operator_id: str, *, lease_seconds: int = 600, task_name: str = "") -> Dict[str, Any]:
+        payload = {"operator_id": operator_id, "lease_seconds": int(lease_seconds)}
+        task_name = str(task_name or "").strip()
+        if task_name:
+            payload["task_name"] = task_name
         return self._post(
             "/api/v1/label/jobs/lease",
-            {"operator_id": operator_id, "lease_seconds": int(lease_seconds)},
+            payload,
         )
+
+    def manual_label_queue(self) -> Dict[str, Any]:
+        return self._get("/api/v1/workflow/stages/manual_label")
+
+    def queued_label_tasks(self) -> List[Dict[str, Any]]:
+        stage = self.manual_label_queue()
+        return grouped_label_tasks(stage.get("queued") or [])
 
     def get_label_job(self, job_id: str) -> Dict[str, Any]:
         return self._get(f"/api/v1/label/jobs/{job_id}")
@@ -170,15 +181,59 @@ def parse_mounts_json(text: str) -> Dict[str, str]:
     return out
 
 
+def grouped_label_tasks(queued_jobs: Any) -> List[Dict[str, Any]]:
+    if not isinstance(queued_jobs, list):
+        return []
+    groups: Dict[str, Dict[str, Any]] = {}
+    subject_sets: Dict[str, Set[str]] = {}
+    for item in queued_jobs:
+        if not isinstance(item, dict):
+            continue
+        task_name = str(item.get("task_name") or "Unspecified").strip() or "Unspecified"
+        group = groups.setdefault(
+            task_name,
+            {
+                "task_name": task_name,
+                "queued": 0,
+                "frames": 0,
+                "oldest_created_at": "",
+                "jobs": [],
+            },
+        )
+        subjects = subject_sets.setdefault(task_name, set())
+        group["queued"] += 1
+        frames_count = item.get("frames_count")
+        if not isinstance(frames_count, bool):
+            try:
+                group["frames"] += max(0, int(frames_count))
+            except (TypeError, ValueError):
+                pass
+        created_at = str(item.get("created_at") or "")
+        if created_at and (not group["oldest_created_at"] or created_at < group["oldest_created_at"]):
+            group["oldest_created_at"] = created_at
+        subject_id = str(item.get("subject_id") or "").strip()
+        if subject_id:
+            subjects.add(subject_id)
+        group["jobs"].append(item)
+    out = []
+    for task_name, group in groups.items():
+        subjects = sorted(subject_sets.get(task_name, set()))
+        group["subjects"] = subjects
+        group["subject_summary"] = ", ".join(subjects)
+        out.append(group)
+    return sorted(out, key=lambda item: (str(item.get("task_name") or ""), str(item.get("oldest_created_at") or "")))
+
+
 def session_from_lease(
     *,
     backend_url: str,
     operator_id: str,
     mounts: Optional[Mapping[str, str]] = None,
     lease_seconds: int = 600,
+    task_name: str = "",
 ) -> LabelJobSession:
     client = LabelBackendClient(backend_url)
-    response = client.lease_label_job(operator_id, lease_seconds=lease_seconds)
+    response = client.lease_label_job(operator_id, lease_seconds=lease_seconds, task_name=task_name)
     job = dict(response.get("job") or {})
     payload = dict(response.get("payload") or job.get("payload") or {})
     job_id = str(payload.get("job_id") or job.get("job_id") or "").strip()

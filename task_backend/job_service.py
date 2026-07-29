@@ -313,8 +313,18 @@ class JobService:
             raise WorkflowError(HTTPStatus.CONFLICT, f"leasing disabled for job type: {job_type}")
         owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
         lease_seconds = _optional_int(body.get("lease_seconds")) or 300
-        job = self.store.lease_job(job_type=job_type, lease_owner=owner, lease_seconds=lease_seconds)
+        task_name = str(body.get("task_name") or body.get("task") or "").strip()
+        subject_id = str(body.get("subject_id") or body.get("subject") or "").strip()
+        job = self.store.lease_job(
+            job_type=job_type,
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+            task_name=task_name,
+            subject_id=subject_id,
+        )
         if job is None:
+            if task_name:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available for task: {task_name}")
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available")
         self._mark_episode_for_leased_job(job)
         return self.enrich_job(job)

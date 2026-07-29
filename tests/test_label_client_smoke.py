@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from label.backend_client import LabelBackendClient, UriResolver
+from label.backend_client import LabelBackendClient, UriResolver, grouped_label_tasks
 from label.storage import correction_task_from_backend_payload
 from task_backend.job_service import JobService
 from task_backend.server import BackendRuntime, RequestHandler, TaskHTTPServer, TaskInstanceRegistry
@@ -15,6 +15,21 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
+    def test_grouped_label_tasks_by_task(self) -> None:
+        groups = grouped_label_tasks(
+            [
+                {"job_id": "job_1", "task_name": "pick_object", "subject_id": "S001", "frames_count": 2, "created_at": "2026-01-01T00:00:01Z"},
+                {"job_id": "job_2", "task_name": "place_object", "subject_id": "S002", "frames_count": 3, "created_at": "2026-01-01T00:00:02Z"},
+                {"job_id": "job_3", "task_name": "pick_object", "subject_id": "S003", "frames_count": 4, "created_at": "2026-01-01T00:00:00Z"},
+            ]
+        )
+        by_task = {item["task_name"]: item for item in groups}
+        self.assertEqual(by_task["pick_object"]["queued"], 2)
+        self.assertEqual(by_task["pick_object"]["frames"], 6)
+        self.assertEqual(by_task["pick_object"]["subjects"], ["S001", "S003"])
+        self.assertEqual(by_task["pick_object"]["oldest_created_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(by_task["place_object"]["queued"], 1)
+
     def test_dev_create_lease_resolve_and_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

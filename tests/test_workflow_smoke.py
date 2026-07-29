@@ -194,6 +194,53 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             leased = service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
             self.assertEqual(leased["payload"]["resolved_data_path"], str(episode_dir.resolve()))
 
+    def test_manual_label_lease_can_filter_by_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            created_a = service.create_manual_label_job(
+                {
+                    "episode_id": "episode_pick",
+                    "subject_id": "S001",
+                    "task_name": "pick_object",
+                    "data_uri": f"local://{tmp_path / 'S001' / 'pick_object' / 'episode_pick'}",
+                    "frames": [1, 2],
+                }
+            )
+            created_b = service.create_manual_label_job(
+                {
+                    "episode_id": "episode_place",
+                    "subject_id": "S001",
+                    "task_name": "place_object",
+                    "data_uri": f"local://{tmp_path / 'S001' / 'place_object' / 'episode_place'}",
+                    "frames": [3],
+                }
+            )
+
+            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
+            leased_b = service.lease_job(
+                {"operator_id": "labeler_01", "task_name": "place_object"},
+                forced_type="manual_label",
+            )
+            self.assertEqual(leased_b["job"]["job_id"], created_b["job"]["job_id"])
+            self.assertEqual(leased_b["payload"]["task_name"], "place_object")
+
+            leased_a = service.lease_job(
+                {"operator_id": "labeler_02", "task": "pick_object"},
+                forced_type="manual_label",
+            )
+            self.assertEqual(leased_a["job"]["job_id"], created_a["job"]["job_id"])
+            self.assertEqual(leased_a["payload"]["task_name"], "pick_object")
+
+            with self.assertRaises(WorkflowError) as missing:
+                service.lease_job(
+                    {"operator_id": "labeler_03", "task_name": "missing_task"},
+                    forced_type="manual_label",
+                )
+            self.assertEqual(missing.exception.status.value, 404)
+            self.assertIn("missing_task", missing.exception.message)
+
     def test_virtual_nas_uploader_completes_collection_upload_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

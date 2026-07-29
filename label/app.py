@@ -8,7 +8,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .backend_client import BackendClientError, LabelJobSession, session_from_lease
+    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from .hand_init import MediaPipeHandInitializer
     from .storage import (
@@ -33,7 +33,7 @@ try:
     from .mano_view import ManoMeshResult, ManoViewRuntime
     from .tracking import CoTrackerRuntime
 except Exception:
-    from backend_client import BackendClientError, LabelJobSession, session_from_lease
+    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from hand_init import MediaPipeHandInitializer
     from storage import (
@@ -203,6 +203,7 @@ class HomePage(ttk.Frame):
         super().__init__(master, style="TFrame")
         self._on_exit = on_exit
         self._on_enter = on_enter
+        self._task_rows: Dict[str, Dict[str, Any]] = {}
 
         outer = ttk.Frame(self, style="TFrame")
         outer.pack(fill="both", expand=True)
@@ -226,11 +227,37 @@ class HomePage(ttk.Frame):
         ttk.Label(form, text="Operator ID", style="Muted.TLabel").pack(anchor="w")
         ttk.Entry(form, textvariable=self._var_operator, width=58).pack(fill="x", pady=(6, 10))
 
+        queue = ttk.Frame(center, style="Panel.TFrame")
+        queue.pack(padx=28, fill="both", pady=(8, 0))
+        ttk.Label(queue, text="Queued manual label tasks", style="Muted.TLabel").pack(anchor="w")
+
+        queue_host = ttk.Frame(queue, style="Panel.TFrame")
+        queue_host.pack(fill="both", pady=(6, 8))
+        cols = ("task", "queued", "subjects", "frames")
+        self._queue_tree = ttk.Treeview(queue_host, columns=cols, show="headings", height=8)
+        self._queue_tree.heading("task", text="Task")
+        self._queue_tree.heading("queued", text="Queued")
+        self._queue_tree.heading("subjects", text="Subjects")
+        self._queue_tree.heading("frames", text="Frames")
+        self._queue_tree.column("task", width=220, anchor="w")
+        self._queue_tree.column("queued", width=70, anchor="center")
+        self._queue_tree.column("subjects", width=170, anchor="w")
+        self._queue_tree.column("frames", width=70, anchor="center")
+        self._queue_tree.pack(side="left", fill="both", expand=True)
+        queue_scroll = ttk.Scrollbar(queue_host, orient="vertical", command=self._queue_tree.yview)
+        queue_scroll.pack(side="left", fill="y", padx=(8, 0))
+        self._queue_tree.configure(yscrollcommand=queue_scroll.set)
+        self._queue_tree.bind("<Double-1>", self._lease_selected_task)
+
+        self._queue_notice = ttk.Label(queue, text="Refresh to load queued tasks.", style="Muted.TLabel")
+        self._queue_notice.pack(anchor="w")
+
         btns = ttk.Frame(center, style="Panel.TFrame")
         btns.pack(pady=(22, 8), fill="x")
 
         ttk.Button(btns, text="Exit", style="Secondary.TButton", command=self._on_exit, width=14).pack(side="left", padx=(0, 12))
-        ttk.Button(btns, text="Get Next Task", style="Primary.TButton", command=self._lease_next, width=18).pack(side="left")
+        ttk.Button(btns, text="Refresh Tasks", style="Secondary.TButton", command=self._refresh_tasks, width=16).pack(side="left", padx=(0, 12))
+        ttk.Button(btns, text="Get Selected Task", style="Primary.TButton", command=self._lease_selected_task, width=18).pack(side="left")
 
         legacy = ttk.Frame(center, style="Panel.TFrame")
         legacy.pack(padx=28, fill="x", pady=(18, 0))
@@ -238,7 +265,45 @@ class HomePage(ttk.Frame):
         ttk.Entry(legacy, textvariable=self._var_jsonl, width=58).pack(fill="x", pady=(6, 8))
         ttk.Button(legacy, text="Start Legacy JSONL", style="Secondary.TButton", command=self._enter_legacy, width=18).pack(anchor="w")
 
-    def _lease_next(self) -> None:
+    def _refresh_tasks(self) -> None:
+        backend_url = (self._var_backend_url.get() or "").strip()
+        if not backend_url:
+            messagebox.showwarning("Notice", "Please enter a backend URL.")
+            return
+        try:
+            groups = LabelBackendClient(backend_url).queued_label_tasks()
+        except BackendClientError as exc:
+            self._queue_notice.configure(text=str(exc))
+            messagebox.showerror("Backend", str(exc))
+            return
+        self._populate_task_rows(groups)
+
+    def _populate_task_rows(self, groups: List[Dict[str, Any]]) -> None:
+        for item_id in self._queue_tree.get_children():
+            self._queue_tree.delete(item_id)
+        self._task_rows = {}
+        for index, group in enumerate(groups, 1):
+            item_id = f"task_{index}"
+            subjects = str(group.get("subject_summary") or "")
+            if len(subjects) > 34:
+                subjects = subjects[:31] + "..."
+            values = (
+                str(group.get("task_name") or ""),
+                str(group.get("queued") or 0),
+                subjects,
+                str(group.get("frames") or 0),
+            )
+            self._queue_tree.insert("", "end", iid=item_id, values=values)
+            self._task_rows[item_id] = dict(group)
+        if groups:
+            first = "task_1"
+            self._queue_tree.selection_set(first)
+            self._queue_tree.focus(first)
+            self._queue_notice.configure(text=f"{len(groups)} task group(s) loaded.")
+        else:
+            self._queue_notice.configure(text="No queued manual label tasks.")
+
+    def _lease_selected_task(self, _event: Any = None) -> None:
         backend_url = (self._var_backend_url.get() or "").strip()
         operator_id = (self._var_operator.get() or "").strip()
         if not backend_url:
@@ -247,14 +312,25 @@ class HomePage(ttk.Frame):
         if not operator_id:
             messagebox.showwarning("Notice", "Please enter an operator ID.")
             return
+        selected = self._queue_tree.selection()
+        if not selected:
+            messagebox.showwarning("Notice", "Please select a queued task.")
+            return
+        task_row = self._task_rows.get(str(selected[0])) or {}
+        task_name = str(task_row.get("task_name") or "").strip()
+        if not task_name:
+            messagebox.showwarning("Notice", "Selected task is invalid.")
+            return
         try:
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
                 lease_seconds=600,
+                task_name=task_name,
             )
         except (BackendClientError, ValueError) as exc:
             messagebox.showerror("Backend", str(exc))
+            self._refresh_tasks()
             return
         self._on_enter(session)
 
