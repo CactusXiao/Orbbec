@@ -1,22 +1,78 @@
 from __future__ import annotations
 
+import calendar
+import json
 import re
+import time
 import uuid
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 try:
     from .storage_resolver import local_uri_from_path, path_from_local_uri, uri_join
-    from .workflow_models import WorkflowError, json_object, require_job_type
+    from .workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from storage_resolver import local_uri_from_path, path_from_local_uri, uri_join  # type: ignore
-    from workflow_models import WorkflowError, json_object, require_job_type  # type: ignore
+    from workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
 
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
+AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
+STAGE_ARTIFACT_KINDS = {
+    "auto_label": {"pred_2d"},
+    "qc": {"qc_report"},
+    "manual_label": {"corrected_2d"},
+}
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _parse_iso_seconds(value: Any) -> Optional[float]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return float(calendar.timegm(time.strptime(text, "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _elapsed_seconds_since(value: Any) -> Optional[int]:
+    parsed = _parse_iso_seconds(value)
+    if parsed is None:
+        return None
+    return max(0, int(time.time() - parsed))
+
+
+def _truthy_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "passed", "pass"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "failed", "fail"}:
+            return False
+    return bool(value)
+
+
+def _short_summary(value: Any, limit: int = 220) -> str:
+    if value is None or value == "" or value == {} or value == []:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
 
 
 def _new_id(prefix: str) -> str:
@@ -132,7 +188,7 @@ class JobService:
         self,
         store: WorkflowStore,
         *,
-        auto_label_after_upload: bool = True,
+        auto_label_after_upload: bool = False,
         auto_label_batch_size: int = 200,
     ):
         self.store = store
@@ -241,6 +297,8 @@ class JobService:
 
     def lease_job(self, body: Dict[str, Any], *, forced_type: str = "") -> Dict[str, Any]:
         job_type = require_job_type(forced_type or str(body.get("type") or body.get("job_type") or ""))
+        if not self.store.lease_enabled_for_job_type(job_type):
+            raise WorkflowError(HTTPStatus.CONFLICT, f"leasing disabled for job type: {job_type}")
         owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
         lease_seconds = _optional_int(body.get("lease_seconds")) or 300
         job = self.store.lease_job(job_type=job_type, lease_owner=owner, lease_seconds=lease_seconds)
@@ -322,6 +380,104 @@ class JobService:
             },
             "artifacts": upload_artifacts,
             "jobs": [_compact_job(job) for job in all_jobs],
+        }
+
+    def workflow_stage(self, job_type: str) -> Dict[str, Any]:
+        job_type = require_stage_job_type(job_type)
+        control = self.store.get_stage_control(job_type)
+        jobs = self.store.jobs_by_type(job_type)
+        now = now_iso()
+        counts = {
+            "queued": 0,
+            "leased_running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "canceled": 0,
+            "total": len(jobs),
+        }
+        active: List[Dict[str, Any]] = []
+        queued: List[Dict[str, Any]] = []
+        completed: List[Dict[str, Any]] = []
+        for job in jobs:
+            status = str(job.get("status") or "")
+            if status == "queued":
+                counts["queued"] += 1
+            elif status in {"leased", "running"}:
+                counts["leased_running"] += 1
+            elif status == "succeeded":
+                counts["succeeded"] += 1
+            elif status == "failed":
+                counts["failed"] += 1
+            elif status == "canceled":
+                counts["canceled"] += 1
+
+            item = self._stage_job_item(job, now)
+            if status == "queued":
+                queued.append(item)
+            elif status in {"leased", "running"}:
+                active.append(item)
+            elif status in TERMINAL_JOB_STATUSES:
+                completed.append(item)
+
+        completed.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("job_id") or "")), reverse=True)
+        return {
+            "job_type": job_type,
+            "control": control,
+            "lease_status": "开放" if control.get("lease_enabled") else "暂停",
+            "stats": counts,
+            "active": active,
+            "queued": queued,
+            "completed": completed,
+            "generated_at": now,
+        }
+
+    def set_stage_leasing(self, job_type: str, enabled: bool, body: Dict[str, Any]) -> Dict[str, Any]:
+        control = self.store.set_stage_control(
+            job_type=require_stage_job_type(job_type),
+            lease_enabled=enabled,
+            updated_by=str(body.get("updated_by") or body.get("operator_id") or body.get("user") or "api"),
+            note=str(body.get("note") or ""),
+        )
+        return {"control": control, "stage": self.workflow_stage(job_type)}
+
+    def push_auto_label(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(body or {})
+        episode_id = str(payload.get("episode_id") or payload.get("episode") or "").strip()
+        task_name = str(payload.get("task_name") or payload.get("task") or "").strip()
+        subject_id = str(payload.get("subject_id") or payload.get("subject") or "").strip()
+        scope = str(payload.get("scope") or "").strip().lower()
+        pushed_by = str(payload.get("pushed_by") or payload.get("operator_id") or payload.get("user") or "api").strip() or "api"
+
+        if episode_id:
+            episode = self.store.get_episode(episode_id)
+            if episode is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+            episodes = [episode]
+            resolved_scope = "episode"
+        elif task_name:
+            episodes = self.store.list_episodes(subject_id=subject_id, task_name=task_name)
+            resolved_scope = "task"
+        elif scope in {"", "all", "eligible"} or bool(payload.get("all")):
+            episodes = self.store.list_episodes(subject_id=subject_id)
+            resolved_scope = "all"
+        else:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id, task_name, or scope=all is required")
+
+        outcomes = [self._push_auto_label_for_episode(episode, pushed_by=pushed_by) for episode in episodes]
+        created_jobs = [job for item in outcomes for job in item.get("jobs", [])]
+        pushed_episodes = [item for item in outcomes if item.get("pushed")]
+        skipped = [item for item in outcomes if not item.get("pushed")]
+        return {
+            "scope": resolved_scope,
+            "episode_id": episode_id,
+            "subject_id": subject_id,
+            "task_name": task_name,
+            "checked": len(outcomes),
+            "pushed": len(pushed_episodes),
+            "created_jobs": len(created_jobs),
+            "skipped": len(skipped),
+            "jobs": created_jobs,
+            "episodes": outcomes,
         }
 
     def heartbeat_job(self, job_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -437,6 +593,72 @@ class JobService:
             "payload": payload,
         }
 
+    def _stage_job_item(self, job: Dict[str, Any], now: str) -> Dict[str, Any]:
+        episode_id = str(job.get("episode_id") or "")
+        episode = self.store.get_episode(episode_id) if episode_id else None
+        artifacts = self.store.artifacts_for_episode(episode_id) if episode_id else []
+        payload = dict(job.get("payload") or {})
+        result = dict(job.get("result") or {})
+        job_type = str(job.get("type") or "")
+        relevant_artifacts = self._relevant_artifacts_for_job(job_type, artifacts)
+        batch_index = _optional_int(payload.get("batch_index"))
+        batch_count = _optional_int(payload.get("batch_count"))
+        frames = payload.get("frames")
+        frames_count = len(frames) if isinstance(frames, list) else None
+        lease_until = str(job.get("lease_until") or "")
+        lease_expired = bool(lease_until and lease_until <= now and str(job.get("status") or "") not in TERMINAL_JOB_STATUSES)
+        subject_id = str((episode or {}).get("subject_id") or payload.get("subject_id") or "")
+        task_name = str((episode or {}).get("task_name") or payload.get("task_name") or "")
+        episode_index = (episode or {}).get("episode_index")
+        if episode_index is None:
+            episode_index = _optional_int(payload.get("episode_index"))
+        return {
+            "job_id": str(job.get("job_id") or ""),
+            "type": job_type,
+            "status": str(job.get("status") or ""),
+            "episode_id": episode_id,
+            "episode_url": f"/episodes/{quote(episode_id, safe='')}" if episode_id else "",
+            "subject_id": subject_id,
+            "task_name": task_name,
+            "episode_index": episode_index,
+            "episode_status": str((episode or {}).get("status") or ""),
+            "lease_owner": str(job.get("lease_owner") or ""),
+            "lease_until": lease_until,
+            "lease_expired": lease_expired,
+            "created_at": str(job.get("created_at") or ""),
+            "updated_at": str(job.get("updated_at") or ""),
+            "waiting_seconds": _elapsed_seconds_since(job.get("created_at")) if str(job.get("status") or "") == "queued" else None,
+            "attempt": _optional_int(job.get("attempt")) or 0,
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+            "frames_count": frames_count,
+            "frames": frames if isinstance(frames, list) else [],
+            "result": result,
+            "result_summary": _short_summary(result),
+            "error": str(result.get("error") or ""),
+            "error_summary": _short_summary(result.get("error")),
+            "artifacts": relevant_artifacts,
+            "artifact_summary": self._artifact_summary(relevant_artifacts),
+        }
+
+    @staticmethod
+    def _relevant_artifacts_for_job(job_type: str, artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        kinds = STAGE_ARTIFACT_KINDS.get(job_type, set())
+        if not kinds:
+            return artifacts
+        return [artifact for artifact in artifacts if str(artifact.get("kind") or "") in kinds]
+
+    @staticmethod
+    def _artifact_summary(artifacts: List[Dict[str, Any]]) -> str:
+        if not artifacts:
+            return ""
+        parts = []
+        for artifact in artifacts[:5]:
+            parts.append(f"{artifact.get('kind')}: {artifact.get('uri')}")
+        if len(artifacts) > 5:
+            parts.append(f"+{len(artifacts) - 5} more")
+        return _short_summary("; ".join(parts))
+
     def _create_job_once(self, *, job_id: str, job_type: str, episode_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         existing = self.store.get_job(job_id)
         if existing is not None:
@@ -487,23 +709,27 @@ class JobService:
             if self.auto_label_after_upload:
                 self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
-            if not artifacts and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") == "pred_2d" for artifact in artifacts) and payload.get("data_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="pred_2d",
                     uri=uri_join(str(payload.get("data_uri")), str(payload.get("prediction_dir") or "pred_2d")),
                     metadata={"source_job_id": job.get("job_id"), "compatibility": "kp2d may map to pred_2d"},
                 )
-            self.store.update_episode_status(episode_id, "auto_labeled")
+            if self._all_episode_jobs_succeeded(episode_id, "auto_label"):
+                self.store.update_episode_status(episode_id, "auto_labeled")
+                self._create_qc_job_from_existing_episode(episode_id, result)
         elif job_type == "qc":
-            passed = bool(result.get("passed") or result.get("qc_passed"))
+            if not any(str(artifact.get("kind") or "") == "qc_report" for artifact in artifacts):
+                self._register_default_qc_report(episode_id, job, result)
+            passed = _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed"))
             self.store.update_episode_status(episode_id, "qc_passed" if passed else "qc_failed")
-            if not passed and result.get("create_manual_label_job", True):
+            if not passed:
                 self._create_manual_label_from_existing_episode(episode_id, result)
         elif job_type == "review":
             self.store.update_episode_status(episode_id, "review_passed")
         elif job_type == "manual_label":
-            if not artifacts and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") == "corrected_2d" for artifact in artifacts) and payload.get("data_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="corrected_2d",
@@ -522,24 +748,111 @@ class JobService:
         episode = self.store.get_episode(episode_id)
         if episode is None:
             return
-        data_uri = str(nas_uri or upload_result.get("nas_uri") or episode.get("data_uri") or "")
-        if not data_uri:
-            return
-        local_path = str(
-            upload_result.get("local_path")
-            or upload_payload.get("local_capture_path")
-            or episode.get("local_capture_path")
-            or ""
+        created = self._create_auto_label_jobs_for_episode(
+            episode,
+            data_uri=str(nas_uri or upload_result.get("nas_uri") or episode.get("data_uri") or ""),
+            local_path=str(
+                upload_result.get("local_path")
+                or upload_payload.get("local_capture_path")
+                or episode.get("local_capture_path")
+                or ""
+            ),
+            source_payload=upload_payload,
+            reason="upload_succeeded",
         )
+        if created:
+            self.store.update_episode_status(
+                episode_id,
+                "uploaded",
+                {
+                    "auto_label_after_upload": True,
+                    "auto_label_batch_count": len(created),
+                    "auto_label_batch_size": self.auto_label_batch_size,
+                },
+            )
+
+    def _push_auto_label_for_episode(self, episode: Dict[str, Any], *, pushed_by: str) -> Dict[str, Any]:
+        episode_id = str(episode.get("episode_id") or "")
+        status = str(episode.get("status") or "")
+        data_uri = self._auto_label_data_uri(episode)
+        base = {
+            "episode_id": episode_id,
+            "subject_id": str(episode.get("subject_id") or ""),
+            "task_name": str(episode.get("task_name") or ""),
+            "episode_index": episode.get("episode_index"),
+            "status": status,
+            "data_uri": data_uri,
+            "pushed": False,
+            "jobs": [],
+        }
+        if status not in AUTO_LABEL_PUSHABLE_STATUSES:
+            return {**base, "reason": f"episode status is not pushable: {status or 'unknown'}"}
+        if not data_uri:
+            return {**base, "reason": "episode has no nas_uri or data_uri"}
+        existing = self.store.jobs_for_episode(episode_id, "auto_label")
+        if existing:
+            return {
+                **base,
+                "reason": "auto_label job already exists",
+                "existing_jobs": [_compact_job(job) for job in existing],
+            }
+
+        jobs = self._create_auto_label_jobs_for_episode(
+            episode,
+            data_uri=data_uri,
+            local_path=str(episode.get("local_capture_path") or ""),
+            source_payload={},
+            reason="manual_push",
+            pushed_by=pushed_by,
+        )
+        if jobs:
+            self.store.update_episode_status(
+                episode_id,
+                "uploaded",
+                {
+                    "auto_label_pushed_at": now_iso(),
+                    "auto_label_pushed_by": pushed_by,
+                    "auto_label_batch_count": len(jobs),
+                    "auto_label_batch_size": self.auto_label_batch_size,
+                },
+            )
+        return {
+            **base,
+            "pushed": bool(jobs),
+            "reason": "created" if jobs else "no jobs created",
+            "jobs": [_compact_job(job) for job in jobs],
+        }
+
+    @staticmethod
+    def _auto_label_data_uri(episode: Dict[str, Any]) -> str:
+        metadata = episode.get("metadata") if isinstance(episode.get("metadata"), dict) else {}
+        nas_uri = str(metadata.get("nas_uri") or "").strip()
+        return nas_uri or str(episode.get("data_uri") or "").strip()
+
+    def _create_auto_label_jobs_for_episode(
+        self,
+        episode: Dict[str, Any],
+        *,
+        data_uri: str,
+        local_path: str,
+        source_payload: Dict[str, Any],
+        reason: str,
+        pushed_by: str = "",
+    ) -> List[Dict[str, Any]]:
+        episode_id = str(episode.get("episode_id") or "")
+        data_uri = str(data_uri or "").strip()
+        if not episode_id or not data_uri:
+            return []
+        source_payload = dict(source_payload or {})
         episode_path = _local_episode_path(str(episode.get("data_uri") or ""), local_path)
         cameras = (
-            _as_str_list(upload_payload.get("cameras"))
+            _as_str_list(source_payload.get("cameras"))
             or _as_str_list(episode.get("cameras"))
             or _discover_cameras(episode_path)
         )
-        frames = _as_int_list(upload_payload.get("frames")) or _discover_frames(episode_path, cameras)
+        frames = _as_int_list(source_payload.get("frames")) or _discover_frames(episode_path, cameras)
         if not frames:
-            frame_count = _optional_int(episode.get("frame_count")) or _optional_int(upload_payload.get("frame_count"))
+            frame_count = _optional_int(episode.get("frame_count")) or _optional_int(source_payload.get("frame_count"))
             if frame_count:
                 frames = list(range(frame_count))
 
@@ -548,6 +861,7 @@ class JobService:
             batches = [[]]
         batch_count = len(batches)
         base_id = _stable_id_part(episode_id, "episode")
+        created: List[Dict[str, Any]] = []
         for index, batch_frames in enumerate(batches, 1):
             job_id = f"auto_label_{base_id}_b{index:04d}"
             payload = {
@@ -562,22 +876,15 @@ class JobService:
                 "batch_index": index,
                 "batch_count": batch_count,
                 "batch_size": self.auto_label_batch_size,
-                "rgb_path_template": str(upload_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-                "prediction_dir": str(upload_payload.get("prediction_dir") or "pred_2d"),
-                "correction_dir": str(upload_payload.get("correction_dir") or "corrected_2d"),
-                "reason": "upload_succeeded",
+                "rgb_path_template": str(source_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
+                "prediction_dir": str(source_payload.get("prediction_dir") or "pred_2d"),
+                "correction_dir": str(source_payload.get("correction_dir") or "corrected_2d"),
+                "reason": reason,
             }
-            self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload=payload)
-
-        self.store.update_episode_status(
-            episode_id,
-            "uploaded",
-            {
-                "auto_label_after_upload": True,
-                "auto_label_batch_count": batch_count,
-                "auto_label_batch_size": self.auto_label_batch_size,
-            },
-        )
+            if pushed_by:
+                payload["pushed_by"] = pushed_by
+            created.append(self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload=payload))
+        return created
 
     @staticmethod
     def _frame_batches(frames: Sequence[int], batch_size: int) -> List[List[int]]:
@@ -587,11 +894,35 @@ class JobService:
         size = max(1, int(batch_size or 1))
         return [clean_frames[i : i + size] for i in range(0, len(clean_frames), size)]
 
-    def _create_manual_label_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
+    def _all_episode_jobs_succeeded(self, episode_id: str, job_type: str) -> bool:
+        jobs = self.store.jobs_for_episode(episode_id, job_type)
+        return bool(jobs) and all(str(job.get("status") or "") == "succeeded" for job in jobs)
+
+    def _episode_frames_from_jobs(self, episode_id: str, job_type: str) -> List[int]:
+        frames: List[int] = []
+        seen = set()
+        for job in self.store.jobs_for_episode(episode_id, job_type):
+            for frame in _as_int_list((job.get("payload") or {}).get("frames")):
+                if frame in seen:
+                    continue
+                seen.add(frame)
+                frames.append(frame)
+        return frames
+
+    def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
+        if self.store.jobs_for_episode(episode_id, "qc"):
+            return
         episode = self.store.get_episode(episode_id)
         if episode is None:
             return
-        job_id = str(result.get("manual_label_job_id") or _new_id("manual_label"))
+        frames = self._episode_frames_from_jobs(episode_id, "auto_label")
+        if not frames:
+            frame_count = _optional_int(episode.get("frame_count"))
+            if frame_count:
+                frames = list(range(frame_count))
+        pred_artifacts = self._relevant_artifacts_for_job("auto_label", self.store.artifacts_for_episode(episode_id))
+        base_id = _stable_id_part(episode_id, "episode")
+        job_id = str(result.get("qc_job_id") or f"qc_{base_id}")
         payload = {
             "job_id": job_id,
             "episode_id": episode["episode_id"],
@@ -599,14 +930,59 @@ class JobService:
             "task_name": episode["task_name"],
             "data_uri": episode["data_uri"],
             "cameras": episode.get("cameras") or [],
-            "frames": result.get("frames") if isinstance(result.get("frames"), list) else [],
+            "frames": frames,
+            "pred_artifacts": pred_artifacts,
+            "pred_uri": str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else "",
+            "reason": "auto_label_succeeded",
+        }
+        self._create_job_once(job_id=job_id, job_type="qc", episode_id=episode_id, payload=payload)
+
+    def _register_default_qc_report(self, episode_id: str, job: Dict[str, Any], result: Dict[str, Any]) -> None:
+        episode = self.store.get_episode(episode_id)
+        payload = dict(job.get("payload") or {})
+        report_uri = str(result.get("qc_report_uri") or result.get("report_uri") or "").strip()
+        data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
+        if not report_uri and data_uri:
+            report_uri = uri_join(data_uri, "qc_report.json")
+        if not report_uri:
+            return
+        self.store.register_artifact(
+            episode_id=episode_id,
+            kind="qc_report",
+            uri=report_uri,
+            metadata={
+                "source_job_id": job.get("job_id"),
+                "passed": _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed")),
+            },
+        )
+
+    def _create_manual_label_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
+        if self.store.jobs_for_episode(episode_id, "manual_label"):
+            return
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            return
+        frames = result.get("frames") if isinstance(result.get("frames"), list) else self._episode_frames_from_jobs(episode_id, "auto_label")
+        if not frames:
+            frame_count = _optional_int(episode.get("frame_count"))
+            if frame_count:
+                frames = list(range(frame_count))
+        base_id = _stable_id_part(episode_id, "episode")
+        job_id = str(result.get("manual_label_job_id") or f"manual_label_{base_id}")
+        payload = {
+            "job_id": job_id,
+            "episode_id": episode["episode_id"],
+            "subject_id": episode["subject_id"],
+            "task_name": episode["task_name"],
+            "data_uri": episode["data_uri"],
+            "cameras": episode.get("cameras") or [],
+            "frames": frames,
             "rgb_path_template": "{camera}/RGB/{frame:05d}.png",
             "prediction_dir": "pred_2d",
             "correction_dir": "corrected_2d",
-            "reason": "qc_stub_failed",
+            "reason": "qc_failed",
             "priority": _optional_int(result.get("priority")) or 50,
         }
-        self.store.update_episode_status(episode_id, "manual_label_pending")
         self._create_job_once(job_id=job_id, job_type="manual_label", episode_id=episode_id, payload=payload)
 
     def _register_artifact_from_payload(self, episode_id: str, artifact: Dict[str, Any]) -> None:

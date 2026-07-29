@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, UriResolver
 from task_backend.job_service import JobService
@@ -27,6 +29,17 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             thread.start()
             try:
                 host, port = server.server_address
+                base_url = f"http://{host}:{port}"
+                req = Request(
+                    base_url + "/api/v1/workflow/stages/manual_label/enable",
+                    data=json.dumps({"updated_by": "smoke"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(req, timeout=5) as resp:
+                    enabled = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(enabled["control"]["lease_enabled"])
+
                 client = LabelBackendClient(f"http://{host}:{port}", timeout_seconds=5)
                 created = client.create_dev_label_job(
                     {
@@ -47,6 +60,10 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
 
                 completed = client.complete_label_job(job_id, result={"ok": True})
                 self.assertEqual(completed["job"]["status"], "succeeded")
+
+                with urlopen(base_url + "/api/v1/workflow/stages/manual_label", timeout=5) as resp:
+                    stage = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(stage["stats"]["succeeded"], 1)
             finally:
                 server.shutdown()
                 server.server_close()

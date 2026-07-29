@@ -611,7 +611,7 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
         job_id=job["job_id"],
         episode_id=payload.get("episode_id") or episode.get("episode_id"),
         nas_uri=nas_uri,
-        auto_label="queued_by_backend",
+        auto_label="manual_push_required",
         cameras=len(cameras),
         frames=len(frames),
     )
@@ -639,11 +639,7 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
         {"ok": True, "model": "virtual_hand2d", "frames_predicted": frames, "virtual_worker": owner},
         artifacts=[{"kind": "pred_2d", "uri": pred_uri, "metadata": {"worker_id": owner, "mock": True}}],
     )
-    qc_job_id = f"qc_{clean_id(str(payload.get('episode_id')))}"
-    qc_payload = dict(payload)
-    qc_payload.update({"job_id": qc_job_id, "pred_uri": pred_uri, "reason": "auto_label_completed_by_virtual_worker"})
-    client.create_dev_job("qc", str(payload.get("episode_id")), qc_payload)
-    print_event("auto_label_completed", job_id=job["job_id"], episode_id=payload.get("episode_id"), pred_uri=pred_uri, next_job=qc_job_id)
+    print_event("auto_label_completed", job_id=job["job_id"], episode_id=payload.get("episode_id"), pred_uri=pred_uri, next_job="queued_by_backend")
     return True
 
 
@@ -663,7 +659,6 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
         "qc_passed": passed,
         "score": round(random.random(), 4),
         "reason": "virtual_qc_pass" if passed else "virtual_qc_failed_needs_manual_label",
-        "create_manual_label_job": False,
         "virtual_worker": owner,
     }
     client.complete_job(
@@ -671,29 +666,10 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
         result,
         artifacts=[{"kind": "qc_report", "uri": qc_report_uri, "metadata": {"passed": passed, "worker_id": owner}}],
     )
-    if not passed:
-        manual_job_id = f"manual_label_qc_{clean_id(str(payload.get('episode_id')))}_{now_ms()}"
-        manual_payload = dict(payload)
-        manual_payload.update(
-            {
-                "job_id": manual_job_id,
-                "reason": "virtual_qc_failed",
-                "metadata": {
-                    "source": "virtual_qc",
-                    "qc_job_id": job["job_id"],
-                    "qc_report_uri": qc_report_uri,
-                },
-            }
-        )
-        created = client.create_manual_label_job(manual_payload)
-        print_event(
-            "qc_failed_manual_label_queued",
-            job_id=job["job_id"],
-            episode_id=payload.get("episode_id"),
-            manual_job_id=created.get("job", {}).get("job_id", manual_job_id),
-        )
-    else:
+    if passed:
         print_event("qc_passed", job_id=job["job_id"], episode_id=payload.get("episode_id"))
+    else:
+        print_event("qc_failed_manual_label_queued", job_id=job["job_id"], episode_id=payload.get("episode_id"), manual_job_id="queued_by_backend")
     return True
 
 

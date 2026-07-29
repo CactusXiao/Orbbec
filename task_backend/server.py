@@ -818,7 +818,7 @@ def sum_storage_bytes(items: Iterable[Dict[str, Any]]) -> int:
 
 def status_class(status: str) -> str:
     status = str(status or "").strip()
-    if status in {"confirmed", "uploaded", "auto_labeled", "qc_passed", "review_passed", "manual_labeled", "finalized", "succeeded", "complete"}:
+    if status in {"confirmed", "uploaded", "auto_labeled", "qc_passed", "review_passed", "manual_labeled", "finalized", "succeeded", "complete", "active"}:
         return "ok"
     if status in {
         "reserved",
@@ -834,7 +834,7 @@ def status_class(status: str) -> str:
         "manual_labeling",
     }:
         return "warn"
-    if status in {"failed", "canceled", "qc_failed"}:
+    if status in {"failed", "canceled", "qc_failed", "expired"}:
         return "bad"
     if status in {"released", "planned", "missing", "not queued", "-"}:
         return "muted"
@@ -1361,7 +1361,21 @@ def render_layout(title: str, body: str) -> str:
     }}
     button.secondary {{ background: #fff; color: var(--accent); }}
     button.danger {{ background: var(--bad); border-color: var(--bad); }}
+    a.button {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      border: 1px solid var(--accent);
+      background: #fff;
+      color: var(--accent);
+      padding: 8px 13px;
+      border-radius: 5px;
+      font-weight: 650;
+      text-decoration: none;
+    }}
+    a.button:hover {{ text-decoration: none; background: #eef8fb; }}
     .actions {{ padding: 0 16px 16px; display: flex; gap: 10px; flex-wrap: wrap; }}
+    .top-actions {{ padding-top: 16px; }}
     @media (max-width: 760px) {{
       main {{ padding: 18px 14px 28px; }}
       header {{ padding: 16px; }}
@@ -1392,6 +1406,45 @@ def render_metric(label: str, value: Any, note: str = "") -> str:
 
 def render_status_badge(status: str) -> str:
     return f"<span class=\"badge {status_class(status)}\">{html_escape(status or 'unknown')}</span>"
+
+
+WORKFLOW_STAGE_LABELS = [
+    ("auto_label", "自动标注"),
+    ("qc", "质检结果"),
+    ("manual_label", "人工处理"),
+]
+
+
+def render_hidden_inputs(fields: Dict[str, Any]) -> str:
+    return "".join(
+        f"<input type=\"hidden\" name=\"{html_escape(key)}\" value=\"{html_escape(value)}\">"
+        for key, value in fields.items()
+        if value is not None
+    )
+
+
+def render_push_auto_label_form(action: str, fields: Dict[str, Any], label: str = "一键推送标注") -> str:
+    return (
+        f"<form method=\"post\" action=\"{html_escape(action)}\">"
+        + render_hidden_inputs(fields)
+        + f"<button type=\"submit\">{html_escape(label)}</button>"
+        + "</form>"
+    )
+
+
+def render_workflow_stage_shortcuts(include_push_all: bool = False) -> str:
+    links = [
+        f"<a class=\"button\" href=\"/workflow/stages/{url_part(job_type)}\">{html_escape(label)}：{html_escape(job_type)}</a>"
+        for job_type, label in WORKFLOW_STAGE_LABELS
+    ]
+    if include_push_all:
+        links.append(render_push_auto_label_form("/workflow/episodes/push-auto-label", {"scope": "all"}))
+    return (
+        "<section><h2>Workflow Stages</h2>"
+        "<div class=\"actions top-actions\">"
+        + "".join(links)
+        + "</div></section>"
+    )
 
 
 def render_setup_page(registry: Registry, data_root: Path, message: str = "", error: str = "") -> str:
@@ -1521,7 +1574,8 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         f"<div class=\"crumbs\">Task backend / Overview / {html_escape(instance_label)}</div>"
         "<div class=\"notice warn\">This backend process is locked to the selected task file and instance. "
         "Restart the process to choose another instance.</div>"
-        "<div class=\"summary\">"
+        + render_workflow_stage_shortcuts(include_push_all=True)
+        + "<div class=\"summary\">"
         + render_metric("Tasks", len(model["tasks"]), "from task file")
         + render_metric("Subjects", len(model["subjects"]), subject_note)
         + render_metric("Episodes", model["reservation_count"], "all reservations")
@@ -1585,7 +1639,10 @@ def render_task_detail(model: Dict[str, Any]) -> str:
     description = task.get("description_cn") or task.get("description_en") or ""
     body = (
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / {html_escape(task_name)}</div>"
-        "<div class=\"summary\">"
+        "<section><h2>Workflow Action</h2><div class=\"actions top-actions\">"
+        + render_push_auto_label_form(f"/tasks/{url_part(task_name)}/push-auto-label", {"task_name": task_name})
+        + "</div></section>"
+        + "<div class=\"summary\">"
         + render_metric("Required / Subject", task.get("total", ""), "configured episodes")
         + render_metric("Confirmed", counts.get("confirmed", 0))
         + render_metric("Reserved", counts.get("reserved", 0))
@@ -1608,6 +1665,135 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + "</tbody></table></div></section>"
     )
     return render_layout(task_name, body)
+
+
+def stage_batch_label(item: Dict[str, Any]) -> str:
+    batch_index = item.get("batch_index")
+    batch_count = item.get("batch_count")
+    if batch_index is None or batch_count is None:
+        return "-"
+    return f"{batch_index}/{batch_count}"
+
+
+def stage_frames_label(item: Dict[str, Any]) -> str:
+    frames = item.get("frames_count")
+    return str(frames) if frames is not None else "-"
+
+
+def stage_episode_cell(item: Dict[str, Any]) -> str:
+    episode_id = str(item.get("episode_id") or "")
+    if not episode_id:
+        return "-"
+    label = episode_id[:8]
+    url = str(item.get("episode_url") or f"/episodes/{url_part(episode_id)}")
+    return f"<a class=\"mono\" href=\"{html_escape(url)}\">{html_escape(label)}</a>"
+
+
+def stage_subject_cell(item: Dict[str, Any]) -> str:
+    episode_index = item.get("episode_index")
+    episode_label = "-" if episode_index is None else str(episode_index)
+    return (
+        f"{html_escape(item.get('subject_id') or '-')}"
+        f"<div class=\"muted mono\">{html_escape(item.get('task_name') or '-')} / {html_escape(episode_label)}</div>"
+    )
+
+
+def render_workflow_stage_page(stage: Dict[str, Any]) -> str:
+    job_type = str(stage.get("job_type") or "")
+    control = stage.get("control") if isinstance(stage.get("control"), dict) else {}
+    stats = stage.get("stats") if isinstance(stage.get("stats"), dict) else {}
+    lease_label = "开放" if control.get("lease_enabled") else "暂停"
+    enable_disabled = " disabled" if control.get("lease_enabled") else ""
+    disable_disabled = "" if control.get("lease_enabled") else " disabled"
+
+    active_rows = []
+    for item in stage.get("active") or []:
+        if not isinstance(item, dict):
+            continue
+        active_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{html_escape(item.get('job_id') or '-')}</td>"
+            f"<td>{stage_episode_cell(item)}</td>"
+            f"<td>{stage_subject_cell(item)}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('lease_owner') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('lease_until') or '-')}</td>"
+            f"<td>{render_status_badge('expired' if item.get('lease_expired') else 'active')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('updated_at') or '-')}</td>"
+            f"<td class=\"num\">{html_escape(item.get('attempt') or 0)}</td>"
+            f"<td class=\"num\">{html_escape(stage_batch_label(item))}</td>"
+            f"<td class=\"num\">{html_escape(stage_frames_label(item))}</td>"
+            "</tr>"
+        )
+    active_html = "\n".join(active_rows) if active_rows else "<tr><td colspan=\"10\" class=\"empty\">No active leases.</td></tr>"
+
+    queued_rows = []
+    for item in stage.get("queued") or []:
+        if not isinstance(item, dict):
+            continue
+        wait = item.get("waiting_seconds")
+        queued_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{html_escape(item.get('job_id') or '-')}</td>"
+            f"<td>{stage_episode_cell(item)}</td>"
+            f"<td>{stage_subject_cell(item)}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('created_at') or '-')}</td>"
+            f"<td class=\"num\">{html_escape(format_duration(float(wait)) if wait is not None else '-')}</td>"
+            f"<td class=\"num\">{html_escape(stage_batch_label(item))}</td>"
+            f"<td class=\"num\">{html_escape(stage_frames_label(item))}</td>"
+            "</tr>"
+        )
+    queued_html = "\n".join(queued_rows) if queued_rows else "<tr><td colspan=\"7\" class=\"empty\">No queued jobs.</td></tr>"
+
+    completed_rows = []
+    for item in stage.get("completed") or []:
+        if not isinstance(item, dict):
+            continue
+        completed_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{html_escape(item.get('job_id') or '-')}</td>"
+            f"<td>{stage_episode_cell(item)}</td>"
+            f"<td>{render_status_badge(str(item.get('status') or '-'))}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('updated_at') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('result_summary') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('error_summary') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('artifact_summary') or '-')}</td>"
+            "</tr>"
+        )
+    completed_html = "\n".join(completed_rows) if completed_rows else "<tr><td colspan=\"7\" class=\"empty\">No completed jobs.</td></tr>"
+
+    body = (
+        f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / Workflow / {html_escape(job_type)}</div>"
+        "<div class=\"summary\">"
+        + render_metric("租借状态", lease_label, str(control.get("updated_at") or ""))
+        + render_metric("Queued", stats.get("queued", 0))
+        + render_metric("Leased / Running", stats.get("leased_running", 0))
+        + render_metric("Succeeded", stats.get("succeeded", 0))
+        + render_metric("Failed", stats.get("failed", 0))
+        + "</div>"
+        "<section><h2>Stage Control</h2><div class=\"actions top-actions\">"
+        f"<form method=\"post\" action=\"/workflow/stages/{url_part(job_type)}/enable\">"
+        f"<button type=\"submit\"{enable_disabled}>开启</button></form>"
+        f"<form method=\"post\" action=\"/workflow/stages/{url_part(job_type)}/disable\">"
+        f"<button type=\"submit\" class=\"secondary\"{disable_disabled}>暂停</button></form>"
+        f"<span class=\"muted mono\">updated_by={html_escape(control.get('updated_by') or '-')} note={html_escape(control.get('note') or '-')}</span>"
+        "</div></section>"
+        "<section><h2>Active Leases</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Job</th><th>Episode</th><th>Subject / Task / Episode</th><th>Lease Owner</th>"
+        "<th>Lease Until</th><th>Expired</th><th>Updated</th><th class=\"num\">Attempt</th>"
+        "<th class=\"num\">Batch</th><th class=\"num\">Frames</th></tr></thead><tbody>"
+        + active_html
+        + "</tbody></table></div></section>"
+        "<section><h2>Queued</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Job</th><th>Episode</th><th>Subject / Task / Episode</th><th>Created</th>"
+        "<th class=\"num\">Waiting</th><th class=\"num\">Batch</th><th class=\"num\">Frames</th></tr></thead><tbody>"
+        + queued_html
+        + "</tbody></table></div></section>"
+        "<section><h2>Completed</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Job</th><th>Episode</th><th>Status</th><th>Updated</th><th>Result</th><th>Error</th><th>Artifacts</th></tr></thead><tbody>"
+        + completed_html
+        + "</tbody></table></div></section>"
+    )
+    return render_layout("Workflow " + job_type, body)
 
 
 def render_episode_detail(model: Dict[str, Any]) -> str:
@@ -1704,7 +1890,10 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / "
         f"<a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a> / "
         f"{html_escape(reservation_id[:8])}</div>"
-        "<div class=\"summary\">"
+        "<section><h2>Workflow Action</h2><div class=\"actions top-actions\">"
+        + render_push_auto_label_form(f"/episodes/{url_part(reservation_id)}/push-auto-label", {"episode_id": reservation_id}, "推送标注")
+        + "</div></section>"
+        + "<div class=\"summary\">"
         + render_metric("Status", status)
         + render_metric("Duration", stats.get("duration_label", "-"))
         + render_metric("Frames", stats.get("frame_count_label", "-"))
@@ -1856,6 +2045,14 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            workflow_stage_api_prefix = "/api/v1/workflow/stages/"
+            if parsed.path.startswith(workflow_stage_api_prefix):
+                job_type = unquote(parsed.path[len(workflow_stage_api_prefix):].strip("/")).strip()
+                if not job_type or "/" in job_type:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "workflow stage not found")
+                self._json_response(HTTPStatus.OK, self.workflow.workflow_stage(job_type))
+                return
+
             if parsed.path.startswith("/api/v1/jobs/"):
                 job_id = unquote(parsed.path[len("/api/v1/jobs/"):].strip("/")).strip()
                 if not job_id or "/" in job_id:
@@ -1894,6 +2091,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.SERVICE_UNAVAILABLE,
                         "task backend instance is not started; choose a task file and instance on the setup page",
                     )
+                if parsed.path.startswith("/workflow/stages/"):
+                    job_type = unquote(parsed.path[len("/workflow/stages/"):].strip("/")).strip()
+                    if not job_type or "/" in job_type:
+                        raise BackendError(HTTPStatus.NOT_FOUND, "workflow stage not found")
+                    self._html_response(HTTPStatus.OK, render_workflow_stage_page(self.workflow.workflow_stage(job_type)))
+                    return
                 raise BackendError(HTTPStatus.NOT_FOUND, "not found")
 
             if parsed.path == "/setup":
@@ -1909,6 +2112,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.OK, self.backend.get_tasks(subject_id))
             elif parsed.path in ("", "/", "/tasks"):
                 self._html_response(HTTPStatus.OK, render_dashboard(self.backend.dashboard_model()))
+            elif parsed.path.startswith("/workflow/stages/"):
+                job_type = unquote(parsed.path[len("/workflow/stages/"):].strip("/")).strip()
+                if not job_type or "/" in job_type:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "workflow stage not found")
+                self._html_response(HTTPStatus.OK, render_workflow_stage_page(self.workflow.workflow_stage(job_type)))
             elif parsed.path.startswith("/tasks/"):
                 task_name = unquote(parsed.path[len("/tasks/"):]).strip()
                 if not task_name:
@@ -1943,7 +2151,65 @@ class RequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         is_episode_html_post = parsed.path.startswith("/episodes/")
+        is_workflow_html_post = not parsed.path.startswith("/api/") and (
+            parsed.path.startswith("/workflow/") or parsed.path.startswith("/tasks/")
+        )
         try:
+            workflow_stage_api_prefix = "/api/v1/workflow/stages/"
+            if parsed.path.startswith(workflow_stage_api_prefix):
+                rest = parsed.path[len(workflow_stage_api_prefix):].strip("/")
+                parts = rest.split("/")
+                if len(parts) != 2 or parts[1] not in {"enable", "disable"}:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "workflow stage action not found")
+                body = self._read_json()
+                enabled = parts[1] == "enable"
+                self._json_response(HTTPStatus.OK, self.workflow.set_stage_leasing(unquote(parts[0]), enabled, body))
+                return
+
+            if parsed.path == "/api/v1/workflow/episodes/push-auto-label":
+                self._json_response(HTTPStatus.OK, self.workflow.push_auto_label(self._read_json()))
+                return
+
+            if parsed.path.startswith("/workflow/stages/"):
+                rest = parsed.path[len("/workflow/stages/"):].strip("/")
+                parts = rest.split("/")
+                if len(parts) != 2 or parts[1] not in {"enable", "disable"}:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "workflow stage action not found")
+                form = self._read_form()
+                enabled = parts[1] == "enable"
+                job_type = unquote(parts[0])
+                self.workflow.set_stage_leasing(job_type, enabled, form)
+                self._redirect(f"/workflow/stages/{url_part(job_type)}")
+                return
+
+            if parsed.path == "/workflow/episodes/push-auto-label":
+                form = self._read_form()
+                self.workflow.push_auto_label(form)
+                self._redirect("/")
+                return
+
+            if parsed.path.startswith("/tasks/") and parsed.path.endswith("/push-auto-label"):
+                raw_name = parsed.path[len("/tasks/"):-len("/push-auto-label")]
+                task_name = unquote(raw_name.strip("/")).strip()
+                if not task_name:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "task not found")
+                form = self._read_form()
+                body = {**form, "task_name": task_name}
+                self.workflow.push_auto_label(body)
+                self._redirect(f"/tasks/{url_part(task_name)}")
+                return
+
+            if parsed.path.startswith("/episodes/") and parsed.path.endswith("/push-auto-label"):
+                raw_id = parsed.path[len("/episodes/"):-len("/push-auto-label")]
+                episode_id = unquote(raw_id.strip("/")).strip()
+                if not episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                form = self._read_form()
+                body = {**form, "episode_id": episode_id}
+                self.workflow.push_auto_label(body)
+                self._redirect(f"/episodes/{url_part(episode_id)}")
+                return
+
             if parsed.path.startswith("/setup/"):
                 if self.runtime.is_started():
                     raise BackendError(
@@ -2026,19 +2292,22 @@ class RequestHandler(BaseHTTPRequestHandler):
         except BackendError as exc:
             if parsed.path.startswith("/setup/"):
                 self._html_response(exc.status, self._setup_page(error=exc.message))
-            elif is_episode_html_post:
+            elif is_episode_html_post or is_workflow_html_post:
                 self._html_response(exc.status, render_error_page(exc.status, exc.message))
             else:
                 self._json_response(exc.status, {"error": exc.message})
         except WorkflowError as exc:
-            self._json_response(exc.status, {"error": exc.message})
+            if is_episode_html_post or is_workflow_html_post:
+                self._html_response(exc.status, render_error_page(exc.status, exc.message))
+            else:
+                self._json_response(exc.status, {"error": exc.message})
         except Exception as exc:  # pragma: no cover - defensive server boundary
             if parsed.path.startswith("/setup/"):
                 self._html_response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     self._setup_page(error=str(exc)),
                 )
-            elif is_episode_html_post:
+            elif is_episode_html_post or is_workflow_html_post:
                 self._html_response(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     render_error_page(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc)),
@@ -2116,7 +2385,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
     auto_label_after_upload = env_bool(
         env,
-        True,
+        False,
         "ORBBEC_AUTO_LABEL_AFTER_UPLOAD",
         "TASK_BACKEND_AUTO_LABEL_AFTER_UPLOAD",
     )

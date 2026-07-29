@@ -12,11 +12,12 @@ modify the existing `task_backend` or `label` modules.
 - A local NAS, stored under `.virtual_nas` by default, exposed as
   `nas://orbbec-virtual/...`.
 - Upload workers that copy or materialize a captured episode into the virtual
-  NAS. The backend queues batched `auto_label` jobs when upload completes.
+  NAS. Upload completion marks episodes `uploaded`; pushing auto-label is a
+  separate dashboard/API action.
 - Auto-label workers that write placeholder 2D prediction `.npy` files, then
-  enqueue a `qc` job.
-- QC workers that randomly pass or fail. Failed QC creates a queued
-  `manual_label` job so the label frontend can lease it.
+  let the backend enqueue a `qc` job.
+- QC workers that randomly pass or fail. Failed QC lets the backend create a
+  queued `manual_label` job so the label frontend can lease it.
 - Optional manual label workers that complete queued manual jobs with
   placeholder corrected `.npy` artifacts.
 
@@ -69,16 +70,31 @@ python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-captured \
 Run the virtual upload, auto-label, and QC workers:
 
 ```bash
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/auto_label/enable \
+  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/qc/enable \
+  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_label/enable \
+  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
+
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers default \
+  --workers upload \
+  --max-iterations 20 \
+  --stop-after-idle-rounds 3
+
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
+  -H 'Content-Type: application/json' -d '{"scope":"all","pushed_by":"virtual_workflow"}'
+
+python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
+  --workers auto-label,qc \
   --qc-fail-rate 0.8 \
   --max-iterations 20 \
   --stop-after-idle-rounds 3
 ```
 
-`default` workers include `upload`, `auto-label`, and `qc`. They intentionally
-leave failed QC episodes in the manual label queue for the label frontend to
-pick up.
+`default` workers include `upload`, `auto-label`, and `qc`; use it only after
+the uploaded episodes have already been pushed into `auto_label`. Failed QC
+episodes are left in the manual label queue for the label frontend to pick up.
 
 ## Complete Manual Labels Virtually
 

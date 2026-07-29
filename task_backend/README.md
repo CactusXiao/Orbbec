@@ -54,8 +54,9 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state/virtual_nas
 # ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
 
-# Upload success automatically queues batched auto_label jobs:
-# ORBBEC_AUTO_LABEL_AFTER_UPLOAD=1
+# Upload success waits for an explicit push before queuing auto_label jobs.
+# Set this to 1 only for legacy fully automatic local tests:
+# ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
 # ORBBEC_AUTO_LABEL_BATCH_SIZE=200
 
 # Optional seed file for the setup page:
@@ -217,18 +218,21 @@ have to match any path on the backend machine.
 8. Backend confirm creates an `upload` job. The virtual NAS uploader copies the
    already-saved local episode asynchronously and records progress in the
    workflow database.
-9. Upload success marks the episode `uploaded` and queues batched `auto_label`
-   jobs according to `ORBBEC_AUTO_LABEL_BATCH_SIZE`.
-10. The collection UI returns to READY/IDLE after backend confirm succeeds. It
+9. Upload success marks the episode `uploaded`. It does not queue
+   `auto_label` by default.
+10. A dashboard, task-page, episode-page, or API push creates batched
+    `auto_label` jobs according to `ORBBEC_AUTO_LABEL_BATCH_SIZE`. Repeating
+    the push for the same episode is idempotent.
+11. The collection UI returns to READY/IDLE after backend confirm succeeds. It
    keeps polling upload progress by reservation ID and displays the latest NAS
    status without blocking the next capture.
-11. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
+12. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
    uses the same reservation and idempotency key.
-12. Reset/Delete deletes local episode data and releases the reservation; it does
+13. Reset/Delete deletes local episode data and releases the reservation; it does
    not increase `completed`.
-13. The capture page has a `Tasks` button for returning to the standalone task
+14. The capture page has a `Tasks` button for returning to the standalone task
    selection page; task selection is not mixed into the capture view.
-14. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
+15. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
     dialog before stopping cameras or leaving collection when applicable.
 
 The backend confirm endpoint is idempotent: repeating the same
@@ -259,8 +263,9 @@ When collection confirms an episode, the workflow sidecar records an Episode
 with status `captured` and queues an `upload` job. The built-in virtual NAS
 uploader leases this job, copies local data to the virtual NAS, updates progress,
 registers a `nas_episode` artifact, and marks the episode `uploaded` only after
-the verified copy completes. The same completion path creates queued
-`auto_label` jobs in frame batches. Manual labeling completion stops at
+the verified copy completes. `auto_label` jobs are created only after an
+explicit push from the dashboard, task page, episode page, or workflow API.
+Manual labeling completion stops at
 `manual_labeled`; any later review or return flow is left to a future policy.
 
 Upload status can be read by reservation/episode ID:
@@ -304,11 +309,31 @@ POST /api/v1/label/jobs/{job_id}/release
 Lease semantics:
 
 - only `queued` jobs, or jobs with an expired lease, can be leased;
+- `auto_label`, `qc`, and `manual_label` leases are paused by default and return
+  `HTTP 409` with `leasing disabled for job type: <type>` until enabled;
 - lease writes `lease_owner`, `lease_until`, and `status=leased`;
 - heartbeat extends the lease and may mark the job `running`;
 - complete is idempotent;
 - fail records an error and increments `attempt`;
 - release clears the lease and returns unfinished work to `queued`.
+
+Workflow stage controls and snapshots:
+
+```text
+GET  /api/v1/workflow/stages/<auto_label|qc|manual_label>
+POST /api/v1/workflow/stages/<job_type>/enable
+POST /api/v1/workflow/stages/<job_type>/disable
+```
+
+Push uploaded episodes into automatic labeling:
+
+```text
+POST /api/v1/workflow/episodes/push-auto-label
+```
+
+The push body may target one `episode_id`, one `task_name`, or all eligible
+episodes with `{"scope":"all"}`. An episode is eligible when it is `uploaded`,
+has a NAS/data URI, and has no existing `auto_label` job.
 
 `manual_label` lease moves the Episode to `manual_labeling`; successful
 completion moves it to `manual_labeled` and can register a `corrected_2d`
@@ -351,8 +376,10 @@ There is also a development-only generic helper for stubbing `upload`,
 POST /api/v1/dev/jobs
 ```
 
-QC stub completion can create a manual label job by completing a `qc` job with
-`{"result":{"passed":false}}`.
+Completing an `auto_label` job registers or accepts `pred_2d` and queues `qc`
+after all auto-label batches for that episode succeed. Completing a `qc` job
+registers or accepts `qc_report`; `{"result":{"passed":false}}` leaves the
+episode `qc_failed` and queues one `manual_label` job.
 
 ## Label Frontend
 

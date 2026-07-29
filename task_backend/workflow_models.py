@@ -30,6 +30,12 @@ JOB_TYPES = {
     "manual_label",
 }
 
+CONTROLLED_STAGE_JOB_TYPES = {
+    "auto_label",
+    "qc",
+    "manual_label",
+}
+
 JOB_STATUSES = {
     "queued",
     "leased",
@@ -54,6 +60,13 @@ def require_job_type(value: str) -> str:
     value = str(value or "").strip()
     if value not in JOB_TYPES:
         raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported job type: {value}")
+    return value
+
+
+def require_stage_job_type(value: str) -> str:
+    value = require_job_type(value)
+    if value not in CONTROLLED_STAGE_JOB_TYPES:
+        raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported workflow stage: {value}")
     return value
 
 

@@ -11,18 +11,22 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     from .workflow_models import (
+        CONTROLLED_STAGE_JOB_TYPES,
         TERMINAL_JOB_STATUSES,
         WorkflowError,
         require_episode_status,
         require_job_status,
+        require_stage_job_type,
         require_job_type,
     )
 except ImportError:  # pragma: no cover - script execution fallback
     from workflow_models import (  # type: ignore
+        CONTROLLED_STAGE_JOB_TYPES,
         TERMINAL_JOB_STATUSES,
         WorkflowError,
         require_episode_status,
         require_job_status,
+        require_stage_job_type,
         require_job_type,
     )
 
@@ -130,9 +134,27 @@ class WorkflowStore:
                     ON jobs(type, status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_jobs_episode
                     ON jobs(episode_id);
+
+                CREATE TABLE IF NOT EXISTS workflow_stage_controls (
+                    job_type TEXT PRIMARY KEY,
+                    lease_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL DEFAULT '',
+                    note TEXT NOT NULL DEFAULT ''
+                );
                 PRAGMA user_version = 1;
                 """
             )
+            timestamp = now_iso()
+            for job_type in sorted(CONTROLLED_STAGE_JOB_TYPES):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO workflow_stage_controls (
+                        job_type, lease_enabled, updated_at, updated_by, note
+                    ) VALUES (?, 0, ?, 'system', 'default paused')
+                    """,
+                    (job_type, timestamp),
+                )
 
     def create_or_update_episode(
         self,
@@ -216,6 +238,36 @@ class WorkflowStore:
     def get_episode(self, episode_id: str) -> Optional[Dict[str, Any]]:
         with self.connect() as conn:
             return self._get_episode_unlocked(conn, episode_id)
+
+    def list_episodes(
+        self,
+        *,
+        subject_id: str = "",
+        task_name: str = "",
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        subject_id = str(subject_id or "").strip()
+        task_name = str(task_name or "").strip()
+        if subject_id:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if task_name:
+            clauses.append("task_name = ?")
+            params.append(task_name)
+        if statuses:
+            clean_statuses = [require_episode_status(status) for status in statuses]
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        query = "SELECT * FROM episodes"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY subject_id, task_name, episode_index, created_at, episode_id"
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_episode(row) for row in rows]
 
     def update_episode_status(self, episode_id: str, status: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         status = require_episode_status(status)
@@ -360,6 +412,80 @@ class WorkflowStore:
         with self.connect() as conn:
             rows = conn.execute(query, params).fetchall()
             return [self._row_to_job(row) for row in rows]
+
+    def jobs_by_type(self, job_type: str) -> List[Dict[str, Any]]:
+        job_type = require_job_type(job_type)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM jobs WHERE type = ? ORDER BY created_at, job_id",
+                (job_type,),
+            ).fetchall()
+            return [self._row_to_job(row) for row in rows]
+
+    def get_stage_control(self, job_type: str) -> Dict[str, Any]:
+        job_type = require_stage_job_type(job_type)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM workflow_stage_controls WHERE job_type = ?",
+                (job_type,),
+            ).fetchone()
+            if row is None:
+                timestamp = now_iso()
+                conn.execute(
+                    """
+                    INSERT INTO workflow_stage_controls (
+                        job_type, lease_enabled, updated_at, updated_by, note
+                    ) VALUES (?, 0, ?, 'system', 'default paused')
+                    """,
+                    (job_type, timestamp),
+                )
+                row = conn.execute(
+                    "SELECT * FROM workflow_stage_controls WHERE job_type = ?",
+                    (job_type,),
+                ).fetchone()
+            if row is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"stage control not found: {job_type}")
+            return self._row_to_stage_control(row)
+
+    def set_stage_control(
+        self,
+        *,
+        job_type: str,
+        lease_enabled: bool,
+        updated_by: str = "",
+        note: str = "",
+    ) -> Dict[str, Any]:
+        job_type = require_stage_job_type(job_type)
+        updated_by = str(updated_by or "").strip() or "api"
+        note = str(note or "").strip()
+        with self.connect() as conn:
+            timestamp = now_iso()
+            conn.execute(
+                """
+                INSERT INTO workflow_stage_controls (
+                    job_type, lease_enabled, updated_at, updated_by, note
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_type) DO UPDATE SET
+                    lease_enabled = excluded.lease_enabled,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by,
+                    note = excluded.note
+                """,
+                (job_type, 1 if lease_enabled else 0, timestamp, updated_by, note),
+            )
+            row = conn.execute(
+                "SELECT * FROM workflow_stage_controls WHERE job_type = ?",
+                (job_type,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"stage control not found: {job_type}")
+            return self._row_to_stage_control(row)
+
+    def lease_enabled_for_job_type(self, job_type: str) -> bool:
+        job_type = require_job_type(job_type)
+        if job_type not in CONTROLLED_STAGE_JOB_TYPES:
+            return True
+        return bool(self.get_stage_control(job_type).get("lease_enabled"))
 
     def lease_job(self, *, job_type: str, lease_owner: str, lease_seconds: int = 300) -> Optional[Dict[str, Any]]:
         job_type = require_job_type(job_type)
@@ -586,4 +712,14 @@ class WorkflowStore:
             "attempt": int(row["attempt"] or 0),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _row_to_stage_control(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "job_type": row["job_type"],
+            "lease_enabled": bool(row["lease_enabled"]),
+            "updated_at": row["updated_at"],
+            "updated_by": row["updated_by"] or "",
+            "note": row["note"] or "",
         }
