@@ -7,8 +7,8 @@ import time
 import uuid
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-from urllib.parse import quote
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import quote, unquote, urlparse
 
 try:
     from .storage_resolver import local_uri_from_path, path_from_local_uri, uri_join
@@ -110,6 +110,16 @@ def _as_int_list(value: Any) -> List[int]:
     return out
 
 
+def _normalize_uri_mounts(value: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for prefix, root in (value or {}).items():
+        clean_prefix = str(prefix or "").strip().rstrip("/")
+        clean_root = str(root or "").strip()
+        if clean_prefix and clean_root:
+            out[clean_prefix] = clean_root
+    return out
+
+
 def _optional_int(value: Any) -> Optional[int]:
     if value is None or value == "":
         return None
@@ -190,10 +200,12 @@ class JobService:
         *,
         auto_label_after_upload: bool = False,
         auto_label_batch_size: int = 200,
+        uri_mounts: Optional[Mapping[str, Any]] = None,
     ):
         self.store = store
         self.auto_label_after_upload = bool(auto_label_after_upload)
         self.auto_label_batch_size = max(1, int(auto_label_batch_size or 200))
+        self.uri_mounts = _normalize_uri_mounts(uri_mounts)
 
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload_in = dict(body or {})
@@ -586,12 +598,43 @@ class JobService:
             payload.setdefault("task_name", episode.get("task_name"))
             payload.setdefault("data_uri", episode.get("data_uri"))
             payload.setdefault("cameras", episode.get("cameras") or [])
+            payload.setdefault("local_capture_path", episode.get("local_capture_path") or "")
+        resolved_data_path = self.resolve_data_path(
+            str(payload.get("data_uri") or ""),
+            str(payload.get("local_capture_path") or (episode or {}).get("local_capture_path") or ""),
+        )
+        if resolved_data_path:
+            payload.setdefault("resolved_data_path", resolved_data_path)
         return {
             "job": job,
             "episode": episode,
             "artifacts": artifacts,
             "payload": payload,
         }
+
+    def resolve_data_path(self, data_uri: str, local_capture_path: str = "") -> str:
+        local_capture_path = str(local_capture_path or "").strip()
+        if local_capture_path:
+            return str(Path(local_capture_path).expanduser().resolve())
+        value = str(data_uri or "").strip()
+        if not value:
+            return ""
+        parsed = urlparse(value)
+        if not parsed.scheme:
+            return str(Path(value).expanduser().resolve())
+        if parsed.scheme == "local":
+            return str(Path(path_from_local_uri(value)).expanduser().resolve())
+        best_prefix = ""
+        best_root = ""
+        for prefix, root in self.uri_mounts.items():
+            if value == prefix or value.startswith(prefix + "/"):
+                if len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+                    best_root = root
+        if not best_prefix:
+            return ""
+        suffix = value[len(best_prefix):].lstrip("/")
+        return str((Path(best_root).expanduser() / unquote(suffix)).resolve())
 
     def _stage_job_item(self, job: Dict[str, Any], now: str) -> Dict[str, Any]:
         episode_id = str(job.get("episode_id") or "")

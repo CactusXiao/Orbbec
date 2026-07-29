@@ -171,6 +171,29 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertTrue(released["released"])
             self.assertEqual(released["job"]["status"], "queued")
 
+    def test_label_lease_payload_includes_backend_resolved_data_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "virtual_nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
+            (episode_dir / "camera_01" / "RGB").mkdir(parents=True)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, uri_mounts={"nas://orbbec-test": str(nas_root)})
+            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
+            service.create_manual_label_job(
+                {
+                    "episode_id": "episode_001",
+                    "subject_id": "S001",
+                    "task_name": "pick_object",
+                    "data_uri": "nas://orbbec-test/S001/pick_object/episode_001",
+                    "cameras": ["camera_01"],
+                    "frames": [1],
+                }
+            )
+
+            leased = service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
+            self.assertEqual(leased["payload"]["resolved_data_path"], str(episode_dir.resolve()))
+
     def test_virtual_nas_uploader_completes_collection_upload_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

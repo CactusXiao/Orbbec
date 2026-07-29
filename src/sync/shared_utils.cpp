@@ -185,8 +185,6 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
 
     const char *pythonEnv = std::getenv("ORBBEC_LABEL_PYTHON");
     const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
-    const char *mountsEnv = std::getenv("ORBBEC_LABEL_MOUNTS_JSON");
-    const std::string mounts = mountsEnv ? mountsEnv : "{}";
     const char *operatorEnv = std::getenv("ORBBEC_LABEL_OPERATOR_ID");
     std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
     if(operatorId.empty()) {
@@ -208,7 +206,6 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
     cmd << "cd " << shellQuote(repoRoot->string())
         << " && ORBBEC_TASK_BACKEND_URL=" << shellQuote(trimString(backendUrl))
         << " ORBBEC_LABEL_OPERATOR_ID=" << shellQuote(operatorId)
-        << " ORBBEC_LABEL_MOUNTS_JSON=" << shellQuote(mounts)
         << " nohup " << shellQuote(python)
         << " -m label.main >> " << shellQuote(logPath.string())
         << " 2>&1 &";

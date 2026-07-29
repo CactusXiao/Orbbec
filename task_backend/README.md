@@ -53,6 +53,8 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # ORBBEC_VIRTUAL_NAS_ENABLED=1
 # ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state/virtual_nas
 # ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
+# Optional backend-owned URI mounts for label/manual workers:
+# ORBBEC_URI_MOUNTS_JSON={"nas://orbbec-dataset":"/Volumes/orbbec-dataset"}
 
 # Upload success waits for an explicit push before queuing auto_label jobs.
 # Set this to 1 only for legacy fully automatic local tests:
@@ -383,15 +385,13 @@ episode `qc_failed` and queues one `manual_label` job.
 
 ## Label Frontend
 
-The label GUI now defaults to server-driven work. On the home page enter:
+The label GUI now defaults to server-driven work. On the home page enter only
+the backend URL and operator ID:
 
 ```json
 {
   "backend_url": "http://127.0.0.1:8765",
-  "operator_id": "labeler_01",
-  "mounts": {
-    "nas://orbbec-dataset": "/Volumes/orbbec-dataset"
-  }
+  "operator_id": "labeler_01"
 }
 ```
 
@@ -403,14 +403,16 @@ The collection frontend also exposes a `Manual Label` button on the Collection
 Config page and the Task Select page. It launches the same `python3 -m
 label.main` GUI as a separate window and pre-fills the backend URL from the
 collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
-`subject_id` as the operator hint; set `ORBBEC_LABEL_MOUNTS_JSON` when a
-NAS-style URI needs a local mount mapping.
+`subject_id` as the operator hint. NAS/local path mapping is owned by the
+backend: it resolves `data_uri` into `resolved_data_path` in the leased job
+payload. For non-virtual NAS prefixes, configure the backend with
+`ORBBEC_URI_MOUNTS_JSON`.
 
 For local smoke tests, a payload with
 `"data_uri":"local:///Users/cactusxiao/data/S001/pick_object/episode_000456"`
 requires no mount mapping. A NAS-style URI such as
 `nas://orbbec-dataset/S001/pick_object/episode_000456` resolves through the
-configured mount prefix.
+backend-configured mount prefix.
 
 Label confirmation still writes corrected 2D arrays to:
 

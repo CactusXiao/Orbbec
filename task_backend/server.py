@@ -227,6 +227,21 @@ def env_bool(env: Dict[str, str], default: bool, *keys: str) -> bool:
     raise ValueError(f"invalid boolean in .env for {joined}: {value!r}")
 
 
+def env_json_object(env: Dict[str, str], *keys: str) -> Dict[str, Any]:
+    value = env_get(env, *keys)
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        joined = ", ".join(keys)
+        raise ValueError(f"invalid JSON object in .env for {joined}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        joined = ", ".join(keys)
+        raise ValueError(f"invalid JSON object in .env for {joined}: value must be an object")
+    return parsed
+
+
 def slugify(value: str, fallback: str = "item") -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip().lower()).strip("-._")
     slug = re.sub(r"-{2,}", "-", slug)
@@ -2383,6 +2398,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     workflow_db_env = env_path(env, "ORBBEC_WORKFLOW_DB", "TASK_BACKEND_WORKFLOW_DB")
     workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
+    virtual_nas_enabled = env_bool(env, True, "ORBBEC_VIRTUAL_NAS_ENABLED", "TASK_BACKEND_VIRTUAL_NAS_ENABLED")
+    virtual_nas_root_env = env_path(env, "ORBBEC_VIRTUAL_NAS_ROOT", "TASK_BACKEND_VIRTUAL_NAS_ROOT")
+    virtual_nas_root = (virtual_nas_root_env or (data_root / "virtual_nas")).expanduser().resolve()
+    virtual_nas_uri_prefix = env_get(env, "ORBBEC_VIRTUAL_NAS_URI_PREFIX", "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX") or "nas://orbbec-virtual"
+    uri_mounts = env_json_object(env, "ORBBEC_URI_MOUNTS_JSON", "TASK_BACKEND_URI_MOUNTS_JSON")
+    uri_mounts.setdefault(virtual_nas_uri_prefix.rstrip("/"), str(virtual_nas_root))
     auto_label_after_upload = env_bool(
         env,
         False,
@@ -2400,11 +2421,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         workflow_store,
         auto_label_after_upload=auto_label_after_upload,
         auto_label_batch_size=auto_label_batch_size,
+        uri_mounts=uri_mounts,
     )
-    virtual_nas_enabled = env_bool(env, True, "ORBBEC_VIRTUAL_NAS_ENABLED", "TASK_BACKEND_VIRTUAL_NAS_ENABLED")
-    virtual_nas_root_env = env_path(env, "ORBBEC_VIRTUAL_NAS_ROOT", "TASK_BACKEND_VIRTUAL_NAS_ROOT")
-    virtual_nas_root = (virtual_nas_root_env or (data_root / "virtual_nas")).expanduser().resolve()
-    virtual_nas_uri_prefix = env_get(env, "ORBBEC_VIRTUAL_NAS_URI_PREFIX", "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX") or "nas://orbbec-virtual"
     virtual_nas_uploader = VirtualNasUploader(
         workflow_service,
         VirtualNasUploadConfig(
@@ -2422,6 +2440,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
     print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} batch_size={auto_label_batch_size}", file=sys.stderr)
     print(f"[task-backend] virtual_nas={'enabled' if virtual_nas_enabled else 'disabled'} root={virtual_nas_root} uri={virtual_nas_uri_prefix}", file=sys.stderr)
+    print(f"[task-backend] uri_mounts={uri_mounts}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)

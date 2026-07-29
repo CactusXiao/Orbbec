@@ -46,16 +46,8 @@ python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
   --limit 1
 ```
 
-If you want the label frontend to resolve `nas://orbbec-virtual/...`, set its
-mount mapping JSON to:
-
-```json
-{
-  "nas://orbbec-virtual": "/Users/cactusxiao/Desktop/demo/Orbbec/.virtual_nas"
-}
-```
-
-Then open the label frontend and request the next backend task.
+The label frontend does not need a mount mapping. It requests the next backend
+task, and the backend returns a resolved local path for `nas://orbbec-virtual`.
 
 ## Simulate Capture To QC
 

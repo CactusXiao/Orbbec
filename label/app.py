@@ -8,7 +8,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .backend_client import BackendClientError, LabelJobSession, parse_mounts_json, session_from_lease
+    from .backend_client import BackendClientError, LabelJobSession, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from .hand_init import MediaPipeHandInitializer
     from .storage import (
@@ -33,7 +33,7 @@ try:
     from .mano_view import ManoMeshResult, ManoViewRuntime
     from .tracking import CoTrackerRuntime
 except Exception:
-    from backend_client import BackendClientError, LabelJobSession, parse_mounts_json, session_from_lease
+    from backend_client import BackendClientError, LabelJobSession, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from hand_init import MediaPipeHandInitializer
     from storage import (
@@ -226,21 +226,6 @@ class HomePage(ttk.Frame):
         ttk.Label(form, text="Operator ID", style="Muted.TLabel").pack(anchor="w")
         ttk.Entry(form, textvariable=self._var_operator, width=58).pack(fill="x", pady=(6, 10))
 
-        ttk.Label(form, text="Mount Mapping JSON", style="Muted.TLabel").pack(anchor="w")
-        self._mounts_text = tk.Text(
-            form,
-            height=4,
-            width=58,
-            bg=Theme.PANEL_2,
-            fg=Theme.FG,
-            insertbackground=Theme.FG,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=Theme.BORDER,
-        )
-        self._mounts_text.insert("1.0", os.environ.get("ORBBEC_LABEL_MOUNTS_JSON", "{}"))
-        self._mounts_text.pack(fill="x", pady=(6, 0))
-
         btns = ttk.Frame(center, style="Panel.TFrame")
         btns.pack(pady=(22, 8), fill="x")
 
@@ -263,11 +248,9 @@ class HomePage(ttk.Frame):
             messagebox.showwarning("Notice", "Please enter an operator ID.")
             return
         try:
-            mounts = parse_mounts_json(self._mounts_text.get("1.0", "end"))
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
-                mounts=mounts,
                 lease_seconds=600,
             )
         except (BackendClientError, ValueError) as exc:

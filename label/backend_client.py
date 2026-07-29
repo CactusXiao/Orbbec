@@ -174,7 +174,7 @@ def session_from_lease(
     *,
     backend_url: str,
     operator_id: str,
-    mounts: Mapping[str, str],
+    mounts: Optional[Mapping[str, str]] = None,
     lease_seconds: int = 600,
 ) -> LabelJobSession:
     client = LabelBackendClient(backend_url)
@@ -190,5 +190,5 @@ def session_from_lease(
         job_id=job_id,
         job=job,
         payload=payload,
-        mounts=dict(mounts),
+        mounts=dict(mounts or {}),
     )

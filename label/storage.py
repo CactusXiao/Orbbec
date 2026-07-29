@@ -182,9 +182,18 @@ def correction_task_from_backend_payload(
 ) -> CorrectionTask:
     if not isinstance(payload, dict):
         raise ValueError("Backend label job payload must be an object.")
-    resolver = UriResolver(mounts or {})
-    data_uri = _as_str(payload, "data_uri", line_no)
-    episode_dir = resolver.resolve(data_uri)
+    resolved_path = str(
+        payload.get("resolved_data_path")
+        or payload.get("local_episode_path")
+        or payload.get("local_capture_path")
+        or ""
+    ).strip()
+    if resolved_path:
+        episode_dir = Path(resolved_path).expanduser().resolve()
+    else:
+        resolver = UriResolver(mounts or {})
+        data_uri = _as_str(payload, "data_uri", line_no)
+        episode_dir = resolver.resolve(data_uri)
     return CorrectionTask(
         line_no=line_no,
         root=str(episode_dir.parent.parent.parent) if len(episode_dir.parts) >= 3 else str(episode_dir.parent),

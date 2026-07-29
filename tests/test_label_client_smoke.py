@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, UriResolver
+from label.storage import correction_task_from_backend_payload
 from task_backend.job_service import JobService
 from task_backend.server import BackendRuntime, RequestHandler, TaskHTTPServer, TaskInstanceRegistry
 from task_backend.workflow_store import WorkflowStore
@@ -68,6 +69,21 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+    def test_backend_payload_resolved_path_does_not_need_mount_mapping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            payload = {
+                "data_uri": "nas://orbbec-test/S001/pick_object/episode_001",
+                "resolved_data_path": str(tmp_path / "virtual_nas" / "S001" / "pick_object" / "episode_001"),
+                "subject_id": "S001",
+                "task_name": "pick_object",
+                "episode_id": "episode_001",
+                "cameras": ["camera_01"],
+                "frames": [1],
+            }
+            task = correction_task_from_backend_payload(payload)
+            self.assertEqual(task.episode_dir(), Path(payload["resolved_data_path"]).resolve())
 
 
 if __name__ == "__main__":
