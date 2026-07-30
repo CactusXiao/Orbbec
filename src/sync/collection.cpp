@@ -6788,6 +6788,9 @@ private:
             else if(hasPendingEgoVideoCandidate && !session_.egoEos) {
                 return false;
             }
+            else {
+                fullThis = false;
+            }
         }
 
         const size_t refIndex = session_.alignedRef;
