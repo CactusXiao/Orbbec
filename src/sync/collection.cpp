@@ -5209,6 +5209,31 @@ private:
         return cfg_.cameraStreamTimeoutSec > 0.0 ? cfg_.cameraStreamTimeoutSec : 2.0;
     }
 
+    uint64_t egoMissingSlotDropWaitUsLocked() const {
+        const auto timeoutUs = static_cast<uint64_t>(std::max(0.1, cameraStreamTimeoutSec()) * 1000000.0 + 0.5);
+        return std::max<uint64_t>(timeoutUs, std::max<uint64_t>(session_.stepUs * 3, session_.maxAbsDiffUs * 2));
+    }
+
+    bool egoSlotDropWaitElapsedLocked(uint64_t centerUs, const StreamState &refState) const {
+        if(refState.eos) {
+            return true;
+        }
+        // Bound the head-of-line wait when Pico/ego stops producing frames.
+        const uint64_t staleRefTailUs = saturatingAddUs(centerUs, egoMissingSlotDropWaitUsLocked());
+        return refState.maxTsUs >= staleRefTailUs;
+    }
+
+    bool egoCanResolveOrDropSlotLocked(uint64_t centerUs, const StreamState &refState) const {
+        if(!session_.saveEgo || session_.egoEos) {
+            return true;
+        }
+        const uint64_t requiredEgoTailUs = saturatingAddUs(centerUs, session_.maxAbsDiffUs);
+        if(!session_.egoFrames.empty() && session_.egoFrames.back().refTimestampUs >= requiredEgoTailUs) {
+            return true;
+        }
+        return egoSlotDropWaitElapsedLocked(centerUs, refState);
+    }
+
     static bool isCameraHealthStream(CollectDataType t) {
         return t == CollectDataType::RGB || t == CollectDataType::Depth;
     }
@@ -6484,15 +6509,6 @@ private:
                 return false;
             }
         }
-        if(session_.saveEgo) {
-            if(session_.egoFrames.empty()) {
-                return session_.egoEos;
-            }
-            const uint64_t requiredEgoTailUs = saturatingAddUs(centerUs, session_.maxAbsDiffUs);
-            if(!session_.egoEos && session_.egoFrames.back().refTimestampUs < requiredEgoTailUs) {
-                return false;
-            }
-        }
         return true;
     }
 
@@ -6710,6 +6726,10 @@ private:
         if(!multiviewCanFinalizeLocked(centerUs)) {
             return false;
         }
+        const bool egoDropWaitElapsed = session_.saveEgo && egoSlotDropWaitElapsedLocked(centerUs, itRefState->second);
+        if(!egoCanResolveOrDropSlotLocked(centerUs, itRefState->second)) {
+            return false;
+        }
 
         std::unordered_map<std::string, std::unordered_map<CollectDataType, size_t>> pickedIndices;
         bool fullThis = true;
@@ -6785,7 +6805,7 @@ private:
                 tsMin = std::min(tsMin, egoFrame.refTimestampUs);
                 tsMax = std::max(tsMax, egoFrame.refTimestampUs);
             }
-            else if(hasPendingEgoVideoCandidate && !session_.egoEos) {
+            else if(hasPendingEgoVideoCandidate && !session_.egoEos && !egoDropWaitElapsed) {
                 return false;
             }
             else {
