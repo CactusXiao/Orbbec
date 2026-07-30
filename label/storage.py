@@ -69,6 +69,7 @@ class CorrectionProgress:
 class PredictionBundle:
     mode: str
     episode_dir: Path
+    prediction_dir: Path
     pred_dir: Path
     corrected_dir: Path
     samples: Dict[Tuple[str, int], "PredictionSample"]
@@ -244,14 +245,22 @@ def correction_task_from_backend_payload(
         episode_dir = Path(resolved_path).expanduser().resolve()
     else:
         resolver = UriResolver(mounts or {})
-        data_uri = _as_str(payload, "data_uri", line_no)
+        data_uri = str(payload.get("data_uri") or "").strip()
+        if not data_uri:
+            raise ValueError("Backend label job payload must include `resolved_data_path` or `data_uri`.")
         episode_dir = resolver.resolve(data_uri)
     cameras = _optional_str_list(payload, "cameras") or _discover_cameras(episode_dir)
     frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
     if not cameras:
-        _as_str_list(payload, "cameras", line_no)
+        raise ValueError(
+            "Backend label job payload must include non-empty `cameras`, "
+            "or `resolved_data_path` must point to an episode directory with camera/RGB folders."
+        )
     if not frames:
-        _as_int_list(payload, "frames", line_no)
+        raise ValueError(
+            "Backend label job payload must include non-empty `frames`, "
+            "or `resolved_data_path` must point to an episode directory with RGB frame files."
+        )
     return CorrectionTask(
         line_no=line_no,
         root=str(episode_dir.parent.parent.parent) if len(episode_dir.parts) >= 3 else str(episode_dir.parent),
@@ -355,6 +364,7 @@ def load_prediction_bundle(task: CorrectionTask, *, mode: str = "pred") -> Predi
     return PredictionBundle(
         mode=mode,
         episode_dir=episode_dir,
+        prediction_dir=episode_dir / task.prediction_dir,
         pred_dir=pred_dir,
         corrected_dir=corrected_dir,
         samples={},
@@ -520,7 +530,7 @@ def apply_view_state_to_corrected(
         _validate_prediction_view(corrected, sample.corrected_path)
         dtype = corrected.dtype
     else:
-        pred_path = find_optional_prediction_frame_path(bundle.episode_dir / "pred_2d", cam_id, frame_idx)
+        pred_path = find_optional_prediction_frame_path(bundle.prediction_dir, cam_id, frame_idx)
         if pred_path is not None:
             pred = _load_prediction_view(pred_path)
             _validate_prediction_view(pred, pred_path)

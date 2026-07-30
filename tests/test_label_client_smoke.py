@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import numpy as np
 import tempfile
 import threading
 import unittest
@@ -9,6 +10,7 @@ from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, UriResolver, grouped_label_tasks
 from label.storage import correction_task_from_backend_payload
+from label.tracking import CoTrackerRuntime
 from task_backend.job_service import JobService
 from task_backend.server import BackendRuntime, RequestHandler, TaskHTTPServer, TaskInstanceRegistry
 from task_backend.workflow_store import WorkflowStore
@@ -119,6 +121,28 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             )
             self.assertEqual(task.cameras, ["00", "01"])
             self.assertEqual(task.frames, [1, 2])
+
+    def test_backend_payload_missing_context_uses_backend_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "data_uri": "local://" + str(Path(tmp) / "empty_episode"),
+                "resolved_data_path": str(Path(tmp) / "empty_episode"),
+            }
+            with self.assertRaises(ValueError) as exc:
+                correction_task_from_backend_payload(payload)
+            self.assertIn("Backend label job payload", str(exc.exception))
+            self.assertNotIn("Line 1", str(exc.exception))
+
+    def test_tracking_uses_task_correction_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
+            corrected = episode_dir / "human_fixed" / "00"
+            corrected.mkdir(parents=True)
+            arr = np.zeros((2, 21, 2), dtype=np.float32)
+            np.save(corrected / "00001.npy", arr)
+
+            loaded = CoTrackerRuntime()._load_previous_annotation(episode_dir, "00", 1, "human_fixed")
+            self.assertEqual(loaded.shape, (2, 21, 2))
 
 
 if __name__ == "__main__":

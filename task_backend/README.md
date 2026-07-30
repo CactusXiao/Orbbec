@@ -395,9 +395,11 @@ the backend URL and operator ID:
 }
 ```
 
-Click `Get Next Task` to lease the next `manual_label` job from
-`/api/v1/label/jobs/lease`. Legacy JSONL remains available for debugging, but it
-is no longer the default task source.
+Click `Refresh Tasks` to load queued `manual_label` jobs from the backend. The
+GUI groups them by `task_name`; select a task and click `Get Selected Task` to
+lease only that task's manual-label job through `/api/v1/label/jobs/lease`.
+Legacy JSONL remains available for debugging, but it is no longer the default
+task source.
 
 The collection frontend also exposes a `Manual Label` button on the Collection
 Config page and the Task Select page. It launches the same `python3 -m
@@ -414,7 +416,8 @@ requires no mount mapping. A NAS-style URI such as
 `nas://orbbec-dataset/S001/pick_object/episode_000456` resolves through the
 backend-configured mount prefix.
 
-Label confirmation still writes corrected 2D arrays to:
+Label confirmation writes corrected 2D arrays to the `correction_dir` returned
+by the backend payload. The default remains:
 
 ```text
 corrected_2d/<camera>/<frame:05d>.npy

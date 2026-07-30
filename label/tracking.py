@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
 
 try:
     from .storage import find_frame_path, find_optional_prediction_frame_path
@@ -34,13 +33,15 @@ class CoTrackerRuntime:
         cam_id: str,
         prev_frame_idx: int,
         frame_idx: int,
+        correction_dir: str = "corrected_2d",
+        rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
     ) -> Tuple[HandPoints, HandVisible]:
-        prev_ann = self._load_previous_annotation(episode_dir, cam_id, prev_frame_idx)
+        prev_ann = self._load_previous_annotation(episode_dir, cam_id, prev_frame_idx, correction_dir)
         queries_np, indices = self._queries_from_annotation(prev_ann)
         if not indices:
             return self._hidden_points(), self._none_visible()
 
-        clip = self._load_clip(episode_dir, cam_id, prev_frame_idx, frame_idx)
+        clip = self._load_clip(episode_dir, cam_id, prev_frame_idx, frame_idx, rgb_path_template)
         torch = self._ensure_torch()
         model = self._ensure_model()
 
@@ -77,21 +78,34 @@ class CoTrackerRuntime:
         self._model.eval()
         return self._model
 
-    def _load_previous_annotation(self, episode_dir: Path, cam_id: str, prev_frame_idx: int) -> np.ndarray:
-        path = find_optional_prediction_frame_path(episode_dir / "corrected_2d", cam_id, prev_frame_idx)
+    def _load_previous_annotation(
+        self,
+        episode_dir: Path,
+        cam_id: str,
+        prev_frame_idx: int,
+        correction_dir: str,
+    ) -> np.ndarray:
+        path = find_optional_prediction_frame_path(episode_dir / (correction_dir or "corrected_2d"), cam_id, prev_frame_idx)
         if path is None:
-            raise FileNotFoundError(f"Missing previous corrected_2d for camera {cam_id}, frame {prev_frame_idx}.")
+            raise FileNotFoundError(f"Missing previous {correction_dir or 'corrected_2d'} for camera {cam_id}, frame {prev_frame_idx}.")
         try:
             ann = np.load(path).astype(np.float32)
         except Exception as exc:
-            raise ValueError(f"Failed to load previous corrected_2d: {path}") from exc
+            raise ValueError(f"Failed to load previous {correction_dir or 'corrected_2d'}: {path}") from exc
         if ann.shape != (_HAND_COUNT, _JOINT_COUNT, 2):
-            raise ValueError(f"Previous corrected_2d must have shape (2,21,2), got {ann.shape}: {path}")
+            raise ValueError(f"Previous {correction_dir or 'corrected_2d'} must have shape (2,21,2), got {ann.shape}: {path}")
         return ann
 
-    def _load_clip(self, episode_dir: Path, cam_id: str, prev_frame_idx: int, frame_idx: int) -> np.ndarray:
-        frame_indices = self._continuous_frame_indices(episode_dir, cam_id, prev_frame_idx, frame_idx)
-        frames = [self._load_rgb_frame(episode_dir, cam_id, idx) for idx in frame_indices]
+    def _load_clip(
+        self,
+        episode_dir: Path,
+        cam_id: str,
+        prev_frame_idx: int,
+        frame_idx: int,
+        rgb_path_template: str,
+    ) -> np.ndarray:
+        frame_indices = self._continuous_frame_indices(episode_dir, cam_id, prev_frame_idx, frame_idx, rgb_path_template)
+        frames = [self._load_rgb_frame(episode_dir, cam_id, idx, rgb_path_template) for idx in frame_indices]
         try:
             return np.stack(frames, axis=0)
         except ValueError as exc:
@@ -103,20 +117,25 @@ class CoTrackerRuntime:
         cam_id: str,
         prev_frame_idx: int,
         frame_idx: int,
+        rgb_path_template: str,
     ) -> List[int]:
         if frame_idx > prev_frame_idx:
             candidate = list(range(int(prev_frame_idx), int(frame_idx) + 1))
-            if all(find_frame_path(episode_dir, cam_id, idx) is not None for idx in candidate):
+            if all(find_frame_path(episode_dir, cam_id, idx, rgb_path_template) is not None for idx in candidate):
                 return candidate
         return [int(prev_frame_idx), int(frame_idx)]
 
-    def _load_rgb_frame(self, episode_dir: Path, cam_id: str, frame_idx: int) -> np.ndarray:
-        path = find_frame_path(episode_dir, cam_id, frame_idx)
+    def _load_rgb_frame(self, episode_dir: Path, cam_id: str, frame_idx: int, rgb_path_template: str) -> np.ndarray:
+        path = find_frame_path(episode_dir, cam_id, frame_idx, rgb_path_template)
         if path is None:
             raise FileNotFoundError(f"Missing RGB frame for camera {cam_id}, frame {frame_idx}.")
         try:
+            from PIL import Image
+
             with Image.open(path) as im:
                 return np.asarray(im.convert("RGB"))
+        except ImportError as exc:
+            raise RuntimeError("Tracking mode requires Pillow to load RGB frames.") from exc
         except Exception as exc:
             raise ValueError(f"Failed to load RGB frame: {path}") from exc
 

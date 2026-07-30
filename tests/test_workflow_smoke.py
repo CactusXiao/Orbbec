@@ -402,6 +402,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
 
             service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
             qc_job = store.jobs_for_episode("episode_missing_cameras", "qc")[0]
+            self.assertEqual(qc_job["payload"]["cameras"], ["00", "01"])
+            self.assertEqual(qc_job["payload"]["frames"], [0, 1])
             service.complete_job(qc_job["job_id"], {"result": {"passed": False}})
 
             manual_job = store.jobs_for_episode("episode_missing_cameras", "manual_label")[0]
@@ -412,6 +414,48 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             leased = service.lease_job({"type": "manual_label", "operator_id": "labeler"}, forced_type="manual_label")
             self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
             self.assertEqual(leased["payload"]["frames"], [0, 1])
+
+    def test_stage_payloads_propagate_label_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            store.create_or_update_episode(
+                episode_id="episode_custom_paths",
+                subject_id="S001",
+                task_name="pick_object",
+                status="uploaded",
+                data_uri=f"local://{tmp_path / 'S001' / 'pick_object' / 'episode_custom_paths'}",
+                frame_count=2,
+                cameras=["00"],
+            )
+            auto = service.create_dev_job(
+                {
+                    "type": "auto_label",
+                    "episode_id": "episode_custom_paths",
+                    "job_id": "auto_custom_paths",
+                    "payload": {
+                        "job_id": "auto_custom_paths",
+                        "episode_id": "episode_custom_paths",
+                        "cameras": ["00"],
+                        "frames": [10, 11],
+                        "rgb_path_template": "rgb/{camera}/{frame:06d}.png",
+                        "prediction_dir": "auto_pred",
+                        "correction_dir": "human_fixed",
+                    },
+                }
+            )
+            service.complete_job(auto["job"]["job_id"], {"result": {"ok": True}})
+            qc_job = store.jobs_for_episode("episode_custom_paths", "qc")[0]
+            self.assertEqual(qc_job["payload"]["rgb_path_template"], "rgb/{camera}/{frame:06d}.png")
+            self.assertEqual(qc_job["payload"]["prediction_dir"], "auto_pred")
+            self.assertEqual(qc_job["payload"]["correction_dir"], "human_fixed")
+
+            service.complete_job(qc_job["job_id"], {"result": {"passed": False}})
+            manual_job = store.jobs_for_episode("episode_custom_paths", "manual_label")[0]
+            self.assertEqual(manual_job["payload"]["rgb_path_template"], "rgb/{camera}/{frame:06d}.png")
+            self.assertEqual(manual_job["payload"]["prediction_dir"], "auto_pred")
+            self.assertEqual(manual_job["payload"]["correction_dir"], "human_fixed")
 
 
 if __name__ == "__main__":

@@ -1002,6 +1002,8 @@ class LabelPage(ttk.Frame):
                     cam_id=cam_id,
                     prev_frame_idx=prev_frame_idx,
                     frame_idx=frame_idx,
+                    correction_dir=task.correction_dir,
+                    rgb_path_template=task.rgb_path_template,
                 )
             except Exception as exc:
                 errors.append(f"Camera {cam_id}: {exc}")

@@ -28,6 +28,7 @@ from urllib.request import Request, urlopen
 
 
 Json = Dict[str, Any]
+_FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
 
 
 class BackendError(RuntimeError):
@@ -354,9 +355,9 @@ class NasSimulator:
         subject = str(payload.get("subject_id") or episode.get("subject_id") or "virtual_subject")
         task_name = str(payload.get("task_name") or episode.get("task_name") or "virtual_task")
         episode_name = str(payload.get("episode") or episode.get("episode_name") or episode_id)
-        cameras = as_string_list(payload.get("cameras") or episode.get("cameras")) or ["00"]
-        frames = as_int_list(payload.get("frames")) or list(range(max(1, int(episode.get("frame_count") or 1))))
-        source = source_path_from_payload(payload, episode) if copy_source else None
+        cameras = cameras_from_payload(payload, episode, self)
+        frames = frames_from_payload(payload, episode, self, cameras)
+        source = source_path_from_payload(payload, episode, self) if copy_source else None
         uri = self.task_uri(subject, task_name, episode_name)
         dst = self.local_path_for_uri(uri)
         self._materialize_episode_dir(
@@ -456,15 +457,115 @@ def as_int_list(value: Any) -> List[int]:
     return out
 
 
-def source_path_from_payload(payload: Json, episode: Optional[Json] = None) -> Optional[Path]:
+def discover_cameras(episode_dir: Optional[Path]) -> List[str]:
+    if episode_dir is None or not episode_dir.exists() or not episode_dir.is_dir():
+        return []
+    cameras: List[str] = []
+    for child in episode_dir.iterdir():
+        if child.is_dir() and (child / "RGB").is_dir():
+            cameras.append(child.name)
+    return sorted(cameras)
+
+
+def discover_frames(episode_dir: Optional[Path], cameras: Sequence[str]) -> List[int]:
+    if episode_dir is None or not cameras:
+        return []
+    rgb_dir = episode_dir / str(cameras[0]) / "RGB"
+    if not rgb_dir.exists() or not rgb_dir.is_dir():
+        return []
+    frames = set()
+    for child in rgb_dir.iterdir():
+        if not child.is_file():
+            continue
+        match = _FRAME_RE.match(child.name)
+        if match:
+            frames.add(int(match.group(1)))
+    return sorted(frames)
+
+
+def source_path_from_payload(
+    payload: Json,
+    episode: Optional[Json] = None,
+    nas: Optional[NasSimulator] = None,
+) -> Optional[Path]:
     episode = episode or {}
-    raw = str(payload.get("local_capture_path") or episode.get("local_capture_path") or payload.get("local_path") or "")
+    raw = str(
+        payload.get("resolved_data_path")
+        or episode.get("resolved_data_path")
+        or payload.get("local_episode_path")
+        or episode.get("local_episode_path")
+        or payload.get("local_capture_path")
+        or episode.get("local_capture_path")
+        or payload.get("local_path")
+        or ""
+    )
     if raw:
         return Path(raw).expanduser().resolve()
     data_uri = str(payload.get("data_uri") or episode.get("data_uri") or "")
     if data_uri.startswith("local://"):
         return path_from_local_uri(data_uri)
+    if nas is not None and data_uri.startswith(nas.uri_prefix):
+        return nas.local_path_for_uri(data_uri)
     return None
+
+
+def cameras_from_payload(payload: Json, episode: Optional[Json], nas: NasSimulator) -> List[str]:
+    cameras = as_string_list(payload.get("cameras")) or as_string_list((episode or {}).get("cameras"))
+    if cameras:
+        return cameras
+    return discover_cameras(source_path_from_payload(payload, episode, nas)) or ["00"]
+
+
+def frames_from_payload(payload: Json, episode: Optional[Json], nas: NasSimulator, cameras: Sequence[str]) -> List[int]:
+    frames = as_int_list(payload.get("frames")) or discover_frames(source_path_from_payload(payload, episode, nas), cameras)
+    if frames:
+        return frames
+    frame_count = payload.get("frame_count") or (episode or {}).get("frame_count")
+    try:
+        count = int(frame_count)
+    except (TypeError, ValueError):
+        count = 0
+    return list(range(max(1, count or 1)))
+
+
+def write_prediction_artifact_for_payload(
+    nas: NasSimulator,
+    payload: Json,
+    episode: Optional[Json],
+    cameras: Sequence[str],
+    frames: Sequence[int],
+    prediction_dir: str,
+) -> str:
+    data_uri = str(payload.get("data_uri") or "")
+    if data_uri.startswith(nas.uri_prefix):
+        return nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir)
+    episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                write_placeholder_npy(episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy")
+        return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
+    return uri_join(data_uri, prediction_dir)
+
+
+def write_corrected_artifact_for_payload(
+    nas: NasSimulator,
+    payload: Json,
+    episode: Optional[Json],
+    cameras: Sequence[str],
+    frames: Sequence[int],
+    correction_dir: str,
+) -> str:
+    data_uri = str(payload.get("data_uri") or "")
+    if data_uri.startswith(nas.uri_prefix):
+        return nas.write_corrected_artifact(data_uri, cameras, frames, correction_dir)
+    episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                write_placeholder_npy(episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy")
+        return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
+    return uri_join(data_uri, correction_dir)
 
 
 def payload_from_task(task: LabelTask, data_uri: str, job_id: str, reason: str) -> Json:
@@ -578,8 +679,21 @@ def enriched_payload(response: Json) -> Json:
     episode = response.get("episode") or {}
     for key in ("job_id", "episode_id"):
         payload.setdefault(key, job.get(key) or episode.get(key))
-    for key in ("subject_id", "task_name", "data_uri", "cameras"):
-        payload.setdefault(key, episode.get(key))
+    for key in (
+        "subject_id",
+        "task_name",
+        "data_uri",
+        "local_capture_path",
+        "resolved_data_path",
+        "cameras",
+        "frames",
+        "frame_count",
+        "rgb_path_template",
+        "prediction_dir",
+        "correction_dir",
+    ):
+        if payload.get(key) in (None, "", []):
+            payload[key] = episode.get(key)
     return payload
 
 
@@ -594,15 +708,15 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
     nas_uri = nas.materialize_payload(payload, episode, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
-    cameras = as_string_list(payload.get("cameras")) or as_string_list(episode.get("cameras")) or ["00"]
-    frames = as_int_list(payload.get("frames")) or list(range(max(1, int(episode.get("frame_count") or 1))))
+    cameras = cameras_from_payload(payload, episode, nas)
+    frames = frames_from_payload(payload, episode, nas, cameras)
     client.complete_job(
         str(job["job_id"]),
         {
             "ok": True,
             "nas_uri": nas_uri,
             "virtual_worker": owner,
-            "copied_from": str(source_path_from_payload(payload, episode) or ""),
+            "copied_from": str(source_path_from_payload(payload, episode, nas) or ""),
         },
         artifacts=[{"kind": "nas_episode", "uri": nas_uri, "metadata": {"worker_id": owner}}],
     )
@@ -625,15 +739,16 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     except NoJobAvailable:
         return False
     job = leased.get("job") or {}
+    episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
     data_uri = str(payload.get("data_uri") or "")
-    cameras = as_string_list(payload.get("cameras")) or ["00"]
-    frames = as_int_list(payload.get("frames")) or [0]
+    cameras = cameras_from_payload(payload, episode, nas)
+    frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
     prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
-    pred_uri = nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir) if data_uri.startswith(nas.uri_prefix) else uri_join(data_uri, prediction_dir)
+    pred_uri = write_prediction_artifact_for_payload(nas, payload, episode, cameras, frames, prediction_dir)
     client.complete_job(
         str(job["job_id"]),
         {"ok": True, "model": "virtual_hand2d", "frames_predicted": frames, "virtual_worker": owner},
@@ -650,6 +765,7 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     except NoJobAvailable:
         return False
     job = leased.get("job") or {}
+    episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
     passed = random.random() >= float(args.qc_fail_rate)
@@ -680,18 +796,16 @@ def handle_manual_label_once(client: BackendClient, nas: NasSimulator, args: arg
     except NoJobAvailable:
         return False
     job = leased.get("job") or {}
+    episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_label_job(str(job["job_id"]), operator, args.lease_seconds)
     data_uri = str(payload.get("data_uri") or "")
-    cameras = as_string_list(payload.get("cameras")) or ["00"]
-    frames = as_int_list(payload.get("frames")) or [0]
+    cameras = cameras_from_payload(payload, episode, nas)
+    frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
     correction_dir = str(payload.get("correction_dir") or "corrected_2d")
-    if data_uri.startswith(nas.uri_prefix):
-        corrected_uri = nas.write_corrected_artifact(data_uri, cameras, frames, correction_dir)
-    else:
-        corrected_uri = uri_join(data_uri, correction_dir)
+    corrected_uri = write_corrected_artifact_for_payload(nas, payload, episode, cameras, frames, correction_dir)
     client.complete_label_job(
         str(job["job_id"]),
         {"operator_id": operator, "frames_completed": frames, "virtual_labeler": True},

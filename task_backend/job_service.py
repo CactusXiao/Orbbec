@@ -717,6 +717,24 @@ class JobService:
             return list(range(frame_count))
         return []
 
+    def _payload_field_for_episode_context(
+        self,
+        episode_id: str,
+        key: str,
+        default: str,
+        *payloads: Dict[str, Any],
+    ) -> str:
+        for payload in payloads:
+            value = str((payload or {}).get(key) or "").strip()
+            if value:
+                return value
+        for job_type in ("manual_label", "qc", "auto_label", "upload"):
+            for job in self.store.jobs_for_episode(episode_id, job_type):
+                value = str((job.get("payload") or {}).get(key) or "").strip()
+                if value:
+                    return value
+        return default
+
     def _stage_job_item(self, job: Dict[str, Any], now: str) -> Dict[str, Any]:
         episode_id = str(job.get("episode_id") or "")
         episode = self.store.get_episode(episode_id) if episode_id else None
@@ -1039,11 +1057,13 @@ class JobService:
         episode = self.store.get_episode(episode_id)
         if episode is None:
             return
-        frames = self._episode_frames_from_jobs(episode_id, "auto_label")
-        if not frames:
-            frame_count = _optional_int(episode.get("frame_count"))
-            if frame_count:
-                frames = list(range(frame_count))
+        cameras = self._cameras_for_episode_context(episode_id, episode, result)
+        frames = _as_int_list(result.get("frames")) or self._frames_for_episode_context(
+            episode_id,
+            episode,
+            cameras,
+            result,
+        )
         pred_artifacts = self._relevant_artifacts_for_job("auto_label", self.store.artifacts_for_episode(episode_id))
         base_id = _stable_id_part(episode_id, "episode")
         job_id = str(result.get("qc_job_id") or f"qc_{base_id}")
@@ -1053,10 +1073,18 @@ class JobService:
             "subject_id": episode["subject_id"],
             "task_name": episode["task_name"],
             "data_uri": episode["data_uri"],
-            "cameras": episode.get("cameras") or [],
+            "cameras": cameras,
             "frames": frames,
             "pred_artifacts": pred_artifacts,
             "pred_uri": str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else "",
+            "rgb_path_template": self._payload_field_for_episode_context(
+                episode_id,
+                "rgb_path_template",
+                "{camera}/RGB/{frame:05d}.png",
+                result,
+            ),
+            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
+            "correction_dir": self._payload_field_for_episode_context(episode_id, "correction_dir", "corrected_2d", result),
             "reason": "auto_label_succeeded",
         }
         self._create_job_once(job_id=job_id, job_type="qc", episode_id=episode_id, payload=payload)
@@ -1103,9 +1131,14 @@ class JobService:
             "data_uri": episode["data_uri"],
             "cameras": cameras,
             "frames": frames,
-            "rgb_path_template": "{camera}/RGB/{frame:05d}.png",
-            "prediction_dir": "pred_2d",
-            "correction_dir": "corrected_2d",
+            "rgb_path_template": self._payload_field_for_episode_context(
+                episode_id,
+                "rgb_path_template",
+                "{camera}/RGB/{frame:05d}.png",
+                result,
+            ),
+            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
+            "correction_dir": self._payload_field_for_episode_context(episode_id, "correction_dir", "corrected_2d", result),
             "reason": "qc_failed",
             "priority": _optional_int(result.get("priority")) or 50,
         }
