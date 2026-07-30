@@ -100,6 +100,26 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             task = correction_task_from_backend_payload(payload)
             self.assertEqual(task.episode_dir(), Path(payload["resolved_data_path"]).resolve())
 
+    def test_backend_payload_can_discover_missing_cameras_and_frames_from_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_001"
+            for camera in ("00", "01"):
+                rgb = episode_dir / camera / "RGB"
+                rgb.mkdir(parents=True)
+                (rgb / "00001.png").write_bytes(b"rgb")
+                (rgb / "00002.png").write_bytes(b"rgb")
+            task = correction_task_from_backend_payload(
+                {
+                    "resolved_data_path": str(episode_dir),
+                    "subject_id": "S001",
+                    "task_name": "pick_object",
+                    "episode_id": "episode_001",
+                }
+            )
+            self.assertEqual(task.cameras, ["00", "01"])
+            self.assertEqual(task.frames, [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

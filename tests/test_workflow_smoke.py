@@ -374,6 +374,45 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(store.get_episode("episode_fail")["status"], "manual_labeled")  # type: ignore[index]
             self.assertTrue(any(item["kind"] == "corrected_2d" for item in store.artifacts_for_episode("episode_fail")))
 
+    def test_qc_failed_manual_label_discovers_missing_episode_cameras(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_missing_cameras"
+            for camera in ("00", "01"):
+                rgb = episode_dir / camera / "RGB"
+                rgb.mkdir(parents=True)
+                (rgb / "00000.png").write_bytes(b"rgb")
+                (rgb / "00001.png").write_bytes(b"rgb")
+
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, auto_label_batch_size=10)
+            store.create_or_update_episode(
+                episode_id="episode_missing_cameras",
+                subject_id="S001",
+                task_name="pick_object",
+                episode_index=1,
+                status="uploaded",
+                data_uri=f"local://{episode_dir}",
+                frame_count=2,
+                cameras=[],
+            )
+            service.push_auto_label({"episode_id": "episode_missing_cameras", "pushed_by": "smoke"})
+            auto_job = store.jobs_for_episode("episode_missing_cameras", "auto_label")[0]
+            self.assertEqual(auto_job["payload"]["cameras"], ["00", "01"])
+
+            service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
+            qc_job = store.jobs_for_episode("episode_missing_cameras", "qc")[0]
+            service.complete_job(qc_job["job_id"], {"result": {"passed": False}})
+
+            manual_job = store.jobs_for_episode("episode_missing_cameras", "manual_label")[0]
+            self.assertEqual(manual_job["payload"]["cameras"], ["00", "01"])
+            self.assertEqual(manual_job["payload"]["frames"], [0, 1])
+
+            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
+            leased = service.lease_job({"type": "manual_label", "operator_id": "labeler"}, forced_type="manual_label")
+            self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
+            self.assertEqual(leased["payload"]["frames"], [0, 1])
+
 
 if __name__ == "__main__":
     unittest.main()

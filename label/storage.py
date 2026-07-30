@@ -128,6 +128,17 @@ def _as_str_list(obj: Dict, key: str, line_no: int) -> List[str]:
     return out
 
 
+def _optional_str_list(obj: Dict, key: str) -> List[str]:
+    value = obj.get(key)
+    if not isinstance(value, list):
+        return []
+    out: List[str] = []
+    for item in value:
+        if isinstance(item, str) and item:
+            out.append(item)
+    return out
+
+
 def _as_int_list(obj: Dict, key: str, line_no: int) -> List[int]:
     value = obj.get(key)
     if not isinstance(value, list) or not value:
@@ -138,6 +149,47 @@ def _as_int_list(obj: Dict, key: str, line_no: int) -> List[int]:
             raise ValueError(f"Line {line_no}: `{key}` must contain integer frame indices.")
         out.append(int(item))
     return out
+
+
+def _optional_int_list(obj: Dict, key: str) -> List[int]:
+    value = obj.get(key)
+    if not isinstance(value, list):
+        return []
+    out: List[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _discover_cameras(episode_dir: Path) -> List[str]:
+    if not episode_dir.exists() or not episode_dir.is_dir():
+        return []
+    cameras: List[str] = []
+    for child in episode_dir.iterdir():
+        if child.is_dir() and (child / "RGB").is_dir():
+            cameras.append(child.name)
+    return sorted(cameras)
+
+
+def _discover_frames(episode_dir: Path, cameras: List[str]) -> List[int]:
+    if not cameras:
+        return []
+    rgb_dir = episode_dir / cameras[0] / "RGB"
+    if not rgb_dir.exists() or not rgb_dir.is_dir():
+        return []
+    frames = set()
+    for child in rgb_dir.iterdir():
+        if not child.is_file():
+            continue
+        match = _FRAME_RE.match(child.name)
+        if match:
+            frames.add(int(match.group(1)))
+    return sorted(frames)
 
 
 def load_correction_tasks(jsonl_path: str) -> List[CorrectionTask]:
@@ -194,14 +246,20 @@ def correction_task_from_backend_payload(
         resolver = UriResolver(mounts or {})
         data_uri = _as_str(payload, "data_uri", line_no)
         episode_dir = resolver.resolve(data_uri)
+    cameras = _optional_str_list(payload, "cameras") or _discover_cameras(episode_dir)
+    frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
+    if not cameras:
+        _as_str_list(payload, "cameras", line_no)
+    if not frames:
+        _as_int_list(payload, "frames", line_no)
     return CorrectionTask(
         line_no=line_no,
         root=str(episode_dir.parent.parent.parent) if len(episode_dir.parts) >= 3 else str(episode_dir.parent),
         subject=str(payload.get("subject_id") or "unknown_subject"),
         task=str(payload.get("task_name") or "manual_label"),
         episode=str(payload.get("episode_id") or episode_dir.name),
-        cameras=_as_str_list(payload, "cameras", line_no),
-        frames=_as_int_list(payload, "frames", line_no),
+        cameras=cameras,
+        frames=frames,
         rgb_path_template=str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
         prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
         correction_dir=str(payload.get("correction_dir") or "corrected_2d"),
