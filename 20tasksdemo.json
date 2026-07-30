@@ -1,0 +1,142 @@
+{
+  "wood_block_stack_and_lean": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将三块木块以不同朝向分开放置后，完成一次稳定堆叠、斜靠、拆下和重新堆叠流程。\n道具：三块木块\n参考动作：抓取、转向、对位、叠放、斜靠、稳定检查、取下、重新摆放\n动作指导：先选取一块木块作为底座，将第二块稳定叠放在其上，再把第三块斜靠在叠好的木块侧面；结构稳定后依次取下三块木块，重新调整方向，完成一次不同方式的堆叠或倚靠，最后将木块分开放回桌面。\n注意事项：不要一次性抓起多块木块；堆叠和斜靠都要清晰出现；重新堆叠时应体现与第一次不同的方向或接触方式。",
+    "task_description_en": "Place three wooden blocks in different orientations, stack and lean them into a stable structure, then disassemble and restack them in a different way.",
+    "scene": "workspace"
+  },
+  "brush_wood_block_painting_simulation": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：使用刷子对木块两个表面进行模拟上漆刷涂，并在结束后归位刷子和木块。\n道具：刷子、木块\n参考动作：抓握刷子、轻刷、往复移动、放下、翻转木块、重新抓取、归位\n动作指导：将刷子和木块分开放置；拿起刷子沿木块上表面从左向右轻刷三次，再从前向后轻刷三次；放下刷子并翻转木块，重新拿起刷子对另一表面重复轻刷动作，最后将刷子和木块分别放回初始区域。\n注意事项：刷涂方向要能区分左右和前后；翻面后也要有完整刷涂过程；不要只用刷子点触木块代替连续轻刷。",
+    "task_description_en": "Use a brush to simulate painting both surfaces of a wooden block, brushing in multiple directions and returning the objects afterward.",
+    "scene": "workspace"
+  },
+  "scissors_drawer_put_take_and_open_close": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将闭合剪刀放入打开的抽屉盒并关闭，再拉开抽屉取出剪刀完成三次张开闭合操作。\n道具：抽屉盒、剪刀\n参考动作：抓取、放入、推合抽屉、拉开抽屉、取出、张开、闭合、归位\n阶段：\n阶段 1：将闭合剪刀放入打开的抽屉并推至完全关闭\n阶段 2：再次拉开抽屉并取出剪刀放到桌面\n阶段 3：连续完成三次剪刀张开和闭合，确认闭合后归位并关闭抽屉\n动作指导：保持抽屉盒打开、剪刀闭合并放置在抽屉外；放入剪刀后推动抽屉至完全关闭，再重新拉开并取出剪刀；剪刀操作完成后确认刀口闭合，再放回桌面并关闭抽屉。\n注意事项：剪刀应始终保持受控，不要甩动；抽屉关闭和再次打开都要完整出现；三次张开闭合要清晰可数。",
+    "task_description_en": "Place closed scissors into an open drawer, close and reopen it, then remove the scissors and open and close them three times.",
+    "scene": "workspace"
+  },
+  "spoon_scoop_and_fork_pick_simulation": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：分别使用勺子和叉子在碗内完成模拟舀取与叉取动作，并将餐具放回原处。\n道具：碗、勺子、叉子\n参考动作：抓握、伸入碗内、舀取、抬出、短暂停留、叉取、释放、归位\n动作指导：将碗开口朝上放在桌面中央，勺子和叉子分别放在碗两侧；先拿起勺子伸入碗内，沿碗底做一次舀取动作并抬出碗口；放回勺子后再拿起叉子伸入碗内，模拟叉取并抬出碗口，随后将叉子放回原处。\n注意事项：勺子和叉子两个工具都必须使用；动作应进入碗内再抬出，不要只在碗口外比划；放回位置要接近初始区域。",
+    "task_description_en": "Use a spoon to simulate scooping from a bowl, then use a fork to simulate picking from the bowl, returning both utensils afterward.",
+    "scene": "kitchen"
+  },
+  "spray_bottle_disassemble_and_restore": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将喷水壶喷头组件旋开取出，调整喷头和壶身朝向后重新插回并旋紧复原。\n道具：喷水壶\n参考动作：固定壶身、旋开、抽出、放置、水平旋转、对准瓶口、插回、旋紧\n阶段：\n阶段 1：固定壶身并逆时针旋开上部喷头组件\n阶段 2：取出喷头组件并分别调整喷头与壶身朝向\n阶段 3：将喷头组件对准瓶口插回并顺时针旋紧\n动作指导：将喷水壶竖直放置；旋开后把上部组件完全抽出并放在桌面上；分别拿起喷头组件和壶身进行一次水平旋转与朝向调整，再对准瓶口插回并旋紧至稳定，最后恢复竖直放置。\n注意事项：喷头必须完全取出再复原；插回前要体现对准动作；旋紧后应有稳定确认，不要只虚放在瓶口。",
+    "task_description_en": "Unscrew and remove the spray bottle head, adjust both parts, then insert and tighten the head back onto the bottle.",
+    "scene": "workspace"
+  },
+  "open_stand_and_close_book": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将合拢平放的书本翻开、立起模拟阅读，再放回桌面整理并完全合上。\n道具：书本\n参考动作：翻开封面、翻页、扶持、立起、保持、放回、整理书页、合上\n动作指导：将书本合拢平放在桌面上；翻开封面和若干书页，使书本保持打开状态；双手扶住书本两侧，将其立起并保持数秒以模拟阅读，随后平稳放回桌面，整理书页并完全合上封面。\n注意事项：不要只掀开封面就结束；立起时要保持书本稳定；合上前应有整理书页动作。",
+    "task_description_en": "Open a closed book, stand it upright briefly as if reading, then place it back down, straighten the pages, and close it.",
+    "scene": "workspace"
+  },
+  "usb_insert_and_remove": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将 USB 插头对准固定接口插入至稳定位置，停留片刻后沿原方向拔出并放回接口旁。\n道具：USB插头、USB接口\n参考动作：抓握线头、观察方向、翻转调整、对准接口、轴向插入、停留、拔出、放回\n动作指导：将 USB 插头与 USB 接口分开放置，确保接口固定；拿起插头后观察并调整正反方向，使其与接口开口对齐；沿接口轴向缓慢插入至稳定位置，停留片刻后沿原方向平稳拔出，最后放回接口旁边。\n注意事项：插入前必须体现方向判断和对位；不要斜插或硬推；拔出时沿接口方向移动，避免左右摇晃。",
+    "task_description_en": "Align a USB plug with a fixed USB port, insert it smoothly, pause briefly, then remove it and place it beside the port.",
+    "scene": "industrial"
+  },
+  "stop_valve_disassemble_arrange_restore": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：拆分停止阀上部组件，完成斜靠和叠放两种摆放方式后重新装回并确认复位。\n道具：停止阀\n参考动作：按下释放按钮、取出组件、旋转、斜靠、叠放、对准、插回、按钮复位确认\n阶段：\n阶段 1：按下释放按钮并取出上部组件\n阶段 2：将上部组件与下部底座调整朝向后完成斜靠和叠放\n阶段 3：对准安装位置插回上部组件并确认停止阀恢复完整\n动作指导：将停止阀完整装配后放置在桌面上；按下释放按钮并保持下压，取出上部组件；分别旋转上部组件和下部底座至不同朝向，先斜靠在下部旁边，再改为叠放在下部上方；随后插回复原。\n注意事项：释放按钮动作要真实出现；斜靠和叠放是两个不同终态；复原后应确认按钮复位和结构完整。",
+    "task_description_en": "Disassemble the stop valve top component, arrange it by leaning and stacking, then reinstall it and confirm the valve is restored.",
+    "scene": "industrial"
+  },
+  "scissors_and_pliers_operate_and_swap": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：依次操作钳子、长剪刀和短剪刀完成开合动作，并交换长剪刀与短剪刀的位置后整齐闭合摆放。\n道具：长剪刀、短剪刀、钳子\n参考动作：抓取、张开、闭合、旋转朝向、放下、换位、对齐\n阶段：\n阶段 1：拿起钳子连续张开闭合三次并旋转朝向后放下\n阶段 2：依次拿起长剪刀和短剪刀，各完成三次张开闭合\n阶段 3：交换长剪刀与短剪刀位置，使三件工具闭合并整齐放置\n动作指导：将长剪刀、短剪刀和钳子闭合后横向分开放置；按顺序操作三件工具，每件完成后再处理下一件；最后换位并整理朝向。\n注意事项：三件工具都要独立操作；开合次数要清楚；结束时所有工具应闭合，避免刀口或钳口张开。",
+    "task_description_en": "Operate pliers, long scissors, and short scissors by opening and closing them, then swap the two scissors and leave all tools closed and aligned.",
+    "scene": "workspace"
+  },
+  "colored_bowls_flip_swap_and_stack": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：对灰色、粉色和绿色碗完成两次翻转、一次换位，并最终开口朝上稳定嵌套堆叠。\n道具：灰色碗、粉色碗、绿色碗\n参考动作：抓取碗沿、翻转、放下、换位、调整开口、套放、稳定检查\n阶段：\n阶段 1：随机选择两个碗分别完成朝向翻转\n阶段 2：选择两个不同颜色的碗交换位置\n阶段 3：将三个碗全部调整为开口朝上并依次嵌套堆叠\n动作指导：将三只碗随机以正放或倒扣方式摆在桌面上；翻转两只碗后，交换两只不同颜色碗的位置；最后按照任意颜色顺序稳定套叠。\n注意事项：翻转、换位、堆叠三个动作都必须出现；不要直接把三只碗叠起跳过前序动作；套放时避免碰倒或卡偏。",
+    "task_description_en": "Flip two colored bowls, swap the positions of two bowls, then set all three bowls opening-up and nest them into a stable stack.",
+    "scene": "kitchen"
+  },
+  "key_unlock_adjust_and_relock": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：使用钥匙打开锁，调整锁体朝向后重新闭锁并拔出钥匙放回锁旁。\n道具：锁、钥匙\n参考动作：固定锁体、拿钥匙、调整方向、插入锁孔、旋转解锁、打开锁梁、合上、拔出\n动作指导：将处于锁闭状态的锁和钥匙分开放置；一手固定锁体，另一手拿起钥匙，调整钥匙方向后插入锁孔并旋转至解锁位置；打开锁梁并旋转锁体朝向，随后合上锁梁，将钥匙转回锁闭位置并拔出。\n注意事项：插钥匙前要体现方向调整；打开锁梁后再复锁；结束时钥匙应离开锁孔并放在锁旁。",
+    "task_description_en": "Use a key to unlock a padlock, adjust the lock orientation, then relock it, remove the key, and place it beside the lock.",
+    "scene": "workspace"
+  },
+  "thermos_open_lid_and_pour_simulation": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：旋开保温杯杯盖，向水杯模拟倒水，再用水杯模拟倾倒，最后旋紧杯盖复原。\n道具：带盖保温杯、水杯\n参考动作：固定杯身、旋开杯盖、放置杯盖、倾斜倒水、回正、端杯、对准杯口、旋紧\n阶段：\n阶段 1：固定保温杯并旋开杯盖\n阶段 2：拿起保温杯向水杯内缓慢倾斜，完成模拟倒水\n阶段 3：端起水杯向空白区域模拟倾倒，再旋紧保温杯杯盖\n动作指导：将带盖保温杯和水杯竖直放置；杯盖旋开后开口朝下放在桌面上；模拟倒水和水杯倾倒都完成后，再拿起杯盖对准保温杯口旋紧。\n注意事项：两个倾倒动作都要出现；杯盖要先取下再复原；倾斜时动作应缓慢受控，避免碰倒杯子。",
+    "task_description_en": "Open a thermos, simulate pouring into a cup, simulate pouring from the cup, then close the thermos lid again.",
+    "scene": "kitchen"
+  },
+  "switch_orientation_and_toggle_states": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：调整开关为三个不同位姿后，连续完成三次 ON/OFF 往返拨动，并恢复 OFF 正向放置。\n道具：开关\n参考动作：抓取、正向放置、侧向放置、反向放置、固定、拨动、复位\n动作指导：将开关置于 OFF 状态并放在桌面上；拿起整个开关，依次调整为正向、侧向和反向三个不同位姿，每次平稳放下；随后保持开关固定，连续完成三次 ON 与 OFF 的往返拨动，最后恢复为 OFF 状态并正向放置。\n注意事项：三种位姿调整要清楚；拨动时应固定开关本体；最后必须回到 OFF 状态。",
+    "task_description_en": "Place a switch in three different orientations, toggle it between ON and OFF three times, then return it to OFF in the forward orientation.",
+    "scene": "industrial"
+  },
+  "rubik_cube_orientation_and_drawer_transfer": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：改变魔方三个侧面的朝上方向，再将魔方放入抽屉关闭、重新取出并放在抽屉盒顶部。\n道具：魔方、抽屉盒\n参考动作：抓取、旋转朝向、短暂停留、拉开抽屉、放入、推合、取出、放置顶部\n阶段：\n阶段 1：拿起魔方，依次将三个不同颜色侧面旋转至朝上位置\n阶段 2：拉开抽屉，将魔方放入并推动抽屉关闭\n阶段 3：再次拉开抽屉取出魔方，放到抽屉盒顶部并关闭抽屉\n动作指导：将复原好的魔方放在关闭的抽屉盒旁；每次改变朝上侧面后短暂停留；抽屉取放要完整，最终魔方放在抽屉盒顶部。\n注意事项：魔方朝向变化和抽屉取放都必须出现；不要把魔方直接放到顶部跳过入抽屉过程；抽屉关闭应到位。",
+    "task_description_en": "Rotate a Rubik's cube to show three different top faces, place it into a drawer, close and reopen the drawer, then put the cube on top.",
+    "scene": "workspace"
+  },
+  "wipe_tableware_with_sponge_brush": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：使用海绵刷依次擦拭杯子、碗、叉子和勺子的指定表面，并在每件完成后放回原处。\n道具：海绵刷、杯子、碗、叉子、勺子\n参考动作：抓握海绵刷、擦拭外壁、擦拭杯口、擦拭内外壁、翻面、正反擦拭、归位\n阶段：\n阶段 1：擦拭杯子外壁与杯口\n阶段 2：擦拭碗的内壁与外壁\n阶段 3：擦拭叉子和勺子的正反两面并归位海绵刷\n动作指导：将海绵刷、杯子、碗、叉子和勺子分开放置；拿起海绵刷按顺序处理每件物体，每件物体擦拭完成后放回原处，最后将海绵刷放回桌面。\n注意事项：四类餐具都要被擦拭；叉子和勺子要体现正反面处理；不要只擦一个物体就结束。",
+    "task_description_en": "Use a sponge brush to wipe a cup, bowl, fork, and spoon on their specified surfaces, returning each item after wiping.",
+    "scene": "kitchen"
+  },
+  "adjust_adjustable_wrench": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：调节活动扳手夹口从闭合到大开口、小开口和中间宽度，翻面观察后恢复接近闭合状态。\n道具：活动扳手\n参考动作：拿起、调整握持、旋转蜗轮、张开夹口、收拢夹口、翻转观察、放回\n动作指导：将活动扳手闭合并平放在桌面上；拿起扳手并调整握持方向，连续旋转调节蜗轮，使两侧夹口依次张开至较大宽度、收拢至较小宽度，再次张开至中间宽度；整体翻转至另一面观察后，调回接近闭合状态并平放回桌面。\n注意事项：蜗轮调节过程要清楚可见；夹口宽度应有明显变化；结束时不要保持大开口状态。",
+    "task_description_en": "Adjust an adjustable wrench through wide, narrow, and medium jaw openings, flip it for inspection, then return it nearly closed.",
+    "scene": "industrial"
+  },
+  "nut_remove_flip_and_screw_back": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将螺母从螺丝上旋下，翻转调整朝向后重新对准螺纹并旋回原来的大致位置。\n道具：螺丝、螺母\n参考动作：固定螺丝、旋转螺母、脱离、拿起、左右翻转、对准螺纹、旋入、平放\n动作指导：将已旋有螺母的螺丝横放在桌面上；一手固定螺丝，另一手连续旋转螺母直至完全脱离；拿起螺母分别向左、向右翻转并调整朝向，再对准螺纹端部，缓慢旋入并拧回原来的大致位置。\n注意事项：螺母必须完全脱离后再旋回；重新旋入前要有对牙对准动作；避免螺丝滚动或螺母丢失。",
+    "task_description_en": "Unscrew a nut from a screw, flip and reorient the nut, then align it with the threads and screw it back to roughly its original position.",
+    "scene": "industrial"
+  },
+  "metal_hinge_plate_open_close": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：将闭合的金属合页板逐步打开至多个角度，再逐步合拢，翻面后重复一次小幅开合并平放。\n道具：金属合页板\n参考动作：双手拿起、缓慢打开、角度停留、逐步合拢、翻面、小幅开合、闭合放回\n动作指导：将合页板闭合后平放在桌面上；双手拿起合页板，缓慢打开至约 45 度、90 度和接近完全展开三个角度，每个角度短暂停留；再按相反顺序逐步合拢，将合页板整体翻转至另一面重复一次小幅开合，最后闭合并平放。\n注意事项：打开角度要有层次变化；翻面后仍要有小幅开合；不要快速甩动合页板。",
+    "task_description_en": "Open a closed metal hinge plate through several angles, close it step by step, flip it over, repeat a small open-close motion, and lay it closed.",
+    "scene": "industrial"
+  },
+  "small_metal_slide_extend_retract": {
+    "horizon": "short",
+    "repeat_times": 5,
+    "task_description_cn": "任务：对小金属滑轨完成两次伸缩操作，并在第二次伸缩中停留于四分之一、二分之一和四分之三位置。\n道具：小金属滑轨\n参考动作：固定外轨、握住内轨、拉出、停留、推回、重复伸缩、完全收拢\n动作指导：将小金属滑轨完全收拢并固定在桌面上；握住内部滑轨，先拉出至约一半位置，再拉至接近最大行程，随后缓慢推回完全收拢；重复两次伸缩操作，并在第二次过程中分别停留在四分之一、二分之一和四分之三位置，最后恢复完全收拢状态。\n注意事项：外轨应保持固定；停留位置要能区分；不要一次拉出后直接松手弹回。",
+    "task_description_en": "Extend and retract a small metal slide twice, pausing at quarter, half, and three-quarter positions during the second cycle.",
+    "scene": "industrial"
+  },
+  "reagent_bottle_dropper_sampling_simulation": {
+    "horizon": "long",
+    "repeat_times": 5,
+    "task_description_cn": "任务：旋开试剂瓶瓶盖，使用滴管伸入瓶内按压释放两次模拟取样，最后旋紧瓶盖恢复密闭。\n道具：带盖试剂瓶、滴管\n参考动作：固定瓶身、旋开瓶盖、放置瓶盖、拿起滴管、伸入瓶口、按压释放、取出、旋紧\n阶段：\n阶段 1：固定试剂瓶并旋开瓶盖，将瓶盖开口朝下放置\n阶段 2：拿起滴管伸入试剂瓶，按压并释放滴管上端两次模拟取样\n阶段 3：取出滴管并放回，拿起瓶盖对准瓶口旋紧\n动作指导：将带盖试剂瓶和滴管竖直放置；滴管进入瓶口时动作要缓慢稳定；模拟取样后让试剂瓶恢复密闭状态。\n注意事项：滴管必须进入瓶内后再按压释放；瓶盖取下和旋紧都要出现；不要让滴管或瓶盖滚落。",
+    "task_description_en": "Open a reagent bottle, insert a dropper and press-release it twice to simulate sampling, then remove the dropper and close the bottle.",
+    "scene": "industrial"
+  }
+}
