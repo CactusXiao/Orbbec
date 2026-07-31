@@ -147,6 +147,30 @@ struct DepthPointCloudFiltersConfig {
     bool        deskCrop                   = false;
 };
 
+struct DemoInteractionConfig {
+    bool colorfulCloudPoints = true;
+    bool deskCrop            = true;
+    bool handGt              = true;
+};
+
+struct DemoCollectionConfig {
+    bool     autoEnter       = true;
+    bool     enableMultiview = true;
+    bool     enableFisheyes  = false;
+    bool     enableEgo       = true;
+    fs::path savePath;
+    fs::path taskPath;
+    std::string subjectId    = "test";
+    float    exposureMs      = -1.0f;
+    int      brightness      = -2;
+};
+
+struct DemoConfig {
+    bool active = false;
+    DemoInteractionConfig interaction;
+    DemoCollectionConfig  collection;
+};
+
 struct VoiceFeedbackConfig {
     bool        enabled       = false;
     std::string speakerDevice = "default";
@@ -183,6 +207,7 @@ struct AppConfig {
     VoiceFeedbackConfig       voiceFeedback;
     EgoModuleConfig           ego;
     FisheyeModuleConfig       fisheye;
+    DemoConfig                demo;
     DepthPointCloudFiltersConfig filters;
     std::vector<DeviceConfig> devices;
 };

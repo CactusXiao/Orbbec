@@ -146,6 +146,46 @@ static void applyPointCloudResolution(AppConfig &cfg, int w, int h, int fps) {
     }
 }
 
+static void enablePointCloudStreams(AppConfig &cfg) {
+    for(auto &d: cfg.devices) {
+        bool hasPointCloud = false;
+        for(auto &s: d.streams) {
+            if(s.type == StreamType::PointCloud) {
+                s.enable = true;
+                hasPointCloud = true;
+            }
+        }
+        if(!hasPointCloud) {
+            StreamConfig sc;
+            sc.type   = StreamType::PointCloud;
+            sc.enable = true;
+            sc.width  = 1280;
+            sc.height = 800;
+            sc.fps    = 30;
+            sc.format = "PLY";
+            d.streams.push_back(sc);
+        }
+    }
+}
+
+static AppConfig buildDemoInteractionCfg(const AppConfig &baseCfg) {
+    AppConfig cfg = baseCfg;
+    cfg.mode = "interaction";
+    cfg.demo.active = true;
+    cfg.colorfulCloudPoints = cfg.demo.interaction.colorfulCloudPoints;
+    cfg.filters.deskCrop = cfg.demo.interaction.deskCrop;
+    enablePointCloudStreams(cfg);
+    return cfg;
+}
+
+static AppConfig buildDemoCollectionCfg(const AppConfig &baseCfg) {
+    AppConfig cfg = baseCfg;
+    cfg.mode = "collection";
+    cfg.demo.active = true;
+    cfg.demo.collection.autoEnter = true;
+    return cfg;
+}
+
 enum class AppPage {
     Menu,
     InteractionConfig,
@@ -333,10 +373,24 @@ int main(int argc, char **argv) {
 
             if(page == AppPage::Menu) {
                 cv::putText(ui, "Sync Menu", cv::Point(24, 48), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
-                cv::Rect b1(60, 110, 780, 90);
-                cv::Rect b2(60, 220, 780, 90);
-                cv::Rect b3(60, 330, 780, 90);
-                cv::Rect b4(60, 440, 780, 90);
+                cv::Rect bDemo(60, 90, 780, 78);
+                cv::Rect b1(60, 180, 780, 78);
+                cv::Rect b2(60, 270, 780, 78);
+                cv::Rect b3(60, 360, 780, 78);
+                cv::Rect b4(60, 450, 780, 78);
+                if(uiButton(ui, bDemo, "Demo", fm)) {
+                    stopPlaceholderMode();
+                    cv::destroyWindow(winName);
+                    const auto ex = run_interactive_visualization(buildDemoInteractionCfg(baseCfg), nullptr);
+                    if(ex == InteractiveExit::StartCollection) {
+                        run_collection(buildDemoCollectionCfg(baseCfg), nullptr);
+                    }
+                    page = AppPage::Menu;
+                    cv::namedWindow(winName, cv::WINDOW_NORMAL);
+                    cv::resizeWindow(winName, 900, 640);
+                    cv::setMouseCallback(winName, mouseThunk, &ms);
+                    continue;
+                }
                 if(uiButton(ui, b1, "Interaction", fm)) {
                     page = AppPage::InteractionConfig;
                 }

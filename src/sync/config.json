@@ -1,11 +1,29 @@
 {
-    "_comment": "avaliable mode: viewer,interaction,collection,calibration",
+    "_comment": "avaliable mode: viewer,interaction,collection,calibration,demo",
     "mode": "interaction",
     "viewer_fps": 30,
     "init_extrinsic_path": "extrinsic.json",
     "max_depth": 6.0,
     "different_color": false,
     "colorful_cloud_points": true,
+    "demo": {
+        "interaction": {
+            "colorful_cloud_points": true,
+            "desk_crop": true,
+            "handgt": true
+        },
+        "collection": {
+            "auto_enter": true,
+            "multiview": true,
+            "fisheyes": true,
+            "ego": true,
+            "save_path": "./collection_000",
+            "task_path": "../../tasks.json",
+            "subject_id": "test",
+            "exposure_ms": 0.8,
+            "brightness": -1
+        }
+    },
     "filters": {
         "_filter_comment": "preset: Default/Hand/High Accuracy/High Density/Medium Density/Custom",
         "preset": "Default",

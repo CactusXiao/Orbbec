@@ -1,5 +1,7 @@
 #include "shared_utils.hpp"
 
+#include <initializer_list>
+
 namespace sync_app {
 
 std::string streamTypeToString(StreamType t) {
@@ -216,6 +218,42 @@ static std::optional<bool> getBool(cJSON *obj, const char *key) {
     return std::nullopt;
 }
 
+static std::optional<bool> getBoolAny(cJSON *obj, std::initializer_list<const char *> keys) {
+    for(const auto *key: keys) {
+        if(auto v = getBool(obj, key)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<int> getIntAny(cJSON *obj, std::initializer_list<const char *> keys) {
+    for(const auto *key: keys) {
+        if(auto v = getInt(obj, key)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<double> getDoubleAny(cJSON *obj, std::initializer_list<const char *> keys) {
+    for(const auto *key: keys) {
+        if(auto v = getDouble(obj, key)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<std::string> getStringAny(cJSON *obj, std::initializer_list<const char *> keys) {
+    for(const auto *key: keys) {
+        if(auto v = getString(obj, key)) {
+            return v;
+        }
+    }
+    return std::nullopt;
+}
+
 AppConfig loadConfig(const fs::path &configPath) {
     auto content = readFileAll(configPath);
     cJSON *root  = cJSON_Parse(content.c_str());
@@ -269,6 +307,58 @@ AppConfig loadConfig(const fs::path &configPath) {
     }
     if(auto v = getBool(root, "colorful_cloud_points")) {
         cfg.colorfulCloudPoints = *v;
+    }
+
+    if(auto *demoObj = cJSON_GetObjectItemCaseSensitive(root, "demo")) {
+        if(cJSON_IsObject(demoObj)) {
+            if(auto *interactionObj = cJSON_GetObjectItemCaseSensitive(demoObj, "interaction")) {
+                if(cJSON_IsObject(interactionObj)) {
+                    if(auto v = getBoolAny(interactionObj, { "colorful_cloud_points", "colorfulCloudPoints", "color_cloud", "colorCloud" })) {
+                        cfg.demo.interaction.colorfulCloudPoints = *v;
+                    }
+                    if(auto v = getBoolAny(interactionObj, { "desk_crop", "deskCrop" })) {
+                        cfg.demo.interaction.deskCrop = *v;
+                    }
+                    if(auto v = getBoolAny(interactionObj, { "handgt", "hand_gt", "handGt", "visualize_gt_hand", "visualizeGtHand" })) {
+                        cfg.demo.interaction.handGt = *v;
+                    }
+                }
+            }
+            if(auto *collectionObj = cJSON_GetObjectItemCaseSensitive(demoObj, "collection")) {
+                if(cJSON_IsObject(collectionObj)) {
+                    if(auto v = getBoolAny(collectionObj, { "auto_enter", "autoEnter", "skip_config", "skipConfig" })) {
+                        cfg.demo.collection.autoEnter = *v;
+                    }
+                    if(auto v = getBoolAny(collectionObj, { "multiview", "enable_multiview", "enableMultiview" })) {
+                        cfg.demo.collection.enableMultiview = *v;
+                    }
+                    if(auto v = getBoolAny(collectionObj, { "fisheyes", "enable_fisheyes", "enableFisheyes" })) {
+                        cfg.demo.collection.enableFisheyes = *v;
+                    }
+                    if(auto v = getBoolAny(collectionObj, { "ego", "enable_ego", "enableEgo" })) {
+                        cfg.demo.collection.enableEgo = *v;
+                    }
+                    if(auto v = getStringAny(collectionObj, { "save_path", "savePath", "save_root", "saveRoot", "outputDir" })) {
+                        cfg.demo.collection.savePath = fs::path(*v);
+                    }
+                    if(auto v = getStringAny(collectionObj, { "task_path", "taskPath", "task_json", "taskJson" })) {
+                        cfg.demo.collection.taskPath = resolveConfigRelativePath(*v);
+                    }
+                    if(auto v = getStringAny(collectionObj, { "subject_id", "subjectId", "subject" })) {
+                        cfg.demo.collection.subjectId = trimString(*v);
+                    }
+                    if(cfg.demo.collection.subjectId.empty()) {
+                        cfg.demo.collection.subjectId = "test";
+                    }
+                    if(auto v = getDoubleAny(collectionObj, { "exposure_ms", "exposureMs", "colorExposureMs" })) {
+                        cfg.demo.collection.exposureMs = static_cast<float>(std::max(0.0, *v));
+                    }
+                    if(auto v = getIntAny(collectionObj, { "brightness", "colorBrightness" })) {
+                        cfg.demo.collection.brightness = *v;
+                    }
+                }
+            }
+        }
     }
 
     if(auto *filtersObj = cJSON_GetObjectItemCaseSensitive(root, "filters")) {
@@ -893,8 +983,8 @@ AppConfig loadConfig(const fs::path &configPath) {
         }
     }
 
-    if(cfg.mode != "viewer" && cfg.mode != "interaction" && cfg.mode != "collection" && cfg.mode != "calibration") {
-        throw std::runtime_error("Invalid mode in config: " + cfg.mode + ", expected viewer/interaction/collection/calibration");
+    if(cfg.mode != "viewer" && cfg.mode != "interaction" && cfg.mode != "collection" && cfg.mode != "calibration" && cfg.mode != "demo") {
+        throw std::runtime_error("Invalid mode in config: " + cfg.mode + ", expected viewer/interaction/collection/calibration/demo");
     }
     return cfg;
 }

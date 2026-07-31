@@ -2276,6 +2276,9 @@ public:
         loadInitExtrinsicsIfNeeded();
         ivizSetStage("loadInitExtrinsics_ok");
         initializeFisheyes();
+        if(cfg_.demo.active && cfg_.demo.interaction.handGt) {
+            setGtVisualizationEnabled(true);
+        }
 
         const std::string winName = "Interaction";
         cv::namedWindow(winName, cv::WINDOW_NORMAL);
@@ -2487,6 +2490,9 @@ public:
             }
             else if(exitReason == InteractiveExit::ReturnConfig) {
                 reason = "ReturnConfig";
+            }
+            else if(exitReason == InteractiveExit::StartCollection) {
+                reason = "StartCollection";
             }
             std::cerr << "[interactive_visualization] exit=" << reason << std::endl;
         }
@@ -5251,9 +5257,17 @@ private:
             out = InteractiveExit::ReturnMenu;
             return true;
         }
-        if(uiButton(canvas, b2, "Back to Config", ms)) {
-            out = InteractiveExit::ReturnConfig;
-            return true;
+        if(cfg_.demo.active) {
+            if(uiButton(canvas, b2, "Enter Collection", ms)) {
+                out = InteractiveExit::StartCollection;
+                return true;
+            }
+        }
+        else {
+            if(uiButton(canvas, b2, "Back to Config", ms)) {
+                out = InteractiveExit::ReturnConfig;
+                return true;
+            }
         }
         if(uiButton(canvas, b3, "Reset View", ms)) {
             viewState.resetView();

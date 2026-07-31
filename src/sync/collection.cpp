@@ -727,6 +727,7 @@ struct CollectionConfigUi {
     bool enableFisheyes  = false;
     bool enableEgo       = false;
     std::string saveRoot;
+    fs::path taskPath;
     std::string subjectId = "test";
     std::string exposureMs;
     std::string brightness;
@@ -8260,13 +8261,32 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     bool extrinsicReadyPassed = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
-    if(cfg.colorExposureMs > 0.0f) {
+    if(cfg.demo.active) {
+        cfgUi.enableMultiview = cfg.demo.collection.enableMultiview;
+        cfgUi.enableFisheyes  = cfg.demo.collection.enableFisheyes;
+        cfgUi.enableEgo       = cfg.demo.collection.enableEgo;
+        if(!cfg.demo.collection.savePath.empty()) {
+            cfgUi.saveRoot = cfg.demo.collection.savePath.string();
+        }
+        else if(!cfg.outputDir.empty()) {
+            cfgUi.saveRoot = cfg.outputDir.string();
+        }
+        cfgUi.taskPath = cfg.demo.collection.taskPath;
+        cfgUi.subjectId = cfg.demo.collection.subjectId.empty() ? "test" : cfg.demo.collection.subjectId;
+    }
+    const float effectiveExposureMs = (cfg.demo.active && cfg.demo.collection.exposureMs >= 0.0f)
+                                    ? cfg.demo.collection.exposureMs
+                                    : cfg.colorExposureMs;
+    const int effectiveBrightness = (cfg.demo.active && cfg.demo.collection.brightness >= -1)
+                                  ? cfg.demo.collection.brightness
+                                  : cfg.colorBrightness;
+    if(effectiveExposureMs > 0.0f) {
         std::ostringstream oss;
-        oss << std::setprecision(4) << cfg.colorExposureMs;
+        oss << std::setprecision(4) << effectiveExposureMs;
         cfgUi.exposureMs = oss.str();
     }
-    if(cfg.colorBrightness >= 0) {
-        cfgUi.brightness = std::to_string(cfg.colorBrightness);
+    if(effectiveBrightness >= 0) {
+        cfgUi.brightness = std::to_string(effectiveBrightness);
     }
 
     auto pushUiLog = [&](std::string s) {
@@ -8289,6 +8309,70 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         cameraReadyAnnounced = false;
         extrinsicReadyChecked = false;
         extrinsicReadyPassed = false;
+    };
+
+    auto enterCapture = [&]() -> bool {
+        collectionSetStage("ui_enter_capture");
+        cfgUi.enforceRules();
+        if(!cfgUi.hasSelectedCaptureType()) {
+            cfgUi.error = "Select at least one capture type";
+            announce("enter_failed", "enter failed");
+            return false;
+        }
+        if(!cfgUi.hasRequiredFields()) {
+            cfgUi.error = "save_path and subject_id are required";
+            announce("enter_failed", "enter failed");
+            return false;
+        }
+
+        const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
+        const std::string subject = trimString(cfgUi.subjectId);
+        const fs::path taskPath = cfgUi.taskPath.empty() ? (saveRoot / "task.json") : cfgUi.taskPath;
+        auto tasks = loadTaskJson(taskPath);
+        if(tasks.empty()) {
+            cfgUi.error = "task.json not found or empty at: " + taskPath.string();
+            announce("enter_failed", "enter failed");
+            return false;
+        }
+
+        cfgUi.error.clear();
+        const fs::path progressPath = saveRoot / subject / "progress.csv";
+        fs::create_directories(saveRoot / subject);
+        const auto existing = loadProgressCsv(progressPath);
+        capUi.tasks = std::move(tasks);
+        capUi.progress = buildProgressFromTasks(capUi.tasks, existing);
+        saveProgressCsv(progressPath, capUi.progress);
+        capUi.currentTaskIdx = getCurrentTaskIndex(capUi.progress);
+        if(capUi.currentTaskIdx == -1) {
+            capUi.msg = "All tasks completed!";
+            capUi.currentEpisode = 0;
+        }
+        else {
+            capUi.currentEpisode = capUi.progress[static_cast<size_t>(capUi.currentTaskIdx)].completed + 1;
+            capUi.msg.clear();
+        }
+        captureState = CaptureState::IDLE;
+        page = CollectionPage::Capture;
+        const bool ok = recorder.start(cfgUi);
+        if(ok) {
+            resetCameraReadyAnnouncement();
+            announce("enter", "enter");
+            pushUiLog("Enter capture");
+            if(!taskPath.empty()) {
+                pushUiLog("Task file: " + taskPath.string());
+            }
+            {
+                const std::string s = recorder.streamProfilesLine();
+                if(!s.empty()) {
+                    pushUiLog(s);
+                }
+            }
+        }
+        else {
+            announce("enter_failed", "enter failed");
+            pushUiLog("Enter capture failed");
+        }
+        return ok;
     };
 
     auto updateReadyState = [&]() {
@@ -8322,6 +8406,10 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         captureState = CaptureState::DELETE_CONFIRM;
         capUi.msg.clear();
     };
+
+    if(cfg.demo.active && cfg.demo.collection.autoEnter) {
+        (void)enterCapture();
+    }
 
     bool running = true;
     while(running) {
@@ -8412,61 +8500,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 running = false;
             }
             if(uiButton(ui, bEnter, "Enter Capture", fm)) {
-                collectionSetStage("ui_enter_capture");
-                cfgUi.enforceRules();
-                if(!cfgUi.hasSelectedCaptureType()) {
-                    cfgUi.error = "Select at least one capture type";
-                    announce("enter_failed", "enter failed");
-                }
-                else if(!cfgUi.hasRequiredFields()) {
-                    cfgUi.error = "save_path and subject_id are required";
-                    announce("enter_failed", "enter failed");
-                }
-                else {
-                    const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
-                    const std::string subject = trimString(cfgUi.subjectId);
-                    auto tasks = loadTaskJson(saveRoot / "task.json");
-                    if(tasks.empty()) {
-                        cfgUi.error = "task.json not found or empty at: " + saveRoot.string();
-                        announce("enter_failed", "enter failed");
-                    }
-                    else {
-                        cfgUi.error.clear();
-                        const fs::path progressPath = saveRoot / subject / "progress.csv";
-                        fs::create_directories(saveRoot / subject);
-                        const auto existing = loadProgressCsv(progressPath);
-                        capUi.tasks = std::move(tasks);
-                        capUi.progress = buildProgressFromTasks(capUi.tasks, existing);
-                        saveProgressCsv(progressPath, capUi.progress);
-                        capUi.currentTaskIdx = getCurrentTaskIndex(capUi.progress);
-                        if(capUi.currentTaskIdx == -1) {
-                            capUi.msg = "All tasks completed!";
-                            capUi.currentEpisode = 0;
-                        }
-                        else {
-                            capUi.currentEpisode = capUi.progress[static_cast<size_t>(capUi.currentTaskIdx)].completed + 1;
-                            capUi.msg.clear();
-                        }
-                        captureState = CaptureState::IDLE;
-                        page = CollectionPage::Capture;
-                        const bool ok = recorder.start(cfgUi);
-                        if(ok) {
-                            resetCameraReadyAnnouncement();
-                            announce("enter", "enter");
-                            pushUiLog("Enter capture");
-                            {
-                                const std::string s = recorder.streamProfilesLine();
-                                if(!s.empty()) {
-                                    pushUiLog(s);
-                                }
-                            }
-                        }
-                        else {
-                            announce("enter_failed", "enter failed");
-                            pushUiLog("Enter capture failed");
-                        }
-                    }
-                }
+                (void)enterCapture();
             }
 
             if(!cfgUi.activeField.empty() && key > 0) {
