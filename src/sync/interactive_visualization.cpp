@@ -2228,8 +2228,11 @@ static std::shared_ptr<ob::Frame> applyIrConfidenceMaskToDepth(const std::shared
 
 class InteractiveVisualizationApp {
 public:
-    explicit InteractiveVisualizationApp(AppConfig cfg, const std::atomic_bool *cancel)
-        : cfg_(std::move(cfg)), cancel_(cancel) {}
+    explicit InteractiveVisualizationApp(AppConfig cfg, const std::atomic_bool *cancel, EgoRecorder *sharedEgoRecorder = nullptr)
+        : cfg_(std::move(cfg)),
+          cancel_(cancel),
+          egoRecorder_(sharedEgoRecorder ? *sharedEgoRecorder : ownedEgoRecorder_),
+          ownsEgoRecorder_(sharedEgoRecorder == nullptr) {}
 
     InteractiveExit run() {
         ivizInstallCrashHandlerOnce();
@@ -2729,6 +2732,10 @@ private:
 
         std::string err;
         if(!egoRecorder_.isRunning()) {
+            if(!ownsEgoRecorder_) {
+                setEgoAprilTagStatus("PICO server is not ready from menu");
+                return false;
+            }
             const EgoModuleConfig egoCfg = buildInteractionEgoConfig();
             if(!egoRecorder_.start(egoCfg, &err)) {
                 setEgoAprilTagStatus("PICO server start failed: " + err);
@@ -2790,7 +2797,9 @@ private:
                 std::string err;
                 (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
             }
-            egoRecorder_.stop();
+            if(ownsEgoRecorder_) {
+                egoRecorder_.stop();
+            }
             latestEgoFrame_.reset();
             lastEgoTagSubmitUs_ = 0;
             lastEgoSessionAttemptUs_ = 0;
@@ -4132,7 +4141,9 @@ private:
             std::string err;
             (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
         }
-        egoRecorder_.stop();
+        if(ownsEgoRecorder_) {
+            egoRecorder_.stop();
+        }
         fisheyeRecorder_.stop();
         for(auto &rt: devices_) {
             try {
@@ -5387,7 +5398,9 @@ private:
     std::unordered_map<std::string, ExtrinsicCamToWorld> rgbExtrinsicsCamToWorld_;
     LiveGtJointWorker gtWorker_;
     LiveEgoAprilTagWorker egoTagWorker_;
-    EgoRecorder egoRecorder_;
+    EgoRecorder ownedEgoRecorder_;
+    EgoRecorder &egoRecorder_;
+    bool ownsEgoRecorder_ = true;
     fs::path egoPreviewEpisodeDir_;
     fs::path egoVideoPath_;
     fs::path egoCameraParamsPath_;
@@ -5424,8 +5437,10 @@ private:
     uint64_t lastEgoSessionAttemptUs_ = 0;
 };
 
-InteractiveExit run_interactive_visualization(const AppConfig &cfg, const std::atomic_bool *cancel) {
-    InteractiveVisualizationApp app(cfg, cancel);
+InteractiveExit run_interactive_visualization(const AppConfig &cfg,
+                                              const std::atomic_bool *cancel,
+                                              EgoRecorder *sharedEgoRecorder) {
+    InteractiveVisualizationApp app(cfg, cancel, sharedEgoRecorder);
     return app.run();
 }
 

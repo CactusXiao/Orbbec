@@ -2,9 +2,11 @@
 
 import json
 import math
+import os
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -25,6 +27,7 @@ AVG_REPROJ_ERROR_MAX_PX = 14.0
 POINT_REPROJ_OUTLIER_MAX_PX = 20.0
 SIDE_HYSTERESIS_THRESHOLD = 0.15
 LANDMARK_NORMALIZED_MARGIN = 0.18
+MAX_PARALLEL_HAND_WORKERS = max(1, os.cpu_count() or 1)
 
 
 def read_exact(stream, size: int) -> Optional[bytes]:
@@ -215,17 +218,37 @@ class TrackState:
 
 class HandGtWorker:
     def __init__(self):
-        self._hands = mp.solutions.hands.Hands(
+        self._hands_by_camera: Dict[str, object] = {}
+        self._executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_HAND_WORKERS)
+        self._frame_index = 0
+        self._tracks = [TrackState(track_id=i) for i in range(MAX_TRACKS)]
+        self._last_time = None
+        self._smoothed_fps = 0.0
+
+    @staticmethod
+    def _create_hands():
+        return mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
             model_complexity=0,
             min_detection_confidence=0.25,
             min_tracking_confidence=0.25,
         )
-        self._frame_index = 0
-        self._tracks = [TrackState(track_id=i) for i in range(MAX_TRACKS)]
-        self._last_time = None
-        self._smoothed_fps = 0.0
+
+    def _hands_for_camera(self, camera_id: str):
+        hands = self._hands_by_camera.get(camera_id)
+        if hands is None:
+            hands = self._create_hands()
+            self._hands_by_camera[camera_id] = hands
+        return hands
+
+    def close(self):
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        for hands in self._hands_by_camera.values():
+            close = getattr(hands, "close", None)
+            if close is not None:
+                close()
+        self._hands_by_camera.clear()
 
     def _projection_matrix(self, cam: Dict) -> np.ndarray:
         intr = cam["intrinsic"]
@@ -311,7 +334,7 @@ class HandGtWorker:
                 cost += 8.0
         return cost
 
-    def _detect_camera(self, cam: Dict, payload: bytes) -> List[HandInstance]:
+    def _detect_camera(self, cam: Dict, payload: bytes, hands) -> List[HandInstance]:
         rgb_width = int(cam["rgb_width"])
         rgb_height = int(cam["rgb_height"])
         rgb_offset = int(cam["rgb_offset"])
@@ -323,7 +346,7 @@ class HandGtWorker:
         bgr = np.frombuffer(payload, dtype=np.uint8, count=rgb_size, offset=rgb_offset).reshape((rgb_height, rgb_width, 3))
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
 
-        result = self._hands.process(rgb)
+        result = hands.process(rgb)
         landmarks_list = result.multi_hand_landmarks or []
         handedness_list = result.multi_handedness or []
 
@@ -835,9 +858,16 @@ class HandGtWorker:
         frame_timestamp_us = int(meta.get("timestamp_us", 0))
         timestamp_s = frame_timestamp_us * 1e-6 if frame_timestamp_us > 0 else time.perf_counter()
 
+        cameras = list(meta.get("cameras", []))
+        futures = []
+        for cam in cameras:
+            camera_id = str(cam.get("camera_id", ""))
+            hands = self._hands_for_camera(camera_id)
+            futures.append(self._executor.submit(self._detect_camera, cam, payload, hands))
+
         all_instances: List[HandInstance] = []
-        for cam in meta.get("cameras", []):
-            all_instances.extend(self._detect_camera(cam, payload))
+        for future in futures:
+            all_instances.extend(future.result())
 
         self._expire_stale_tracks()
         groups = self._build_frame_groups(all_instances)
@@ -882,26 +912,29 @@ class HandGtWorker:
 
 def main():
     worker = HandGtWorker()
-    while True:
-        meta, payload = read_message()
-        if meta is None:
-            break
-        if meta.get("type") == "shutdown":
-            write_message({"ok": True, "status": "shutdown", "visible_hands": 0, "hands": []})
-            break
-        try:
-            response = worker.process_frame_batch(meta, payload or b"")
-        except Exception as exc:  # noqa: BLE001
-            response = {
-                "ok": False,
-                "frame_id": int(meta.get("frame_id", 0)),
-                "timestamp_us": int(meta.get("timestamp_us", 0)),
-                "fps": 0.0,
-                "status": f"worker error: {type(exc).__name__}",
-                "visible_hands": 0,
-                "hands": [],
-            }
-        write_message(response)
+    try:
+        while True:
+            meta, payload = read_message()
+            if meta is None:
+                break
+            if meta.get("type") == "shutdown":
+                write_message({"ok": True, "status": "shutdown", "visible_hands": 0, "hands": []})
+                break
+            try:
+                response = worker.process_frame_batch(meta, payload or b"")
+            except Exception as exc:  # noqa: BLE001
+                response = {
+                    "ok": False,
+                    "frame_id": int(meta.get("frame_id", 0)),
+                    "timestamp_us": int(meta.get("timestamp_us", 0)),
+                    "fps": 0.0,
+                    "status": f"worker error: {type(exc).__name__}",
+                    "visible_hands": 0,
+                    "hands": [],
+                }
+            write_message(response)
+    finally:
+        worker.close()
 
 
 if __name__ == "__main__":
