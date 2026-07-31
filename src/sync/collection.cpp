@@ -8311,8 +8311,58 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
         extrinsicReadyPassed = false;
     };
 
+    auto ensureCollectionConfigDefaults = [&]() {
+        if(!cfg.demo.active) {
+            return;
+        }
+        cfgUi.saveRoot = trimString(cfgUi.saveRoot);
+        cfgUi.subjectId = trimString(cfgUi.subjectId);
+        if(cfgUi.saveRoot.empty()) {
+            cfgUi.saveRoot = cfg.outputDir.empty() ? "./collection_000" : cfg.outputDir.string();
+        }
+        if(cfgUi.subjectId.empty()) {
+            cfgUi.subjectId = "test";
+        }
+        if(cfg.demo.active && !cfgUi.hasSelectedCaptureType()) {
+            cfgUi.enableMultiview = true;
+        }
+    };
+
+    auto resolveCollectionTaskPath = [&](const fs::path &saveRoot) {
+        if(!cfg.demo.active) {
+            return cfgUi.taskPath.empty() ? (saveRoot / "task.json") : cfgUi.taskPath;
+        }
+
+        std::vector<fs::path> candidates;
+        if(!cfgUi.taskPath.empty()) {
+            candidates.push_back(cfgUi.taskPath);
+        }
+        candidates.push_back(saveRoot / "task.json");
+        candidates.push_back(fs::current_path() / "tasks.json");
+        candidates.push_back(fs::current_path() / "task.json");
+        candidates.push_back(fs::current_path() / ".." / "tasks.json");
+        candidates.push_back(fs::current_path() / ".." / "task.json");
+        candidates.push_back(fs::current_path() / ".." / ".." / "tasks.json");
+
+        for(const auto &candidate: candidates) {
+            if(candidate.empty()) {
+                continue;
+            }
+            std::error_code ec;
+            fs::path absP = candidate;
+            if(absP.is_relative()) {
+                absP = (fs::current_path() / absP).lexically_normal();
+            }
+            if(fs::exists(absP, ec) && !ec) {
+                return absP;
+            }
+        }
+        return cfgUi.taskPath.empty() ? (saveRoot / "task.json") : cfgUi.taskPath;
+    };
+
     auto enterCapture = [&]() -> bool {
         collectionSetStage("ui_enter_capture");
+        ensureCollectionConfigDefaults();
         cfgUi.enforceRules();
         if(!cfgUi.hasSelectedCaptureType()) {
             cfgUi.error = "Select at least one capture type";
@@ -8327,7 +8377,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
 
         const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
         const std::string subject = trimString(cfgUi.subjectId);
-        const fs::path taskPath = cfgUi.taskPath.empty() ? (saveRoot / "task.json") : cfgUi.taskPath;
+        const fs::path taskPath = resolveCollectionTaskPath(saveRoot);
         auto tasks = loadTaskJson(taskPath);
         if(tasks.empty()) {
             cfgUi.error = "task.json not found or empty at: " + taskPath.string();
@@ -8408,7 +8458,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     };
 
     if(cfg.demo.active && cfg.demo.collection.autoEnter) {
-        (void)enterCapture();
+        if(!enterCapture()) {
+            page = CollectionPage::Capture;
+            std::string msg = cfgUi.error.empty() ? recorder.lastInfoLine() : cfgUi.error;
+            if(msg.empty()) {
+                msg = "Demo enter capture failed";
+            }
+            capUi.msg = msg;
+            pushUiLog("Demo enter capture failed: " + msg);
+        }
     }
 
     bool running = true;
@@ -8864,7 +8922,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
             bool doSave     = uiButtonEx(ui, bSave,  "Confirm [Ctrl+3]", fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);
             bool doBackMenu = uiButtonEx(ui, bMenu,  "Menu",            fm, allowNav);
-            bool doBackCfg  = uiButtonEx(ui, bConfig,"Config",          fm, allowNav);
+            bool doBackCfg  = uiButtonEx(ui, bConfig,"Config",          fm, allowNav && !cfg.demo.active);
             bool doDeleteConfirm = false;
             bool doDeleteCancel  = false;
             bool doFaultExit = false;
@@ -9077,7 +9135,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
                 recorder.stopIfRunning();
                 running = false;
             }
-            if(doBackCfg) {
+            if(doBackCfg && !cfg.demo.active) {
                 collectionSetStage("ui_capture_back_config");
                 announce("config", "config");
                 recorder.stopIfRunning(false);

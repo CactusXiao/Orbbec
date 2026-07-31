@@ -10,7 +10,8 @@
         "interaction": {
             "colorful_cloud_points": true,
             "desk_crop": true,
-            "handgt": true
+            "handgt": true,
+            "point_cloud_decimation_factor": 4
         },
         "collection": {
             "auto_enter": true,

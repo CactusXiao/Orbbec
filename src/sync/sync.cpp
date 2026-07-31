@@ -174,6 +174,7 @@ static AppConfig buildDemoInteractionCfg(const AppConfig &baseCfg) {
     cfg.demo.active = true;
     cfg.colorfulCloudPoints = cfg.demo.interaction.colorfulCloudPoints;
     cfg.filters.deskCrop = cfg.demo.interaction.deskCrop;
+    cfg.filters.pointCloudDecimationFactor = std::max(1, cfg.demo.interaction.pointCloudDecimationFactor);
     enablePointCloudStreams(cfg);
     return cfg;
 }

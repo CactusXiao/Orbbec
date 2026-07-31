@@ -2501,6 +2501,93 @@ public:
     }
 
 private:
+    struct LiveDeskPlane {
+        bool  valid   = false;
+        float a       = 0.0f;
+        float b       = 0.0f;
+        float c       = 0.0f;
+        float d       = 0.0f;
+        float invNorm = 1.0f;
+    };
+
+    static LiveDeskPlane fitLiveDeskPlaneSampled(const OBPoint *data, size_t count, float scaleMm) {
+        LiveDeskPlane plane;
+        if(!data || count < 200) {
+            return plane;
+        }
+
+        const size_t kMaxSamples = 40000;
+        const size_t step = std::max<size_t>(4, count / kMaxSamples);
+        const float  sM = scaleMm * 0.001f;
+        auto sample = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        sample->points.reserve(std::min(kMaxSamples, count / step + 1));
+        for(size_t i = 0; i < count; i += step) {
+            const OBPoint &p = data[i];
+            if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) || p.z <= 0.0f) {
+                continue;
+            }
+            const float x = p.x * sM;
+            const float y = p.y * sM;
+            const float z = p.z * sM;
+            if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || z <= 0.0f) {
+                continue;
+            }
+            sample->points.emplace_back(x, y, z);
+        }
+        sample->width = static_cast<uint32_t>(sample->points.size());
+        sample->height = 1;
+        sample->is_dense = false;
+        if(sample->points.size() < 200) {
+            return plane;
+        }
+
+        pcl::SACSegmentation<pcl::PointXYZ> seg;
+        seg.setOptimizeCoefficients(false);
+        seg.setModelType(pcl::SACMODEL_PLANE);
+        seg.setMethodType(pcl::SAC_RANSAC);
+        seg.setMaxIterations(35);
+        seg.setDistanceThreshold(0.015);
+        seg.setInputCloud(sample);
+
+        pcl::PointIndices::Ptr     inliers(new pcl::PointIndices());
+        pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients());
+        try {
+            seg.segment(*inliers, *coefficients);
+        }
+        catch(...) {
+            return plane;
+        }
+
+        const size_t minInliers = std::min<size_t>(1500, std::max<size_t>(100, sample->points.size() / 20));
+        if(!inliers || inliers->indices.size() < minInliers || !coefficients || coefficients->values.size() < 4) {
+            return plane;
+        }
+
+        const float a = coefficients->values[0];
+        const float b = coefficients->values[1];
+        const float c = coefficients->values[2];
+        const float d = coefficients->values[3];
+        const float n = std::sqrt(a * a + b * b + c * c);
+        if(!std::isfinite(n) || n <= 1e-6f) {
+            return plane;
+        }
+        plane.valid = true;
+        plane.a = a;
+        plane.b = b;
+        plane.c = c;
+        plane.d = d;
+        plane.invNorm = 1.0f / n;
+        return plane;
+    }
+
+    static bool isPointOnLiveDeskPlane(const LiveDeskPlane &plane, float x, float y, float z) {
+        if(!plane.valid) {
+            return false;
+        }
+        const float dist = std::fabs((plane.a * x + plane.b * y + plane.c * z + plane.d) * plane.invNorm);
+        return std::isfinite(dist) && dist <= 0.015f;
+    }
+
     enum class StreamMode {
         DepthOnly,
         DepthColor,
@@ -4765,31 +4852,7 @@ private:
                 continue;
             }
 
-            auto cloudCam = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-            cloudCam->points.reserve(static_cast<size_t>(count));
-            for(size_t i = 0; i < count; i++) {
-                const OBPoint &p = data[i];
-                if(!std::isfinite(p.z) || p.z <= 0.0f) {
-                    continue;
-                }
-                const float z = p.z * scaleMm * 0.001f;
-                if(!std::isfinite(z) || z <= 0.0f) {
-                    continue;
-                }
-                const float x = p.x * scaleMm * 0.001f;
-                const float y = p.y * scaleMm * 0.001f;
-                if(!std::isfinite(x) || !std::isfinite(y)) {
-                    continue;
-                }
-                cloudCam->points.emplace_back(x, y, z);
-            }
-            cloudCam->width = static_cast<uint32_t>(cloudCam->points.size());
-            cloudCam->height = 1;
-            cloudCam->is_dense = false;
-
-            if(cfg_.filters.deskCrop) {
-                cloudCam = removeDominantPlaneRansac(cloudCam, 100, 0.015, 1500);
-            }
+            const LiveDeskPlane deskPlane = cfg_.filters.deskCrop ? fitLiveDeskPlaneSampled(data, count, scaleMm) : LiveDeskPlane{};
 
             const cv::Vec3b color = cfg_.differentColor ? palette[static_cast<size_t>(deviceIndex) % palette.size()] : cv::Vec3b(255, 255, 255);
             const bool forceColorCloud = extrinsicSingleTagMode;
@@ -4822,9 +4885,23 @@ private:
                 }
             }
 
-            for(size_t i = 0; i < cloudCam->points.size(); i++) {
-                const auto &p = cloudCam->points[i];
-                const cv::Vec3f pCam(p.x, p.y, p.z);
+            const float pointScaleM = scaleMm * 0.001f;
+            for(size_t i = 0; i < count; i++) {
+                const OBPoint &p = data[i];
+                if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) || p.z <= 0.0f) {
+                    continue;
+                }
+                const float xCamM = p.x * pointScaleM;
+                const float yCamM = p.y * pointScaleM;
+                const float zCamM = p.z * pointScaleM;
+                if(!std::isfinite(xCamM) || !std::isfinite(yCamM) || !std::isfinite(zCamM) || zCamM <= 0.0f) {
+                    continue;
+                }
+                if(isPointOnLiveDeskPlane(deskPlane, xCamM, yCamM, zCamM)) {
+                    continue;
+                }
+
+                const cv::Vec3f pCam(xCamM, yCamM, zCamM);
                 const cv::Vec3f pw = Rcam * pCam + tcam;
                 const float x = pw[0];
                 const float y = pw[1];
@@ -4836,12 +4913,12 @@ private:
                 cv::Vec3b pointColor = color;
                 bool pointColorMapped = false;
                 if(useColorCloud && rgbDepthParamValid) {
-                    const float zM = p.z;
+                    const float zM = zCamM;
                     if(zM > 0.0f && rgbDepthParam.depthIntrinsic.fx > 0.0f && rgbDepthParam.depthIntrinsic.fy > 0.0f) {
                         const float depthMm = zM * 1000.0f;
                         OBPoint2f src{};
-                        src.x = (p.x * rgbDepthParam.depthIntrinsic.fx / zM) + rgbDepthParam.depthIntrinsic.cx;
-                        src.y = (p.y * rgbDepthParam.depthIntrinsic.fy / zM) + rgbDepthParam.depthIntrinsic.cy;
+                        src.x = (xCamM * rgbDepthParam.depthIntrinsic.fx / zM) + rgbDepthParam.depthIntrinsic.cx;
+                        src.y = (yCamM * rgbDepthParam.depthIntrinsic.fy / zM) + rgbDepthParam.depthIntrinsic.cy;
                         OBPoint2f dst{};
                         bool ok = false;
                         try {

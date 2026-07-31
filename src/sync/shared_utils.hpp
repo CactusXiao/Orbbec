@@ -151,6 +151,7 @@ struct DemoInteractionConfig {
     bool colorfulCloudPoints = true;
     bool deskCrop            = true;
     bool handGt              = true;
+    int  pointCloudDecimationFactor = 4;
 };
 
 struct DemoCollectionConfig {

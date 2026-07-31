@@ -322,6 +322,9 @@ AppConfig loadConfig(const fs::path &configPath) {
                     if(auto v = getBoolAny(interactionObj, { "handgt", "hand_gt", "handGt", "visualize_gt_hand", "visualizeGtHand" })) {
                         cfg.demo.interaction.handGt = *v;
                     }
+                    if(auto v = getIntAny(interactionObj, { "point_cloud_decimation_factor", "pointCloudDecimationFactor", "preview_decimation", "previewDecimation" })) {
+                        cfg.demo.interaction.pointCloudDecimationFactor = std::max(1, *v);
+                    }
                 }
             }
             if(auto *collectionObj = cJSON_GetObjectItemCaseSensitive(demoObj, "collection")) {
