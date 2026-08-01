@@ -1524,6 +1524,82 @@ private:
 #endif
 };
 
+class LivePicoRgbFrameSource {
+public:
+    LivePicoRgbFrameSource() = default;
+
+    void close() {
+        if(cap_.isOpened()) {
+            cap_.release();
+        }
+        path_.clear();
+        currentIndex_ = -1;
+        lastFrame_.release();
+    }
+
+    bool read(const fs::path &path, int frameIndex, cv::Mat &out, std::string *status) {
+        out.release();
+        if(frameIndex < 0) {
+            setStatus(status, "PICO RGB waiting for video frame");
+            return false;
+        }
+        std::error_code ec;
+        if(path.empty() || !fs::exists(path, ec) || ec) {
+            close();
+            setStatus(status, "PICO RGB video file not ready");
+            return false;
+        }
+        if(!cap_.isOpened() || path_ != path || frameIndex < currentIndex_) {
+            if(!open(path, status)) {
+                return false;
+            }
+        }
+
+        while(currentIndex_ < frameIndex) {
+            cv::Mat frame;
+            if(!cap_.read(frame) || frame.empty()) {
+                setStatus(status, "PICO RGB frame not ready");
+                return false;
+            }
+            currentIndex_++;
+            lastFrame_ = std::move(frame);
+        }
+
+        if(lastFrame_.empty()) {
+            setStatus(status, "PICO RGB frame not ready");
+            return false;
+        }
+        out = lastFrame_.clone();
+        setStatus(status, "PICO RGB frame " + std::to_string(frameIndex));
+        return true;
+    }
+
+private:
+    static void setStatus(std::string *status, const std::string &value) {
+        if(status) {
+            *status = value;
+        }
+    }
+
+    bool open(const fs::path &path, std::string *status) {
+        close();
+        cap_.open(path.string());
+        if(!cap_.isOpened()) {
+            setStatus(status, "PICO RGB video open failed");
+            return false;
+        }
+        path_ = path;
+        currentIndex_ = -1;
+        setStatus(status, "PICO RGB video opened");
+        return true;
+    }
+
+    fs::path path_;
+    cv::VideoCapture cap_;
+    int currentIndex_ = -1;
+    cv::Mat lastFrame_;
+};
+
 struct InteractiveViewState {
     int width = 1600;
     int height = 900;
@@ -2459,6 +2535,7 @@ public:
                 maybeStartPendingExtrinsicHealthCheck(frameSnapshot);
                 submitGtInferenceIfNeeded(frameSnapshot, loopNowUs);
                 submitEgoAprilTagsIfNeeded(frameSnapshot, loopNowUs);
+                updatePicoRgbPreviewIfNeeded(loopNowUs);
                 ivizSetStage("loop_render_pointcloud");
                 lastPc = renderUnifiedPointCloud(frameSnapshot, viewState);
             }
@@ -2600,6 +2677,10 @@ private:
         DepthIrAny
     };
 
+    enum class ImageType { Depth, RGB, IRLeft, IRRight };
+
+    enum class RgbImageSource { Orbbec, Pico };
+
     struct Layout {
         cv::Rect camsRect;
         cv::Rect pcRect;
@@ -2721,8 +2802,34 @@ private:
         egoTagWorker_.setIdleStatus(status, clearResult);
     }
 
+    bool wantsPicoRgbPreview() const {
+        return imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Pico;
+    }
+
+    bool wantsEgoPreviewSession() const {
+        return showEgoAprilTags_ || wantsPicoRgbPreview();
+    }
+
+    void clearPicoRgbPreview() {
+        picoRgbFrameSource_.close();
+        latestPicoRgbFrame_.release();
+        latestPicoRgbVideoFrameIndex_ = -1;
+        picoRgbStatusLine_ = "PICO RGB off";
+    }
+
+    void stopEgoPreviewSessionIfUnused() {
+        if(wantsEgoPreviewSession()) {
+            return;
+        }
+        clearPicoRgbPreview();
+        if(egoRecorder_.isSessionActive()) {
+            std::string err;
+            (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
+        }
+    }
+
     bool ensureEgoAprilTagPreviewSession(uint64_t nowUs) {
-        if(!showEgoAprilTags_) {
+        if(!wantsEgoPreviewSession()) {
             return false;
         }
         if(!cfg_.ego.enabled) {
@@ -2793,16 +2900,17 @@ private:
         if(!enabled) {
             showEgoAprilTags_ = false;
             egoTagWorker_.stop();
-            if(egoRecorder_.isSessionActive()) {
-                std::string err;
-                (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
-            }
-            if(ownsEgoRecorder_) {
+            stopEgoPreviewSessionIfUnused();
+            if(ownsEgoRecorder_ && !wantsEgoPreviewSession()) {
                 egoRecorder_.stop();
             }
-            latestEgoFrame_.reset();
+            if(!wantsPicoRgbPreview()) {
+                latestEgoFrame_.reset();
+            }
             lastEgoTagSubmitUs_ = 0;
-            lastEgoSessionAttemptUs_ = 0;
+            if(!wantsEgoPreviewSession()) {
+                lastEgoSessionAttemptUs_ = 0;
+            }
             egoTagStatusLine_ = "PICO tags off";
             return;
         }
@@ -3646,7 +3754,7 @@ private:
     }
 
     void pollEgoFrames() {
-        if(!showEgoAprilTags_ || !egoRecorder_.isRunning()) {
+        if(!wantsEgoPreviewSession() || !egoRecorder_.isRunning()) {
             return;
         }
         EgoFrame frame;
@@ -3752,6 +3860,39 @@ private:
         }
         lastEgoTagSubmitUs_ = frameId;
         egoTagWorker_.submitLatest(std::move(req));
+    }
+
+    void updatePicoRgbPreviewIfNeeded(uint64_t frameId) {
+        if(!wantsPicoRgbPreview()) {
+            return;
+        }
+        if(!ensureEgoAprilTagPreviewSession(frameId)) {
+            picoRgbStatusLine_ = buildEgoAprilTagStatusLine();
+            return;
+        }
+        pollEgoFrames();
+        if(!latestEgoFrame_.has_value()) {
+            picoRgbStatusLine_ = "PICO RGB waiting for frames";
+            return;
+        }
+        if(latestEgoFrame_->videoFrameIndex < 0) {
+            picoRgbStatusLine_ = "PICO RGB waiting for video frame";
+            return;
+        }
+        if(egoVideoPath_.empty()) {
+            picoRgbStatusLine_ = "PICO RGB video path missing";
+            return;
+        }
+
+        cv::Mat frame;
+        std::string status;
+        if(picoRgbFrameSource_.read(egoVideoPath_, latestEgoFrame_->videoFrameIndex, frame, &status)) {
+            latestPicoRgbFrame_ = std::move(frame);
+            latestPicoRgbVideoFrameIndex_ = latestEgoFrame_->videoFrameIndex;
+        }
+        picoRgbStatusLine_ = status.empty()
+                            ? ("PICO RGB frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
+                            : status;
     }
 
     std::string buildGtStatusLine() const {
@@ -4137,6 +4278,7 @@ private:
         }
         gtWorker_.stop();
         egoTagWorker_.stop();
+        clearPicoRgbPreview();
         if(egoRecorder_.isSessionActive()) {
             std::string err;
             (void)egoRecorder_.stopSessionAndWait(std::chrono::milliseconds(std::min(2000, std::max(100, cfg_.ego.stopTimeoutMs))), &err);
@@ -5009,8 +5151,6 @@ private:
         return canvas;
     }
 
-    enum class ImageType { Depth, RGB, IRLeft, IRRight };
-
     bool drawLeftPanel(cv::Mat &canvas, CvMouseState &ms) {
         cv::rectangle(canvas, layout_.camsRect, cv::Scalar(16, 16, 16), cv::FILLED);
         cv::rectangle(canvas, layout_.camsRect, cv::Scalar(60, 60, 60), 1);
@@ -5028,6 +5168,27 @@ private:
                 imageType_ = t;
                 imageScrollY_ = 0;
                 typeChanged = true;
+                if(wantsPicoRgbPreview()) {
+                    picoRgbStatusLine_ = "Starting PICO RGB preview";
+                }
+                else {
+                    clearPicoRgbPreview();
+                }
+                stopEgoPreviewSessionIfUnused();
+            }
+        };
+        auto setRgbSource = [&](RgbImageSource source) {
+            if(rgbImageSource_ != source) {
+                rgbImageSource_ = source;
+                imageScrollY_ = 0;
+                typeChanged = true;
+                if(rgbImageSource_ == RgbImageSource::Pico) {
+                    picoRgbStatusLine_ = "Starting PICO RGB preview";
+                }
+                else {
+                    clearPicoRgbPreview();
+                }
+                stopEgoPreviewSessionIfUnused();
             }
         };
 
@@ -5039,6 +5200,18 @@ private:
             setType(ImageType::RGB);
         }
         by += bh + 8;
+        if(imageType_ == ImageType::RGB) {
+            const int halfW = (bw - 8) / 2;
+            const cv::Rect orbbecBtn(bx, by, halfW, 30);
+            const cv::Rect picoBtn(bx + halfW + 8, by, bw - halfW - 8, 30);
+            if(uiButton(canvas, orbbecBtn, rgbImageSource_ == RgbImageSource::Orbbec ? "Orbbec RGB*" : "Orbbec RGB", ms)) {
+                setRgbSource(RgbImageSource::Orbbec);
+            }
+            if(uiButton(canvas, picoBtn, rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB*" : "PICO RGB", ms)) {
+                setRgbSource(RgbImageSource::Pico);
+            }
+            by += 30 + 8;
+        }
         if(uiButton(canvas, cv::Rect(bx, by, bw, bh), "IR Left", ms)) {
             setType(ImageType::IRLeft);
         }
@@ -5263,7 +5436,7 @@ private:
             title += "Depth";
         }
         else if(imageType_ == ImageType::RGB) {
-            title += "RGB";
+            title += rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB" : "RGB";
         }
         else if(imageType_ == ImageType::IRLeft) {
             title += "IR Left";
@@ -5276,6 +5449,46 @@ private:
         const int contentTop = layout_.imgRect.y + 40;
         int y = contentTop - imageScrollY_;
         int totalH = 0;
+
+        if(imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Pico) {
+            const int targetW = std::max(1, layout_.imgRect.width - 20);
+            const cv::Mat &img = latestPicoRgbFrame_;
+            if(!img.empty()) {
+                const int targetH = std::max(10, static_cast<int>(static_cast<double>(img.rows) * (static_cast<double>(targetW) / static_cast<double>(img.cols))));
+                cv::Mat resized;
+                cv::resize(img, resized, cv::Size(targetW, targetH));
+                totalH += 24 + targetH + 16;
+                if(y + 24 + targetH >= contentTop && y <= layout_.imgRect.y + layout_.imgRect.height) {
+                    const std::string label = latestPicoRgbVideoFrameIndex_ >= 0
+                                            ? ("PICO ego RGB  frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
+                                            : "PICO ego RGB";
+                    cv::putText(canvas, label, cv::Point(layout_.imgRect.x + 12, y + 16), cv::FONT_HERSHEY_DUPLEX, 0.55,
+                                cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+                    const int imgY = y + 24;
+                    const int imgX = layout_.imgRect.x + 10;
+                    const cv::Rect roi(imgX, imgY, targetW, targetH);
+                    if(roi.y >= layout_.imgRect.y && roi.y + roi.height <= layout_.imgRect.y + layout_.imgRect.height) {
+                        resized.copyTo(canvas(roi));
+                    }
+                    cv::rectangle(canvas, roi, cv::Scalar(80, 80, 80), 1);
+                    if(!picoRgbStatusLine_.empty() && roi.y + roi.height + 18 <= layout_.imgRect.y + layout_.imgRect.height) {
+                        cv::putText(canvas, picoRgbStatusLine_, cv::Point(layout_.imgRect.x + 12, roi.y + roi.height + 16),
+                                    cv::FONT_HERSHEY_DUPLEX, 0.45, cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
+                    }
+                }
+            }
+            else {
+                const std::string status = picoRgbStatusLine_.empty() ? "PICO RGB waiting for frames" : picoRgbStatusLine_;
+                totalH += 80;
+                cv::putText(canvas, "PICO ego RGB", cv::Point(layout_.imgRect.x + 12, y + 22), cv::FONT_HERSHEY_DUPLEX, 0.62,
+                            cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+                cv::putText(canvas, status, cv::Point(layout_.imgRect.x + 12, y + 54), cv::FONT_HERSHEY_DUPLEX, 0.5,
+                            cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
+            }
+            const int maxScroll = std::max(0, totalH - (layout_.imgRect.height - 40));
+            imageScrollY_ = std::max(0, std::min(maxScroll, imageScrollY_));
+            return false;
+        }
 
         auto frames = snapshotFrames();
         const int targetW = layout_.imgRect.width - 20;
@@ -5417,6 +5630,7 @@ private:
     bool clockSyncEnabled_ = false;
 
     ImageType imageType_ = ImageType::Depth;
+    RgbImageSource rgbImageSource_ = RgbImageSource::Orbbec;
     int imageScrollY_ = 0;
     bool showGtJoints_ = false;
     bool showEgoAprilTags_ = false;
@@ -5435,6 +5649,10 @@ private:
     ExtrinsicHealthSampleResult latestExtrinsicHealthResult_;
     uint64_t lastEgoTagSubmitUs_ = 0;
     uint64_t lastEgoSessionAttemptUs_ = 0;
+    LivePicoRgbFrameSource picoRgbFrameSource_;
+    cv::Mat latestPicoRgbFrame_;
+    int latestPicoRgbVideoFrameIndex_ = -1;
+    std::string picoRgbStatusLine_ = "PICO RGB off";
 };
 
 InteractiveExit run_interactive_visualization(const AppConfig &cfg,
