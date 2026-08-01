@@ -6317,28 +6317,27 @@ private:
                 const auto &a = hand.joints[static_cast<size_t>(edge.first)];
                 const auto &b = hand.joints[static_cast<size_t>(edge.second)];
                 if(validPoint(a) && validPoint(b)) {
+                    cv::line(img, toPoint(a), toPoint(b), cv::Scalar(12, 12, 12), 4, cv::LINE_AA);
                     cv::line(img, toPoint(a), toPoint(b), skeletonColor, 2, cv::LINE_AA);
                 }
             }
+
+            std::vector<const PicoHand2dJoint *> ordered;
+            ordered.reserve(hand.joints.size());
             for(const auto &joint: hand.joints) {
                 if(validPoint(joint)) {
-                    const cv::Point pt = toPoint(joint);
-                    cv::circle(img, pt, joint.jointIndex == 0 ? 5 : 3, toScalar(joint.color), cv::FILLED, cv::LINE_AA);
-                    cv::circle(img, pt, joint.jointIndex == 0 ? 6 : 4, cv::Scalar(20, 20, 20), 1, cv::LINE_AA);
+                    ordered.push_back(&joint);
                 }
             }
-            if(hand.bbox.width > 1.0f && hand.bbox.height > 1.0f) {
-                cv::Rect box(cv::Point(std::max(0, static_cast<int>(std::floor(hand.bbox.x))),
-                                       std::max(0, static_cast<int>(std::floor(hand.bbox.y)))),
-                             cv::Point(std::min(img.cols - 1, static_cast<int>(std::ceil(hand.bbox.x + hand.bbox.width))),
-                                       std::min(img.rows - 1, static_cast<int>(std::ceil(hand.bbox.y + hand.bbox.height)))));
-                if(box.width > 0 && box.height > 0) {
-                    cv::rectangle(img, box, skeletonColor, 1, cv::LINE_AA);
-                    if(!hand.side.empty()) {
-                        cv::putText(img, hand.side, cv::Point(box.x, std::max(16, box.y - 6)), cv::FONT_HERSHEY_DUPLEX,
-                                    0.55, skeletonColor, 1, cv::LINE_AA);
-                    }
-                }
+            std::sort(ordered.begin(), ordered.end(), [](const PicoHand2dJoint *a, const PicoHand2dJoint *b) {
+                return a->z > b->z;
+            });
+            for(const auto *joint: ordered) {
+                const cv::Point pt = toPoint(*joint);
+                const int radius = joint->jointIndex == 0 ? 7 : 5;
+                cv::circle(img, pt, radius + 2, cv::Scalar(16, 16, 16), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, pt, radius, toScalar(joint->color), cv::FILLED, cv::LINE_AA);
+                cv::circle(img, pt, std::max(1, radius / 2), cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
             }
         }
     }
