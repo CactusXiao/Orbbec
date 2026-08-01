@@ -5865,9 +5865,9 @@ private:
             const int gridW = std::max(1, layout_.imgRect.width - 16);
             const int gridBottom = layout_.imgRect.y + layout_.imgRect.height - 8;
             const int gridH = std::max(1, gridBottom - contentTop);
-            const int cols = 2;
-            const int visibleRows = 3;
-            const int tileW = std::max(1, (gridW - gap) / cols);
+            const int cols = 1;
+            const int visibleRows = 6;
+            const int tileW = std::max(1, (gridW - gap * (cols - 1)) / cols);
             const int tileH = std::max(70, (gridH - gap * (visibleRows - 1)) / visibleRows);
             const int rowsNeeded = std::max(visibleRows, static_cast<int>((visibleDeviceIndices.size() + cols - 1) / cols));
             totalH = rowsNeeded * tileH + std::max(0, rowsNeeded - 1) * gap;
