@@ -6317,8 +6317,8 @@ private:
                 const auto &a = hand.joints[static_cast<size_t>(edge.first)];
                 const auto &b = hand.joints[static_cast<size_t>(edge.second)];
                 if(validPoint(a) && validPoint(b)) {
-                    cv::line(img, toPoint(a), toPoint(b), cv::Scalar(12, 12, 12), 4, cv::LINE_AA);
-                    cv::line(img, toPoint(a), toPoint(b), skeletonColor, 2, cv::LINE_AA);
+                    cv::line(img, toPoint(a), toPoint(b), cv::Scalar(12, 12, 12), 3, cv::LINE_AA);
+                    cv::line(img, toPoint(a), toPoint(b), skeletonColor, 1, cv::LINE_AA);
                 }
             }
 
@@ -6334,7 +6334,7 @@ private:
             });
             for(const auto *joint: ordered) {
                 const cv::Point pt = toPoint(*joint);
-                const int radius = std::max(4, std::min(10, static_cast<int>(std::lround(0.018 * static_cast<double>(std::min(img.cols, img.rows))))));
+                const int radius = std::max(3, std::min(8, static_cast<int>(std::lround(0.014 * static_cast<double>(std::min(img.cols, img.rows))))));
                 cv::circle(img, pt, radius + 2, cv::Scalar(16, 16, 16), cv::FILLED, cv::LINE_AA);
                 cv::circle(img, pt, radius, toScalar(joint->color), cv::FILLED, cv::LINE_AA);
                 cv::circle(img, pt, std::max(1, radius / 2), cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
