@@ -877,6 +877,7 @@ public:
         timeSyncCv_.notify_all();
         sessionCv_.notify_all();
         frameCv_.notify_all();
+        hevcCv_.notify_all();
         std::thread acceptThread;
         std::thread readerThread;
         {
@@ -902,6 +903,7 @@ public:
             std::lock_guard<std::mutex> lock(frameMtx_);
             frameQueue_.clear();
         }
+        clearHevcSamples(false);
         running_.store(false);
     }
 
@@ -969,6 +971,11 @@ public:
             std::lock_guard<std::mutex> frameLock(frameMtx_);
             frameQueue_.clear();
             nextFrameSequence_ = 0;
+        }
+        clearHevcSamples(false);
+        {
+            std::lock_guard<std::mutex> hevcLock(hevcMtx_);
+            nextHevcSequence_ = 0;
         }
 
         {
@@ -1049,6 +1056,37 @@ public:
     bool hasPendingFrames() const {
         std::lock_guard<std::mutex> lock(frameMtx_);
         return !frameQueue_.empty();
+    }
+
+    bool popHevcSample(EgoHevcSample &out, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(hevcMtx_);
+        if(!hevcCv_.wait_for(lock, timeout, [&]() {
+               return !hevcQueue_.empty() || stopRequested_.load();
+           })) {
+            return false;
+        }
+        if(hevcQueue_.empty()) {
+            return false;
+        }
+        out = std::move(hevcQueue_.front());
+        hevcQueue_.pop_front();
+        return true;
+    }
+
+    void clearHevcSamples(bool keepCodecConfig) {
+        {
+            std::lock_guard<std::mutex> lock(hevcMtx_);
+            hevcQueue_.clear();
+            if(!keepCodecConfig) {
+                latestCodecConfigSamples_.clear();
+            }
+            else {
+                for(const auto &sample: latestCodecConfigSamples_) {
+                    hevcQueue_.push_back(sample);
+                }
+            }
+        }
+        hevcCv_.notify_all();
     }
 
     int videoFrameIndexForSourceFrame(int sourceFrameIndex) const;
@@ -1719,6 +1757,7 @@ private:
         }
         case PKT_HEVC_SAMPLE: {
             const int mappedSourceFrameIndex = session_->writeHevcSample(packet.headerJson, packet.payload);
+            pushHevcSample(packet);
             releasePendingTimestampFrameLocked(mappedSourceFrameIndex);
             break;
         }
@@ -1813,6 +1852,32 @@ private:
         frameCv_.notify_all();
     }
 
+    void pushHevcSample(const Packet &packet) {
+        EgoHevcSample sample;
+        const auto frameIndex = jsonInt64Field(packet.headerJson, "frame_index");
+        if(frameIndex.has_value()) {
+            sample.sourceFrameIndex = static_cast<int>(*frameIndex);
+        }
+        sample.codecConfig = jsonBoolField(packet.headerJson, "is_codec_config").value_or(sample.sourceFrameIndex < 0);
+        sample.receivedUnixUs = unixUsNow();
+        sample.headerJson = packet.headerJson;
+        sample.payload = packet.payload;
+
+        {
+            std::lock_guard<std::mutex> lock(hevcMtx_);
+            sample.sequence = nextHevcSequence_++;
+            if(sample.codecConfig && !sample.payload.empty()) {
+                latestCodecConfigSamples_.clear();
+                latestCodecConfigSamples_.push_back(sample);
+            }
+            hevcQueue_.push_back(std::move(sample));
+            while(hevcQueue_.size() > 96) {
+                hevcQueue_.pop_front();
+            }
+        }
+        hevcCv_.notify_all();
+    }
+
     void closeSessionLocked(const std::string &reason) {
         if(!session_) {
             return;
@@ -1821,6 +1886,7 @@ private:
         session_->close(reason);
         session_.reset();
         pendingTimestampFramesBySourceFrame_.clear();
+        clearHevcSamples(false);
         sessionCv_.notify_all();
     }
 
@@ -1856,6 +1922,12 @@ private:
     std::condition_variable frameCv_;
     std::deque<EgoFrame> frameQueue_;
     uint64_t nextFrameSequence_ = 0;
+
+    mutable std::mutex hevcMtx_;
+    std::condition_variable hevcCv_;
+    std::deque<EgoHevcSample> hevcQueue_;
+    std::vector<EgoHevcSample> latestCodecConfigSamples_;
+    uint64_t nextHevcSequence_ = 0;
 };
 
 int EgoRecorder::Impl::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
@@ -1928,6 +2000,14 @@ bool EgoRecorder::hasPendingFrames() const {
 
 int EgoRecorder::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
     return impl_->videoFrameIndexForSourceFrame(sourceFrameIndex);
+}
+
+bool EgoRecorder::popHevcSample(EgoHevcSample &out, std::chrono::milliseconds timeout) {
+    return impl_->popHevcSample(out, timeout);
+}
+
+void EgoRecorder::clearHevcSamples(bool keepCodecConfig) {
+    impl_->clearHevcSamples(keepCodecConfig);
 }
 
 }  // namespace sync_app

@@ -48,6 +48,15 @@ struct EgoFrame {
     uint64_t gazeTimestampUs = 0;
 };
 
+struct EgoHevcSample {
+    uint64_t sequence = 0;
+    int sourceFrameIndex = -1;
+    bool codecConfig = false;
+    uint64_t receivedUnixUs = 0;
+    std::string headerJson;
+    std::vector<uint8_t> payload;
+};
+
 class EgoRecorder {
 public:
     EgoRecorder();
@@ -74,6 +83,8 @@ public:
     bool popFrame(EgoFrame &out, std::chrono::milliseconds timeout);
     bool hasPendingFrames() const;
     int videoFrameIndexForSourceFrame(int sourceFrameIndex) const;
+    bool popHevcSample(EgoHevcSample &out, std::chrono::milliseconds timeout);
+    void clearHevcSamples(bool keepCodecConfig = true);
 
 private:
     class Impl;

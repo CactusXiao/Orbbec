@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <csignal>
 #include <cmath>
 #include <condition_variable>
@@ -1533,46 +1534,51 @@ public:
     }
 
     void close() {
-        {
-            std::lock_guard<std::mutex> lock(mtx_);
-            stopRequested_ = true;
-            cv_.notify_all();
-        }
+        stopRequested_.store(true);
+#if !defined(_WIN32)
+        closeDecoderPipesOnly();
+#endif
         if(workerThread_.joinable()) {
             workerThread_.join();
         }
+#if !defined(_WIN32)
+        closeDecoder();
+#endif
         {
             std::lock_guard<std::mutex> lock(mtx_);
-            stopRequested_ = false;
-            requestSerial_ = 0;
-            targetFrameIndex_ = -1;
-            targetPath_.clear();
+            stopRequested_.store(false);
+            recorder_ = nullptr;
             latestFrame_.release();
             latestFrameIndex_ = -1;
             statusLine_ = "PICO RGB off";
         }
     }
 
-    void request(const fs::path &path, int frameIndex) {
-        std::lock_guard<std::mutex> lock(mtx_);
-        if(!workerThread_.joinable()) {
-            stopRequested_ = false;
-            workerThread_ = std::thread([this]() { workerLoop(); });
-        }
-        if(frameIndex < 0) {
-            statusLine_ = "PICO RGB waiting for video frame";
+    void start(EgoRecorder *recorder) {
+        if(!recorder) {
+            publishStatus("PICO RGB recorder missing");
             return;
         }
-        targetPath_ = path;
-        targetFrameIndex_ = frameIndex;
-        requestSerial_++;
-        if(latestFrame_.empty()) {
-            statusLine_ = "PICO RGB decode queued";
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if(workerThread_.joinable() && recorder_ == recorder && workerRunning_.load() && !stopRequested_.load()) {
+                return;
+            }
         }
-        cv_.notify_one();
+
+        close();
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_.store(false);
+            recorder_ = recorder;
+            latestFrame_.release();
+            latestFrameIndex_ = -1;
+            statusLine_ = "PICO RGB live decoder starting";
+        }
+        workerThread_ = std::thread([this, recorder]() { workerLoop(recorder); });
     }
 
-    bool latest(cv::Mat &out, int *frameIndex, std::string *status) const {
+    bool latest(cv::Mat &out, int *frameIndex, std::string *status, int sinceFrameIndex = -1) const {
         std::lock_guard<std::mutex> lock(mtx_);
         if(frameIndex) {
             *frameIndex = latestFrameIndex_;
@@ -1580,7 +1586,7 @@ public:
         if(status) {
             *status = statusLine_;
         }
-        if(latestFrame_.empty()) {
+        if(latestFrame_.empty() || latestFrameIndex_ == sinceFrameIndex) {
             out.release();
             return false;
         }
@@ -1594,144 +1600,396 @@ private:
         statusLine_ = status;
     }
 
-    void publishFrame(const cv::Mat &frame, int frameIndex, int targetFrameIndex) {
+    void publishFrame(const cv::Mat &frame) {
         if(frame.empty()) {
             return;
         }
         std::lock_guard<std::mutex> lock(mtx_);
-        latestFrame_ = frame.clone();
-        latestFrameIndex_ = frameIndex;
-        statusLine_ = frameIndex >= targetFrameIndex
-                    ? ("PICO RGB frame " + std::to_string(frameIndex))
-                    : ("PICO RGB catching up " + std::to_string(frameIndex) + "/" + std::to_string(targetFrameIndex));
+        latestFrame_ = frame;
+        latestFrameIndex_++;
+        statusLine_ = "PICO RGB live frame " + std::to_string(latestFrameIndex_);
     }
 
-    void workerLoop() {
-        cv::VideoCapture cap;
-        fs::path capPath;
-        int currentIndex = -1;
-        uint64_t seenSerial = 0;
-        fs::path requestedPath;
-        int requestedIndex = -1;
-        bool readBlocked = false;
-        uintmax_t lastBlockedFileSize = 0;
-        int blockedRetries = 0;
+    void workerLoop(EgoRecorder *recorder) {
+        struct RunningGuard {
+            std::atomic_bool &running;
+            ~RunningGuard() {
+                running.store(false);
+            }
+        };
+        workerRunning_.store(true);
+        RunningGuard guard{ workerRunning_ };
+#if defined(_WIN32)
+        (void)recorder;
+        publishStatus("PICO RGB live preview is unsupported on Windows");
+#else
+        if(!launchDecoder()) {
+            publishStatus("PICO RGB ffmpeg start failed");
+            return;
+        }
+        recorder->clearHevcSamples(true);
+        publishStatus("PICO RGB waiting for live H265");
+        auto restartDecoder = [&]() {
+            publishStatus("PICO RGB decoder restarting");
+            closeDecoder();
+            if(stopRequested_.load()) {
+                return false;
+            }
+            if(!launchDecoder()) {
+                publishStatus("PICO RGB ffmpeg start failed");
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                return false;
+            }
+            recorder->clearHevcSamples(true);
+            publishStatus("PICO RGB waiting for live H265");
+            return true;
+        };
 
-        for(;;) {
-            {
-                std::unique_lock<std::mutex> lock(mtx_);
-                if(!readBlocked && seenSerial == requestSerial_) {
-                    cv_.wait(lock, [&]() { return stopRequested_ || seenSerial != requestSerial_; });
-                }
-                else {
-                    cv_.wait_for(lock, std::chrono::milliseconds(readBlocked ? 35 : 1), [&]() {
-                        return stopRequested_ || seenSerial != requestSerial_;
-                    });
-                }
-                if(stopRequested_) {
+        while(!stopRequested_.load()) {
+            EgoHevcSample sample;
+            if(!recorder->popHevcSample(sample, std::chrono::milliseconds(20))) {
+                continue;
+            }
+            if(sample.payload.empty()) {
+                continue;
+            }
+            if(sample.codecConfig) {
+                if(!writeSample(sample) && !restartDecoder()) {
                     break;
                 }
-                if(seenSerial != requestSerial_) {
-                    requestedPath = targetPath_;
-                    requestedIndex = targetFrameIndex_;
-                    seenSerial = requestSerial_;
-                    readBlocked = false;
-                }
-                else if(!readBlocked) {
-                    continue;
-                }
-            }
-
-            if(requestedIndex < 0) {
-                publishStatus("PICO RGB waiting for video frame");
-                continue;
-            }
-            std::error_code ec;
-            if(requestedPath.empty() || !fs::exists(requestedPath, ec) || ec) {
-                if(cap.isOpened()) {
-                    cap.release();
-                }
-                capPath.clear();
-                currentIndex = -1;
-                readBlocked = true;
-                blockedRetries = 0;
-                lastBlockedFileSize = 0;
-                publishStatus("PICO RGB video file not ready");
                 continue;
             }
 
-            if(!cap.isOpened() || capPath != requestedPath || requestedIndex < currentIndex) {
-                if(cap.isOpened()) {
-                    cap.release();
-                }
-                cap.open(requestedPath.string());
-                capPath = requestedPath;
-                currentIndex = -1;
-                if(!cap.isOpened()) {
-                    capPath.clear();
-                    readBlocked = true;
-                    blockedRetries = 0;
-                    lastBlockedFileSize = 0;
-                    publishStatus("PICO RGB video open failed");
+            int droppedSamples = 0;
+            bool restartFailed = false;
+            EgoHevcSample newer;
+            while(recorder->popHevcSample(newer, std::chrono::milliseconds(0))) {
+                if(newer.payload.empty()) {
                     continue;
                 }
-                blockedRetries = 0;
-                lastBlockedFileSize = 0;
-            }
-
-            int decodedThisRound = 0;
-            constexpr int kMaxDecodePerRound = 6;
-            while(currentIndex < requestedIndex && decodedThisRound < kMaxDecodePerRound) {
-                cv::Mat frame;
-                if(!cap.read(frame) || frame.empty()) {
-                    readBlocked = true;
-                    std::error_code sizeEc;
-                    const uintmax_t fileSize = fs::file_size(requestedPath, sizeEc);
-                    if(!sizeEc && fileSize > lastBlockedFileSize) {
-                        lastBlockedFileSize = fileSize;
-                        blockedRetries++;
-                    }
-                    if(blockedRetries >= 4) {
-                        if(cap.isOpened()) {
-                            cap.release();
-                        }
-                        capPath.clear();
-                        currentIndex = -1;
-                        blockedRetries = 0;
-                        publishStatus("PICO RGB resyncing H265");
+                if(newer.codecConfig) {
+                    if(!writeSample(newer) && !restartDecoder()) {
+                        restartFailed = true;
                         break;
                     }
-                    publishStatus("PICO RGB waiting for H265 data");
+                    continue;
+                }
+                sample = std::move(newer);
+                droppedSamples++;
+            }
+            if(restartFailed) {
+                if(stopRequested_.load()) {
                     break;
                 }
-                currentIndex++;
-                decodedThisRound++;
-                readBlocked = false;
-                blockedRetries = 0;
-                publishFrame(frame, currentIndex, requestedIndex);
+                continue;
             }
-
-            if(decodedThisRound >= kMaxDecodePerRound && currentIndex < requestedIndex) {
-                publishStatus("PICO RGB catching up " + std::to_string(currentIndex) + "/" + std::to_string(requestedIndex));
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if(stopRequested_.load()) {
+                break;
+            }
+            if(droppedSamples > 0 && latestFrameIndex() < 0) {
+                publishStatus("PICO RGB dropping delayed startup frames");
+            }
+            if(!writeSample(sample) && !restartDecoder()) {
+                break;
+            }
+            if(!sample.codecConfig && latestFrameIndex() < 0) {
+                publishStatus("PICO RGB decoding live stream");
             }
         }
 
-        if(cap.isOpened()) {
-            cap.release();
+        closeDecoder();
+#endif
+    }
+
+    int latestFrameIndex() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return latestFrameIndex_;
+    }
+
+#if !defined(_WIN32)
+    bool launchDecoder() {
+        closeDecoder();
+
+        std::signal(SIGPIPE, SIG_IGN);
+        int stdinPipe[2] = { -1, -1 };
+        int stdoutPipe[2] = { -1, -1 };
+        if(::pipe(stdinPipe) != 0) {
+            return false;
+        }
+        if(::pipe(stdoutPipe) != 0) {
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if(pid < 0) {
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            return false;
+        }
+        if(pid == 0) {
+            ::dup2(stdinPipe[0], STDIN_FILENO);
+            ::dup2(stdoutPipe[1], STDOUT_FILENO);
+            const int devNull = ::open("/dev/null", O_WRONLY);
+            if(devNull >= 0) {
+                ::dup2(devNull, STDERR_FILENO);
+                ::close(devNull);
+            }
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            ::execlp("ffmpeg",
+                     "ffmpeg",
+                     "-hide_banner",
+                     "-loglevel",
+                     "error",
+                     "-probesize",
+                     "32",
+                     "-analyzeduration",
+                     "0",
+                     "-fflags",
+                     "nobuffer",
+                     "-flags",
+                     "low_delay",
+                     "-f",
+                     "hevc",
+                     "-i",
+                     "pipe:0",
+                     "-an",
+                     "-pix_fmt",
+                     "rgb24",
+                     "-f",
+                     "image2pipe",
+                     "-flush_packets",
+                     "1",
+                     "-vcodec",
+                     "ppm",
+                     "pipe:1",
+                     static_cast<char *>(nullptr));
+            _exit(127);
+        }
+
+        ::close(stdinPipe[0]);
+        ::close(stdoutPipe[1]);
+        {
+            std::lock_guard<std::mutex> lock(processMtx_);
+            decoderPid_ = pid;
+            decoderStdinFd_ = stdinPipe[1];
+            decoderStdoutFd_ = stdoutPipe[0];
+        }
+        readerThread_ = std::thread([this]() { readerLoop(); });
+        return true;
+    }
+
+    void closeDecoderPipesOnly() {
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> lock(processMtx_);
+            stdinFd = decoderStdinFd_;
+            stdoutFd = decoderStdoutFd_;
+            pid = decoderPid_;
+            decoderStdinFd_ = -1;
+            decoderStdoutFd_ = -1;
+        }
+        if(stdinFd >= 0) {
+            ::close(stdinFd);
+        }
+        if(stdoutFd >= 0) {
+            ::close(stdoutFd);
+        }
+        if(pid > 0) {
+            ::kill(pid, SIGTERM);
         }
     }
 
+    void closeDecoder() {
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> lock(processMtx_);
+            stdinFd = decoderStdinFd_;
+            stdoutFd = decoderStdoutFd_;
+            pid = decoderPid_;
+            decoderStdinFd_ = -1;
+            decoderStdoutFd_ = -1;
+            decoderPid_ = -1;
+        }
+        if(stdinFd >= 0) {
+            ::close(stdinFd);
+        }
+        if(pid > 0) {
+            ::kill(pid, SIGTERM);
+        }
+        if(stdoutFd >= 0) {
+            ::close(stdoutFd);
+        }
+        if(readerThread_.joinable()) {
+            readerThread_.join();
+        }
+        if(pid > 0) {
+            int status = 0;
+            (void)::waitpid(pid, &status, 0);
+        }
+    }
+
+    bool writeSample(const EgoHevcSample &sample) {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(processMtx_);
+            fd = decoderStdinFd_;
+        }
+        return fd >= 0 && writeAllFd(fd, sample.payload.data(), sample.payload.size());
+    }
+
+    static bool nextPpmToken(const std::vector<uint8_t> &buffer, size_t &pos, std::string &token) {
+        token.clear();
+        for(;;) {
+            while(pos < buffer.size() && std::isspace(static_cast<unsigned char>(buffer[pos]))) {
+                ++pos;
+            }
+            if(pos < buffer.size() && buffer[pos] == '#') {
+                while(pos < buffer.size() && buffer[pos] != '\n') {
+                    ++pos;
+                }
+                continue;
+            }
+            break;
+        }
+        if(pos >= buffer.size()) {
+            return false;
+        }
+        const size_t start = pos;
+        while(pos < buffer.size() && !std::isspace(static_cast<unsigned char>(buffer[pos]))) {
+            ++pos;
+        }
+        if(pos == buffer.size()) {
+            return false;
+        }
+        token.assign(reinterpret_cast<const char *>(buffer.data() + start), pos - start);
+        return !token.empty();
+    }
+
+    static bool tryPopPpmFrame(std::vector<uint8_t> &buffer, cv::Mat &out) {
+        out.release();
+        if(buffer.size() < 3) {
+            return false;
+        }
+        size_t start = std::string::npos;
+        for(size_t i = 0; i + 1 < buffer.size(); ++i) {
+            if(buffer[i] == 'P' && buffer[i + 1] == '6') {
+                start = i;
+                break;
+            }
+        }
+        if(start == std::string::npos) {
+            buffer.clear();
+            return false;
+        }
+        if(start > 0) {
+            buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(start));
+        }
+
+        size_t pos = 2;
+        std::string widthToken;
+        std::string heightToken;
+        std::string maxToken;
+        if(!nextPpmToken(buffer, pos, widthToken) || !nextPpmToken(buffer, pos, heightToken) || !nextPpmToken(buffer, pos, maxToken)) {
+            return false;
+        }
+        if(pos >= buffer.size()) {
+            return false;
+        }
+        const uint8_t separator = buffer[pos];
+        ++pos;
+        if(separator == '\r' && pos < buffer.size() && buffer[pos] == '\n') {
+            ++pos;
+        }
+
+        int width = 0;
+        int height = 0;
+        int maxValue = 0;
+        try {
+            width = std::stoi(widthToken);
+            height = std::stoi(heightToken);
+            maxValue = std::stoi(maxToken);
+        }
+        catch(...) {
+            buffer.erase(buffer.begin());
+            return false;
+        }
+        if(width <= 0 || height <= 0 || width > 8192 || height > 8192 || maxValue != 255) {
+            buffer.erase(buffer.begin());
+            return false;
+        }
+        const size_t bytesNeeded = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
+        if(buffer.size() - pos < bytesNeeded) {
+            return false;
+        }
+        cv::Mat rgb(height, width, CV_8UC3, buffer.data() + pos);
+        cv::cvtColor(rgb, out, cv::COLOR_RGB2BGR);
+        buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(pos + bytesNeeded));
+        return !out.empty();
+    }
+
+    void readerLoop() {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(processMtx_);
+            fd = decoderStdoutFd_;
+        }
+        if(fd < 0) {
+            return;
+        }
+
+        std::vector<uint8_t> buffer;
+        buffer.reserve(2 * 1024 * 1024);
+        std::array<uint8_t, 32768> chunk{};
+        while(!stopRequested_.load()) {
+            const ssize_t n = ::read(fd, chunk.data(), chunk.size());
+            if(n < 0) {
+                if(errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if(n == 0) {
+                break;
+            }
+            buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + n);
+            cv::Mat frame;
+            while(tryPopPpmFrame(buffer, frame)) {
+                publishFrame(frame);
+            }
+            if(buffer.size() > 12 * 1024 * 1024) {
+                buffer.clear();
+                publishStatus("PICO RGB decoder buffer reset");
+            }
+        }
+    }
+#endif
+
     mutable std::mutex mtx_;
-    std::condition_variable cv_;
     std::thread workerThread_;
-    bool stopRequested_ = false;
-    uint64_t requestSerial_ = 0;
-    fs::path targetPath_;
-    int targetFrameIndex_ = -1;
+    std::atomic_bool stopRequested_{ false };
+    std::atomic_bool workerRunning_{ false };
+    EgoRecorder *recorder_ = nullptr;
     cv::Mat latestFrame_;
     int latestFrameIndex_ = -1;
     std::string statusLine_ = "PICO RGB off";
+#if !defined(_WIN32)
+    std::mutex processMtx_;
+    std::thread readerThread_;
+    pid_t decoderPid_ = -1;
+    int decoderStdinFd_ = -1;
+    int decoderStdoutFd_ = -1;
+#endif
 };
 
 struct InteractiveViewState {
@@ -4004,31 +4262,17 @@ private:
             picoRgbStatusLine_ = buildEgoAprilTagStatusLine();
             return;
         }
-        pollEgoFrames();
-        if(!latestEgoFrame_.has_value()) {
-            picoRgbStatusLine_ = "PICO RGB waiting for frames";
-            return;
-        }
-        if(latestEgoFrame_->videoFrameIndex < 0) {
-            picoRgbStatusLine_ = "PICO RGB waiting for video frame";
-            return;
-        }
-        if(egoVideoPath_.empty()) {
-            picoRgbStatusLine_ = "PICO RGB video path missing";
-            return;
-        }
-
-        picoRgbFrameSource_.request(egoVideoPath_, latestEgoFrame_->videoFrameIndex);
+        picoRgbFrameSource_.start(&egoRecorder_);
 
         cv::Mat frame;
         int decodedFrameIndex = -1;
         std::string status;
-        if(picoRgbFrameSource_.latest(frame, &decodedFrameIndex, &status)) {
+        if(picoRgbFrameSource_.latest(frame, &decodedFrameIndex, &status, latestPicoRgbVideoFrameIndex_)) {
             latestPicoRgbFrame_ = std::move(frame);
             latestPicoRgbVideoFrameIndex_ = decodedFrameIndex;
         }
         picoRgbStatusLine_ = status.empty()
-                            ? ("PICO RGB frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
+                            ? ("PICO RGB live frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
                             : status;
     }
 
