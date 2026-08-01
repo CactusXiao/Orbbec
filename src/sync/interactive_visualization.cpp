@@ -1528,98 +1528,210 @@ class LivePicoRgbFrameSource {
 public:
     LivePicoRgbFrameSource() = default;
 
-    void close() {
-        if(cap_.isOpened()) {
-            cap_.release();
-        }
-        path_.clear();
-        currentIndex_ = -1;
-        lastFileSize_ = 0;
-        readBlocked_ = false;
-        lastFrame_.release();
+    ~LivePicoRgbFrameSource() {
+        close();
     }
 
-    bool read(const fs::path &path, int frameIndex, cv::Mat &out, std::string *status) {
-        out.release();
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = true;
+            cv_.notify_all();
+        }
+        if(workerThread_.joinable()) {
+            workerThread_.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = false;
+            requestSerial_ = 0;
+            targetFrameIndex_ = -1;
+            targetPath_.clear();
+            latestFrame_.release();
+            latestFrameIndex_ = -1;
+            statusLine_ = "PICO RGB off";
+        }
+    }
+
+    void request(const fs::path &path, int frameIndex) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if(!workerThread_.joinable()) {
+            stopRequested_ = false;
+            workerThread_ = std::thread([this]() { workerLoop(); });
+        }
         if(frameIndex < 0) {
-            setStatus(status, "PICO RGB waiting for video frame");
-            return false;
+            statusLine_ = "PICO RGB waiting for video frame";
+            return;
         }
-        std::error_code ec;
-        if(path.empty() || !fs::exists(path, ec) || ec) {
-            close();
-            setStatus(status, "PICO RGB video file not ready");
-            return false;
+        targetPath_ = path;
+        targetFrameIndex_ = frameIndex;
+        requestSerial_++;
+        if(latestFrame_.empty()) {
+            statusLine_ = "PICO RGB decode queued";
         }
-        const uintmax_t fileSize = fs::file_size(path, ec);
-        const bool fileSizeKnown = !ec;
-        const bool fileGrewAfterBlock = readBlocked_ && fileSizeKnown && fileSize > lastFileSize_;
-        if(!cap_.isOpened() || path_ != path || frameIndex < currentIndex_ || fileGrewAfterBlock) {
-            if(!open(path, status)) {
-                return false;
-            }
-            if(fileSizeKnown) {
-                lastFileSize_ = fileSize;
-            }
-        }
+        cv_.notify_one();
+    }
 
-        while(currentIndex_ < frameIndex) {
-            cv::Mat frame;
-            if(!cap_.read(frame) || frame.empty()) {
-                if(cap_.isOpened()) {
-                    cap_.release();
-                }
-                readBlocked_ = true;
-                if(fileSizeKnown) {
-                    lastFileSize_ = fileSize;
-                }
-                setStatus(status, "PICO RGB waiting for H265 data");
-                return false;
-            }
-            currentIndex_++;
-            lastFrame_ = std::move(frame);
+    bool latest(cv::Mat &out, int *frameIndex, std::string *status) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if(frameIndex) {
+            *frameIndex = latestFrameIndex_;
         }
-
-        if(lastFrame_.empty()) {
-            setStatus(status, "PICO RGB frame not ready");
+        if(status) {
+            *status = statusLine_;
+        }
+        if(latestFrame_.empty()) {
+            out.release();
             return false;
         }
-        out = lastFrame_.clone();
-        readBlocked_ = false;
-        if(fileSizeKnown) {
-            lastFileSize_ = fileSize;
-        }
-        setStatus(status, "PICO RGB frame " + std::to_string(frameIndex));
+        out = latestFrame_.clone();
         return true;
     }
 
 private:
-    static void setStatus(std::string *status, const std::string &value) {
-        if(status) {
-            *status = value;
+    void publishStatus(const std::string &status) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        statusLine_ = status;
+    }
+
+    void publishFrame(const cv::Mat &frame, int frameIndex, int targetFrameIndex) {
+        if(frame.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mtx_);
+        latestFrame_ = frame.clone();
+        latestFrameIndex_ = frameIndex;
+        statusLine_ = frameIndex >= targetFrameIndex
+                    ? ("PICO RGB frame " + std::to_string(frameIndex))
+                    : ("PICO RGB catching up " + std::to_string(frameIndex) + "/" + std::to_string(targetFrameIndex));
+    }
+
+    void workerLoop() {
+        cv::VideoCapture cap;
+        fs::path capPath;
+        int currentIndex = -1;
+        uint64_t seenSerial = 0;
+        fs::path requestedPath;
+        int requestedIndex = -1;
+        bool readBlocked = false;
+        uintmax_t lastBlockedFileSize = 0;
+        int blockedRetries = 0;
+
+        for(;;) {
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                if(!readBlocked && seenSerial == requestSerial_) {
+                    cv_.wait(lock, [&]() { return stopRequested_ || seenSerial != requestSerial_; });
+                }
+                else {
+                    cv_.wait_for(lock, std::chrono::milliseconds(readBlocked ? 35 : 1), [&]() {
+                        return stopRequested_ || seenSerial != requestSerial_;
+                    });
+                }
+                if(stopRequested_) {
+                    break;
+                }
+                if(seenSerial != requestSerial_) {
+                    requestedPath = targetPath_;
+                    requestedIndex = targetFrameIndex_;
+                    seenSerial = requestSerial_;
+                    readBlocked = false;
+                }
+                else if(!readBlocked) {
+                    continue;
+                }
+            }
+
+            if(requestedIndex < 0) {
+                publishStatus("PICO RGB waiting for video frame");
+                continue;
+            }
+            std::error_code ec;
+            if(requestedPath.empty() || !fs::exists(requestedPath, ec) || ec) {
+                if(cap.isOpened()) {
+                    cap.release();
+                }
+                capPath.clear();
+                currentIndex = -1;
+                readBlocked = true;
+                blockedRetries = 0;
+                lastBlockedFileSize = 0;
+                publishStatus("PICO RGB video file not ready");
+                continue;
+            }
+
+            if(!cap.isOpened() || capPath != requestedPath || requestedIndex < currentIndex) {
+                if(cap.isOpened()) {
+                    cap.release();
+                }
+                cap.open(requestedPath.string());
+                capPath = requestedPath;
+                currentIndex = -1;
+                if(!cap.isOpened()) {
+                    capPath.clear();
+                    readBlocked = true;
+                    blockedRetries = 0;
+                    lastBlockedFileSize = 0;
+                    publishStatus("PICO RGB video open failed");
+                    continue;
+                }
+                blockedRetries = 0;
+                lastBlockedFileSize = 0;
+            }
+
+            int decodedThisRound = 0;
+            constexpr int kMaxDecodePerRound = 6;
+            while(currentIndex < requestedIndex && decodedThisRound < kMaxDecodePerRound) {
+                cv::Mat frame;
+                if(!cap.read(frame) || frame.empty()) {
+                    readBlocked = true;
+                    std::error_code sizeEc;
+                    const uintmax_t fileSize = fs::file_size(requestedPath, sizeEc);
+                    if(!sizeEc && fileSize > lastBlockedFileSize) {
+                        lastBlockedFileSize = fileSize;
+                        blockedRetries++;
+                    }
+                    if(blockedRetries >= 4) {
+                        if(cap.isOpened()) {
+                            cap.release();
+                        }
+                        capPath.clear();
+                        currentIndex = -1;
+                        blockedRetries = 0;
+                        publishStatus("PICO RGB resyncing H265");
+                        break;
+                    }
+                    publishStatus("PICO RGB waiting for H265 data");
+                    break;
+                }
+                currentIndex++;
+                decodedThisRound++;
+                readBlocked = false;
+                blockedRetries = 0;
+                publishFrame(frame, currentIndex, requestedIndex);
+            }
+
+            if(decodedThisRound >= kMaxDecodePerRound && currentIndex < requestedIndex) {
+                publishStatus("PICO RGB catching up " + std::to_string(currentIndex) + "/" + std::to_string(requestedIndex));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        if(cap.isOpened()) {
+            cap.release();
         }
     }
 
-    bool open(const fs::path &path, std::string *status) {
-        close();
-        cap_.open(path.string());
-        if(!cap_.isOpened()) {
-            setStatus(status, "PICO RGB video open failed");
-            return false;
-        }
-        path_ = path;
-        currentIndex_ = -1;
-        readBlocked_ = false;
-        setStatus(status, "PICO RGB video opened");
-        return true;
-    }
-
-    fs::path path_;
-    cv::VideoCapture cap_;
-    int currentIndex_ = -1;
-    uintmax_t lastFileSize_ = 0;
-    bool readBlocked_ = false;
-    cv::Mat lastFrame_;
+    mutable std::mutex mtx_;
+    std::condition_variable cv_;
+    std::thread workerThread_;
+    bool stopRequested_ = false;
+    uint64_t requestSerial_ = 0;
+    fs::path targetPath_;
+    int targetFrameIndex_ = -1;
+    cv::Mat latestFrame_;
+    int latestFrameIndex_ = -1;
+    std::string statusLine_ = "PICO RGB off";
 };
 
 struct InteractiveViewState {
@@ -3906,11 +4018,14 @@ private:
             return;
         }
 
+        picoRgbFrameSource_.request(egoVideoPath_, latestEgoFrame_->videoFrameIndex);
+
         cv::Mat frame;
+        int decodedFrameIndex = -1;
         std::string status;
-        if(picoRgbFrameSource_.read(egoVideoPath_, latestEgoFrame_->videoFrameIndex, frame, &status)) {
+        if(picoRgbFrameSource_.latest(frame, &decodedFrameIndex, &status)) {
             latestPicoRgbFrame_ = std::move(frame);
-            latestPicoRgbVideoFrameIndex_ = latestEgoFrame_->videoFrameIndex;
+            latestPicoRgbVideoFrameIndex_ = decodedFrameIndex;
         }
         picoRgbStatusLine_ = status.empty()
                             ? ("PICO RGB frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
