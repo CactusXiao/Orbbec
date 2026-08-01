@@ -6282,30 +6282,30 @@ private:
         return typeChanged;
     }
 
-    void drawPicoHand2dOverlay(cv::Mat &img, const PicoHand2dResult &result) const {
+    void drawPicoHand2dOverlay(cv::Mat &img, const PicoHand2dResult &result, double scaleX, double scaleY) const {
         if(img.empty() || !result.valid || result.hands.empty()) {
             return;
         }
-        static const std::array<std::pair<int, int>, 20> edges = {
-            std::make_pair(0, 1), std::make_pair(1, 2), std::make_pair(2, 3), std::make_pair(3, 4),
-            std::make_pair(0, 5), std::make_pair(5, 6), std::make_pair(6, 7), std::make_pair(7, 8),
-            std::make_pair(5, 9), std::make_pair(9, 10), std::make_pair(10, 11), std::make_pair(11, 12),
-            std::make_pair(9, 13), std::make_pair(13, 14), std::make_pair(14, 15), std::make_pair(15, 16),
-            std::make_pair(13, 17), std::make_pair(17, 18), std::make_pair(18, 19), std::make_pair(19, 20)
+        static const std::array<std::pair<int, int>, 23> edges = {
+            std::make_pair(0, 1),   std::make_pair(1, 2),   std::make_pair(2, 3),   std::make_pair(3, 4),   std::make_pair(0, 5),   std::make_pair(5, 6),
+            std::make_pair(6, 7),   std::make_pair(7, 8),   std::make_pair(0, 9),   std::make_pair(9, 10),  std::make_pair(10, 11), std::make_pair(11, 12),
+            std::make_pair(0, 13),  std::make_pair(13, 14), std::make_pair(14, 15), std::make_pair(15, 16), std::make_pair(0, 17),  std::make_pair(17, 18),
+            std::make_pair(18, 19), std::make_pair(19, 20), std::make_pair(5, 9),   std::make_pair(9, 13),  std::make_pair(13, 17)
         };
 
         auto validPoint = [&](const PicoHand2dJoint &joint) {
-            return joint.valid
-                   && std::isfinite(joint.point.x)
-                   && std::isfinite(joint.point.y)
-                   && joint.point.x >= -20.0f
-                   && joint.point.y >= -20.0f
-                   && joint.point.x <= static_cast<float>(img.cols + 20)
-                   && joint.point.y <= static_cast<float>(img.rows + 20);
+            if(!joint.valid || !std::isfinite(joint.point.x) || !std::isfinite(joint.point.y)) {
+                return false;
+            }
+            const double x = static_cast<double>(joint.point.x) * scaleX;
+            const double y = static_cast<double>(joint.point.y) * scaleY;
+            return x >= -20.0 && y >= -20.0 && x <= static_cast<double>(img.cols + 20) && y <= static_cast<double>(img.rows + 20);
         };
         auto toPoint = [&](const PicoHand2dJoint &joint) {
-            return cv::Point(std::max(0, std::min(img.cols - 1, static_cast<int>(std::lround(joint.point.x)))),
-                             std::max(0, std::min(img.rows - 1, static_cast<int>(std::lround(joint.point.y)))));
+            const int x = static_cast<int>(std::lround(static_cast<double>(joint.point.x) * scaleX));
+            const int y = static_cast<int>(std::lround(static_cast<double>(joint.point.y) * scaleY));
+            return cv::Point(std::max(0, std::min(img.cols - 1, x)),
+                             std::max(0, std::min(img.rows - 1, y)));
         };
 
         for(const auto &hand: result.hands) {
@@ -6334,7 +6334,7 @@ private:
             });
             for(const auto *joint: ordered) {
                 const cv::Point pt = toPoint(*joint);
-                const int radius = joint->jointIndex == 0 ? 7 : 5;
+                const int radius = std::max(4, std::min(10, static_cast<int>(std::lround(0.018 * static_cast<double>(std::min(img.cols, img.rows))))));
                 cv::circle(img, pt, radius + 2, cv::Scalar(16, 16, 16), cv::FILLED, cv::LINE_AA);
                 cv::circle(img, pt, radius, toScalar(joint->color), cv::FILLED, cv::LINE_AA);
                 cv::circle(img, pt, std::max(1, radius / 2), cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
@@ -6375,12 +6375,14 @@ private:
             const int targetW = std::max(1, layout_.imgRect.width - 20);
             const cv::Mat &img = latestPicoRgbFrame_;
             if(!img.empty()) {
-                cv::Mat overlay = img.clone();
-                const PicoHand2dResult hand2dResult = picoHand2dWorker_.latestResult();
-                drawPicoHand2dOverlay(overlay, hand2dResult);
-                const int targetH = std::max(10, static_cast<int>(static_cast<double>(overlay.rows) * (static_cast<double>(targetW) / static_cast<double>(overlay.cols))));
+                const int targetH = std::max(10, static_cast<int>(static_cast<double>(img.rows) * (static_cast<double>(targetW) / static_cast<double>(img.cols))));
                 cv::Mat resized;
-                cv::resize(overlay, resized, cv::Size(targetW, targetH));
+                cv::resize(img, resized, cv::Size(targetW, targetH));
+                const PicoHand2dResult hand2dResult = picoHand2dWorker_.latestResult();
+                drawPicoHand2dOverlay(resized,
+                                      hand2dResult,
+                                      static_cast<double>(targetW) / static_cast<double>(img.cols),
+                                      static_cast<double>(targetH) / static_cast<double>(img.rows));
                 totalH += 24 + targetH + 16;
                 if(y + 24 + targetH >= contentTop && y <= layout_.imgRect.y + layout_.imgRect.height) {
                     const std::string label = latestPicoRgbVideoFrameIndex_ >= 0
