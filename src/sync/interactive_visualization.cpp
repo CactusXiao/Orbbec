@@ -1,10 +1,12 @@
 #include "interactive_visualization.hpp"
 #include "fisheyes.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
+#include <chrono>
 #include <csignal>
 #include <cmath>
 #include <condition_variable>
@@ -12,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -91,6 +94,9 @@ static void ivizInstallCrashHandlerOnce() {
     sa.sa_flags = SA_RESETHAND;
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGABRT, &sa, nullptr);
+#endif
+#if !defined(_WIN32) && defined(SIGPIPE)
+    std::signal(SIGPIPE, SIG_IGN);
 #endif
 }
 
@@ -637,6 +643,44 @@ static uint64_t getU64Le(const uint8_t *src) {
 }
 
 #if !defined(_WIN32)
+static void terminateChildProcess(pid_t &pid, int graceMs = 120) {
+    if(pid <= 0) {
+        return;
+    }
+
+    auto hasExited = [&]() {
+        int status = 0;
+        for(;;) {
+            const pid_t result = ::waitpid(pid, &status, WNOHANG);
+            if(result == pid || result < 0) {
+                if(result < 0 && errno == EINTR) {
+                    continue;
+                }
+                return true;
+            }
+            if(result == 0) {
+                return false;
+            }
+        }
+    };
+
+    ::kill(pid, SIGTERM);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, graceMs));
+    while(!hasExited()) {
+        if(std::chrono::steady_clock::now() >= deadline) {
+            ::kill(pid, SIGKILL);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    const auto killDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(80);
+    while(!hasExited() && std::chrono::steady_clock::now() < killDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    pid = -1;
+}
+
 static bool writeAllFd(int fd, const void *data, size_t size) {
     const auto *ptr = reinterpret_cast<const uint8_t *>(data);
     size_t      off = 0;
@@ -740,8 +784,12 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             stopRequested_ = true;
             hasPendingRequest_ = false;
+            pendingRequest_ = GtInferenceRequest{};
             cv_.notify_all();
         }
+#if !defined(_WIN32)
+        closeChild();
+#endif
         if(workerThread_.joinable()) {
             workerThread_.join();
         }
@@ -845,9 +893,12 @@ private:
 
         ::close(stdinPipe[0]);
         ::close(stdoutPipe[1]);
-        childPid_ = pid;
-        childStdinFd_ = stdinPipe[1];
-        childStdoutFd_ = stdoutPipe[0];
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            childPid_ = pid;
+            childStdinFd_ = stdinPipe[1];
+            childStdoutFd_ = stdoutPipe[0];
+        }
         {
             std::lock_guard<std::mutex> lock(mtx_);
             statusLine_ = "GT worker ready";
@@ -855,21 +906,31 @@ private:
         return true;
     }
 
+    bool childRunning() const {
+        std::lock_guard<std::mutex> childLock(childMtx_);
+        return childPid_ > 0;
+    }
+
     void closeChild() {
-        if(childStdinFd_ >= 0) {
-            ::close(childStdinFd_);
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+            stdoutFd = childStdoutFd_;
+            pid = childPid_;
             childStdinFd_ = -1;
-        }
-        if(childStdoutFd_ >= 0) {
-            ::close(childStdoutFd_);
             childStdoutFd_ = -1;
-        }
-        if(childPid_ > 0) {
-            ::kill(childPid_, SIGTERM);
-            int status = 0;
-            ::waitpid(childPid_, &status, 0);
             childPid_ = -1;
         }
+        if(stdinFd >= 0) {
+            ::close(stdinFd);
+        }
+        if(stdoutFd >= 0) {
+            ::close(stdoutFd);
+        }
+        terminateChildProcess(pid);
     }
 
     std::string buildRequestJson(const GtInferenceRequest &req, uint64_t &payloadBytesOut) const {
@@ -906,7 +967,12 @@ private:
     }
 
     bool sendRequest(const GtInferenceRequest &req) {
-        if(childStdinFd_ < 0) {
+        int stdinFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+        }
+        if(stdinFd < 0) {
             return false;
         }
         uint64_t payloadBytes = 0;
@@ -914,17 +980,17 @@ private:
         uint8_t header[12];
         putU32Le(header, static_cast<uint32_t>(json.size()));
         putU64Le(header + 4, payloadBytes);
-        if(!writeAllFd(childStdinFd_, header, sizeof(header))) {
+        if(!writeAllFd(stdinFd, header, sizeof(header))) {
             return false;
         }
-        if(!json.empty() && !writeAllFd(childStdinFd_, json.data(), json.size())) {
+        if(!json.empty() && !writeAllFd(stdinFd, json.data(), json.size())) {
             return false;
         }
         for(const auto &cam : req.cameras) {
-            if(!cam.rgbBgr.empty() && !writeAllFd(childStdinFd_, cam.rgbBgr.data, matByteSize(cam.rgbBgr))) {
+            if(!cam.rgbBgr.empty() && !writeAllFd(stdinFd, cam.rgbBgr.data, matByteSize(cam.rgbBgr))) {
                 return false;
             }
-            if(!cam.depthAlignedRgb16.empty() && !writeAllFd(childStdinFd_, cam.depthAlignedRgb16.data, matByteSize(cam.depthAlignedRgb16))) {
+            if(!cam.depthAlignedRgb16.empty() && !writeAllFd(stdinFd, cam.depthAlignedRgb16.data, matByteSize(cam.depthAlignedRgb16))) {
                 return false;
             }
         }
@@ -932,11 +998,16 @@ private:
     }
 
     bool readResponse(GtInferenceResult &out) {
-        if(childStdoutFd_ < 0) {
+        int stdoutFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdoutFd = childStdoutFd_;
+        }
+        if(stdoutFd < 0) {
             return false;
         }
         uint8_t header[12];
-        if(!readAllFd(childStdoutFd_, header, sizeof(header))) {
+        if(!readAllFd(stdoutFd, header, sizeof(header))) {
             return false;
         }
         const uint32_t jsonBytes = getU32Le(header);
@@ -945,7 +1016,7 @@ private:
             return false;
         }
         std::string json(jsonBytes, '\0');
-        if(jsonBytes > 0 && !readAllFd(childStdoutFd_, json.data(), jsonBytes)) {
+        if(jsonBytes > 0 && !readAllFd(stdoutFd, json.data(), jsonBytes)) {
             return false;
         }
 
@@ -1095,7 +1166,7 @@ private:
                 hasPendingRequest_ = false;
             }
 
-            if(childPid_ <= 0 && !launchChild()) {
+            if(!childRunning() && !launchChild()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
@@ -1147,6 +1218,7 @@ private:
     double                  smoothedFps_ = 0.0;
     std::chrono::steady_clock::time_point lastResponseTime_{};
 #if !defined(_WIN32)
+    mutable std::mutex childMtx_;
     pid_t childPid_ = -1;
     int   childStdinFd_ = -1;
     int   childStdoutFd_ = -1;
@@ -1183,8 +1255,12 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             stopRequested_ = true;
             hasPendingRequest_ = false;
+            pendingRequest_ = PicoHand2dRequest{};
             cv_.notify_all();
         }
+#if !defined(_WIN32)
+        closeChild();
+#endif
         if(workerThread_.joinable()) {
             workerThread_.join();
         }
@@ -1288,9 +1364,12 @@ private:
 
         ::close(stdinPipe[0]);
         ::close(stdoutPipe[1]);
-        childPid_ = pid;
-        childStdinFd_ = stdinPipe[1];
-        childStdoutFd_ = stdoutPipe[0];
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            childPid_ = pid;
+            childStdinFd_ = stdinPipe[1];
+            childStdoutFd_ = stdoutPipe[0];
+        }
         {
             std::lock_guard<std::mutex> lock(mtx_);
             statusLine_ = "PICO hand2d worker ready";
@@ -1298,21 +1377,31 @@ private:
         return true;
     }
 
+    bool childRunning() const {
+        std::lock_guard<std::mutex> childLock(childMtx_);
+        return childPid_ > 0;
+    }
+
     void closeChild() {
-        if(childStdinFd_ >= 0) {
-            ::close(childStdinFd_);
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+            stdoutFd = childStdoutFd_;
+            pid = childPid_;
             childStdinFd_ = -1;
-        }
-        if(childStdoutFd_ >= 0) {
-            ::close(childStdoutFd_);
             childStdoutFd_ = -1;
-        }
-        if(childPid_ > 0) {
-            ::kill(childPid_, SIGTERM);
-            int status = 0;
-            ::waitpid(childPid_, &status, 0);
             childPid_ = -1;
         }
+        if(stdinFd >= 0) {
+            ::close(stdinFd);
+        }
+        if(stdoutFd >= 0) {
+            ::close(stdoutFd);
+        }
+        terminateChildProcess(pid);
     }
 
     std::string buildRequestJson(const PicoHand2dRequest &req, uint64_t &payloadBytesOut) const {
@@ -1332,7 +1421,12 @@ private:
     }
 
     bool sendRequest(const PicoHand2dRequest &req) {
-        if(childStdinFd_ < 0 || req.rgbBgr.empty()) {
+        int stdinFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+        }
+        if(stdinFd < 0 || req.rgbBgr.empty()) {
             return false;
         }
         uint64_t payloadBytes = 0;
@@ -1340,13 +1434,13 @@ private:
         uint8_t header[12];
         putU32Le(header, static_cast<uint32_t>(json.size()));
         putU64Le(header + 4, payloadBytes);
-        if(!writeAllFd(childStdinFd_, header, sizeof(header))) {
+        if(!writeAllFd(stdinFd, header, sizeof(header))) {
             return false;
         }
-        if(!json.empty() && !writeAllFd(childStdinFd_, json.data(), json.size())) {
+        if(!json.empty() && !writeAllFd(stdinFd, json.data(), json.size())) {
             return false;
         }
-        return payloadBytes == 0 || writeAllFd(childStdinFd_, req.rgbBgr.data, matByteSize(req.rgbBgr));
+        return payloadBytes == 0 || writeAllFd(stdinFd, req.rgbBgr.data, matByteSize(req.rgbBgr));
     }
 
     static bool readNumberArray2(cJSON *arr, cv::Point2f &pt) {
@@ -1363,11 +1457,16 @@ private:
     }
 
     bool readResponse(PicoHand2dResult &out) {
-        if(childStdoutFd_ < 0) {
+        int stdoutFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdoutFd = childStdoutFd_;
+        }
+        if(stdoutFd < 0) {
             return false;
         }
         uint8_t header[12];
-        if(!readAllFd(childStdoutFd_, header, sizeof(header))) {
+        if(!readAllFd(stdoutFd, header, sizeof(header))) {
             return false;
         }
         const uint32_t jsonBytes = getU32Le(header);
@@ -1376,7 +1475,7 @@ private:
             return false;
         }
         std::string json(jsonBytes, '\0');
-        if(jsonBytes > 0 && !readAllFd(childStdoutFd_, json.data(), jsonBytes)) {
+        if(jsonBytes > 0 && !readAllFd(stdoutFd, json.data(), jsonBytes)) {
             return false;
         }
 
@@ -1520,7 +1619,7 @@ private:
                 hasPendingRequest_ = false;
             }
 
-            if(childPid_ <= 0 && !launchChild()) {
+            if(!childRunning() && !launchChild()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
@@ -1572,6 +1671,7 @@ private:
     double                  smoothedFps_ = 0.0;
     std::chrono::steady_clock::time_point lastResponseTime_{};
 #if !defined(_WIN32)
+    mutable std::mutex childMtx_;
     pid_t childPid_ = -1;
     int   childStdinFd_ = -1;
     int   childStdoutFd_ = -1;
@@ -1608,8 +1708,12 @@ public:
             std::lock_guard<std::mutex> lock(mtx_);
             stopRequested_ = true;
             hasPendingRequest_ = false;
+            pendingRequest_ = EgoAprilTagRequest{};
             cv_.notify_all();
         }
+#if !defined(_WIN32)
+        closeChild();
+#endif
         if(workerThread_.joinable()) {
             workerThread_.join();
         }
@@ -1713,9 +1817,12 @@ private:
 
         ::close(stdinPipe[0]);
         ::close(stdoutPipe[1]);
-        childPid_ = pid;
-        childStdinFd_ = stdinPipe[1];
-        childStdoutFd_ = stdoutPipe[0];
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            childPid_ = pid;
+            childStdinFd_ = stdinPipe[1];
+            childStdoutFd_ = stdoutPipe[0];
+        }
         {
             std::lock_guard<std::mutex> lock(mtx_);
             statusLine_ = "PICO tags worker ready";
@@ -1723,21 +1830,31 @@ private:
         return true;
     }
 
+    bool childRunning() const {
+        std::lock_guard<std::mutex> childLock(childMtx_);
+        return childPid_ > 0;
+    }
+
     void closeChild() {
-        if(childStdinFd_ >= 0) {
-            ::close(childStdinFd_);
+        int stdinFd = -1;
+        int stdoutFd = -1;
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+            stdoutFd = childStdoutFd_;
+            pid = childPid_;
             childStdinFd_ = -1;
-        }
-        if(childStdoutFd_ >= 0) {
-            ::close(childStdoutFd_);
             childStdoutFd_ = -1;
-        }
-        if(childPid_ > 0) {
-            ::kill(childPid_, SIGTERM);
-            int status = 0;
-            ::waitpid(childPid_, &status, 0);
             childPid_ = -1;
         }
+        if(stdinFd >= 0) {
+            ::close(stdinFd);
+        }
+        if(stdoutFd >= 0) {
+            ::close(stdoutFd);
+        }
+        terminateChildProcess(pid);
     }
 
     std::string buildRequestJson(const EgoAprilTagRequest &req, uint64_t &payloadBytesOut) const {
@@ -1789,7 +1906,12 @@ private:
     }
 
     bool sendRequest(const EgoAprilTagRequest &req) {
-        if(childStdinFd_ < 0) {
+        int stdinFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdinFd = childStdinFd_;
+        }
+        if(stdinFd < 0) {
             return false;
         }
         uint64_t payloadBytes = 0;
@@ -1797,14 +1919,14 @@ private:
         uint8_t header[12];
         putU32Le(header, static_cast<uint32_t>(json.size()));
         putU64Le(header + 4, payloadBytes);
-        if(!writeAllFd(childStdinFd_, header, sizeof(header))) {
+        if(!writeAllFd(stdinFd, header, sizeof(header))) {
             return false;
         }
-        if(!json.empty() && !writeAllFd(childStdinFd_, json.data(), json.size())) {
+        if(!json.empty() && !writeAllFd(stdinFd, json.data(), json.size())) {
             return false;
         }
         for(const auto &cam : req.cameras) {
-            if(!cam.rgbBgr.empty() && !writeAllFd(childStdinFd_, cam.rgbBgr.data, matByteSize(cam.rgbBgr))) {
+            if(!cam.rgbBgr.empty() && !writeAllFd(stdinFd, cam.rgbBgr.data, matByteSize(cam.rgbBgr))) {
                 return false;
             }
         }
@@ -1812,11 +1934,16 @@ private:
     }
 
     bool readResponse(EgoAprilTagResult &out) {
-        if(childStdoutFd_ < 0) {
+        int stdoutFd = -1;
+        {
+            std::lock_guard<std::mutex> childLock(childMtx_);
+            stdoutFd = childStdoutFd_;
+        }
+        if(stdoutFd < 0) {
             return false;
         }
         uint8_t header[12];
-        if(!readAllFd(childStdoutFd_, header, sizeof(header))) {
+        if(!readAllFd(stdoutFd, header, sizeof(header))) {
             return false;
         }
         const uint32_t jsonBytes = getU32Le(header);
@@ -1825,7 +1952,7 @@ private:
             return false;
         }
         std::string json(jsonBytes, '\0');
-        if(jsonBytes > 0 && !readAllFd(childStdoutFd_, json.data(), jsonBytes)) {
+        if(jsonBytes > 0 && !readAllFd(stdoutFd, json.data(), jsonBytes)) {
             return false;
         }
 
@@ -1928,7 +2055,7 @@ private:
                 hasPendingRequest_ = false;
             }
 
-            if(childPid_ <= 0 && !launchChild()) {
+            if(!childRunning() && !launchChild()) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 continue;
             }
@@ -1980,6 +2107,7 @@ private:
     double                  smoothedFps_ = 0.0;
     std::chrono::steady_clock::time_point lastResponseTime_{};
 #if !defined(_WIN32)
+    mutable std::mutex childMtx_;
     pid_t childPid_ = -1;
     int   childStdinFd_ = -1;
     int   childStdoutFd_ = -1;
@@ -2236,6 +2364,10 @@ private:
 
         ::close(stdinPipe[0]);
         ::close(stdoutPipe[1]);
+        const int stdoutFlags = ::fcntl(stdoutPipe[0], F_GETFL, 0);
+        if(stdoutFlags >= 0) {
+            (void)::fcntl(stdoutPipe[0], F_SETFL, stdoutFlags | O_NONBLOCK);
+        }
         {
             std::lock_guard<std::mutex> lock(processMtx_);
             decoderPid_ = pid;
@@ -2257,6 +2389,7 @@ private:
             pid = decoderPid_;
             decoderStdinFd_ = -1;
             decoderStdoutFd_ = -1;
+            decoderPid_ = -1;
         }
         if(stdinFd >= 0) {
             ::close(stdinFd);
@@ -2264,9 +2397,7 @@ private:
         if(stdoutFd >= 0) {
             ::close(stdoutFd);
         }
-        if(pid > 0) {
-            ::kill(pid, SIGTERM);
-        }
+        terminateChildProcess(pid, 80);
     }
 
     void closeDecoder() {
@@ -2285,18 +2416,12 @@ private:
         if(stdinFd >= 0) {
             ::close(stdinFd);
         }
-        if(pid > 0) {
-            ::kill(pid, SIGTERM);
-        }
         if(stdoutFd >= 0) {
             ::close(stdoutFd);
         }
+        terminateChildProcess(pid, 80);
         if(readerThread_.joinable()) {
             readerThread_.join();
-        }
-        if(pid > 0) {
-            int status = 0;
-            (void)::waitpid(pid, &status, 0);
         }
     }
 
@@ -2416,6 +2541,10 @@ private:
             const ssize_t n = ::read(fd, chunk.data(), chunk.size());
             if(n < 0) {
                 if(errno == EINTR) {
+                    continue;
+                }
+                if(errno == EAGAIN || errno == EWOULDBLOCK) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
                     continue;
                 }
                 break;
@@ -3208,9 +3337,7 @@ public:
         loadInitExtrinsicsIfNeeded();
         ivizSetStage("loadInitExtrinsics_ok");
         initializeFisheyes();
-        if(cfg_.demo.active && cfg_.demo.interaction.handGt) {
-            setGtVisualizationEnabled(true);
-        }
+        setGtVisualizationEnabled(true);
 
         const std::string winName = "Interaction";
         cv::namedWindow(winName, cv::WINDOW_NORMAL);
@@ -6079,10 +6206,7 @@ private:
         {
             const cv::Rect row(bx, by, bw, 30);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                if(uiCheckbox(canvas, row, showGtJoints_, "GT hand", ms)) {
-                    setGtVisualizationEnabled(!showGtJoints_);
-                    typeChanged = true;
-                }
+                (void)uiCheckbox(canvas, row, true, "GT hand", ms);
             }
             by += 34;
         }
