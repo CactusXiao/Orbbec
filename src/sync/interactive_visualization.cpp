@@ -3083,7 +3083,7 @@ private:
             const int bottomH = 110;
             const int usableH = std::max(1, winH - bottomH);
 
-            int leftW  = std::max(116, std::min(150, winW / 11));
+            int leftW  = std::max(232, std::min(300, winW / 6));
             int rightW = std::max(320, std::min(400, winW / 5));
             int pcW    = winW - leftW - rightW;
             if(pcW < 1) {
