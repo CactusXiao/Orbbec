@@ -3083,8 +3083,8 @@ private:
             const int bottomH = 110;
             const int usableH = std::max(1, winH - bottomH);
 
-            int leftW  = std::max(160, std::min(360, winW / 4));
-            int rightW = std::max(200, std::min(560, winW / 3));
+            int leftW  = std::max(116, std::min(150, winW / 11));
+            int rightW = std::max(320, std::min(400, winW / 5));
             int pcW    = winW - leftW - rightW;
             if(pcW < 1) {
                 pcW = 1;
@@ -5536,31 +5536,22 @@ private:
         cv::rectangle(canvas, layout_.camsRect, cv::Scalar(16, 16, 16), cv::FILLED);
         cv::rectangle(canvas, layout_.camsRect, cv::Scalar(60, 60, 60), 1);
 
-        cv::putText(canvas, "Data Type", cv::Point(layout_.camsRect.x + 12, layout_.camsRect.y + 26), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        if(imageType_ != ImageType::RGB) {
+            imageType_ = ImageType::RGB;
+            imageScrollY_ = 0;
+        }
+        cv::putText(canvas, "RGB", cv::Point(layout_.camsRect.x + 10, layout_.camsRect.y + 24), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
 
-        const int bx = layout_.camsRect.x + 10;
-        int       by = layout_.camsRect.y + 36;
-        const int bw = layout_.camsRect.width - 20;
-        const int bh = 34;
+        const int bx = layout_.camsRect.x + 8;
+        int       by = layout_.camsRect.y + 34;
+        const int bw = layout_.camsRect.width - 16;
+        const int bh = 28;
 
         bool typeChanged = false;
-        auto setType = [&](ImageType t) {
-            if(imageType_ != t) {
-                imageType_ = t;
-                imageScrollY_ = 0;
-                typeChanged = true;
-                if(wantsPicoRgbPreview()) {
-                    picoRgbStatusLine_ = "Starting PICO RGB preview";
-                }
-                else {
-                    clearPicoRgbPreview();
-                }
-                stopEgoPreviewSessionIfUnused();
-            }
-        };
         auto setRgbSource = [&](RgbImageSource source) {
             if(rgbImageSource_ != source) {
                 rgbImageSource_ = source;
+                imageType_ = ImageType::RGB;
                 imageScrollY_ = 0;
                 typeChanged = true;
                 if(rgbImageSource_ == RgbImageSource::Pico) {
@@ -5573,42 +5564,21 @@ private:
             }
         };
 
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), "Depth", ms)) {
-            setType(ImageType::Depth);
+        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Orbbec ? "Orbbec*" : "Orbbec", ms)) {
+            setRgbSource(RgbImageSource::Orbbec);
         }
-        by += bh + 8;
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), "RGB", ms)) {
-            setType(ImageType::RGB);
+        by += bh + 6;
+        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Pico ? "PICO*" : "PICO", ms)) {
+            setRgbSource(RgbImageSource::Pico);
         }
-        by += bh + 8;
-        if(imageType_ == ImageType::RGB) {
-            const int halfW = (bw - 8) / 2;
-            const cv::Rect orbbecBtn(bx, by, halfW, 30);
-            const cv::Rect picoBtn(bx + halfW + 8, by, bw - halfW - 8, 30);
-            if(uiButton(canvas, orbbecBtn, rgbImageSource_ == RgbImageSource::Orbbec ? "Orbbec RGB*" : "Orbbec RGB", ms)) {
-                setRgbSource(RgbImageSource::Orbbec);
-            }
-            if(uiButton(canvas, picoBtn, rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB*" : "PICO RGB", ms)) {
-                setRgbSource(RgbImageSource::Pico);
-            }
-            by += 30 + 8;
-        }
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), "IR Left", ms)) {
-            setType(ImageType::IRLeft);
-        }
-        by += bh + 8;
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), "IR Right", ms)) {
-            setType(ImageType::IRRight);
-        }
-
-        by += 18;
-        cv::putText(canvas, "Overlays", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-        by += 34;
+        by += bh + 12;
+        cv::putText(canvas, "Overlay", cv::Point(layout_.camsRect.x + 10, by + 18), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        by += 26;
 
         {
             const cv::Rect row(bx, by, bw, 30);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                if(uiCheckbox(canvas, row, showGtJoints_, "Visualize GT hand", ms)) {
+                if(uiCheckbox(canvas, row, showGtJoints_, "GT hand", ms)) {
                     setGtVisualizationEnabled(!showGtJoints_);
                     typeChanged = true;
                 }
@@ -5618,7 +5588,7 @@ private:
         {
             const cv::Rect row(bx, by, bw, 30);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                if(uiCheckbox(canvas, row, showEgoAprilTags_, "Visualize PICO AprilTags", ms)) {
+                if(uiCheckbox(canvas, row, showEgoAprilTags_, "PICO tags", ms)) {
                     setEgoAprilTagOverlayEnabled(!showEgoAprilTags_);
                     typeChanged = true;
                 }
@@ -5640,13 +5610,13 @@ private:
 
         by += 14;
         if(by + 22 <= layout_.camsRect.y + layout_.camsRect.height) {
-            cv::putText(canvas, "Extrinsic Check", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+            cv::putText(canvas, "Extrinsic", cv::Point(layout_.camsRect.x + 10, by + 20), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         }
-        by += 34;
+        by += 28;
         {
             const cv::Rect row(bx, by, bw, 32);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                const std::string label = isExtrinsicHealthRunning() ? "Checking..." : "Sample Extrinsic";
+                const std::string label = isExtrinsicHealthRunning() ? "Checking..." : "Sample";
                 if(uiButton(canvas, row, label, ms)) {
                     requestExtrinsicHealthCheck();
                     typeChanged = true;
@@ -5669,7 +5639,7 @@ private:
         {
             const cv::Rect row(bx, by, bw, 30);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                if(uiCheckbox(canvas, row, showExtrinsicHealthOverlay_, "Visualize Extrinsic", ms)) {
+                if(uiCheckbox(canvas, row, showExtrinsicHealthOverlay_, "Show", ms)) {
                     showExtrinsicHealthOverlay_ = !showExtrinsicHealthOverlay_;
                     if(showExtrinsicHealthOverlay_) {
                         extrinsicHealthForceColor_ = true;
@@ -5684,11 +5654,11 @@ private:
             const cv::Rect allBtn(bx, by, halfW, 30);
             const cv::Rect oneBtn(bx + halfW + 8, by, bw - halfW - 8, 30);
             if(oneBtn.y + oneBtn.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                if(uiButton(canvas, allBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::AllTags ? "All Tags*" : "All Tags", ms)) {
+                if(uiButton(canvas, allBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::AllTags ? "All*" : "All", ms)) {
                     extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::AllTags;
                     typeChanged = true;
                 }
-                if(uiButton(canvas, oneBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag ? "One Tag*" : "One Tag", ms)) {
+                if(uiButton(canvas, oneBtn, extrinsicHealthVizMode_ == ExtrinsicHealthVizMode::SingleTag ? "One*" : "One", ms)) {
                     extrinsicHealthVizMode_ = ExtrinsicHealthVizMode::SingleTag;
                     typeChanged = true;
                 }
@@ -5697,7 +5667,7 @@ private:
             {
                 const cv::Rect row(bx, by, bw, 30);
                 if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                    if(uiCheckbox(canvas, row, showExtrinsicCameraTagPoses_, "Camera tag poses", ms)) {
+                    if(uiCheckbox(canvas, row, showExtrinsicCameraTagPoses_, "Cam poses", ms)) {
                         showExtrinsicCameraTagPoses_ = !showExtrinsicCameraTagPoses_;
                         typeChanged = true;
                     }
@@ -5707,7 +5677,7 @@ private:
             {
                 const cv::Rect row(bx, by, bw, 30);
                 if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                    if(uiCheckbox(canvas, row, showExtrinsicFusedTagPoses_, "Fused tag poses", ms)) {
+                    if(uiCheckbox(canvas, row, showExtrinsicFusedTagPoses_, "Fused poses", ms)) {
                         showExtrinsicFusedTagPoses_ = !showExtrinsicFusedTagPoses_;
                         typeChanged = true;
                     }
@@ -5757,13 +5727,17 @@ private:
         }
 
         by += 18;
-        cv::putText(canvas, "Cameras", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-        by += 34;
+        cv::putText(canvas, "Cameras", cv::Point(layout_.camsRect.x + 10, by + 20), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        by += 28;
 
         for(size_t i = 0; i < devices_.size(); i++) {
             const auto &rt = devices_[i];
-            const std::string label = rt.cfg.index + "  " + rt.cfg.sn;
-            const cv::Rect row(bx, by, bw, 30);
+            const std::string label = ellipsizeTextToWidth(rt.cfg.index.empty() ? rt.cfg.sn : rt.cfg.index,
+                                                           bw - 28,
+                                                           cv::FONT_HERSHEY_DUPLEX,
+                                                           0.55,
+                                                           1);
+            const cv::Rect row(bx, by, bw, 26);
             if(row.y + row.height > layout_.camsRect.y + layout_.camsRect.height) {
                 break;
             }
@@ -5773,27 +5747,32 @@ private:
                 setCameraEnabled(static_cast<int>(i), next);
                 restartPipeline(static_cast<int>(i), next);
             }
-            by += 34;
+            by += 29;
         }
 
         if(!fisheyeLabels_.empty()) {
             by += 14;
             if(by + 22 < layout_.camsRect.y + layout_.camsRect.height) {
-                cv::putText(canvas, "Fisheyes", cv::Point(layout_.camsRect.x + 12, by + 22), cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+                cv::putText(canvas, "Fisheyes", cv::Point(layout_.camsRect.x + 10, by + 20), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
             }
-            by += 34;
+            by += 28;
             for(size_t i = 0; i < fisheyeLabels_.size(); ++i) {
-                const cv::Rect row(bx, by, bw, 30);
+                const cv::Rect row(bx, by, bw, 26);
                 if(row.y + row.height > layout_.camsRect.y + layout_.camsRect.height) {
                     break;
                 }
                 const bool visible = i < fisheyeVisible_.size() && fisheyeVisible_[i] != 0;
-                if(uiCheckbox(canvas, row, visible, fisheyeLabels_[i], ms)) {
+                const std::string label = ellipsizeTextToWidth(fisheyeLabels_[i],
+                                                               bw - 28,
+                                                               cv::FONT_HERSHEY_DUPLEX,
+                                                               0.55,
+                                                               1);
+                if(uiCheckbox(canvas, row, visible, label, ms)) {
                     if(i < fisheyeVisible_.size()) {
                         fisheyeVisible_[i] = visible ? 0 : 1;
                     }
                 }
-                by += 34;
+                by += 29;
             }
         }
         else if(!fisheyeStatusLine_.empty() && by + 24 < layout_.camsRect.y + layout_.camsRect.height) {
@@ -5817,7 +5796,7 @@ private:
             title += "Depth";
         }
         else if(imageType_ == ImageType::RGB) {
-            title += rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB" : "RGB";
+            title += rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB" : "Orbbec RGB";
         }
         else if(imageType_ == ImageType::IRLeft) {
             title += "IR Left";
@@ -5872,6 +5851,87 @@ private:
         }
 
         auto frames = snapshotFrames();
+        if(imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Orbbec) {
+            std::vector<int> visibleDeviceIndices;
+            visibleDeviceIndices.reserve(devices_.size());
+            for(size_t i = 0; i < devices_.size(); i++) {
+                if(isCameraEnabled(static_cast<int>(i))) {
+                    visibleDeviceIndices.push_back(static_cast<int>(i));
+                }
+            }
+
+            const int gap = 8;
+            const int gridX = layout_.imgRect.x + 8;
+            const int gridW = std::max(1, layout_.imgRect.width - 16);
+            const int gridBottom = layout_.imgRect.y + layout_.imgRect.height - 8;
+            const int gridH = std::max(1, gridBottom - contentTop);
+            const int cols = 2;
+            const int visibleRows = 3;
+            const int tileW = std::max(1, (gridW - gap) / cols);
+            const int tileH = std::max(70, (gridH - gap * (visibleRows - 1)) / visibleRows);
+            const int rowsNeeded = std::max(visibleRows, static_cast<int>((visibleDeviceIndices.size() + cols - 1) / cols));
+            totalH = rowsNeeded * tileH + std::max(0, rowsNeeded - 1) * gap;
+            y = contentTop - imageScrollY_;
+
+            for(size_t slot = 0; slot < visibleDeviceIndices.size(); ++slot) {
+                const int deviceIndex = visibleDeviceIndices[slot];
+                const int row = static_cast<int>(slot) / cols;
+                const int col = static_cast<int>(slot) % cols;
+                const int tileX = gridX + col * (tileW + gap);
+                const int tileY = y + row * (tileH + gap);
+                const cv::Rect tile(tileX, tileY, tileW, tileH);
+                if(tile.y + tile.height < contentTop || tile.y > gridBottom) {
+                    continue;
+                }
+
+                cv::rectangle(canvas, tile, cv::Scalar(24, 24, 24), cv::FILLED);
+                cv::rectangle(canvas, tile, cv::Scalar(78, 78, 78), 1);
+                const auto &rt = devices_[static_cast<size_t>(deviceIndex)];
+                const std::string label = ellipsizeTextToWidth(rt.cfg.index + " " + rt.cfg.sn,
+                                                               std::max(1, tile.width - 10),
+                                                               cv::FONT_HERSHEY_DUPLEX,
+                                                               0.42,
+                                                               1);
+                cv::putText(canvas, label, cv::Point(tile.x + 5, tile.y + 15), cv::FONT_HERSHEY_DUPLEX, 0.42,
+                            cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+
+                cv::Mat img;
+                auto it = frames.find(deviceIndex);
+                if(it != frames.end()) {
+                    img = visualizeObFrame(it->second.color);
+                }
+                const cv::Rect imgArea(tile.x + 3, tile.y + 20, std::max(1, tile.width - 6), std::max(1, tile.height - 23));
+                if(!img.empty()) {
+                    double scale = std::min(static_cast<double>(imgArea.width) / static_cast<double>(img.cols),
+                                            static_cast<double>(imgArea.height) / static_cast<double>(img.rows));
+                    if(!(scale > 0.0)) {
+                        scale = 1.0;
+                    }
+                    const int drawW = std::max(1, std::min(imgArea.width, static_cast<int>(std::lround(static_cast<double>(img.cols) * scale))));
+                    const int drawH = std::max(1, std::min(imgArea.height, static_cast<int>(std::lround(static_cast<double>(img.rows) * scale))));
+                    const cv::Rect roi(imgArea.x + (imgArea.width - drawW) / 2,
+                                       imgArea.y + (imgArea.height - drawH) / 2,
+                                       drawW,
+                                       drawH);
+                    if(roi.x >= layout_.imgRect.x && roi.y >= layout_.imgRect.y
+                       && roi.x + roi.width <= layout_.imgRect.x + layout_.imgRect.width
+                       && roi.y + roi.height <= layout_.imgRect.y + layout_.imgRect.height) {
+                        cv::Mat resized;
+                        cv::resize(img, resized, cv::Size(drawW, drawH), 0.0, 0.0, cv::INTER_AREA);
+                        resized.copyTo(canvas(roi));
+                    }
+                }
+                else {
+                    cv::putText(canvas, "waiting", cv::Point(imgArea.x + 8, imgArea.y + std::max(22, imgArea.height / 2)),
+                                cv::FONT_HERSHEY_DUPLEX, 0.46, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+                }
+            }
+
+            const int maxScroll = std::max(0, totalH - gridH);
+            imageScrollY_ = std::max(0, std::min(maxScroll, imageScrollY_));
+            return false;
+        }
+
         const int targetW = layout_.imgRect.width - 20;
         for(size_t i = 0; i < devices_.size(); i++) {
             if(!isCameraEnabled(static_cast<int>(i))) {
@@ -6010,7 +6070,7 @@ private:
     std::vector<int> frameCountByDevice_;
     bool clockSyncEnabled_ = false;
 
-    ImageType imageType_ = ImageType::Depth;
+    ImageType imageType_ = ImageType::RGB;
     RgbImageSource rgbImageSource_ = RgbImageSource::Orbbec;
     int imageScrollY_ = 0;
     bool showGtJoints_ = false;
