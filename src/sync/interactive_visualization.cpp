@@ -1534,6 +1534,8 @@ public:
         }
         path_.clear();
         currentIndex_ = -1;
+        lastFileSize_ = 0;
+        readBlocked_ = false;
         lastFrame_.release();
     }
 
@@ -1549,16 +1551,29 @@ public:
             setStatus(status, "PICO RGB video file not ready");
             return false;
         }
-        if(!cap_.isOpened() || path_ != path || frameIndex < currentIndex_) {
+        const uintmax_t fileSize = fs::file_size(path, ec);
+        const bool fileSizeKnown = !ec;
+        const bool fileGrewAfterBlock = readBlocked_ && fileSizeKnown && fileSize > lastFileSize_;
+        if(!cap_.isOpened() || path_ != path || frameIndex < currentIndex_ || fileGrewAfterBlock) {
             if(!open(path, status)) {
                 return false;
+            }
+            if(fileSizeKnown) {
+                lastFileSize_ = fileSize;
             }
         }
 
         while(currentIndex_ < frameIndex) {
             cv::Mat frame;
             if(!cap_.read(frame) || frame.empty()) {
-                setStatus(status, "PICO RGB frame not ready");
+                if(cap_.isOpened()) {
+                    cap_.release();
+                }
+                readBlocked_ = true;
+                if(fileSizeKnown) {
+                    lastFileSize_ = fileSize;
+                }
+                setStatus(status, "PICO RGB waiting for H265 data");
                 return false;
             }
             currentIndex_++;
@@ -1570,6 +1585,10 @@ public:
             return false;
         }
         out = lastFrame_.clone();
+        readBlocked_ = false;
+        if(fileSizeKnown) {
+            lastFileSize_ = fileSize;
+        }
         setStatus(status, "PICO RGB frame " + std::to_string(frameIndex));
         return true;
     }
@@ -1590,6 +1609,7 @@ private:
         }
         path_ = path;
         currentIndex_ = -1;
+        readBlocked_ = false;
         setStatus(status, "PICO RGB video opened");
         return true;
     }
@@ -1597,6 +1617,8 @@ private:
     fs::path path_;
     cv::VideoCapture cap_;
     int currentIndex_ = -1;
+    uintmax_t lastFileSize_ = 0;
+    bool readBlocked_ = false;
     cv::Mat lastFrame_;
 };
 
@@ -5460,7 +5482,7 @@ private:
                 totalH += 24 + targetH + 16;
                 if(y + 24 + targetH >= contentTop && y <= layout_.imgRect.y + layout_.imgRect.height) {
                     const std::string label = latestPicoRgbVideoFrameIndex_ >= 0
-                                            ? ("PICO ego RGB  frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
+                                            ? ("PICO ego RGB frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
                                             : "PICO ego RGB";
                     cv::putText(canvas, label, cv::Point(layout_.imgRect.x + 12, y + 16), cv::FONT_HERSHEY_DUPLEX, 0.55,
                                 cv::Scalar(230, 230, 230), 1, cv::LINE_AA);

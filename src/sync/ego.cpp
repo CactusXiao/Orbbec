@@ -1236,6 +1236,7 @@ private:
             if(video_) {
                 videoBytes_ += payload.size();
                 hevcSamplesWritten_++;
+                video_.flush();
             }
             else {
                 lastError_ = "failed to write ego HEVC payload";
