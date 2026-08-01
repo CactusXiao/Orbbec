@@ -311,6 +311,42 @@ struct GtInferenceResult {
     std::string          status;
 };
 
+struct PicoHand2dJoint {
+    bool        valid = false;
+    int         jointIndex = -1;
+    cv::Point2f point = cv::Point2f(0.0f, 0.0f);
+    float       z = 0.0f;
+    cv::Vec3b   color = cv::Vec3b(255, 255, 255);
+};
+
+struct PicoHand2d {
+    int                       trackId = -1;
+    std::string               side;
+    bool                      visible = false;
+    int                       validJointCount = 0;
+    float                     score = 0.0f;
+    cv::Rect2f                bbox;
+    std::vector<PicoHand2dJoint> joints;
+};
+
+struct PicoHand2dRequest {
+    uint64_t frameId = 0;
+    uint64_t captureTsUs = 0;
+    cv::Mat  rgbBgr;
+    float    rgbScaleX = 1.0f;
+    float    rgbScaleY = 1.0f;
+};
+
+struct PicoHand2dResult {
+    bool                    valid = false;
+    uint64_t                frameId = 0;
+    uint64_t                captureTsUs = 0;
+    std::vector<PicoHand2d> hands;
+    int                     visibleHands = 0;
+    double                  workerFps = 0.0;
+    std::string             status;
+};
+
 struct EgoAprilTagCameraPacket {
     std::string camIndex;
     int         deviceIndex = -1;
@@ -1106,6 +1142,431 @@ private:
     GtInferenceRequest      pendingRequest_;
     GtInferenceResult       latestResult_;
     std::string             statusLine_ = "GT disabled";
+    fs::path                scriptPath_;
+    std::thread             workerThread_;
+    double                  smoothedFps_ = 0.0;
+    std::chrono::steady_clock::time_point lastResponseTime_{};
+#if !defined(_WIN32)
+    pid_t childPid_ = -1;
+    int   childStdinFd_ = -1;
+    int   childStdoutFd_ = -1;
+#endif
+};
+
+class LivePicoHand2dWorker {
+public:
+    LivePicoHand2dWorker() = default;
+
+    ~LivePicoHand2dWorker() {
+        stop();
+    }
+
+    void setScriptPath(fs::path scriptPath) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        scriptPath_ = std::move(scriptPath);
+    }
+
+    void ensureRunning() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if(workerThread_.joinable()) {
+            return;
+        }
+        stopRequested_ = false;
+        hasPendingRequest_ = false;
+        latestResult_ = PicoHand2dResult{};
+        statusLine_ = "PICO hand2d worker starting";
+        workerThread_ = std::thread([this]() { workerLoop(); });
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = true;
+            hasPendingRequest_ = false;
+            cv_.notify_all();
+        }
+        if(workerThread_.joinable()) {
+            workerThread_.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            stopRequested_ = false;
+            latestResult_ = PicoHand2dResult{};
+            statusLine_ = "PICO hand2d off";
+        }
+    }
+
+    void submitLatest(PicoHand2dRequest req) {
+        ensureRunning();
+        std::lock_guard<std::mutex> lock(mtx_);
+        pendingRequest_ = std::move(req);
+        hasPendingRequest_ = true;
+        cv_.notify_one();
+    }
+
+    void setIdleStatus(const std::string &status, bool clearResult) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        statusLine_ = status;
+        if(clearResult) {
+            latestResult_ = PicoHand2dResult{};
+            latestResult_.status = status;
+            latestResult_.workerFps = smoothedFps_;
+        }
+    }
+
+    PicoHand2dResult latestResult() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return latestResult_;
+    }
+
+    bool hasPendingRequest() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return hasPendingRequest_;
+    }
+
+    std::string statusLine() const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return statusLine_;
+    }
+
+private:
+#if !defined(_WIN32)
+    bool launchChild() {
+        fs::path scriptPath;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            scriptPath = scriptPath_;
+        }
+        if(scriptPath.empty() || !fs::exists(scriptPath)) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "PICO hand2d script not found";
+            return false;
+        }
+
+        int stdinPipe[2] = { -1, -1 };
+        int stdoutPipe[2] = { -1, -1 };
+        if(::pipe(stdinPipe) != 0 || ::pipe(stdoutPipe) != 0) {
+            if(stdinPipe[0] >= 0) {
+                ::close(stdinPipe[0]);
+            }
+            if(stdinPipe[1] >= 0) {
+                ::close(stdinPipe[1]);
+            }
+            if(stdoutPipe[0] >= 0) {
+                ::close(stdoutPipe[0]);
+            }
+            if(stdoutPipe[1] >= 0) {
+                ::close(stdoutPipe[1]);
+            }
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "PICO hand2d pipe creation failed";
+            return false;
+        }
+
+        const pid_t pid = ::fork();
+        if(pid < 0) {
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "PICO hand2d fork failed";
+            return false;
+        }
+
+        if(pid == 0) {
+            ::dup2(stdinPipe[0], STDIN_FILENO);
+            ::dup2(stdoutPipe[1], STDOUT_FILENO);
+            ::close(stdinPipe[0]);
+            ::close(stdinPipe[1]);
+            ::close(stdoutPipe[0]);
+            ::close(stdoutPipe[1]);
+            ::execlp("python3", "python3", scriptPath.string().c_str(), "--stdio", nullptr);
+            ::execlp("python", "python", scriptPath.string().c_str(), "--stdio", nullptr);
+            _exit(127);
+        }
+
+        ::close(stdinPipe[0]);
+        ::close(stdoutPipe[1]);
+        childPid_ = pid;
+        childStdinFd_ = stdinPipe[1];
+        childStdoutFd_ = stdoutPipe[0];
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            statusLine_ = "PICO hand2d worker ready";
+        }
+        return true;
+    }
+
+    void closeChild() {
+        if(childStdinFd_ >= 0) {
+            ::close(childStdinFd_);
+            childStdinFd_ = -1;
+        }
+        if(childStdoutFd_ >= 0) {
+            ::close(childStdoutFd_);
+            childStdoutFd_ = -1;
+        }
+        if(childPid_ > 0) {
+            ::kill(childPid_, SIGTERM);
+            int status = 0;
+            ::waitpid(childPid_, &status, 0);
+            childPid_ = -1;
+        }
+    }
+
+    std::string buildRequestJson(const PicoHand2dRequest &req, uint64_t &payloadBytesOut) const {
+        payloadBytesOut = static_cast<uint64_t>(matByteSize(req.rgbBgr));
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        oss << std::setprecision(9);
+        oss << "{\"type\":\"pico_rgb_frame\",\"frame_id\":" << req.frameId
+            << ",\"timestamp_us\":" << req.captureTsUs
+            << ",\"rgb_width\":" << req.rgbBgr.cols
+            << ",\"rgb_height\":" << req.rgbBgr.rows
+            << ",\"rgb_size\":" << payloadBytesOut
+            << ",\"rgb_scale_x\":" << req.rgbScaleX
+            << ",\"rgb_scale_y\":" << req.rgbScaleY
+            << "}";
+        return oss.str();
+    }
+
+    bool sendRequest(const PicoHand2dRequest &req) {
+        if(childStdinFd_ < 0 || req.rgbBgr.empty()) {
+            return false;
+        }
+        uint64_t payloadBytes = 0;
+        const std::string json = buildRequestJson(req, payloadBytes);
+        uint8_t header[12];
+        putU32Le(header, static_cast<uint32_t>(json.size()));
+        putU64Le(header + 4, payloadBytes);
+        if(!writeAllFd(childStdinFd_, header, sizeof(header))) {
+            return false;
+        }
+        if(!json.empty() && !writeAllFd(childStdinFd_, json.data(), json.size())) {
+            return false;
+        }
+        return payloadBytes == 0 || writeAllFd(childStdinFd_, req.rgbBgr.data, matByteSize(req.rgbBgr));
+    }
+
+    static bool readNumberArray2(cJSON *arr, cv::Point2f &pt) {
+        if(!arr || !cJSON_IsArray(arr) || cJSON_GetArraySize(arr) < 2) {
+            return false;
+        }
+        auto *xItem = cJSON_GetArrayItem(arr, 0);
+        auto *yItem = cJSON_GetArrayItem(arr, 1);
+        if(!xItem || !yItem || !cJSON_IsNumber(xItem) || !cJSON_IsNumber(yItem)) {
+            return false;
+        }
+        pt = cv::Point2f(static_cast<float>(xItem->valuedouble), static_cast<float>(yItem->valuedouble));
+        return true;
+    }
+
+    bool readResponse(PicoHand2dResult &out) {
+        if(childStdoutFd_ < 0) {
+            return false;
+        }
+        uint8_t header[12];
+        if(!readAllFd(childStdoutFd_, header, sizeof(header))) {
+            return false;
+        }
+        const uint32_t jsonBytes = getU32Le(header);
+        const uint64_t payloadBytes = getU64Le(header + 4);
+        if(payloadBytes != 0) {
+            return false;
+        }
+        std::string json(jsonBytes, '\0');
+        if(jsonBytes > 0 && !readAllFd(childStdoutFd_, json.data(), jsonBytes)) {
+            return false;
+        }
+
+        cJSON *root = cJSON_Parse(json.c_str());
+        if(!root || !cJSON_IsObject(root)) {
+            if(root) {
+                cJSON_Delete(root);
+            }
+            return false;
+        }
+
+        out = PicoHand2dResult{};
+        auto *okItem = cJSON_GetObjectItemCaseSensitive(root, "ok");
+        out.valid = okItem && cJSON_IsBool(okItem) ? (okItem->valueint != 0) : false;
+        auto *frameIdItem = cJSON_GetObjectItemCaseSensitive(root, "frame_id");
+        if(frameIdItem && cJSON_IsNumber(frameIdItem)) {
+            out.frameId = static_cast<uint64_t>(frameIdItem->valuedouble);
+        }
+        auto *tsItem = cJSON_GetObjectItemCaseSensitive(root, "timestamp_us");
+        if(tsItem && cJSON_IsNumber(tsItem)) {
+            out.captureTsUs = static_cast<uint64_t>(tsItem->valuedouble);
+        }
+        auto *fpsItem = cJSON_GetObjectItemCaseSensitive(root, "fps");
+        if(fpsItem && cJSON_IsNumber(fpsItem)) {
+            out.workerFps = fpsItem->valuedouble;
+        }
+        auto *statusItem = cJSON_GetObjectItemCaseSensitive(root, "status");
+        if(statusItem && cJSON_IsString(statusItem) && statusItem->valuestring) {
+            out.status = statusItem->valuestring;
+        }
+        auto *visibleHandsItem = cJSON_GetObjectItemCaseSensitive(root, "visible_hands");
+        if(visibleHandsItem && cJSON_IsNumber(visibleHandsItem)) {
+            out.visibleHands = visibleHandsItem->valueint;
+        }
+        auto *handsItem = cJSON_GetObjectItemCaseSensitive(root, "hands");
+        if(handsItem && cJSON_IsArray(handsItem)) {
+            const int handCount = cJSON_GetArraySize(handsItem);
+            out.hands.reserve(static_cast<size_t>(handCount));
+            for(int hi = 0; hi < handCount; ++hi) {
+                auto *handObj = cJSON_GetArrayItem(handsItem, hi);
+                if(!handObj || !cJSON_IsObject(handObj)) {
+                    continue;
+                }
+                PicoHand2d hand;
+                auto *trackIdItem = cJSON_GetObjectItemCaseSensitive(handObj, "track_id");
+                if(trackIdItem && cJSON_IsNumber(trackIdItem)) {
+                    hand.trackId = trackIdItem->valueint;
+                }
+                auto *sideItem = cJSON_GetObjectItemCaseSensitive(handObj, "side");
+                if(sideItem && cJSON_IsString(sideItem) && sideItem->valuestring) {
+                    hand.side = sideItem->valuestring;
+                }
+                auto *scoreItem = cJSON_GetObjectItemCaseSensitive(handObj, "score");
+                if(scoreItem && cJSON_IsNumber(scoreItem)) {
+                    hand.score = static_cast<float>(scoreItem->valuedouble);
+                }
+                auto *visibleItem = cJSON_GetObjectItemCaseSensitive(handObj, "visible");
+                hand.visible = visibleItem && cJSON_IsBool(visibleItem) ? (visibleItem->valueint != 0) : false;
+                auto *countItem = cJSON_GetObjectItemCaseSensitive(handObj, "valid_joint_count");
+                if(countItem && cJSON_IsNumber(countItem)) {
+                    hand.validJointCount = countItem->valueint;
+                }
+                auto *bboxItem = cJSON_GetObjectItemCaseSensitive(handObj, "bbox");
+                if(bboxItem && cJSON_IsArray(bboxItem) && cJSON_GetArraySize(bboxItem) >= 4) {
+                    auto *x0 = cJSON_GetArrayItem(bboxItem, 0);
+                    auto *y0 = cJSON_GetArrayItem(bboxItem, 1);
+                    auto *x1 = cJSON_GetArrayItem(bboxItem, 2);
+                    auto *y1 = cJSON_GetArrayItem(bboxItem, 3);
+                    if(x0 && y0 && x1 && y1 && cJSON_IsNumber(x0) && cJSON_IsNumber(y0) && cJSON_IsNumber(x1) && cJSON_IsNumber(y1)) {
+                        hand.bbox = cv::Rect2f(static_cast<float>(x0->valuedouble),
+                                               static_cast<float>(y0->valuedouble),
+                                               static_cast<float>(x1->valuedouble - x0->valuedouble),
+                                               static_cast<float>(y1->valuedouble - y0->valuedouble));
+                    }
+                }
+
+                hand.joints.assign(21, PicoHand2dJoint{});
+                auto *jointsItem = cJSON_GetObjectItemCaseSensitive(handObj, "joints");
+                if(jointsItem && cJSON_IsArray(jointsItem)) {
+                    const int jointCount = cJSON_GetArraySize(jointsItem);
+                    for(int ji = 0; ji < jointCount; ++ji) {
+                        auto *jointObj = cJSON_GetArrayItem(jointsItem, ji);
+                        if(!jointObj || !cJSON_IsObject(jointObj)) {
+                            continue;
+                        }
+                        auto *indexItem = cJSON_GetObjectItemCaseSensitive(jointObj, "index");
+                        if(!indexItem || !cJSON_IsNumber(indexItem)) {
+                            continue;
+                        }
+                        const int jointIndex = indexItem->valueint;
+                        if(jointIndex < 0 || jointIndex >= 21) {
+                            continue;
+                        }
+                        PicoHand2dJoint joint;
+                        joint.jointIndex = jointIndex;
+                        auto *validItem = cJSON_GetObjectItemCaseSensitive(jointObj, "valid");
+                        joint.valid = validItem && cJSON_IsBool(validItem) ? (validItem->valueint != 0) : false;
+                        cv::Point2f pt;
+                        if(!readNumberArray2(cJSON_GetObjectItemCaseSensitive(jointObj, "xy"), pt)) {
+                            joint.valid = false;
+                        }
+                        joint.point = pt;
+                        auto *zItem = cJSON_GetObjectItemCaseSensitive(jointObj, "z");
+                        if(zItem && cJSON_IsNumber(zItem)) {
+                            joint.z = static_cast<float>(zItem->valuedouble);
+                        }
+                        joint.color = gtJointColorFor(hand.side, joint.jointIndex);
+                        hand.joints[static_cast<size_t>(jointIndex)] = joint;
+                    }
+                }
+                out.hands.push_back(std::move(hand));
+            }
+        }
+        if(out.visibleHands <= 0) {
+            for(const auto &hand : out.hands) {
+                if(hand.visible) {
+                    out.visibleHands++;
+                }
+            }
+        }
+
+        cJSON_Delete(root);
+        return true;
+    }
+#endif
+
+    void workerLoop() {
+#if defined(_WIN32)
+        std::lock_guard<std::mutex> lock(mtx_);
+        statusLine_ = "PICO hand2d unsupported on Windows";
+#else
+        for(;;) {
+            PicoHand2dRequest req;
+            {
+                std::unique_lock<std::mutex> lock(mtx_);
+                cv_.wait(lock, [&]() { return stopRequested_ || hasPendingRequest_; });
+                if(stopRequested_) {
+                    break;
+                }
+                req = std::move(pendingRequest_);
+                hasPendingRequest_ = false;
+            }
+
+            if(childPid_ <= 0 && !launchChild()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                continue;
+            }
+
+            PicoHand2dResult response;
+            if(!sendRequest(req) || !readResponse(response)) {
+                closeChild();
+                {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    latestResult_ = PicoHand2dResult{};
+                    latestResult_.status = "PICO hand2d worker disconnected";
+                    latestResult_.workerFps = smoothedFps_;
+                    statusLine_ = "PICO hand2d worker disconnected";
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(80));
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                const auto now = std::chrono::steady_clock::now();
+                if(lastResponseTime_.time_since_epoch().count() != 0) {
+                    const double dt = std::chrono::duration<double>(now - lastResponseTime_).count();
+                    if(dt > 1e-6) {
+                        const double instantFps = 1.0 / dt;
+                        smoothedFps_ = smoothedFps_ > 0.0 ? (0.8 * smoothedFps_ + 0.2 * instantFps) : instantFps;
+                    }
+                }
+                lastResponseTime_ = now;
+                response.workerFps = response.workerFps > 0.0 ? response.workerFps : smoothedFps_;
+                latestResult_ = std::move(response);
+                statusLine_ = latestResult_.status.empty() ? "PICO hand2d worker ready" : latestResult_.status;
+            }
+        }
+
+        closeChild();
+#endif
+    }
+
+    mutable std::mutex      mtx_;
+    std::condition_variable cv_;
+    bool                    stopRequested_ = false;
+    bool                    hasPendingRequest_ = false;
+    PicoHand2dRequest       pendingRequest_;
+    PicoHand2dResult        latestResult_;
+    std::string             statusLine_ = "PICO hand2d off";
     fs::path                scriptPath_;
     std::thread             workerThread_;
     double                  smoothedFps_ = 0.0;
@@ -3204,8 +3665,11 @@ private:
 
     void clearPicoRgbPreview() {
         picoRgbFrameSource_.close();
+        picoHand2dWorker_.stop();
         latestPicoRgbFrame_.release();
         latestPicoRgbVideoFrameIndex_ = -1;
+        lastPicoHand2dSubmitUs_ = 0;
+        lastPicoHand2dSubmitFrameIndex_ = -1;
         picoRgbStatusLine_ = "PICO RGB off";
     }
 
@@ -4254,6 +4718,42 @@ private:
         egoTagWorker_.submitLatest(std::move(req));
     }
 
+    void submitPicoHand2dIfNeeded(uint64_t nowUs) {
+        if(!wantsPicoRgbPreview()) {
+            return;
+        }
+        if(latestPicoRgbFrame_.empty() || latestPicoRgbVideoFrameIndex_ < 0) {
+            picoHand2dWorker_.setIdleStatus("PICO hand2d waiting RGB", true);
+            return;
+        }
+        if(picoHand2dWorker_.hasPendingRequest()) {
+            return;
+        }
+        if(lastPicoHand2dSubmitFrameIndex_ == latestPicoRgbVideoFrameIndex_) {
+            return;
+        }
+        if(lastPicoHand2dSubmitUs_ != 0 && nowUs > lastPicoHand2dSubmitUs_ && nowUs - lastPicoHand2dSubmitUs_ < 66000) {
+            return;
+        }
+
+        PicoHand2dRequest req;
+        req.frameId = static_cast<uint64_t>(std::max(0, latestPicoRgbVideoFrameIndex_));
+        req.captureTsUs = nowUs;
+        req.rgbBgr = resizeMatKeepingAspect(latestPicoRgbFrame_, picoHand2dWorkerMaxImageSide_, cv::INTER_AREA, req.rgbScaleX, req.rgbScaleY);
+        if(req.rgbBgr.empty() || req.rgbBgr.type() != CV_8UC3) {
+            picoHand2dWorker_.setIdleStatus("PICO hand2d invalid RGB", true);
+            return;
+        }
+        if(!req.rgbBgr.isContinuous()) {
+            req.rgbBgr = req.rgbBgr.clone();
+        }
+
+        picoHand2dWorker_.setScriptPath(resolveGtWorkerScriptPath());
+        picoHand2dWorker_.submitLatest(std::move(req));
+        lastPicoHand2dSubmitUs_ = nowUs;
+        lastPicoHand2dSubmitFrameIndex_ = latestPicoRgbVideoFrameIndex_;
+    }
+
     void updatePicoRgbPreviewIfNeeded(uint64_t frameId) {
         if(!wantsPicoRgbPreview()) {
             return;
@@ -4274,6 +4774,7 @@ private:
         picoRgbStatusLine_ = status.empty()
                             ? ("PICO RGB live frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
                             : status;
+        submitPicoHand2dIfNeeded(frameId);
     }
 
     std::string buildGtStatusLine() const {
@@ -5781,6 +6282,67 @@ private:
         return typeChanged;
     }
 
+    void drawPicoHand2dOverlay(cv::Mat &img, const PicoHand2dResult &result) const {
+        if(img.empty() || !result.valid || result.hands.empty()) {
+            return;
+        }
+        static const std::array<std::pair<int, int>, 20> edges = {
+            std::make_pair(0, 1), std::make_pair(1, 2), std::make_pair(2, 3), std::make_pair(3, 4),
+            std::make_pair(0, 5), std::make_pair(5, 6), std::make_pair(6, 7), std::make_pair(7, 8),
+            std::make_pair(5, 9), std::make_pair(9, 10), std::make_pair(10, 11), std::make_pair(11, 12),
+            std::make_pair(9, 13), std::make_pair(13, 14), std::make_pair(14, 15), std::make_pair(15, 16),
+            std::make_pair(13, 17), std::make_pair(17, 18), std::make_pair(18, 19), std::make_pair(19, 20)
+        };
+
+        auto validPoint = [&](const PicoHand2dJoint &joint) {
+            return joint.valid
+                   && std::isfinite(joint.point.x)
+                   && std::isfinite(joint.point.y)
+                   && joint.point.x >= -20.0f
+                   && joint.point.y >= -20.0f
+                   && joint.point.x <= static_cast<float>(img.cols + 20)
+                   && joint.point.y <= static_cast<float>(img.rows + 20);
+        };
+        auto toPoint = [&](const PicoHand2dJoint &joint) {
+            return cv::Point(std::max(0, std::min(img.cols - 1, static_cast<int>(std::lround(joint.point.x)))),
+                             std::max(0, std::min(img.rows - 1, static_cast<int>(std::lround(joint.point.y)))));
+        };
+
+        for(const auto &hand: result.hands) {
+            if(!hand.visible || hand.joints.size() < 21) {
+                continue;
+            }
+            const cv::Scalar skeletonColor = toScalar(gtSkeletonColorForSide(hand.side));
+            for(const auto &edge: edges) {
+                const auto &a = hand.joints[static_cast<size_t>(edge.first)];
+                const auto &b = hand.joints[static_cast<size_t>(edge.second)];
+                if(validPoint(a) && validPoint(b)) {
+                    cv::line(img, toPoint(a), toPoint(b), skeletonColor, 2, cv::LINE_AA);
+                }
+            }
+            for(const auto &joint: hand.joints) {
+                if(validPoint(joint)) {
+                    const cv::Point pt = toPoint(joint);
+                    cv::circle(img, pt, joint.jointIndex == 0 ? 5 : 3, toScalar(joint.color), cv::FILLED, cv::LINE_AA);
+                    cv::circle(img, pt, joint.jointIndex == 0 ? 6 : 4, cv::Scalar(20, 20, 20), 1, cv::LINE_AA);
+                }
+            }
+            if(hand.bbox.width > 1.0f && hand.bbox.height > 1.0f) {
+                cv::Rect box(cv::Point(std::max(0, static_cast<int>(std::floor(hand.bbox.x))),
+                                       std::max(0, static_cast<int>(std::floor(hand.bbox.y)))),
+                             cv::Point(std::min(img.cols - 1, static_cast<int>(std::ceil(hand.bbox.x + hand.bbox.width))),
+                                       std::min(img.rows - 1, static_cast<int>(std::ceil(hand.bbox.y + hand.bbox.height)))));
+                if(box.width > 0 && box.height > 0) {
+                    cv::rectangle(img, box, skeletonColor, 1, cv::LINE_AA);
+                    if(!hand.side.empty()) {
+                        cv::putText(img, hand.side, cv::Point(box.x, std::max(16, box.y - 6)), cv::FONT_HERSHEY_DUPLEX,
+                                    0.55, skeletonColor, 1, cv::LINE_AA);
+                    }
+                }
+            }
+        }
+    }
+
     bool drawImagePanel(cv::Mat &canvas, CvMouseState &ms) {
         cv::rectangle(canvas, layout_.imgRect, cv::Scalar(16, 16, 16), cv::FILLED);
         cv::rectangle(canvas, layout_.imgRect, cv::Scalar(60, 60, 60), 1);
@@ -5814,9 +6376,12 @@ private:
             const int targetW = std::max(1, layout_.imgRect.width - 20);
             const cv::Mat &img = latestPicoRgbFrame_;
             if(!img.empty()) {
-                const int targetH = std::max(10, static_cast<int>(static_cast<double>(img.rows) * (static_cast<double>(targetW) / static_cast<double>(img.cols))));
+                cv::Mat overlay = img.clone();
+                const PicoHand2dResult hand2dResult = picoHand2dWorker_.latestResult();
+                drawPicoHand2dOverlay(overlay, hand2dResult);
+                const int targetH = std::max(10, static_cast<int>(static_cast<double>(overlay.rows) * (static_cast<double>(targetW) / static_cast<double>(overlay.cols))));
                 cv::Mat resized;
-                cv::resize(img, resized, cv::Size(targetW, targetH));
+                cv::resize(overlay, resized, cv::Size(targetW, targetH));
                 totalH += 24 + targetH + 16;
                 if(y + 24 + targetH >= contentTop && y <= layout_.imgRect.y + layout_.imgRect.height) {
                     const std::string label = latestPicoRgbVideoFrameIndex_ >= 0
@@ -5831,17 +6396,27 @@ private:
                         resized.copyTo(canvas(roi));
                     }
                     cv::rectangle(canvas, roi, cv::Scalar(80, 80, 80), 1);
-                    if(!picoRgbStatusLine_.empty() && roi.y + roi.height + 18 <= layout_.imgRect.y + layout_.imgRect.height) {
-                        cv::putText(canvas, picoRgbStatusLine_, cv::Point(layout_.imgRect.x + 12, roi.y + roi.height + 16),
+                    std::string status = picoRgbStatusLine_;
+                    if(!hand2dResult.status.empty()) {
+                        status += status.empty() ? hand2dResult.status : (" | " + hand2dResult.status);
+                    }
+                    if(!status.empty() && roi.y + roi.height + 18 <= layout_.imgRect.y + layout_.imgRect.height) {
+                        status = ellipsizeTextToWidth(status, layout_.imgRect.width - 24, cv::FONT_HERSHEY_DUPLEX, 0.45, 1);
+                        cv::putText(canvas, status, cv::Point(layout_.imgRect.x + 12, roi.y + roi.height + 16),
                                     cv::FONT_HERSHEY_DUPLEX, 0.45, cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
                     }
                 }
             }
             else {
-                const std::string status = picoRgbStatusLine_.empty() ? "PICO RGB waiting for frames" : picoRgbStatusLine_;
+                std::string status = picoRgbStatusLine_.empty() ? "PICO RGB waiting for frames" : picoRgbStatusLine_;
+                const std::string handStatus = picoHand2dWorker_.statusLine();
+                if(!handStatus.empty()) {
+                    status += " | " + handStatus;
+                }
                 totalH += 80;
                 cv::putText(canvas, "PICO ego RGB", cv::Point(layout_.imgRect.x + 12, y + 22), cv::FONT_HERSHEY_DUPLEX, 0.62,
                             cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+                status = ellipsizeTextToWidth(status, layout_.imgRect.width - 24, cv::FONT_HERSHEY_DUPLEX, 0.5, 1);
                 cv::putText(canvas, status, cv::Point(layout_.imgRect.x + 12, y + 54), cv::FONT_HERSHEY_DUPLEX, 0.5,
                             cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
             }
@@ -6029,6 +6604,7 @@ private:
 private:
     static constexpr int gtWorkerMaxImageSide_ = 384;
     static constexpr int egoTagWorkerMaxImageSide_ = 640;
+    static constexpr int picoHand2dWorkerMaxImageSide_ = 640;
     static constexpr size_t kMaxAlignedFrameQueueSize_ = 8;
 
     AppConfig cfg_;
@@ -6051,6 +6627,7 @@ private:
     std::unordered_map<std::string, ExtrinsicCamToWorld> depthExtrinsicsCamToWorld_;
     std::unordered_map<std::string, ExtrinsicCamToWorld> rgbExtrinsicsCamToWorld_;
     LiveGtJointWorker gtWorker_;
+    LivePicoHand2dWorker picoHand2dWorker_;
     LiveEgoAprilTagWorker egoTagWorker_;
     EgoRecorder ownedEgoRecorder_;
     EgoRecorder &egoRecorder_;
@@ -6093,6 +6670,8 @@ private:
     LivePicoRgbFrameSource picoRgbFrameSource_;
     cv::Mat latestPicoRgbFrame_;
     int latestPicoRgbVideoFrameIndex_ = -1;
+    uint64_t lastPicoHand2dSubmitUs_ = 0;
+    int lastPicoHand2dSubmitFrameIndex_ = -1;
     std::string picoRgbStatusLine_ = "PICO RGB off";
 };
 

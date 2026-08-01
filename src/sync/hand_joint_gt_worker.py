@@ -10,8 +10,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import mediapipe as mp
 import numpy as np
+
+try:
+    import mediapipe as mp
+except ModuleNotFoundError:
+    mp = None
 
 
 HEADER = struct.Struct("<IQ")
@@ -227,6 +231,8 @@ class HandGtWorker:
 
     @staticmethod
     def _create_hands():
+        if mp is None:
+            raise RuntimeError("mediapipe is not installed")
         return mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
@@ -909,6 +915,90 @@ class HandGtWorker:
             "hands": hands,
         }
 
+    def process_pico_rgb_frame(self, meta: Dict, payload: bytes) -> Dict:
+        self._frame_index += 1
+        frame_timestamp_us = int(meta.get("timestamp_us", 0))
+        rgb_width = int(meta.get("rgb_width", 0))
+        rgb_height = int(meta.get("rgb_height", 0))
+        rgb_size = int(meta.get("rgb_size", len(payload)))
+        rgb_scale_x = float(meta.get("rgb_scale_x", 1.0))
+        rgb_scale_y = float(meta.get("rgb_scale_y", 1.0))
+        if rgb_width <= 0 or rgb_height <= 0 or rgb_size <= 0:
+            raise ValueError("invalid pico rgb frame shape")
+        if len(payload) < rgb_size:
+            raise ValueError("short pico rgb payload")
+
+        bgr = np.frombuffer(payload, dtype=np.uint8, count=rgb_size).reshape((rgb_height, rgb_width, 3))
+        rgb = np.ascontiguousarray(bgr[:, :, ::-1])
+        hands_detector = self._hands_for_camera("pico_rgb")
+        result = hands_detector.process(rgb)
+        landmarks_list = result.multi_hand_landmarks or []
+        handedness_list = result.multi_handedness or []
+
+        hands = []
+        for idx, hand_landmarks in enumerate(landmarks_list[:MAX_TRACKS]):
+            side = ""
+            score = 0.0
+            if idx < len(handedness_list) and handedness_list[idx].classification:
+                cls = handedness_list[idx].classification[0]
+                side = normalize_handedness(cls.label)
+                score = float(cls.score)
+
+            joints = []
+            xs = []
+            ys = []
+            valid_count = 0
+            for joint_index, lm in enumerate(hand_landmarks.landmark[:MAX_JOINTS]):
+                valid = (-LANDMARK_NORMALIZED_MARGIN) <= lm.x <= (1.0 + LANDMARK_NORMALIZED_MARGIN) and (-LANDMARK_NORMALIZED_MARGIN) <= lm.y <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
+                x = float(lm.x) * float(rgb_width) * rgb_scale_x
+                y = float(lm.y) * float(rgb_height) * rgb_scale_y
+                if valid:
+                    xs.append(x)
+                    ys.append(y)
+                    valid_count += 1
+                joints.append(
+                    {
+                        "index": int(joint_index),
+                        "valid": bool(valid),
+                        "xy": [x, y],
+                        "z": float(lm.z),
+                    }
+                )
+
+            bbox = [0.0, 0.0, 0.0, 0.0]
+            if xs and ys:
+                bbox = [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
+            hands.append(
+                {
+                    "track_id": int(idx),
+                    "side": side,
+                    "score": float(score),
+                    "visible": bool(valid_count >= MIN_DETECTION_LANDMARKS),
+                    "valid_joint_count": int(valid_count),
+                    "bbox": bbox,
+                    "joints": joints,
+                }
+            )
+
+        now = time.perf_counter()
+        if self._last_time is not None:
+            dt = max(1e-6, now - self._last_time)
+            instant = 1.0 / dt
+            self._smoothed_fps = instant if self._smoothed_fps <= 0.0 else (0.8 * self._smoothed_fps + 0.2 * instant)
+        self._last_time = now
+
+        visible_hands = sum(1 for hand in hands if hand["visible"])
+        status = f"PICO hand2d {visible_hands} hand(s)" if visible_hands > 0 else "PICO hand2d no hands"
+        return {
+            "ok": True,
+            "frame_id": int(meta.get("frame_id", 0)),
+            "timestamp_us": frame_timestamp_us,
+            "fps": float(self._smoothed_fps),
+            "status": status,
+            "visible_hands": int(visible_hands),
+            "hands": hands,
+        }
+
 
 def main():
     worker = HandGtWorker()
@@ -921,7 +1011,10 @@ def main():
                 write_message({"ok": True, "status": "shutdown", "visible_hands": 0, "hands": []})
                 break
             try:
-                response = worker.process_frame_batch(meta, payload or b"")
+                if meta.get("type") == "pico_rgb_frame":
+                    response = worker.process_pico_rgb_frame(meta, payload or b"")
+                else:
+                    response = worker.process_frame_batch(meta, payload or b"")
             except Exception as exc:  # noqa: BLE001
                 response = {
                     "ok": False,
