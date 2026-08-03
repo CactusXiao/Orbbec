@@ -881,7 +881,7 @@ class JobService:
         payload = self._segment_label_payload(segment, episode or {}, artifacts)
         resolved_data_path = self.resolve_data_path(
             str(payload.get("episode_base_uri") or payload.get("data_uri") or ""),
-            str((episode or {}).get("local_capture_path") or ""),
+            "",
         )
         if resolved_data_path:
             payload["resolved_data_path"] = resolved_data_path

@@ -414,7 +414,10 @@ collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
 `subject_id` as the operator hint. NAS/local path mapping is owned by the
 backend: it resolves `data_uri` into `resolved_data_path` in the leased segment
 payload. For non-virtual NAS prefixes, configure the backend with
-`ORBBEC_URI_MOUNTS_JSON`.
+`ORBBEC_URI_MOUNTS_JSON`. For uploaded episodes, segment label payloads resolve
+the uploaded `data_uri` mount rather than the original collection
+`local_capture_path`, so human `manual_2d` outputs are written under the NAS
+episode directory.
 
 For local smoke tests, a payload with
 `"data_uri":"local:///Users/cactusxiao/data/S001/pick_object/episode_000456"`

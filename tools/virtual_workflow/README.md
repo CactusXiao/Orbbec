@@ -9,19 +9,25 @@ modify the existing `task_backend` or `label` modules.
 
 ## What It Simulates
 
-- A local NAS, stored under `.virtual_nas` by default, exposed as
-  `nas://orbbec-virtual/...`.
+- A local NAS, stored under `task_backend_state/virtual_nas` by default,
+  exposed as `nas://orbbec-virtual/...`. This matches the backend's default
+  virtual NAS mount.
 - Upload workers that copy or materialize a captured episode into the virtual
   NAS. Upload completion marks episodes `uploaded`; pushing auto-label is a
   separate dashboard/API action.
-- Auto-label workers that write placeholder 2D prediction `.npy` files, then
-  let the backend enqueue an episode-level `mano_opt` job.
-- MANO workers that write placeholder episode MANO outputs and segment patch
-  outputs.
-- QC workers that randomly pass or fail. Failed QC lets the backend create a
-  set of `pending_manual` segments so the label frontend can lease them.
-- Optional manual workers that complete queued segments with placeholder
-  `manual_2d` artifacts.
+- Auto-label workers that write low-precision `(2,21,2)` prediction `.npy`
+  files. They use the interaction handGT-style lightweight MediaPipe path when
+  those optional libraries are installed, and fall back to a deterministic
+  visible hand skeleton otherwise.
+- MANO workers that write low-precision episode MANO outputs from `pred_2d` and
+  segment patch outputs from real `manual_2d`.
+- QC workers that pass or fail with `--qc-fail-rate`, default `0.5`. Failed QC
+  writes `qc/qc_report.json` and returns random 2-3 failed frame ranges, each
+  10-20 frames long when the episode is long enough.
+
+Manual labeling is not simulated by this worker. Failed segments must be opened
+from the real Label entry in the main menu, saved by the label frontend into
+`manual_2d/segments/<segment_id>`, and then completed by that frontend.
 
 ## Start Backend
 
@@ -51,17 +57,23 @@ python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
 The label frontend does not need a mount mapping. It requests the next backend
 task, and the backend returns a resolved local path for `nas://orbbec-virtual`.
 
-## Simulate Capture To QC
+## Real Collection And Label Flow
 
-Seed upload jobs from the same label JSONL:
+Start the backend, then open the existing main-menu `Collection` page/app and
+capture an episode normally. Collection confirm creates an `upload` job.
+
+Run the virtual upload worker against the same NAS root and URI prefix as the
+backend:
 
 ```bash
-python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-captured \
-  --jsonl label/task.jsonl \
-  --limit 1
+python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
+  --workers upload \
+  --max-iterations 20 \
+  --stop-after-idle-rounds 3
 ```
 
-Run the virtual upload, auto-label, and QC workers:
+Enable the controlled stages, push uploaded episodes into auto-label, and run
+the virtual auto-label, MANO, and QC workers:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/auto_label/enable \
@@ -73,42 +85,60 @@ curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/qc/enable \
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_segment/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
 
-python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers upload \
-  --max-iterations 20 \
-  --stop-after-idle-rounds 3
-
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
   -H 'Content-Type: application/json' -d '{"scope":"all","pushed_by":"virtual_workflow"}'
 
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
   --workers auto-label,mano-opt,qc \
-  --qc-fail-rate 0.8 \
+  --qc-fail-rate 0.5 \
   --max-iterations 20 \
   --stop-after-idle-rounds 3
 ```
 
-`default` workers include `upload`, `auto-label`, and `qc`; use it only after
-the uploaded episodes have already been pushed into `auto_label`. Failed QC
-episodes are left in the manual label queue for the label frontend to pick up.
+If QC fails, open the existing main-menu `Label` page/app. The label frontend
+leases the failed segments from the backend, opens the backend-resolved NAS
+episode path, and writes:
 
-## Complete Manual Labels Virtually
+```text
+manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
+```
 
-To drain queued manual label jobs without opening the real label UI:
+After the Label frontend completes a segment, run the virtual MANO worker again
+to consume the real `manual_2d` files and write the segment patch:
 
 ```bash
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers manual-label \
+  --workers mano-opt \
   --max-iterations 20 \
   --stop-after-idle-rounds 3
 ```
 
-Use `--workers all` if you want one process to run upload, auto-label, QC, and
-manual label simulation together.
+Repeat Label completion and `mano-opt` until the episode finalizes. The backend
+keeps the final NAS source map at:
+
+```text
+workflow/final_3d_sources.json
+```
+
+`default` and `all` workers both include only `upload`, `auto-label`,
+`mano-opt`, and `qc`; manual labeling stays in the real Label frontend.
+
+## Simulate Captured Upload Jobs
+
+For smoke tests without opening Collection, seed upload jobs from a label JSONL:
+
+```bash
+python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-captured \
+  --jsonl label/task.jsonl \
+  --limit 1
+```
+
+Then run the same virtual worker commands above.
 
 ## Useful Options
 
-- `--nas-root PATH`: local directory for the virtual NAS.
+- `--nas-root PATH`: local directory for the virtual NAS. It must match the
+  backend mount for `--nas-uri-prefix`.
 - `--nas-uri-prefix URI`: NAS URI prefix, default `nas://orbbec-virtual`.
 - `seed-label --frames-per-job N`: split one JSONL task into frame batches.
 - `seed-label --max-jobs N`: seed only the first N manual-label batches.

@@ -26,9 +26,52 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
+try:
+    import mediapipe as mp
+except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
+    mp = None
+
+try:
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
+    np = None
+
+try:
+    from PIL import Image
+except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
+    Image = None
+
 
 Json = Dict[str, Any]
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
+_HAND_COUNT = 2
+_JOINT_COUNT = 21
+_FALLBACK_IMAGE_SIZE = (640, 480)
+_HAND_TEMPLATE = (
+    (0.00, 0.00),
+    (-0.18, -0.14),
+    (-0.34, -0.25),
+    (-0.48, -0.34),
+    (-0.62, -0.42),
+    (-0.16, -0.38),
+    (-0.19, -0.61),
+    (-0.22, -0.82),
+    (-0.24, -1.02),
+    (0.00, -0.43),
+    (0.00, -0.70),
+    (0.00, -0.94),
+    (0.00, -1.16),
+    (0.16, -0.38),
+    (0.21, -0.62),
+    (0.26, -0.83),
+    (0.31, -1.02),
+    (0.30, -0.28),
+    (0.43, -0.47),
+    (0.54, -0.64),
+    (0.64, -0.80),
+)
+MIN_DETECTION_LANDMARKS = 6
+LANDMARK_NORMALIZED_MARGIN = 0.18
 
 
 class BackendError(RuntimeError):
@@ -46,6 +89,15 @@ def now_ms() -> int:
 def clean_id(value: str, fallback: str = "item") -> str:
     text = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip()).strip("_").lower()
     return text or fallback
+
+
+def normalize_handedness(label: str) -> str:
+    # Match interaction handGT: MediaPipe handedness is mirrored/selfie-oriented.
+    if label == "Left":
+        return "Right"
+    if label == "Right":
+        return "Left"
+    return label
 
 
 def local_uri_from_path(path: Path) -> str:
@@ -292,15 +344,292 @@ def write_placeholder_rgb_image(path: Path) -> None:
         write_placeholder_ppm(path)
 
 
-def write_placeholder_npy(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    shape = (2, 21, 2)
-    header = "{'descr': '<f4', 'fortran_order': False, 'shape': (2, 21, 2), }"
+def _npy_header(shape: Tuple[int, ...]) -> bytes:
+    header = f"{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}"
     header_bytes = header.encode("latin1")
     pad = 16 - ((10 + len(header_bytes) + 1) % 16)
-    full_header = header_bytes + b" " * pad + b"\n"
-    data = struct.pack("<" + "f" * (shape[0] * shape[1] * shape[2]), *([-1.0] * 84))
+    return header_bytes + b" " * pad + b"\n"
+
+
+def write_float32_npy(path: Path, values: Sequence[float], shape: Tuple[int, ...] = (_HAND_COUNT, _JOINT_COUNT, 2)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    expected = 1
+    for dim in shape:
+        expected *= int(dim)
+    clean_values = [float(value) for value in values]
+    if len(clean_values) != expected:
+        raise ValueError(f"npy value count mismatch: expected {expected}, got {len(clean_values)}")
+    full_header = _npy_header(shape)
+    data = struct.pack("<" + "f" * expected, *clean_values)
     path.write_bytes(b"\x93NUMPY" + bytes([1, 0]) + struct.pack("<H", len(full_header)) + full_header + data)
+
+
+def _stable_rng(*parts: Any) -> random.Random:
+    seed = zlib.crc32("|".join(str(part) for part in parts).encode("utf-8")) & 0xFFFFFFFF
+    return random.Random(seed)
+
+
+def read_image_size(path: Path) -> Optional[Tuple[int, int]]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return struct.unpack(">II", data[16:24])
+    if data.startswith(b"P6") or data.startswith(b"P3"):
+        tokens: List[bytes] = []
+        token = bytearray()
+        in_comment = False
+        for byte in data[2:256]:
+            if in_comment:
+                if byte in b"\r\n":
+                    in_comment = False
+                continue
+            if byte == ord("#"):
+                in_comment = True
+                continue
+            if chr(byte).isspace():
+                if token:
+                    tokens.append(bytes(token))
+                    token.clear()
+                    if len(tokens) >= 2:
+                        break
+                continue
+            token.append(byte)
+        if len(tokens) >= 2:
+            try:
+                return int(tokens[0]), int(tokens[1])
+            except ValueError:
+                return None
+    if data.startswith(b"\xff\xd8"):
+        idx = 2
+        while idx + 9 < len(data):
+            if data[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = data[idx + 1]
+            idx += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if idx + 2 > len(data):
+                return None
+            length = struct.unpack(">H", data[idx:idx + 2])[0]
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF} and length >= 7:
+                height, width = struct.unpack(">HH", data[idx + 3:idx + 7])
+                return width, height
+            idx += max(2, length)
+    return None
+
+
+def find_rgb_frame_path(episode_dir: Path, cam: str, frame: int, rgb_path_template: str = "") -> Optional[Path]:
+    candidates: List[Path] = []
+    if rgb_path_template:
+        try:
+            candidates.append(episode_dir / rgb_path_template.format(camera=cam, frame=int(frame)))
+        except Exception:
+            pass
+    for suffix in (".png", ".jpg", ".jpeg", ".ppm"):
+        candidates.append(episode_dir / str(cam) / "RGB" / f"{int(frame):05d}{suffix}")
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    rgb_dir = episode_dir / str(cam) / "RGB"
+    if rgb_dir.exists() and rgb_dir.is_dir():
+        prefix = f"{int(frame):05d}."
+        for child in sorted(rgb_dir.iterdir()):
+            if child.is_file() and child.name.startswith(prefix):
+                return child
+    return None
+
+
+def image_size_for_frame(episode_dir: Path, cam: str, frame: int, rgb_path_template: str = "") -> Tuple[int, int]:
+    path = find_rgb_frame_path(episode_dir, cam, frame, rgb_path_template)
+    if path is not None:
+        size = read_image_size(path)
+        if size is not None and size[0] > 0 and size[1] > 0:
+            return size
+    return _FALLBACK_IMAGE_SIZE
+
+
+def virtual_hand_values(cam: str, frame: int, width: int, height: int, variant: str = "pred") -> List[float]:
+    rng = _stable_rng(cam, frame, variant)
+    scale = max(18.0, min(float(width), float(height)) * 0.22)
+    centers = ((0.40 * width, 0.70 * height), (0.62 * width, 0.70 * height))
+    variant_noise = {"pred": 3.5, "mano": 2.0, "manual": 1.0}.get(variant, 2.5)
+    values: List[float] = []
+    for hand_idx, center in enumerate(centers):
+        mirror = -1.0 if hand_idx == 1 else 1.0
+        drift_x = ((int(frame) % 17) - 8) * 0.7
+        drift_y = ((int(frame) % 11) - 5) * 0.45
+        for joint_idx, (tx, ty) in enumerate(_HAND_TEMPLATE):
+            x = center[0] + mirror * tx * scale + drift_x + rng.uniform(-variant_noise, variant_noise)
+            y = center[1] + ty * scale + drift_y + rng.uniform(-variant_noise, variant_noise)
+            # Quantize a little so the fixture looks like low-precision hand GT.
+            quant = 4.0 if variant == "pred" else 2.0
+            x = round(max(0.0, min(float(width - 1), x)) / quant) * quant
+            y = round(max(0.0, min(float(height - 1), y)) / quant) * quant
+            values.extend((x, y))
+    return values
+
+
+def write_virtual_hand_npy(
+    path: Path,
+    *,
+    cam: str = "00",
+    frame: int = 0,
+    width: int = _FALLBACK_IMAGE_SIZE[0],
+    height: int = _FALLBACK_IMAGE_SIZE[1],
+    variant: str = "pred",
+) -> None:
+    write_float32_npy(path, virtual_hand_values(cam, frame, width, height, variant))
+
+
+def write_frame_hand_npy(
+    path: Path,
+    episode_dir: Path,
+    cam: str,
+    frame: int,
+    *,
+    rgb_path_template: str = "",
+    variant: str = "pred",
+) -> None:
+    width, height = image_size_for_frame(episode_dir, cam, frame, rgb_path_template)
+    write_virtual_hand_npy(path, cam=cam, frame=frame, width=width, height=height, variant=variant)
+
+
+def write_placeholder_npy(path: Path) -> None:
+    write_virtual_hand_npy(path)
+
+
+class InteractionHandGtDetector:
+    def __init__(self):
+        self.available = mp is not None and np is not None and Image is not None
+        self._hands = None
+        if self.available:
+            self._hands = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                model_complexity=0,
+                min_detection_confidence=0.25,
+                min_tracking_confidence=0.25,
+            )
+
+    def close(self) -> None:
+        hands = self._hands
+        self._hands = None
+        if hands is not None:
+            close = getattr(hands, "close", None)
+            if close is not None:
+                close()
+
+    def detect_values(
+        self,
+        episode_dir: Path,
+        cam: str,
+        frame: int,
+        *,
+        rgb_path_template: str = "",
+    ) -> Optional[List[float]]:
+        if self._hands is None or np is None or Image is None:
+            return None
+        rgb_path = find_rgb_frame_path(episode_dir, cam, int(frame), rgb_path_template)
+        if rgb_path is None:
+            return None
+        try:
+            with Image.open(rgb_path) as image:
+                rgb = np.asarray(image.convert("RGB"))
+        except Exception:
+            return None
+        if rgb.ndim != 3 or rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
+            return None
+
+        result = self._hands.process(rgb)
+        landmarks_list = result.multi_hand_landmarks or []
+        handedness_list = result.multi_handedness or []
+        if not landmarks_list:
+            return None
+
+        width = float(rgb.shape[1])
+        height = float(rgb.shape[0])
+        values = [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
+        used_slots = set()
+        detections: List[Tuple[float, int, List[Tuple[float, float]]]] = []
+        for idx, hand_landmarks in enumerate(landmarks_list[:_HAND_COUNT]):
+            side = ""
+            score = 0.0
+            if idx < len(handedness_list) and handedness_list[idx].classification:
+                cls = handedness_list[idx].classification[0]
+                side = normalize_handedness(str(cls.label))
+                score = float(cls.score)
+
+            points: List[Tuple[float, float]] = []
+            valid_count = 0
+            for lm in hand_landmarks.landmark[:_JOINT_COUNT]:
+                valid = (
+                    (-LANDMARK_NORMALIZED_MARGIN) <= float(lm.x) <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
+                    and (-LANDMARK_NORMALIZED_MARGIN) <= float(lm.y) <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
+                )
+                if valid:
+                    valid_count += 1
+                    points.append((float(lm.x) * width, float(lm.y) * height))
+                else:
+                    points.append((-1.0, -1.0))
+            if valid_count < MIN_DETECTION_LANDMARKS:
+                continue
+
+            preferred_slot = 0 if side == "Left" else 1 if side == "Right" else idx
+            detections.append((score, preferred_slot, points))
+
+        for _score, preferred_slot, points in sorted(detections, key=lambda item: item[0], reverse=True):
+            slot = preferred_slot
+            if slot in used_slots:
+                free = [candidate for candidate in range(_HAND_COUNT) if candidate not in used_slots]
+                if not free:
+                    continue
+                slot = free[0]
+            used_slots.add(slot)
+            base_index = slot * _JOINT_COUNT * 2
+            for joint_idx, (x, y) in enumerate(points[:_JOINT_COUNT]):
+                values[base_index + joint_idx * 2] = float(x)
+                values[base_index + joint_idx * 2 + 1] = float(y)
+        return values if used_slots else None
+
+
+def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDetector:
+    detector = getattr(args, "_interaction_hand_gt_detector", None)
+    if detector is None:
+        detector = InteractionHandGtDetector()
+        setattr(args, "_interaction_hand_gt_detector", detector)
+        print_event(
+            "interaction_handgt",
+            available=bool(detector.available),
+            mode="mediapipe_lightweight" if detector.available else "fallback_low_precision",
+        )
+    return detector
+
+
+def copy_or_write_projected_npy(
+    out_path: Path,
+    source_path: Optional[Path],
+    episode_dir: Path,
+    cam: str,
+    frame: int,
+    *,
+    rgb_path_template: str = "",
+    variant: str = "mano",
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if source_path is not None and source_path.exists() and source_path.is_file():
+        shutil.copyfile(source_path, out_path)
+        return
+    write_frame_hand_npy(out_path, episode_dir, cam, frame, rgb_path_template=rgb_path_template, variant=variant)
+
+
+def copy_required_projected_npy(out_path: Path, source_path: Path, cam: str, frame: int) -> None:
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(f"manual_2d npy is required for segment MANO camera={cam} frame={frame}: {source_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_path, out_path)
 
 
 class NasSimulator:
@@ -325,6 +654,7 @@ class NasSimulator:
         *,
         copy_source: bool = False,
         max_frames: int = 0,
+        materialize_predictions: bool = True,
     ) -> str:
         uri = self.task_uri(task.subject, task.task, task.episode)
         dst = self.local_path_for_uri(uri)
@@ -339,6 +669,7 @@ class NasSimulator:
             prediction_dir=task.prediction_dir,
             source=task.episode_dir if copy_source else None,
             max_frames=max_frames,
+            materialize_predictions=materialize_predictions,
         )
         return uri
 
@@ -349,6 +680,7 @@ class NasSimulator:
         *,
         copy_source: bool = False,
         max_frames: int = 0,
+        materialize_predictions: bool = True,
     ) -> str:
         episode = episode or {}
         episode_id = str(payload.get("episode_id") or episode.get("episode_id") or f"episode_{uuid.uuid4().hex[:8]}")
@@ -371,6 +703,7 @@ class NasSimulator:
             prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
             source=source,
             max_frames=max_frames,
+            materialize_predictions=materialize_predictions,
         )
         return uri
 
@@ -387,6 +720,7 @@ class NasSimulator:
         prediction_dir: str,
         source: Optional[Path],
         max_frames: int,
+        materialize_predictions: bool,
     ) -> None:
         if source and source.exists():
             if dst.exists():
@@ -407,9 +741,10 @@ class NasSimulator:
                 rgb_path = dst / rel
                 if not rgb_path.exists():
                     write_placeholder_rgb_image(rgb_path)
-                pred_path = dst / prediction_dir / cam / f"{int(frame):05d}.npy"
-                if not pred_path.exists():
-                    write_placeholder_npy(pred_path)
+                if materialize_predictions:
+                    pred_path = dst / prediction_dir / cam / f"{int(frame):05d}.npy"
+                    if not pred_path.exists():
+                        write_frame_hand_npy(pred_path, dst, cam, int(frame), rgb_path_template=rgb_path_template, variant="pred")
         metadata = {
             "virtual_nas": True,
             "subject_id": subject,
@@ -422,21 +757,34 @@ class NasSimulator:
         }
         (dst / "virtual_episode.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    def write_prediction_artifact(self, data_uri: str, cameras: Sequence[str], frames: Sequence[int], prediction_dir: str = "pred_2d") -> str:
+    def write_prediction_artifact(
+        self,
+        data_uri: str,
+        cameras: Sequence[str],
+        frames: Sequence[int],
+        prediction_dir: str = "pred_2d",
+        rgb_path_template: str = "",
+        detector: Optional[InteractionHandGtDetector] = None,
+    ) -> str:
         base = self.local_path_for_uri(data_uri)
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
-                write_placeholder_npy(base / prediction_dir / str(cam) / f"{int(frame):05d}.npy")
+                out = base / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+                values = detector.detect_values(base, str(cam), int(frame), rgb_path_template=rgb_path_template) if detector is not None else None
+                if values is not None:
+                    write_float32_npy(out, values)
+                else:
+                    write_frame_hand_npy(out, base, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
         return uri_join(data_uri, prediction_dir)
 
-    def write_corrected_artifact(self, data_uri: str, cameras: Sequence[str], frames: Sequence[int], correction_dir: str = "corrected_2d") -> str:
-        base = self.local_path_for_uri(data_uri)
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                write_placeholder_npy(base / correction_dir / str(cam) / f"{int(frame):05d}.npy")
-        return uri_join(data_uri, correction_dir)
-
-    def write_mano_episode_artifact(self, data_uri: str, cameras: Sequence[str], frames: Sequence[int]) -> str:
+    def write_mano_episode_artifact(
+        self,
+        data_uri: str,
+        cameras: Sequence[str],
+        frames: Sequence[int],
+        prediction_dir: str = "pred_2d",
+        rgb_path_template: str = "",
+    ) -> str:
         base = self.local_path_for_uri(data_uri)
         out = base / "mano" / "episode"
         out.mkdir(parents=True, exist_ok=True)
@@ -446,10 +794,20 @@ class NasSimulator:
         )
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
-                write_placeholder_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy")
+                source = base / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+                copy_or_write_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, base, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="mano")
         return uri_join(data_uri, "mano", "episode")
 
-    def write_mano_segment_patch(self, data_uri: str, segment_id: str, cameras: Sequence[str], frames: Sequence[int]) -> str:
+    def write_mano_segment_patch(
+        self,
+        data_uri: str,
+        segment_id: str,
+        cameras: Sequence[str],
+        frames: Sequence[int],
+        manual_2d_dir: str = "",
+        manual_2d_uri: str = "",
+        rgb_path_template: str = "",
+    ) -> str:
         base = self.local_path_for_uri(data_uri)
         out = base / "mano" / "segments" / clean_id(segment_id, "segment")
         out.mkdir(parents=True, exist_ok=True)
@@ -457,7 +815,24 @@ class NasSimulator:
             json.dumps({"mock": True, "segment_id": segment_id, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        source_dir = self.manual_2d_source_path(data_uri, segment_id, manual_2d_dir, manual_2d_uri)
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                source = source_dir / str(cam) / f"{int(frame):05d}.npy"
+                copy_required_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, str(cam), int(frame))
         return uri_join(data_uri, "mano", "segments", segment_id)
+
+    def manual_2d_source_path(self, data_uri: str, segment_id: str, manual_2d_dir: str = "", manual_2d_uri: str = "") -> Path:
+        data_uri = str(data_uri or "").rstrip("/")
+        manual_2d_uri = str(manual_2d_uri or "").rstrip("/")
+        if manual_2d_uri:
+            if data_uri and manual_2d_uri.startswith(data_uri + "/"):
+                return self.local_path_for_uri(data_uri) / manual_2d_uri[len(data_uri):].lstrip("/")
+            if manual_2d_uri.startswith(self.uri_prefix):
+                return self.local_path_for_uri(manual_2d_uri)
+            if manual_2d_uri.startswith("local://"):
+                return path_from_local_uri(manual_2d_uri)
+        return self.local_path_for_uri(data_uri) / (manual_2d_dir or f"manual_2d/segments/{segment_id}")
 
 
 def as_string_list(value: Any) -> List[str]:
@@ -558,37 +933,24 @@ def write_prediction_artifact_for_payload(
     cameras: Sequence[str],
     frames: Sequence[int],
     prediction_dir: str,
+    detector: Optional[InteractionHandGtDetector] = None,
 ) -> str:
     data_uri = str(payload.get("data_uri") or "")
+    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
     if data_uri.startswith(nas.uri_prefix):
-        return nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir)
+        return nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template, detector)
     episode_path = source_path_from_payload(payload, episode, nas)
     if episode_path is not None:
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
-                write_placeholder_npy(episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy")
+                out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template) if detector is not None else None
+                if values is not None:
+                    write_float32_npy(out, values)
+                else:
+                    write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
         return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
     return uri_join(data_uri, prediction_dir)
-
-
-def write_corrected_artifact_for_payload(
-    nas: NasSimulator,
-    payload: Json,
-    episode: Optional[Json],
-    cameras: Sequence[str],
-    frames: Sequence[int],
-    correction_dir: str,
-) -> str:
-    data_uri = str(payload.get("data_uri") or "")
-    if data_uri.startswith(nas.uri_prefix):
-        return nas.write_corrected_artifact(data_uri, cameras, frames, correction_dir)
-    episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                write_placeholder_npy(episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy")
-        return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
-    return uri_join(data_uri, correction_dir)
 
 
 def write_mano_artifact_for_payload(
@@ -601,27 +963,84 @@ def write_mano_artifact_for_payload(
     data_uri = str(payload.get("data_uri") or "")
     scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
     segment_id = str(payload.get("segment_id") or "")
+    prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
+    manual_2d_dir = str(payload.get("manual_2d_dir") or f"manual_2d/segments/{segment_id}")
+    manual_2d_uri = str(payload.get("manual_2d_uri") or payload.get("input_2d_uri") or "")
+    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
     if data_uri.startswith(nas.uri_prefix):
         if scope == "segment":
-            return "mano_segment_patch", nas.write_mano_segment_patch(data_uri, segment_id, cameras, frames)
-        return "mano_episode", nas.write_mano_episode_artifact(data_uri, cameras, frames)
+            return "mano_segment_patch", nas.write_mano_segment_patch(data_uri, segment_id, cameras, frames, manual_2d_dir, manual_2d_uri, rgb_path_template)
+        return "mano_episode", nas.write_mano_episode_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template)
     episode_path = source_path_from_payload(payload, episode, nas)
     if episode_path is not None:
         if scope == "segment":
             out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
             out.mkdir(parents=True, exist_ok=True)
-            (out / "mano_patch.json").write_text(json.dumps({"mock": True, "segment_id": segment_id}) + "\n", encoding="utf-8")
+            (out / "mano_patch.json").write_text(json.dumps({"mock": True, "segment_id": segment_id, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
+            for cam in cameras or ["00"]:
+                for frame in frames or [0]:
+                    source = source_dir / str(cam) / f"{int(frame):05d}.npy"
+                    copy_required_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, str(cam), int(frame))
             return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
         out = episode_path / "mano" / "episode"
         out.mkdir(parents=True, exist_ok=True)
-        (out / "mano_episode.json").write_text(json.dumps({"mock": True}) + "\n", encoding="utf-8")
+        (out / "mano_episode.json").write_text(json.dumps({"mock": True, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
-                write_placeholder_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy")
+                source = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+                copy_or_write_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="mano")
         return "mano_episode", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode")
     if scope == "segment":
         return "mano_segment_patch", uri_join(data_uri, "mano", "segments", segment_id)
     return "mano_episode", uri_join(data_uri, "mano", "episode")
+
+
+def manual_2d_source_path_for_payload(
+    nas: NasSimulator,
+    data_uri: str,
+    episode_path: Path,
+    segment_id: str,
+    manual_2d_dir: str,
+    manual_2d_uri: str,
+) -> Path:
+    data_uri = str(data_uri or "").rstrip("/")
+    manual_2d_uri = str(manual_2d_uri or "").rstrip("/")
+    if manual_2d_uri:
+        if data_uri and manual_2d_uri.startswith(data_uri + "/"):
+            return episode_path / manual_2d_uri[len(data_uri):].lstrip("/")
+        if manual_2d_uri.startswith(nas.uri_prefix):
+            return nas.local_path_for_uri(manual_2d_uri)
+        if manual_2d_uri.startswith("local://"):
+            return path_from_local_uri(manual_2d_uri)
+    return episode_path / (manual_2d_dir or f"manual_2d/segments/{segment_id}")
+
+
+def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optional[Json], result: Json) -> str:
+    data_uri = str(payload.get("data_uri") or (episode or {}).get("data_uri") or "")
+    report = {
+        "mock": True,
+        "generated_at_ms": now_ms(),
+        "episode_id": payload.get("episode_id") or (episode or {}).get("episode_id") or "",
+        "passed": bool(result.get("passed")),
+        "qc_passed": bool(result.get("qc_passed")),
+        "score": result.get("score"),
+        "segments": result.get("segments") if isinstance(result.get("segments"), list) else [],
+        "reason": str(result.get("reason") or ""),
+        "virtual_worker": str(result.get("virtual_worker") or ""),
+    }
+    if data_uri.startswith(nas.uri_prefix):
+        out = nas.local_path_for_uri(data_uri) / "qc" / "qc_report.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return uri_join(data_uri, "qc", "qc_report.json")
+    episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        out = episode_path / "qc" / "qc_report.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return uri_join(data_uri or local_uri_from_path(episode_path), "qc", "qc_report.json")
+    return uri_join(data_uri, "qc", "qc_report.json")
 
 
 def payload_from_task(task: LabelTask, data_uri: str, job_id: str, reason: str) -> Json:
@@ -770,7 +1189,13 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
-    nas_uri = nas.materialize_payload(payload, episode, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
+    nas_uri = nas.materialize_payload(
+        payload,
+        episode,
+        copy_source=args.copy_source,
+        max_frames=args.max_materialized_frames,
+        materialize_predictions=False,
+    )
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
     client.complete_job(
@@ -811,7 +1236,7 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
     prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
-    pred_uri = write_prediction_artifact_for_payload(nas, payload, episode, cameras, frames, prediction_dir)
+    pred_uri = write_prediction_artifact_for_payload(nas, payload, episode, cameras, frames, prediction_dir, hand_gt_detector_for_args(args))
     client.complete_job(
         str(job["job_id"]),
         {"ok": True, "model": "virtual_hand2d", "frames_predicted": frames, "virtual_worker": owner},
@@ -875,7 +1300,6 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
     failed_segments = [] if passed else virtual_failed_segments(frames)
-    qc_report_uri = uri_join(str(payload.get("data_uri") or ""), "qc", "qc_report.json")
     result = {
         "passed": passed,
         "qc_passed": passed,
@@ -884,6 +1308,7 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
         "reason": "virtual_qc_pass" if passed else "virtual_qc_failed_needs_manual_segments",
         "virtual_worker": owner,
     }
+    qc_report_uri = write_qc_report_for_payload(nas, payload, episode, result)
     client.complete_job(
         str(job["job_id"]),
         result,
@@ -902,56 +1327,34 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
 
 
 def virtual_failed_segments(frames: Sequence[int]) -> List[Json]:
-    clean_frames = sorted(int(frame) for frame in frames if not isinstance(frame, bool))
+    clean_frames = sorted({int(frame) for frame in frames if not isinstance(frame, bool)})
     if not clean_frames:
         return [{"start_frame": 0, "end_frame": 0, "reason": "virtual_qc_failed"}]
-    first = clean_frames[0]
-    last = clean_frames[-1]
-    if len(clean_frames) == 1:
-        return [{"start_frame": first, "end_frame": first, "reason": "virtual_qc_failed"}]
-    mid = clean_frames[len(clean_frames) // 2]
-    segments = [{"start_frame": first, "end_frame": min(first + 1, last), "reason": "virtual_low_score"}]
-    if mid > segments[0]["end_frame"]:
-        segments.append({"start_frame": mid, "end_frame": min(mid + 1, last), "reason": "virtual_temporal_jump"})
-    return segments
-
-
-def handle_manual_label_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
-    operator = args.worker_id or f"virtual_labeler_{os.getpid()}"
-    try:
-        leased = client.lease_label_job(operator, args.lease_seconds)
-    except NoJobAvailable:
-        return False
-    job = leased.get("job") or leased.get("segment") or {}
-    episode = leased.get("episode") or {}
-    payload = enriched_payload(leased)
-    job_id = str(job.get("job_id") or job.get("segment_id") or payload.get("segment_id") or "")
-    client.heartbeat_label_job(job_id, operator, args.lease_seconds)
-    data_uri = str(payload.get("data_uri") or "")
-    cameras = cameras_from_payload(payload, episode, nas)
-    frames = frames_from_payload(payload, episode, nas, cameras)
-    if args.max_materialized_frames > 0:
-        frames = frames[: args.max_materialized_frames]
-    correction_dir = str(payload.get("correction_dir") or "corrected_2d")
-    corrected_uri = write_corrected_artifact_for_payload(nas, payload, episode, cameras, frames, correction_dir)
-    client.complete_label_job(
-        job_id,
-        {"operator_id": operator, "frames_completed": frames, "virtual_labeler": True},
-        artifacts=[
+    target_count = min(random.randint(2, 3), max(1, len(clean_frames) // 10)) if len(clean_frames) >= 20 else 1
+    segments: List[Json] = []
+    used_ranges: List[Tuple[int, int]] = []
+    attempts = 0
+    while len(segments) < target_count and attempts < 80:
+        attempts += 1
+        length = min(random.randint(10, 20), len(clean_frames))
+        start_idx = random.randint(0, max(0, len(clean_frames) - length))
+        end_idx = min(len(clean_frames) - 1, start_idx + length - 1)
+        start_frame = int(clean_frames[start_idx])
+        end_frame = int(clean_frames[end_idx])
+        overlaps = any(not (end_frame < used_start or start_frame > used_end) for used_start, used_end in used_ranges)
+        if overlaps and len(clean_frames) >= target_count * 12:
+            continue
+        used_ranges.append((start_frame, end_frame))
+        segments.append(
             {
-                "kind": "manual_2d",
-                "uri": corrected_uri,
-                "metadata": {"operator_id": operator, "segment_id": payload.get("segment_id") or "", "frames": frames, "mock": True},
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "reason": random.choice(["virtual_low_score", "virtual_temporal_jump", "virtual_projection_error"]),
+                "score": round(random.uniform(0.05, 0.45), 4),
             }
-        ],
-    )
-    print_event(
-        "manual_segment_completed",
-        segment_id=payload.get("segment_id") or job_id,
-        episode_id=payload.get("episode_id"),
-        corrected_uri=corrected_uri,
-    )
-    return True
+        )
+    segments.sort(key=lambda item: (int(item["start_frame"]), int(item["end_frame"])))
+    return segments or [{"start_frame": clean_frames[0], "end_frame": clean_frames[min(len(clean_frames) - 1, 9)], "reason": "virtual_qc_failed"}]
 
 
 WORKER_HANDLERS = {
@@ -959,7 +1362,6 @@ WORKER_HANDLERS = {
     "auto-label": handle_auto_label_once,
     "mano-opt": handle_mano_opt_once,
     "qc": handle_qc_once,
-    "manual-label": handle_manual_label_once,
 }
 
 
@@ -967,7 +1369,7 @@ def parse_workers(raw: str) -> List[str]:
     if raw == "default":
         return ["upload", "auto-label", "mano-opt", "qc"]
     if raw == "all":
-        return ["upload", "auto-label", "mano-opt", "qc", "manual-label"]
+        return ["upload", "auto-label", "mano-opt", "qc"]
     workers = [part.strip() for part in raw.split(",") if part.strip()]
     bad = [worker for worker in workers if worker not in WORKER_HANDLERS]
     if bad:
@@ -1014,7 +1416,7 @@ def run_workers(args: argparse.Namespace) -> int:
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--backend-url", default=os.environ.get("ORBBEC_TASK_BACKEND_URL", "http://127.0.0.1:8765"))
     parser.add_argument("--timeout", type=float, default=10.0)
-    parser.add_argument("--nas-root", type=Path, default=Path(".virtual_nas"))
+    parser.add_argument("--nas-root", type=Path, default=Path("task_backend_state/virtual_nas"))
     parser.add_argument("--nas-uri-prefix", default="nas://orbbec-virtual")
 
 
@@ -1041,12 +1443,12 @@ def build_parser() -> argparse.ArgumentParser:
     seed_upload.add_argument("--job-prefix", default="seeded_upload")
     seed_upload.set_defaults(func=seed_captured_upload_jobs)
 
-    workers = sub.add_parser("run-workers", help="Run virtual upload, auto-label, QC, and optionally manual-label workers.")
+    workers = sub.add_parser("run-workers", help="Run virtual upload, auto-label, MANO, and QC workers. Manual labeling stays in the real label frontend.")
     add_common_args(workers)
-    workers.add_argument("--workers", default="default", help="default, all, or comma list: upload,auto-label,mano-opt,qc,manual-label")
+    workers.add_argument("--workers", default="default", help="default, all, or comma list: upload,auto-label,mano-opt,qc")
     workers.add_argument("--worker-id", default="")
     workers.add_argument("--lease-seconds", type=int, default=300)
-    workers.add_argument("--qc-fail-rate", type=float, default=0.35)
+    workers.add_argument("--qc-fail-rate", type=float, default=0.5)
     workers.add_argument("--copy-source", action="store_true")
     workers.add_argument("--max-materialized-frames", type=int, default=0)
     workers.add_argument("--once", action="store_true")
