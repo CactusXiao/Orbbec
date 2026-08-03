@@ -9,6 +9,7 @@ fixture for the current server and frontends.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import random
@@ -25,11 +26,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
-
-try:
-    import mediapipe as mp
-except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
-    mp = None
 
 try:
     import numpy as np
@@ -70,8 +66,6 @@ _HAND_TEMPLATE = (
     (0.54, -0.64),
     (0.64, -0.80),
 )
-MIN_DETECTION_LANDMARKS = 6
-LANDMARK_NORMALIZED_MARGIN = 0.18
 
 
 def strip_env_comment(value: str) -> str:
@@ -190,15 +184,6 @@ def now_ms() -> int:
 def clean_id(value: str, fallback: str = "item") -> str:
     text = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip()).strip("_").lower()
     return text or fallback
-
-
-def normalize_handedness(label: str) -> str:
-    # Match interaction handGT: MediaPipe handedness is mirrored/selfie-oriented.
-    if label == "Left":
-        return "Right"
-    if label == "Right":
-        return "Left"
-    return label
 
 
 def local_uri_from_path(path: Path) -> str:
@@ -604,24 +589,45 @@ def write_placeholder_npy(path: Path) -> None:
 
 class InteractionHandGtDetector:
     def __init__(self):
-        self.available = mp is not None and np is not None and Image is not None
-        self._hands = None
-        if self.available:
-            self._hands = mp.solutions.hands.Hands(
-                static_image_mode=False,
-                max_num_hands=2,
-                model_complexity=0,
-                min_detection_confidence=0.25,
-                min_tracking_confidence=0.25,
-            )
+        if np is None:
+            raise BackendError("interaction handGT requires numpy in the worker Python environment")
+        if Image is None:
+            raise BackendError("interaction handGT requires Pillow in the worker Python environment")
+        self._module = self._load_interaction_worker_module()
+        try:
+            self._worker = self._module.HandGtWorker()
+        except ModuleNotFoundError as exc:
+            raise BackendError(f"interaction handGT dependency is missing: {exc.name}") from exc
+        except AttributeError as exc:
+            raise BackendError(f"interaction handGT failed to initialize dependency API: {exc}") from exc
+        self.available = True
+
+    @staticmethod
+    def _load_interaction_worker_module():
+        worker_path = Path(__file__).resolve().parents[2] / "src" / "sync" / "hand_joint_gt_worker.py"
+        if not worker_path.exists():
+            raise BackendError(f"interaction handGT worker not found: {worker_path}")
+        module_name = "_orbbec_interaction_hand_joint_gt_worker"
+        spec = importlib.util.spec_from_file_location(module_name, worker_path)
+        if spec is None or spec.loader is None:
+            raise BackendError(f"cannot load interaction handGT worker: {worker_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except ModuleNotFoundError as exc:
+            raise BackendError(f"interaction handGT dependency is missing: {exc.name}") from exc
+        except AttributeError as exc:
+            raise BackendError(f"interaction handGT failed to initialize dependency API: {exc}") from exc
+        return module
 
     def close(self) -> None:
-        hands = self._hands
-        self._hands = None
+        hands = getattr(getattr(self, "_worker", None), "_hands", None)
         if hands is not None:
             close = getattr(hands, "close", None)
             if close is not None:
                 close()
+        self._worker = None
 
     def detect_values(
         self,
@@ -631,57 +637,38 @@ class InteractionHandGtDetector:
         *,
         rgb_path_template: str = "",
     ) -> Optional[List[float]]:
-        if self._hands is None or np is None or Image is None:
-            return None
         rgb_path = find_rgb_frame_path(episode_dir, cam, int(frame), rgb_path_template)
         if rgb_path is None:
-            return None
-        try:
-            with Image.open(rgb_path) as image:
-                rgb = np.asarray(image.convert("RGB"))
-        except Exception:
-            return None
+            raise BackendError(f"interaction handGT missing RGB frame: camera={cam} frame={int(frame):05d}")
+        with Image.open(rgb_path) as image:
+            rgb = np.asarray(image.convert("RGB"))
         if rgb.ndim != 3 or rgb.shape[0] <= 0 or rgb.shape[1] <= 0:
-            return None
-
-        result = self._hands.process(rgb)
-        landmarks_list = result.multi_hand_landmarks or []
-        handedness_list = result.multi_handedness or []
-        if not landmarks_list:
-            return None
+            raise BackendError(f"interaction handGT invalid RGB frame: {rgb_path}")
 
         width = float(rgb.shape[1])
         height = float(rgb.shape[0])
         values = [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
         used_slots = set()
-        detections: List[Tuple[float, int, List[Tuple[float, float]]]] = []
-        for idx, hand_landmarks in enumerate(landmarks_list[:_HAND_COUNT]):
-            side = ""
-            score = 0.0
-            if idx < len(handedness_list) and handedness_list[idx].classification:
-                cls = handedness_list[idx].classification[0]
-                side = normalize_handedness(str(cls.label))
-                score = float(cls.score)
+        bgr = np.ascontiguousarray(rgb[:, :, ::-1])
+        cam_meta = {
+            "camera_id": str(cam),
+            "rgb_width": int(width),
+            "rgb_height": int(height),
+            "rgb_offset": 0,
+            "rgb_size": int(bgr.size),
+            "rgb_scale_x": 1.0,
+            "rgb_scale_y": 1.0,
+            "intrinsic": {"fx": width, "fy": height, "cx": width * 0.5, "cy": height * 0.5},
+            "Rcw": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            "tcw": [0.0, 0.0, 0.0],
+        }
+        detections = self._worker._detect_camera(cam_meta, bgr.tobytes())
+        if not detections:
+            return None
 
-            points: List[Tuple[float, float]] = []
-            valid_count = 0
-            for lm in hand_landmarks.landmark[:_JOINT_COUNT]:
-                valid = (
-                    (-LANDMARK_NORMALIZED_MARGIN) <= float(lm.x) <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
-                    and (-LANDMARK_NORMALIZED_MARGIN) <= float(lm.y) <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
-                )
-                if valid:
-                    valid_count += 1
-                    points.append((float(lm.x) * width, float(lm.y) * height))
-                else:
-                    points.append((-1.0, -1.0))
-            if valid_count < MIN_DETECTION_LANDMARKS:
-                continue
-
+        for idx, inst in enumerate(detections[:_HAND_COUNT]):
+            side = str(getattr(inst, "side_vote", "") or "")
             preferred_slot = 0 if side == "Left" else 1 if side == "Right" else idx
-            detections.append((score, preferred_slot, points))
-
-        for _score, preferred_slot, points in sorted(detections, key=lambda item: item[0], reverse=True):
             slot = preferred_slot
             if slot in used_slots:
                 free = [candidate for candidate in range(_HAND_COUNT) if candidate not in used_slots]
@@ -690,9 +677,12 @@ class InteractionHandGtDetector:
                 slot = free[0]
             used_slots.add(slot)
             base_index = slot * _JOINT_COUNT * 2
-            for joint_idx, (x, y) in enumerate(points[:_JOINT_COUNT]):
-                values[base_index + joint_idx * 2] = float(x)
-                values[base_index + joint_idx * 2 + 1] = float(y)
+            for joint_idx, point in enumerate(list(getattr(inst, "joints_orig", []))[:_JOINT_COUNT]):
+                if point is None:
+                    continue
+                x, y = point
+                values[base_index + joint_idx * 2] = max(0.0, min(width - 1.0, float(x)))
+                values[base_index + joint_idx * 2 + 1] = max(0.0, min(height - 1.0, float(y)))
         return values if used_slots else None
 
 
@@ -704,7 +694,7 @@ def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDete
         print_event(
             "interaction_handgt",
             available=bool(detector.available),
-            mode="mediapipe_lightweight" if detector.available else "fallback_low_precision",
+            mode="src_sync_hand_joint_gt_worker",
         )
     return detector
 
@@ -871,11 +861,12 @@ class NasSimulator:
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
                 out = base / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-                values = detector.detect_values(base, str(cam), int(frame), rgb_path_template=rgb_path_template) if detector is not None else None
-                if values is not None:
-                    write_float32_npy(out, values)
-                else:
-                    write_frame_hand_npy(out, base, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
+                if detector is None:
+                    raise BackendError("auto_label requires interaction handGT detector")
+                values = detector.detect_values(base, str(cam), int(frame), rgb_path_template=rgb_path_template)
+                if values is None:
+                    raise BackendError(f"interaction handGT detected no hand: camera={cam} frame={int(frame):05d}")
+                write_float32_npy(out, values)
         return uri_join(data_uri, prediction_dir)
 
     def write_mano_episode_artifact(
@@ -1045,11 +1036,12 @@ def write_prediction_artifact_for_payload(
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
                 out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template) if detector is not None else None
-                if values is not None:
-                    write_float32_npy(out, values)
-                else:
-                    write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
+                if detector is None:
+                    raise BackendError("auto_label requires interaction handGT detector")
+                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
+                if values is None:
+                    raise BackendError(f"interaction handGT detected no hand: camera={cam} frame={int(frame):05d}")
+                write_float32_npy(out, values)
         return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
     return uri_join(data_uri, prediction_dir)
 

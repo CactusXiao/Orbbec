@@ -24,6 +24,7 @@ from task_backend.job_service import FINAL_3D_SOURCES_REL_PATH, JobService
 from task_backend.server import BackendRuntime, RequestHandler, TaskHTTPServer, TaskInstanceRegistry
 from task_backend.workflow_store import WorkflowStore
 from tools.virtual_workflow.orbbec_virtual_workflow import (
+    BackendError,
     BackendClient,
     LabelTask,
     NasSimulator,
@@ -33,9 +34,20 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     handle_upload_once,
     build_parser,
     load_env_defaults,
+    virtual_hand_values,
     virtual_failed_segments,
     write_placeholder_rgb_image,
 )
+
+
+class FakeHandGtDetector:
+    available = True
+
+    def detect_values(self, _episode_dir: Path, cam: str, frame: int, *, rgb_path_template: str = "") -> list[float]:
+        return virtual_hand_values(cam, frame, 640, 480, "pred")
+
+    def close(self) -> None:
+        pass
 
 
 class VirtualWorkflowToolSmokeTest(unittest.TestCase):
@@ -94,11 +106,28 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertTrue((episode_dir / "00" / "RGB" / "00000.png").exists())
             self.assertFalse((episode_dir / "pred_2d").exists())
 
-            pred_uri = nas.write_prediction_artifact(data_uri, ["00"], [0])
+            pred_uri = nas.write_prediction_artifact(data_uri, ["00"], [0], detector=FakeHandGtDetector())
             pred = np.load(episode_dir / "pred_2d" / "00" / "00000.npy")
             self.assertEqual(pred_uri, data_uri + "/pred_2d")
             self.assertEqual(pred.shape, (2, 21, 2))
             self.assertTrue(np.any(pred >= 0))
+
+    def test_auto_label_prediction_requires_handgt_detector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "virtual_nas", "nas://orbbec-test")
+            task = LabelTask(
+                root=tmp_path / "captures",
+                subject="S001",
+                task="pick_object",
+                episode="episode_001",
+                cameras=["00"],
+                frames=[0],
+            )
+            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+
+            with self.assertRaisesRegex(BackendError, "requires interaction handGT detector"):
+                nas.write_prediction_artifact(data_uri, ["00"], [0])
 
     def test_virtual_failed_segments_use_random_ten_to_twenty_frame_ranges(self) -> None:
         random.seed(123)
@@ -138,6 +167,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                     max_materialized_frames=0,
                     copy_source=True,
                     qc_fail_rate=1.0,
+                    _interaction_hand_gt_detector=FakeHandGtDetector(),
                 )
 
                 service.record_collection_confirm(

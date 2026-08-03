@@ -15,10 +15,11 @@ modify the existing `task_backend` or `label` modules.
 - Upload workers that copy or materialize a captured episode into the virtual
   NAS. Upload completion marks episodes `uploaded`; pushing auto-label is a
   separate dashboard/API action.
-- Auto-label workers that write low-precision `(2,21,2)` prediction `.npy`
-  files. They use the interaction handGT-style lightweight MediaPipe path when
-  those optional libraries are installed, and fall back to a deterministic
-  visible hand skeleton otherwise.
+- Auto-label workers that write `(2,21,2)` prediction `.npy` files by reusing
+  `src/sync/hand_joint_gt_worker.py`. The virtual worker requires the same
+  MediaPipe/Python environment as interaction handGT; missing dependencies,
+  incompatible MediaPipe APIs, missing RGB frames, or frames with no detected
+  hands fail the job instead of writing synthetic predictions.
 - MANO workers that write low-precision episode MANO outputs from `pred_2d` and
   segment patch outputs from real `manual_2d`.
 - QC workers that pass or fail with `--qc-fail-rate`, default `0.5`. Failed QC
