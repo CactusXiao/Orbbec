@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import sqlite3
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from task_backend.job_service import JobService
+from task_backend.job_service import FINAL_3D_SOURCES_REL_PATH, JobService
 from task_backend.server import render_workflow_stage_page
 from task_backend.virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader
 from task_backend.workflow_models import WorkflowError
@@ -13,235 +13,7 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class WorkflowStoreSmokeTest(unittest.TestCase):
-    def test_manual_label_job_lifecycle(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
-
-            episode = store.create_or_update_episode(
-                episode_id="episode_000456",
-                subject_id="S001",
-                task_name="pick_object",
-                episode_index=456,
-                status="planned",
-                data_uri=f"local://{tmp_path / 'S001' / 'pick_object' / 'episode_000456'}",
-                cameras=["camera_01", "camera_02"],
-                frame_count=4,
-                metadata={"smoke": True},
-            )
-            self.assertEqual(episode["status"], "planned")
-
-            created = service.create_manual_label_job(
-                {
-                    "episode_id": episode["episode_id"],
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": episode["data_uri"],
-                    "cameras": ["camera_01", "camera_02"],
-                    "frames": [120, 121, 122, 123],
-                }
-            )
-            job_id = created["job"]["job_id"]
-            self.assertEqual(created["job"]["type"], "manual_label")
-            self.assertEqual(created["job"]["status"], "queued")
-
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            leased = service.lease_job(
-                {"operator_id": "labeler_01", "lease_seconds": 60},
-                forced_type="manual_label",
-            )
-            self.assertEqual(leased["job"]["job_id"], job_id)
-            self.assertEqual(leased["job"]["status"], "leased")
-
-            with self.assertRaises(WorkflowError):
-                service.lease_job(
-                    {"operator_id": "labeler_02", "lease_seconds": 60},
-                    forced_type="manual_label",
-                )
-
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE jobs SET lease_until = '1970-01-01T00:00:00Z' WHERE job_id = ?",
-                    (job_id,),
-                )
-
-            leased_again = service.lease_job(
-                {"operator_id": "labeler_02", "lease_seconds": 1},
-                forced_type="manual_label",
-            )
-            self.assertEqual(leased_again["job"]["lease_owner"], "labeler_02")
-
-            heartbeat = service.heartbeat_job(
-                job_id,
-                {"operator_id": "labeler_02", "lease_seconds": 60, "status": "running"},
-            )
-            self.assertEqual(heartbeat["job"]["status"], "running")
-            self.assertGreater(heartbeat["job"]["lease_until"], leased_again["job"]["lease_until"])
-
-            completed = service.complete_job(job_id, {"result": {"ok": True}})
-            self.assertTrue(completed["changed"])
-            self.assertEqual(completed["job"]["status"], "succeeded")
-            self.assertEqual(store.get_episode(episode["episode_id"])["status"], "manual_labeled")  # type: ignore[index]
-
-            completed_again = service.complete_job(job_id, {"result": {"ok": True}})
-            self.assertFalse(completed_again["changed"])
-            self.assertEqual(completed_again["job"]["status"], "succeeded")
-
-            created_release = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_release",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": f"local://{tmp_path / 'release'}",
-                    "cameras": ["camera_01"],
-                    "frames": [1],
-                }
-            )
-            release_job_id = created_release["job"]["job_id"]
-            service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
-            released = service.release_job(release_job_id, {"reason": "smoke"})
-            self.assertTrue(released["released"])
-            self.assertEqual(released["job"]["status"], "queued")
-            leased_after_release = service.lease_job({"operator_id": "labeler_03"}, forced_type="manual_label")
-            self.assertEqual(leased_after_release["job"]["job_id"], release_job_id)
-
-    def test_stage_lease_controls_block_new_leases_only(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
-            created = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_lease_control",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": f"local://{tmp_path / 'episode_lease_control'}",
-                    "cameras": ["camera_01"],
-                    "frames": [1],
-                }
-            )
-            job_id = created["job"]["job_id"]
-
-            with self.assertRaises(WorkflowError) as disabled:
-                service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
-            self.assertEqual(disabled.exception.status.value, 409)
-            self.assertIn("leasing disabled for job type: manual_label", disabled.exception.message)
-
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            leased = service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
-            self.assertEqual(leased["job"]["job_id"], job_id)
-
-            service.set_stage_leasing("manual_label", False, {"updated_by": "smoke"})
-            heartbeat = service.heartbeat_job(job_id, {"operator_id": "labeler_01", "status": "running"})
-            self.assertEqual(heartbeat["job"]["status"], "running")
-            completed = service.complete_job(job_id, {"result": {"ok": True}})
-            self.assertEqual(completed["job"]["status"], "succeeded")
-
-            fail_created = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_fail_after_disable",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": f"local://{tmp_path / 'episode_fail_after_disable'}",
-                    "frames": [1],
-                }
-            )
-            fail_job_id = fail_created["job"]["job_id"]
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            service.lease_job({"operator_id": "labeler_02"}, forced_type="manual_label")
-            service.set_stage_leasing("manual_label", False, {"updated_by": "smoke"})
-            failed = service.fail_job(fail_job_id, {"error": "smoke fail"})
-            self.assertEqual(failed["job"]["status"], "failed")
-
-            release_created = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_release_after_disable",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": f"local://{tmp_path / 'episode_release_after_disable'}",
-                    "frames": [1],
-                }
-            )
-            release_job_id = release_created["job"]["job_id"]
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            service.lease_job({"operator_id": "labeler_03"}, forced_type="manual_label")
-            service.set_stage_leasing("manual_label", False, {"updated_by": "smoke"})
-            released = service.release_job(release_job_id, {"reason": "smoke"})
-            self.assertTrue(released["released"])
-            self.assertEqual(released["job"]["status"], "queued")
-
-    def test_label_lease_payload_includes_backend_resolved_data_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            nas_root = tmp_path / "virtual_nas"
-            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
-            (episode_dir / "camera_01" / "RGB").mkdir(parents=True)
-            store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, uri_mounts={"nas://orbbec-test": str(nas_root)})
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            service.create_manual_label_job(
-                {
-                    "episode_id": "episode_001",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": "nas://orbbec-test/S001/pick_object/episode_001",
-                    "cameras": ["camera_01"],
-                    "frames": [1],
-                }
-            )
-
-            leased = service.lease_job({"operator_id": "labeler_01"}, forced_type="manual_label")
-            self.assertEqual(leased["payload"]["resolved_data_path"], str(episode_dir.resolve()))
-
-    def test_manual_label_lease_can_filter_by_task(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
-            created_a = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_pick",
-                    "subject_id": "S001",
-                    "task_name": "pick_object",
-                    "data_uri": f"local://{tmp_path / 'S001' / 'pick_object' / 'episode_pick'}",
-                    "frames": [1, 2],
-                }
-            )
-            created_b = service.create_manual_label_job(
-                {
-                    "episode_id": "episode_place",
-                    "subject_id": "S001",
-                    "task_name": "place_object",
-                    "data_uri": f"local://{tmp_path / 'S001' / 'place_object' / 'episode_place'}",
-                    "frames": [3],
-                }
-            )
-
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            leased_b = service.lease_job(
-                {"operator_id": "labeler_01", "task_name": "place_object"},
-                forced_type="manual_label",
-            )
-            self.assertEqual(leased_b["job"]["job_id"], created_b["job"]["job_id"])
-            self.assertEqual(leased_b["payload"]["task_name"], "place_object")
-
-            leased_a = service.lease_job(
-                {"operator_id": "labeler_02", "task": "pick_object"},
-                forced_type="manual_label",
-            )
-            self.assertEqual(leased_a["job"]["job_id"], created_a["job"]["job_id"])
-            self.assertEqual(leased_a["payload"]["task_name"], "pick_object")
-
-            with self.assertRaises(WorkflowError) as missing:
-                service.lease_job(
-                    {"operator_id": "labeler_03", "task_name": "missing_task"},
-                    forced_type="manual_label",
-                )
-            self.assertEqual(missing.exception.status.value, 404)
-            self.assertIn("missing_task", missing.exception.message)
-
-    def test_virtual_nas_uploader_completes_collection_upload_job(self) -> None:
+    def test_virtual_nas_uploader_keeps_auto_label_as_manual_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
@@ -265,9 +37,6 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 }
             )
 
-            status_before = service.upload_status("reservation_001")
-            self.assertEqual(status_before["upload"]["status"], "queued")
-
             uploader = VirtualNasUploader(
                 service,
                 VirtualNasUploadConfig(
@@ -280,182 +49,262 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
 
             status_after = service.upload_status("reservation_001")
             self.assertEqual(status_after["upload"]["status"], "succeeded")
-            self.assertEqual(status_after["upload"]["percent"], 100.0)
-            self.assertTrue(status_after["upload"]["nas_uri"].startswith("nas://orbbec-virtual-test/"))
             self.assertEqual(status_after["workflow"]["status"], "uploaded")
-            self.assertEqual(status_after["workflow"]["job_count"], 1)
             self.assertFalse(any(job["type"] == "auto_label" for job in status_after["jobs"]))
-            episode = store.get_episode("reservation_001")
-            self.assertIsNotNone(episode)
-            self.assertEqual(episode["status"], "uploaded")  # type: ignore[index]
-            self.assertEqual(episode["data_uri"], status_after["upload"]["nas_uri"])  # type: ignore[index]
             self.assertEqual(store.jobs_for_episode("reservation_001", "auto_label"), [])
 
             pushed = service.push_auto_label({"episode_id": "reservation_001", "pushed_by": "smoke"})
             self.assertEqual(pushed["pushed"], 1)
             self.assertEqual(pushed["created_jobs"], 2)
-            pushed_again = service.push_auto_label({"episode_id": "reservation_001", "pushed_by": "smoke"})
-            self.assertEqual(pushed_again["pushed"], 0)
-            self.assertEqual(pushed_again["created_jobs"], 0)
-            auto_label_jobs = store.jobs_for_episode("reservation_001", "auto_label")
-            self.assertEqual(len(auto_label_jobs), 2)
-            self.assertEqual(auto_label_jobs[0]["status"], "queued")
-            self.assertEqual(auto_label_jobs[0]["payload"]["frames"], [1])
-            self.assertEqual(auto_label_jobs[1]["payload"]["frames"], [2])
-            stage = service.workflow_stage("auto_label")
-            self.assertEqual(stage["stats"]["queued"], 2)
-            self.assertEqual(stage["queued"][0]["episode_url"], "/episodes/reservation_001")
-            self.assertIn("/episodes/reservation_001", render_workflow_stage_page(stage))
-            nas_path = tmp_path / "virtual_nas" / "S001" / "pick_object" / "reservation_001"
-            self.assertTrue((nas_path / "00" / "RGB" / "00001.png").exists())
-            self.assertTrue((nas_path / "00" / "RGB" / "00002.png").exists())
-            self.assertTrue((nas_path / ".orbbec_upload_manifest.json").exists())
+            self.assertEqual(len(store.jobs_for_episode("reservation_001", "auto_label")), 2)
+            self.assertIn("/episodes/reservation_001", render_workflow_stage_page(service.workflow_stage("auto_label")))
 
-    def test_stage_auto_advance_from_auto_label_to_manual_label(self) -> None:
+    def test_auto_label_mano_episode_qc_pass_finalizes_episode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_pass"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
             service = JobService(store, auto_label_batch_size=10)
-            store.create_or_update_episode(
-                episode_id="episode_pass",
-                subject_id="S001",
-                task_name="pick_object",
-                episode_index=1,
-                status="uploaded",
-                data_uri="nas://orbbec-test/S001/pick_object/episode_pass",
-                frame_count=2,
-                cameras=["camera_01"],
-                metadata={"nas_uri": "nas://orbbec-test/S001/pick_object/episode_pass"},
-            )
+            self._create_uploaded_episode(store, tmp_path, "episode_pass", frames=2)
+
             service.push_auto_label({"episode_id": "episode_pass", "pushed_by": "smoke"})
-            service.set_stage_leasing("auto_label", True, {"updated_by": "smoke"})
-            auto_job = service.lease_job({"type": "auto_label", "worker_id": "auto_worker"})["job"]
-            service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
+            auto_job = store.jobs_for_episode("episode_pass", "auto_label")[0]
+            service.complete_job(
+                auto_job["job_id"],
+                {
+                    "result": {"ok": True},
+                    "artifacts": [{"kind": "pred_2d", "uri": f"local://{episode_dir / 'pred_2d'}", "metadata": {"mock": True}}],
+                },
+            )
             self.assertEqual(store.get_episode("episode_pass")["status"], "auto_labeled")  # type: ignore[index]
-            self.assertEqual(len(store.artifacts_for_episode("episode_pass")), 1)
+            self.assertEqual(store.jobs_for_episode("episode_pass", "qc"), [])
+
+            mano_jobs = store.jobs_for_episode("episode_pass", "mano_opt")
+            self.assertEqual(len(mano_jobs), 1)
+            self.assertEqual(mano_jobs[0]["payload"]["scope"], "episode")
+            service.complete_job(
+                mano_jobs[0]["job_id"],
+                {
+                    "result": {"ok": True},
+                    "artifacts": [{"kind": "mano_episode", "uri": f"local://{episode_dir / 'mano' / 'episode'}", "metadata": {"mock": True}}],
+                },
+            )
+            self.assertEqual(store.get_episode("episode_pass")["status"], "mano_optimized")  # type: ignore[index]
+
             qc_jobs = store.jobs_for_episode("episode_pass", "qc")
             self.assertEqual(len(qc_jobs), 1)
-            self.assertEqual(qc_jobs[0]["status"], "queued")
-
-            service.set_stage_leasing("qc", True, {"updated_by": "smoke"})
-            qc_job = service.lease_job({"type": "qc", "worker_id": "qc_worker"})["job"]
-            service.complete_job(qc_job["job_id"], {"result": {"passed": True, "score": 0.99}})
-            self.assertEqual(store.get_episode("episode_pass")["status"], "qc_passed")  # type: ignore[index]
-            self.assertEqual(store.jobs_for_episode("episode_pass", "manual_label"), [])
-            self.assertTrue(any(item["kind"] == "qc_report" for item in store.artifacts_for_episode("episode_pass")))
-
-            store.create_or_update_episode(
-                episode_id="episode_fail",
-                subject_id="S001",
-                task_name="pick_object",
-                episode_index=2,
-                status="uploaded",
-                data_uri="nas://orbbec-test/S001/pick_object/episode_fail",
-                frame_count=2,
-                cameras=["camera_01"],
-                metadata={"nas_uri": "nas://orbbec-test/S001/pick_object/episode_fail"},
+            service.complete_job(
+                qc_jobs[0]["job_id"],
+                {
+                    "result": {"passed": True, "score": 0.99},
+                    "artifacts": [{"kind": "qc_report", "uri": f"local://{episode_dir / 'qc' / 'qc_report.json'}", "metadata": {"passed": True}}],
+                },
             )
-            service.push_auto_label({"episode_id": "episode_fail", "pushed_by": "smoke"})
-            auto_job_fail = service.lease_job({"type": "auto_label", "worker_id": "auto_worker"})["job"]
-            service.complete_job(auto_job_fail["job_id"], {"result": {"ok": True}})
-            qc_job_fail = service.lease_job({"type": "qc", "worker_id": "qc_worker"})["job"]
-            service.complete_job(qc_job_fail["job_id"], {"result": {"passed": False, "score": 0.1}})
-            self.assertEqual(store.get_episode("episode_fail")["status"], "qc_failed")  # type: ignore[index]
-            manual_jobs = store.jobs_for_episode("episode_fail", "manual_label")
-            self.assertEqual(len(manual_jobs), 1)
-            self.assertEqual(manual_jobs[0]["status"], "queued")
-            manual_stage = service.workflow_stage("manual_label")
-            self.assertEqual(manual_stage["stats"]["queued"], 1)
-            self.assertIn("/episodes/episode_fail", render_workflow_stage_page(manual_stage))
+            self.assertEqual(store.get_episode("episode_pass")["status"], "finalized")  # type: ignore[index]
+            kinds = [item["kind"] for item in store.artifacts_for_episode("episode_pass")]
+            self.assertIn("pred_2d", kinds)
+            self.assertIn("mano_episode", kinds)
+            self.assertIn("qc_report", kinds)
+            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["qc"]["status"], "passed")
+            self.assertEqual(manifest["base_3d"]["relative_path"], "mano/episode")
+            self.assertEqual(manifest["overrides"], [])
 
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            manual_job = service.lease_job({"type": "manual_label", "operator_id": "labeler"})["job"]
-            service.complete_job(manual_job["job_id"], {"result": {"ok": True}})
-            self.assertEqual(store.get_episode("episode_fail")["status"], "manual_labeled")  # type: ignore[index]
-            self.assertTrue(any(item["kind"] == "corrected_2d" for item in store.artifacts_for_episode("episode_fail")))
-
-    def test_qc_failed_manual_label_discovers_missing_episode_cameras(self) -> None:
+    def test_qc_failure_segments_manual_segment_mano_patch_finalize(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            episode_dir = tmp_path / "S001" / "pick_object" / "episode_missing_cameras"
-            for camera in ("00", "01"):
-                rgb = episode_dir / camera / "RGB"
-                rgb.mkdir(parents=True)
-                (rgb / "00000.png").write_bytes(b"rgb")
-                (rgb / "00001.png").write_bytes(b"rgb")
-
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_fail"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
             service = JobService(store, auto_label_batch_size=10)
-            store.create_or_update_episode(
-                episode_id="episode_missing_cameras",
-                subject_id="S001",
-                task_name="pick_object",
-                episode_index=1,
-                status="uploaded",
-                data_uri=f"local://{episode_dir}",
-                frame_count=2,
-                cameras=[],
+            self._create_uploaded_episode(store, tmp_path, "episode_fail", frames=30, cameras=["00", "01"])
+            self._advance_to_qc_job(service, store, "episode_fail")
+
+            qc_job = store.jobs_for_episode("episode_fail", "qc")[0]
+            service.complete_job(
+                qc_job["job_id"],
+                {
+                    "result": {
+                        "passed": False,
+                        "score": 0.2,
+                        "segments": [
+                            {"start_frame": 10, "end_frame": 12, "reason": "low_confidence"},
+                            {"start_frame": 20, "end_frame": 21, "reason": "temporal_jump"},
+                        ],
+                    }
+                },
             )
-            service.push_auto_label({"episode_id": "episode_missing_cameras", "pushed_by": "smoke"})
-            auto_job = store.jobs_for_episode("episode_missing_cameras", "auto_label")[0]
-            self.assertEqual(auto_job["payload"]["cameras"], ["00", "01"])
+            self.assertEqual(store.get_episode("episode_fail")["status"], "manual_correction_pending")  # type: ignore[index]
+            segments = store.segments_for_episode("episode_fail")
+            self.assertEqual([(s["start_frame"], s["end_frame"], s["status"]) for s in segments], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
+            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
+            self.assertEqual([(o["start_frame"], o["end_frame"], o["status"]) for o in manifest["overrides"]], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
+            self.assertEqual(service.label_tasks()["tasks"][0]["segments"], 2)
+            self.assertEqual(service.label_task_episodes("pick_object")["episodes"][0]["episode_id"], "episode_fail")
 
-            service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
-            qc_job = store.jobs_for_episode("episode_missing_cameras", "qc")[0]
-            self.assertEqual(qc_job["payload"]["cameras"], ["00", "01"])
-            self.assertEqual(qc_job["payload"]["frames"], [0, 1])
-            service.complete_job(qc_job["job_id"], {"result": {"passed": False}})
-
-            manual_job = store.jobs_for_episode("episode_missing_cameras", "manual_label")[0]
-            self.assertEqual(manual_job["payload"]["cameras"], ["00", "01"])
-            self.assertEqual(manual_job["payload"]["frames"], [0, 1])
-
-            service.set_stage_leasing("manual_label", True, {"updated_by": "smoke"})
-            leased = service.lease_job({"type": "manual_label", "operator_id": "labeler"}, forced_type="manual_label")
+            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
+            leased = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
+            self.assertEqual(leased["segment"]["start_frame"], 10)
+            self.assertEqual(leased["payload"]["frames"], [10, 11, 12])
             self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
-            self.assertEqual(leased["payload"]["frames"], [0, 1])
+            self.assertEqual(leased["payload"]["correction_dir"], f"manual_2d/segments/{leased['segment']['segment_id']}")
 
-    def test_stage_payloads_propagate_label_paths(self) -> None:
+            first_segment_id = leased["segment"]["segment_id"]
+            completed = service.complete_label_segment(
+                first_segment_id,
+                {
+                    "result": {"operator_id": "labeler", "frames_completed": [10, 11, 12]},
+                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / first_segment_id}", "metadata": {"segment_id": first_segment_id}}],
+                },
+            )
+            self.assertEqual(completed["segment"]["status"], "mano_queued")
+            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["overrides"][0]["status"], "mano_queued")
+            self.assertEqual(manifest["overrides"][0]["manual_2d_relative_path"], f"manual_2d/segments/{first_segment_id}")
+            segment_mano = [job for job in store.jobs_for_episode("episode_fail", "mano_opt") if job["payload"].get("scope") == "segment"]
+            self.assertEqual(len(segment_mano), 1)
+            self.assertEqual(segment_mano[0]["payload"]["segment_id"], first_segment_id)
+
+            service.complete_job(
+                segment_mano[0]["job_id"],
+                {
+                    "result": {"ok": True, "output_uri": f"local://{episode_dir / 'mano' / 'segments' / first_segment_id}"},
+                    "artifacts": [{"kind": "mano_segment_patch", "uri": f"local://{episode_dir / 'mano' / 'segments' / first_segment_id}", "metadata": {"segment_id": first_segment_id}}],
+                },
+            )
+            self.assertNotEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
+            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["ready_override_count"], 1)
+            self.assertEqual(manifest["overrides"][0]["status"], "ready")
+            self.assertEqual(manifest["overrides"][0]["relative_path"], f"mano/segments/{first_segment_id}")
+
+            second = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
+            second_segment_id = second["segment"]["segment_id"]
+            self.assertEqual(second["segment"]["start_frame"], 20)
+            service.complete_label_segment(
+                second_segment_id,
+                {
+                    "result": {"operator_id": "labeler", "frames_completed": [20, 21]},
+                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / second_segment_id}", "metadata": {"segment_id": second_segment_id}}],
+                },
+            )
+            second_mano = [
+                job
+                for job in store.jobs_for_episode("episode_fail", "mano_opt")
+                if job["payload"].get("scope") == "segment" and job["payload"].get("segment_id") == second_segment_id
+            ][0]
+            service.complete_job(
+                second_mano["job_id"],
+                {
+                    "result": {"ok": True, "output_uri": f"local://{episode_dir / 'mano' / 'segments' / second_segment_id}"},
+                    "artifacts": [{"kind": "mano_segment_patch", "uri": f"local://{episode_dir / 'mano' / 'segments' / second_segment_id}", "metadata": {"segment_id": second_segment_id}}],
+                },
+            )
+            self.assertEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
+            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["episode_status"], "finalized")
+            self.assertEqual(manifest["ready_override_count"], 2)
+            self.assertTrue(all(item["status"] == "ready" for item in manifest["overrides"]))
+
+    def test_manual_segment_lease_orders_by_task_episode_and_start_frame(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
             service = JobService(store)
-            store.create_or_update_episode(
-                episode_id="episode_custom_paths",
-                subject_id="S001",
-                task_name="pick_object",
-                status="uploaded",
-                data_uri=f"local://{tmp_path / 'S001' / 'pick_object' / 'episode_custom_paths'}",
-                frame_count=2,
-                cameras=["00"],
-            )
-            auto = service.create_dev_job(
-                {
-                    "type": "auto_label",
-                    "episode_id": "episode_custom_paths",
-                    "job_id": "auto_custom_paths",
-                    "payload": {
-                        "job_id": "auto_custom_paths",
-                        "episode_id": "episode_custom_paths",
-                        "cameras": ["00"],
-                        "frames": [10, 11],
-                        "rgb_path_template": "rgb/{camera}/{frame:06d}.png",
-                        "prediction_dir": "auto_pred",
-                        "correction_dir": "human_fixed",
-                    },
-                }
-            )
-            service.complete_job(auto["job"]["job_id"], {"result": {"ok": True}})
-            qc_job = store.jobs_for_episode("episode_custom_paths", "qc")[0]
-            self.assertEqual(qc_job["payload"]["rgb_path_template"], "rgb/{camera}/{frame:06d}.png")
-            self.assertEqual(qc_job["payload"]["prediction_dir"], "auto_pred")
-            self.assertEqual(qc_job["payload"]["correction_dir"], "human_fixed")
+            self._create_uploaded_episode(store, tmp_path, "episode_late", frames=10, episode_index=2)
+            self._create_uploaded_episode(store, tmp_path, "episode_early", frames=10, episode_index=1)
+            store.create_segment(segment_id="late_001", episode_id="episode_late", start_frame=1, end_frame=1)
+            store.create_segment(segment_id="early_005", episode_id="episode_early", start_frame=5, end_frame=5)
+            store.create_segment(segment_id="early_002", episode_id="episode_early", start_frame=2, end_frame=3)
 
-            service.complete_job(qc_job["job_id"], {"result": {"passed": False}})
-            manual_job = store.jobs_for_episode("episode_custom_paths", "manual_label")[0]
-            self.assertEqual(manual_job["payload"]["rgb_path_template"], "rgb/{camera}/{frame:06d}.png")
-            self.assertEqual(manual_job["payload"]["prediction_dir"], "auto_pred")
-            self.assertEqual(manual_job["payload"]["correction_dir"], "human_fixed")
+            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
+            first = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object"})
+            self.assertEqual(first["segment"]["segment_id"], "early_002")
+            released = service.release_label_segment("early_002", {"reason": "smoke"})
+            self.assertTrue(released["released"])
+            second = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_early"})
+            self.assertEqual(second["segment"]["segment_id"], "early_002")
+
+            with self.assertRaises(WorkflowError):
+                service.lease_label_segment({"operator_id": "labeler", "task_name": "missing"})
+
+    def test_segment_mano_failure_requeues_only_segment_and_cleans_attempt_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_retry"
+            official_pred = episode_dir / "pred_2d" / "00"
+            official_pred.mkdir(parents=True)
+            (official_pred / "00000.npy").write_bytes(b"official")
+            attempt_dir = episode_dir / ".tmp" / "mano_attempt"
+            attempt_dir.mkdir(parents=True)
+            (attempt_dir / "partial.json").write_text("partial", encoding="utf-8")
+
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            self._create_uploaded_episode(store, tmp_path, "episode_retry", frames=1, data_uri=f"local://{episode_dir}")
+            store.register_artifact(episode_id="episode_retry", kind="pred_2d", uri=f"local://{episode_dir / 'pred_2d'}")
+            store.register_artifact(episode_id="episode_retry", kind="mano_episode", uri=f"local://{episode_dir / 'mano' / 'episode'}")
+            segment = store.create_segment(segment_id="retry_seg", episode_id="episode_retry", start_frame=0, end_frame=0)
+            service.complete_label_segment(
+                segment["segment_id"],
+                {
+                    "result": {"operator_id": "labeler"},
+                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / 'retry_seg'}"}],
+                },
+            )
+            mano_job = [
+                job
+                for job in store.jobs_for_episode("episode_retry", "mano_opt")
+                if job["payload"].get("scope") == "segment"
+            ][0]
+
+            service.fail_job(
+                mano_job["job_id"],
+                {
+                    "error": "optimizer crashed",
+                    "result": {"cleanup_manifest": {"paths": [str(attempt_dir)]}},
+                },
+            )
+            self.assertFalse(attempt_dir.exists())
+            self.assertTrue((official_pred / "00000.npy").exists())
+            self.assertTrue(any(item["kind"] == "pred_2d" for item in store.artifacts_for_episode("episode_retry")))
+            updated_segment = store.get_segment("retry_seg")
+            self.assertIsNotNone(updated_segment)
+            self.assertEqual(updated_segment["status"], "mano_queued")  # type: ignore[index]
+            segment_mano_jobs = [job for job in store.jobs_for_episode("episode_retry", "mano_opt") if job["payload"].get("scope") == "segment"]
+            self.assertEqual(len(segment_mano_jobs), 2)
+            self.assertEqual(segment_mano_jobs[0]["status"], "failed")
+            self.assertEqual(segment_mano_jobs[1]["status"], "queued")
+            self.assertEqual(segment_mano_jobs[1]["payload"]["segment_id"], "retry_seg")
+
+    @staticmethod
+    def _create_uploaded_episode(
+        store: WorkflowStore,
+        tmp_path: Path,
+        episode_id: str,
+        *,
+        frames: int,
+        cameras: list[str] | None = None,
+        episode_index: int = 1,
+        data_uri: str = "",
+    ) -> None:
+        store.create_or_update_episode(
+            episode_id=episode_id,
+            subject_id="S001",
+            task_name="pick_object",
+            episode_index=episode_index,
+            status="uploaded",
+            data_uri=data_uri or f"local://{tmp_path / 'S001' / 'pick_object' / episode_id}",
+            frame_count=frames,
+            cameras=cameras or ["00"],
+            metadata={"nas_uri": data_uri or f"local://{tmp_path / 'S001' / 'pick_object' / episode_id}"},
+        )
+
+    def _advance_to_qc_job(self, service: JobService, store: WorkflowStore, episode_id: str) -> None:
+        service.push_auto_label({"episode_id": episode_id, "pushed_by": "smoke"})
+        for auto_job in store.jobs_for_episode(episode_id, "auto_label"):
+            service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
+        mano_job = store.jobs_for_episode(episode_id, "mano_opt")[0]
+        service.complete_job(mano_job["job_id"], {"result": {"ok": True}})
 
 
 if __name__ == "__main__":

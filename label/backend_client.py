@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Set
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -21,6 +21,7 @@ class LabelJobSession:
     job: Dict[str, Any]
     payload: Dict[str, Any]
     mounts: Dict[str, str]
+    segment_id: str = ""
 
 
 class UriResolver:
@@ -74,29 +75,52 @@ class LabelBackendClient:
     def create_dev_label_job(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._post("/api/v1/dev/label/jobs", payload)
 
-    def lease_label_job(self, operator_id: str, *, lease_seconds: int = 600, task_name: str = "") -> Dict[str, Any]:
+    def lease_label_segment(
+        self,
+        operator_id: str,
+        *,
+        lease_seconds: int = 600,
+        task_name: str = "",
+        episode_id: str = "",
+    ) -> Dict[str, Any]:
         payload = {"operator_id": operator_id, "lease_seconds": int(lease_seconds)}
         task_name = str(task_name or "").strip()
         if task_name:
             payload["task_name"] = task_name
+        episode_id = str(episode_id or "").strip()
+        if episode_id:
+            payload["episode_id"] = episode_id
         return self._post(
-            "/api/v1/label/jobs/lease",
+            "/api/v1/label/segments/lease",
             payload,
         )
 
+    def lease_label_job(self, operator_id: str, *, lease_seconds: int = 600, task_name: str = "") -> Dict[str, Any]:
+        return self.lease_label_segment(operator_id, lease_seconds=lease_seconds, task_name=task_name)
+
     def manual_label_queue(self) -> Dict[str, Any]:
-        return self._get("/api/v1/workflow/stages/manual_label")
+        return self._get("/api/v1/label/tasks")
 
     def queued_label_tasks(self) -> List[Dict[str, Any]]:
-        stage = self.manual_label_queue()
-        return grouped_label_tasks(stage.get("queued") or [])
+        response = self.manual_label_queue()
+        tasks = response.get("tasks")
+        if isinstance(tasks, list):
+            return [dict(item) for item in tasks if isinstance(item, dict)]
+        return []
+
+    def label_task_episodes(self, task_name: str) -> List[Dict[str, Any]]:
+        response = self._get(f"/api/v1/label/tasks/{quote(str(task_name or ''), safe='')}/episodes")
+        episodes = response.get("episodes")
+        if isinstance(episodes, list):
+            return [dict(item) for item in episodes if isinstance(item, dict)]
+        return []
 
     def get_label_job(self, job_id: str) -> Dict[str, Any]:
         return self._get(f"/api/v1/label/jobs/{job_id}")
 
     def heartbeat_label_job(self, job_id: str, operator_id: str, *, lease_seconds: int = 600) -> Dict[str, Any]:
         return self._post(
-            f"/api/v1/label/jobs/{job_id}/heartbeat",
+            f"/api/v1/label/segments/{job_id}/heartbeat",
             {"operator_id": operator_id, "lease_seconds": int(lease_seconds), "status": "running"},
         )
 
@@ -110,10 +134,23 @@ class LabelBackendClient:
         payload: Dict[str, Any] = {"result": result or {}}
         if artifacts:
             payload["artifacts"] = artifacts
-        return self._post(f"/api/v1/label/jobs/{job_id}/complete", payload)
+        return self._post(f"/api/v1/label/segments/{job_id}/complete", payload)
 
     def release_label_job(self, job_id: str, *, reason: str = "") -> Dict[str, Any]:
-        return self._post(f"/api/v1/label/jobs/{job_id}/release", {"reason": reason})
+        return self._post(f"/api/v1/label/segments/{job_id}/release", {"reason": reason})
+
+    def fail_label_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+        result: Optional[Dict[str, Any]] = None,
+        cleanup_manifest: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"error": error, "result": result or {}}
+        if cleanup_manifest:
+            payload["cleanup_manifest"] = cleanup_manifest
+        return self._post(f"/api/v1/label/segments/{job_id}/fail", payload)
 
     def _get(self, path: str) -> Dict[str, Any]:
         return self._request("GET", path, None)
@@ -231,14 +268,20 @@ def session_from_lease(
     mounts: Optional[Mapping[str, str]] = None,
     lease_seconds: int = 600,
     task_name: str = "",
+    episode_id: str = "",
 ) -> LabelJobSession:
     client = LabelBackendClient(backend_url)
-    response = client.lease_label_job(operator_id, lease_seconds=lease_seconds, task_name=task_name)
-    job = dict(response.get("job") or {})
+    response = client.lease_label_segment(
+        operator_id,
+        lease_seconds=lease_seconds,
+        task_name=task_name,
+        episode_id=episode_id,
+    )
+    job = dict(response.get("job") or response.get("segment") or {})
     payload = dict(response.get("payload") or job.get("payload") or {})
-    job_id = str(payload.get("job_id") or job.get("job_id") or "").strip()
+    job_id = str(payload.get("segment_id") or payload.get("job_id") or job.get("segment_id") or job.get("job_id") or "").strip()
     if not job_id:
-        raise BackendClientError("Backend did not return a label job id.")
+        raise BackendClientError("Backend did not return a label segment id.")
     return LabelJobSession(
         client=client,
         operator_id=operator_id,
@@ -246,4 +289,5 @@ def session_from_lease(
         job=job,
         payload=payload,
         mounts=dict(mounts or {}),
+        segment_id=job_id,
     )

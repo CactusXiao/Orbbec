@@ -61,8 +61,9 @@ except Exception:
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
 SourceStateCache = Dict[Tuple[str, int, str, str], Tuple[HandPoints, HandVisible]]
-SOURCE_ORDER = ("pred", "correct", "last", "tracking", "scratch")
+SOURCE_ORDER = ("mano", "pred", "correct", "last", "tracking", "scratch")
 SOURCE_LABELS = {
+    "mano": "MANO",
     "pred": "Pred",
     "correct": "Correct",
     "last": "Last",
@@ -183,6 +184,10 @@ class LabelToolApp(tk.Tk):
             self._is_maximized = False
 
     def _on_exit(self) -> None:
+        try:
+            self._label.release_on_exit()
+        except Exception:
+            pass
         self.destroy()
 
     def _go_home(self) -> None:
@@ -204,6 +209,7 @@ class HomePage(ttk.Frame):
         self._on_exit = on_exit
         self._on_enter = on_enter
         self._task_rows: Dict[str, Dict[str, Any]] = {}
+        self._episode_rows: Dict[str, Dict[str, Any]] = {}
 
         outer = ttk.Frame(self, style="TFrame")
         outer.pack(fill="both", expand=True)
@@ -229,25 +235,47 @@ class HomePage(ttk.Frame):
 
         queue = ttk.Frame(center, style="Panel.TFrame")
         queue.pack(padx=28, fill="both", pady=(8, 0))
-        ttk.Label(queue, text="Queued manual label tasks", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(queue, text="Queued correction segments", style="Muted.TLabel").pack(anchor="w")
 
         queue_host = ttk.Frame(queue, style="Panel.TFrame")
         queue_host.pack(fill="both", pady=(6, 8))
-        cols = ("task", "queued", "subjects", "frames")
+        cols = ("task", "segments", "episodes", "subjects", "frames")
         self._queue_tree = ttk.Treeview(queue_host, columns=cols, show="headings", height=8)
         self._queue_tree.heading("task", text="Task")
-        self._queue_tree.heading("queued", text="Queued")
+        self._queue_tree.heading("segments", text="Segments")
+        self._queue_tree.heading("episodes", text="Episodes")
         self._queue_tree.heading("subjects", text="Subjects")
         self._queue_tree.heading("frames", text="Frames")
-        self._queue_tree.column("task", width=220, anchor="w")
-        self._queue_tree.column("queued", width=70, anchor="center")
-        self._queue_tree.column("subjects", width=170, anchor="w")
+        self._queue_tree.column("task", width=180, anchor="w")
+        self._queue_tree.column("segments", width=76, anchor="center")
+        self._queue_tree.column("episodes", width=76, anchor="center")
+        self._queue_tree.column("subjects", width=150, anchor="w")
         self._queue_tree.column("frames", width=70, anchor="center")
         self._queue_tree.pack(side="left", fill="both", expand=True)
         queue_scroll = ttk.Scrollbar(queue_host, orient="vertical", command=self._queue_tree.yview)
         queue_scroll.pack(side="left", fill="y", padx=(8, 0))
         self._queue_tree.configure(yscrollcommand=queue_scroll.set)
-        self._queue_tree.bind("<Double-1>", self._lease_selected_task)
+        self._queue_tree.bind("<<TreeviewSelect>>", self._load_selected_task_episodes)
+
+        episode_host = ttk.Frame(queue, style="Panel.TFrame")
+        episode_host.pack(fill="both", pady=(4, 8))
+        episode_cols = ("episode", "subject", "segments", "frames", "first")
+        self._episode_tree = ttk.Treeview(episode_host, columns=episode_cols, show="headings", height=7)
+        self._episode_tree.heading("episode", text="Episode")
+        self._episode_tree.heading("subject", text="Subject")
+        self._episode_tree.heading("segments", text="Segments")
+        self._episode_tree.heading("frames", text="Frames")
+        self._episode_tree.heading("first", text="First Frame")
+        self._episode_tree.column("episode", width=180, anchor="w")
+        self._episode_tree.column("subject", width=120, anchor="w")
+        self._episode_tree.column("segments", width=76, anchor="center")
+        self._episode_tree.column("frames", width=70, anchor="center")
+        self._episode_tree.column("first", width=86, anchor="center")
+        self._episode_tree.pack(side="left", fill="both", expand=True)
+        episode_scroll = ttk.Scrollbar(episode_host, orient="vertical", command=self._episode_tree.yview)
+        episode_scroll.pack(side="left", fill="y", padx=(8, 0))
+        self._episode_tree.configure(yscrollcommand=episode_scroll.set)
+        self._episode_tree.bind("<Double-1>", self._lease_selected_episode)
 
         self._queue_notice = ttk.Label(queue, text="Refresh to load queued tasks.", style="Muted.TLabel")
         self._queue_notice.pack(anchor="w")
@@ -257,7 +285,7 @@ class HomePage(ttk.Frame):
 
         ttk.Button(btns, text="Exit", style="Secondary.TButton", command=self._on_exit, width=14).pack(side="left", padx=(0, 12))
         ttk.Button(btns, text="Refresh Tasks", style="Secondary.TButton", command=self._refresh_tasks, width=16).pack(side="left", padx=(0, 12))
-        ttk.Button(btns, text="Get Selected Task", style="Primary.TButton", command=self._lease_selected_task, width=18).pack(side="left")
+        ttk.Button(btns, text="Get Selected Episode", style="Primary.TButton", command=self._lease_selected_episode, width=20).pack(side="left")
 
         legacy = ttk.Frame(center, style="Panel.TFrame")
         legacy.pack(padx=28, fill="x", pady=(18, 0))
@@ -281,7 +309,10 @@ class HomePage(ttk.Frame):
     def _populate_task_rows(self, groups: List[Dict[str, Any]]) -> None:
         for item_id in self._queue_tree.get_children():
             self._queue_tree.delete(item_id)
+        for item_id in self._episode_tree.get_children():
+            self._episode_tree.delete(item_id)
         self._task_rows = {}
+        self._episode_rows = {}
         for index, group in enumerate(groups, 1):
             item_id = f"task_{index}"
             subjects = str(group.get("subject_summary") or "")
@@ -289,7 +320,8 @@ class HomePage(ttk.Frame):
                 subjects = subjects[:31] + "..."
             values = (
                 str(group.get("task_name") or ""),
-                str(group.get("queued") or 0),
+                str(group.get("segments") or group.get("queued") or 0),
+                str(group.get("episodes") or 0),
                 subjects,
                 str(group.get("frames") or 0),
             )
@@ -301,9 +333,46 @@ class HomePage(ttk.Frame):
             self._queue_tree.focus(first)
             self._queue_notice.configure(text=f"{len(groups)} task group(s) loaded.")
         else:
-            self._queue_notice.configure(text="No queued manual label tasks.")
+            self._queue_notice.configure(text="No queued correction segments.")
 
-    def _lease_selected_task(self, _event: Any = None) -> None:
+    def _load_selected_task_episodes(self, _event: Any = None) -> None:
+        backend_url = (self._var_backend_url.get() or "").strip()
+        selected = self._queue_tree.selection()
+        for item_id in self._episode_tree.get_children():
+            self._episode_tree.delete(item_id)
+        self._episode_rows = {}
+        if not backend_url or not selected:
+            return
+        task_row = self._task_rows.get(str(selected[0])) or {}
+        task_name = str(task_row.get("task_name") or "").strip()
+        if not task_name:
+            return
+        try:
+            episodes = LabelBackendClient(backend_url).label_task_episodes(task_name)
+        except BackendClientError as exc:
+            self._queue_notice.configure(text=str(exc))
+            return
+        for index, episode in enumerate(episodes, 1):
+            item_id = f"episode_{index}"
+            episode_id = str(episode.get("episode_id") or "")
+            values = (
+                episode_id,
+                str(episode.get("subject_id") or ""),
+                str(episode.get("pending_segments") or 0),
+                str(episode.get("frames") or 0),
+                str(episode.get("first_start_frame") if episode.get("first_start_frame") is not None else ""),
+            )
+            self._episode_tree.insert("", "end", iid=item_id, values=values)
+            self._episode_rows[item_id] = dict(episode)
+        if episodes:
+            first = "episode_1"
+            self._episode_tree.selection_set(first)
+            self._episode_tree.focus(first)
+            self._queue_notice.configure(text=f"{len(episodes)} episode(s) loaded for {task_name}.")
+        else:
+            self._queue_notice.configure(text=f"No pending episodes for {task_name}.")
+
+    def _lease_selected_episode(self, _event: Any = None) -> None:
         backend_url = (self._var_backend_url.get() or "").strip()
         operator_id = (self._var_operator.get() or "").strip()
         if not backend_url:
@@ -321,12 +390,22 @@ class HomePage(ttk.Frame):
         if not task_name:
             messagebox.showwarning("Notice", "Selected task is invalid.")
             return
+        selected_episode = self._episode_tree.selection()
+        if not selected_episode:
+            messagebox.showwarning("Notice", "Please select an episode.")
+            return
+        episode_row = self._episode_rows.get(str(selected_episode[0])) or {}
+        episode_id = str(episode_row.get("episode_id") or "").strip()
+        if not episode_id:
+            messagebox.showwarning("Notice", "Selected episode is invalid.")
+            return
         try:
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
                 lease_seconds=600,
                 task_name=task_name,
+                episode_id=episode_id,
             )
         except (BackendClientError, ValueError) as exc:
             messagebox.showerror("Backend", str(exc))
@@ -351,7 +430,7 @@ class LabelPage(ttk.Frame):
         self._backend_session: Optional[LabelJobSession] = None
         self._backend_completed: bool = False
         self._heartbeat_after_id: Optional[str] = None
-        self._mode: str = "pred"
+        self._mode: str = "mano"
         self._tasks: List[CorrectionTask] = []
         self._tasks_by_key: Dict[str, CorrectionTask] = {}
         self._progress: Dict[str, CorrectionProgress] = {}
@@ -461,7 +540,7 @@ class LabelPage(ttk.Frame):
         self._jsonl_path = None
         self._backend_session = None
         self._backend_completed = False
-        self._mode = "pred"
+        self._mode = "mano"
         self._tasks = []
         self._tasks_by_key = {}
         self._progress = {}
@@ -479,6 +558,9 @@ class LabelPage(ttk.Frame):
         self._hand_initializer.close()
         if self._frame_status is not None:
             self._frame_status.configure(text="")
+
+    def release_on_exit(self) -> None:
+        self._release_backend_job("operator_exit")
 
     def set_session(self, *, session: Any = None, jsonl_path: str = "") -> bool:
         if isinstance(session, LabelJobSession):
@@ -525,7 +607,7 @@ class LabelPage(ttk.Frame):
         progress: Dict[str, CorrectionProgress],
         info_prefix: str,
     ) -> bool:
-        self._mode = "pred"
+        self._mode = "mano"
         self._tasks = tasks
         self._tasks_by_key = {t.key: t for t in tasks}
         self._progress = progress
@@ -713,7 +795,7 @@ class LabelPage(ttk.Frame):
 
     def _normalize_source(self, source: str) -> str:
         source = (source or "").strip().lower()
-        return source if source in SOURCE_ORDER else "pred"
+        return source if source in SOURCE_ORDER else "mano"
 
     def _copy_view_state(self, state: Tuple[HandPoints, HandVisible]) -> Tuple[HandPoints, HandVisible]:
         points, visible = state
@@ -1448,6 +1530,7 @@ class LabelPage(ttk.Frame):
             save_corrected_array(bundle)
             self._invalidate_corrected_source_cache()
         except Exception as exc:
+            self._fail_backend_job(f"save_failed: {exc}")
             messagebox.showerror("Error", str(exc))
             return
 
@@ -1479,15 +1562,18 @@ class LabelPage(ttk.Frame):
         if session is None or self._backend_completed:
             return True
         data_uri = str(session.payload.get("data_uri") or "").rstrip("/")
-        correction_dir = str(session.payload.get("correction_dir") or task.correction_dir or "corrected_2d").strip("/")
-        artifact_uri = f"{data_uri}/{correction_dir}" if data_uri and correction_dir else data_uri
+        artifact_uri = str(session.payload.get("manual_2d_output_uri") or session.payload.get("manual_2d_uri") or "").strip()
+        if not artifact_uri:
+            correction_dir = str(session.payload.get("correction_dir") or task.correction_dir or "manual_2d").strip("/")
+            artifact_uri = f"{data_uri}/{correction_dir}" if data_uri and correction_dir else data_uri
         artifacts = []
         if artifact_uri:
             artifacts.append(
                 {
-                    "kind": "corrected_2d",
+                    "kind": "manual_2d",
                     "uri": artifact_uri,
                     "metadata": {
+                        "segment_id": session.segment_id or session.job_id,
                         "cameras": list(task.cameras),
                         "frames": list(task.frames),
                         "operator_id": session.operator_id,
@@ -1510,6 +1596,21 @@ class LabelPage(ttk.Frame):
         self._backend_completed = True
         self._cancel_backend_heartbeat()
         return True
+
+    def _fail_backend_job(self, error: str) -> None:
+        session = self._backend_session
+        if session is None or self._backend_completed:
+            return
+        try:
+            session.client.fail_label_job(
+                session.job_id,
+                error=error,
+                result={"operator_id": session.operator_id, "local_progress_cache": self._jsonl_path or ""},
+            )
+            self._backend_completed = True
+            self._cancel_backend_heartbeat()
+        except Exception:
+            pass
 
     def _update_tree_row(self, task: CorrectionTask) -> None:
         rec = self._progress.get(task.key)

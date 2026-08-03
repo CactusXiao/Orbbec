@@ -100,7 +100,7 @@ class BackendClient:
                 raw = resp.read().decode("utf-8")
         except HTTPError as exc:
             message = self._http_error_message(exc)
-            if exc.code == 404 and message.startswith("no queued "):
+            if exc.code == 404 and (message.startswith("no queued ") or message.startswith("no pending manual segment")):
                 raise NoJobAvailable(message) from exc
             raise BackendError(f"HTTP {exc.code}: {message}") from exc
         except (URLError, TimeoutError) as exc:
@@ -160,13 +160,13 @@ class BackendClient:
 
     def lease_label_job(self, operator_id: str, lease_seconds: int = 600) -> Json:
         return self.post(
-            "/api/v1/label/jobs/lease",
+            "/api/v1/label/segments/lease",
             {"operator_id": operator_id, "lease_seconds": lease_seconds},
         )
 
     def heartbeat_label_job(self, job_id: str, operator_id: str, lease_seconds: int = 600) -> Json:
         return self.post(
-            f"/api/v1/label/jobs/{quote(job_id, safe='')}/heartbeat",
+            f"/api/v1/label/segments/{quote(job_id, safe='')}/heartbeat",
             {"operator_id": operator_id, "lease_seconds": lease_seconds, "status": "running"},
         )
 
@@ -174,7 +174,7 @@ class BackendClient:
         body: Json = {"result": result}
         if artifacts:
             body["artifacts"] = artifacts
-        return self.post(f"/api/v1/label/jobs/{quote(job_id, safe='')}/complete", body)
+        return self.post(f"/api/v1/label/segments/{quote(job_id, safe='')}/complete", body)
 
 
 @dataclass
@@ -436,6 +436,29 @@ class NasSimulator:
                 write_placeholder_npy(base / correction_dir / str(cam) / f"{int(frame):05d}.npy")
         return uri_join(data_uri, correction_dir)
 
+    def write_mano_episode_artifact(self, data_uri: str, cameras: Sequence[str], frames: Sequence[int]) -> str:
+        base = self.local_path_for_uri(data_uri)
+        out = base / "mano" / "episode"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "mano_episode.json").write_text(
+            json.dumps({"mock": True, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                write_placeholder_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy")
+        return uri_join(data_uri, "mano", "episode")
+
+    def write_mano_segment_patch(self, data_uri: str, segment_id: str, cameras: Sequence[str], frames: Sequence[int]) -> str:
+        base = self.local_path_for_uri(data_uri)
+        out = base / "mano" / "segments" / clean_id(segment_id, "segment")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "mano_patch.json").write_text(
+            json.dumps({"mock": True, "segment_id": segment_id, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return uri_join(data_uri, "mano", "segments", segment_id)
+
 
 def as_string_list(value: Any) -> List[str]:
     if not isinstance(value, list):
@@ -568,6 +591,39 @@ def write_corrected_artifact_for_payload(
     return uri_join(data_uri, correction_dir)
 
 
+def write_mano_artifact_for_payload(
+    nas: NasSimulator,
+    payload: Json,
+    episode: Optional[Json],
+    cameras: Sequence[str],
+    frames: Sequence[int],
+) -> Tuple[str, str]:
+    data_uri = str(payload.get("data_uri") or "")
+    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
+    segment_id = str(payload.get("segment_id") or "")
+    if data_uri.startswith(nas.uri_prefix):
+        if scope == "segment":
+            return "mano_segment_patch", nas.write_mano_segment_patch(data_uri, segment_id, cameras, frames)
+        return "mano_episode", nas.write_mano_episode_artifact(data_uri, cameras, frames)
+    episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        if scope == "segment":
+            out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "mano_patch.json").write_text(json.dumps({"mock": True, "segment_id": segment_id}) + "\n", encoding="utf-8")
+            return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
+        out = episode_path / "mano" / "episode"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "mano_episode.json").write_text(json.dumps({"mock": True}) + "\n", encoding="utf-8")
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                write_placeholder_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy")
+        return "mano_episode", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode")
+    if scope == "segment":
+        return "mano_segment_patch", uri_join(data_uri, "mano", "segments", segment_id)
+    return "mano_episode", uri_join(data_uri, "mano", "episode")
+
+
 def payload_from_task(task: LabelTask, data_uri: str, job_id: str, reason: str) -> Json:
     return {
         "job_id": job_id,
@@ -613,20 +669,21 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
             if local_path:
                 body["local_path"] = local_path
             result = client.create_manual_label_job(body)
+            segment = result.get("segment", {})
             count += 1
             print_event(
-                "manual_label_seeded",
-                job_id=result.get("job", {}).get("job_id", job_id),
+                "manual_segment_seeded",
+                segment_id=segment.get("segment_id", job_id),
                 episode_id=task.episode_id,
                 data_uri=data_uri,
                 frames=len(batch_task.frames),
                 batch_index=batch_index,
                 batch_count=len(batches),
-                status=result.get("job", {}).get("status"),
+                status=segment.get("status"),
             )
         if stop:
             break
-    print_event("manual_label_seed_done", count=count)
+    print_event("manual_segment_seed_done", count=count)
     return 0
 
 
@@ -675,22 +732,28 @@ def seed_captured_upload_jobs(args: argparse.Namespace) -> int:
 
 def enriched_payload(response: Json) -> Json:
     payload = dict(response.get("payload") or {})
-    job = response.get("job") or {}
+    job = response.get("job") or response.get("segment") or {}
     episode = response.get("episode") or {}
-    for key in ("job_id", "episode_id"):
+    for key in ("job_id", "segment_id", "episode_id"):
         payload.setdefault(key, job.get(key) or episode.get(key))
     for key in (
         "subject_id",
         "task_name",
         "data_uri",
+        "episode_base_uri",
         "local_capture_path",
         "resolved_data_path",
         "cameras",
         "frames",
+        "start_frame",
+        "end_frame",
         "frame_count",
         "rgb_path_template",
         "prediction_dir",
         "correction_dir",
+        "manual_2d_output_uri",
+        "manual_2d_uri",
+        "mano_episode_uri",
     ):
         if payload.get(key) in (None, "", []):
             payload[key] = episode.get(key)
@@ -758,6 +821,45 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     return True
 
 
+def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
+    owner = args.worker_id or f"virtual_mano_opt_{os.getpid()}"
+    try:
+        leased = client.lease_job("mano_opt", owner, args.lease_seconds)
+    except NoJobAvailable:
+        return False
+    job = leased.get("job") or {}
+    episode = leased.get("episode") or {}
+    payload = enriched_payload(leased)
+    client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
+    cameras = cameras_from_payload(payload, episode, nas)
+    frames = frames_from_payload(payload, episode, nas, cameras)
+    if args.max_materialized_frames > 0:
+        frames = frames[: args.max_materialized_frames]
+    kind, uri = write_mano_artifact_for_payload(nas, payload, episode, cameras, frames)
+    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
+    client.complete_job(
+        str(job["job_id"]),
+        {
+            "ok": True,
+            "scope": scope,
+            "segment_id": payload.get("segment_id") or "",
+            "frames_optimized": frames,
+            "virtual_worker": owner,
+            "output_uri": uri,
+        },
+        artifacts=[{"kind": kind, "uri": uri, "metadata": {"worker_id": owner, "mock": True, "scope": scope}}],
+    )
+    print_event(
+        "mano_opt_completed",
+        job_id=job["job_id"],
+        episode_id=payload.get("episode_id"),
+        segment_id=payload.get("segment_id") or "",
+        scope=scope,
+        uri=uri,
+    )
+    return True
+
+
 def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
     owner = args.worker_id or f"virtual_qc_{os.getpid()}"
     try:
@@ -769,12 +871,17 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
     passed = random.random() >= float(args.qc_fail_rate)
-    qc_report_uri = uri_join(str(payload.get("data_uri") or ""), "virtual_qc_report.json")
+    frames = frames_from_payload(payload, episode, nas, cameras_from_payload(payload, episode, nas))
+    if args.max_materialized_frames > 0:
+        frames = frames[: args.max_materialized_frames]
+    failed_segments = [] if passed else virtual_failed_segments(frames)
+    qc_report_uri = uri_join(str(payload.get("data_uri") or ""), "qc", "qc_report.json")
     result = {
         "passed": passed,
         "qc_passed": passed,
         "score": round(random.random(), 4),
-        "reason": "virtual_qc_pass" if passed else "virtual_qc_failed_needs_manual_label",
+        "segments": failed_segments,
+        "reason": "virtual_qc_pass" if passed else "virtual_qc_failed_needs_manual_segments",
         "virtual_worker": owner,
     }
     client.complete_job(
@@ -785,8 +892,28 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     if passed:
         print_event("qc_passed", job_id=job["job_id"], episode_id=payload.get("episode_id"))
     else:
-        print_event("qc_failed_manual_label_queued", job_id=job["job_id"], episode_id=payload.get("episode_id"), manual_job_id="queued_by_backend")
+        print_event(
+            "qc_failed_manual_segments_created",
+            job_id=job["job_id"],
+            episode_id=payload.get("episode_id"),
+            segments=failed_segments,
+        )
     return True
+
+
+def virtual_failed_segments(frames: Sequence[int]) -> List[Json]:
+    clean_frames = sorted(int(frame) for frame in frames if not isinstance(frame, bool))
+    if not clean_frames:
+        return [{"start_frame": 0, "end_frame": 0, "reason": "virtual_qc_failed"}]
+    first = clean_frames[0]
+    last = clean_frames[-1]
+    if len(clean_frames) == 1:
+        return [{"start_frame": first, "end_frame": first, "reason": "virtual_qc_failed"}]
+    mid = clean_frames[len(clean_frames) // 2]
+    segments = [{"start_frame": first, "end_frame": min(first + 1, last), "reason": "virtual_low_score"}]
+    if mid > segments[0]["end_frame"]:
+        segments.append({"start_frame": mid, "end_frame": min(mid + 1, last), "reason": "virtual_temporal_jump"})
+    return segments
 
 
 def handle_manual_label_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
@@ -795,10 +922,11 @@ def handle_manual_label_once(client: BackendClient, nas: NasSimulator, args: arg
         leased = client.lease_label_job(operator, args.lease_seconds)
     except NoJobAvailable:
         return False
-    job = leased.get("job") or {}
+    job = leased.get("job") or leased.get("segment") or {}
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
-    client.heartbeat_label_job(str(job["job_id"]), operator, args.lease_seconds)
+    job_id = str(job.get("job_id") or job.get("segment_id") or payload.get("segment_id") or "")
+    client.heartbeat_label_job(job_id, operator, args.lease_seconds)
     data_uri = str(payload.get("data_uri") or "")
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
@@ -807,23 +935,29 @@ def handle_manual_label_once(client: BackendClient, nas: NasSimulator, args: arg
     correction_dir = str(payload.get("correction_dir") or "corrected_2d")
     corrected_uri = write_corrected_artifact_for_payload(nas, payload, episode, cameras, frames, correction_dir)
     client.complete_label_job(
-        str(job["job_id"]),
+        job_id,
         {"operator_id": operator, "frames_completed": frames, "virtual_labeler": True},
         artifacts=[
             {
-                "kind": "corrected_2d",
+                "kind": "manual_2d",
                 "uri": corrected_uri,
-                "metadata": {"operator_id": operator, "frames": frames, "mock": True},
+                "metadata": {"operator_id": operator, "segment_id": payload.get("segment_id") or "", "frames": frames, "mock": True},
             }
         ],
     )
-    print_event("manual_label_completed", job_id=job["job_id"], episode_id=payload.get("episode_id"), corrected_uri=corrected_uri)
+    print_event(
+        "manual_segment_completed",
+        segment_id=payload.get("segment_id") or job_id,
+        episode_id=payload.get("episode_id"),
+        corrected_uri=corrected_uri,
+    )
     return True
 
 
 WORKER_HANDLERS = {
     "upload": handle_upload_once,
     "auto-label": handle_auto_label_once,
+    "mano-opt": handle_mano_opt_once,
     "qc": handle_qc_once,
     "manual-label": handle_manual_label_once,
 }
@@ -831,9 +965,9 @@ WORKER_HANDLERS = {
 
 def parse_workers(raw: str) -> List[str]:
     if raw == "default":
-        return ["upload", "auto-label", "qc"]
+        return ["upload", "auto-label", "mano-opt", "qc"]
     if raw == "all":
-        return ["upload", "auto-label", "qc", "manual-label"]
+        return ["upload", "auto-label", "mano-opt", "qc", "manual-label"]
     workers = [part.strip() for part in raw.split(",") if part.strip()]
     bad = [worker for worker in workers if worker not in WORKER_HANDLERS]
     if bad:
@@ -888,7 +1022,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Virtual NAS, auto-label, QC, and label workers for Orbbec backend testing.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    seed_label = sub.add_parser("seed-label", help="Queue manual_label jobs from an existing label JSONL file.")
+    seed_label = sub.add_parser("seed-label", help="Queue manual correction segments from an existing label JSONL file.")
     add_common_args(seed_label)
     seed_label.add_argument("--jsonl", type=Path, default=Path("label/task.jsonl"))
     seed_label.add_argument("--limit", type=int, default=0)
@@ -909,7 +1043,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     workers = sub.add_parser("run-workers", help="Run virtual upload, auto-label, QC, and optionally manual-label workers.")
     add_common_args(workers)
-    workers.add_argument("--workers", default="default", help="default, all, or comma list: upload,auto-label,qc,manual-label")
+    workers.add_argument("--workers", default="default", help="default, all, or comma list: upload,auto-label,mano-opt,qc,manual-label")
     workers.add_argument("--worker-id", default="")
     workers.add_argument("--lease-seconds", type=int, default=300)
     workers.add_argument("--qc-fail-rate", type=float, default=0.35)

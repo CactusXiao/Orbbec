@@ -833,7 +833,21 @@ def sum_storage_bytes(items: Iterable[Dict[str, Any]]) -> int:
 
 def status_class(status: str) -> str:
     status = str(status or "").strip()
-    if status in {"confirmed", "uploaded", "auto_labeled", "qc_passed", "review_passed", "manual_labeled", "finalized", "succeeded", "complete", "active"}:
+    if status in {
+        "confirmed",
+        "uploaded",
+        "auto_labeled",
+        "mano_optimized",
+        "qc_passed",
+        "review_passed",
+        "manual_labeled",
+        "manual_labeled",
+        "mano_succeeded",
+        "finalized",
+        "succeeded",
+        "complete",
+        "active",
+    }:
         return "ok"
     if status in {
         "reserved",
@@ -843,10 +857,17 @@ def status_class(status: str) -> str:
         "leased",
         "running",
         "auto_labeling",
+        "mano_optimizing",
         "qc_running",
         "review_pending",
         "manual_label_pending",
         "manual_labeling",
+        "manual_correction_pending",
+        "manual_correction_running",
+        "pending_manual",
+        "segment_mano_optimizing",
+        "mano_queued",
+        "mano_running",
     }:
         return "warn"
     if status in {"failed", "canceled", "qc_failed", "expired"}:
@@ -1425,8 +1446,9 @@ def render_status_badge(status: str) -> str:
 
 WORKFLOW_STAGE_LABELS = [
     ("auto_label", "自动标注"),
+    ("mano_opt", "MANO 优化"),
     ("qc", "质检结果"),
-    ("manual_label", "人工处理"),
+    ("manual_segment", "人工纠偏"),
 ]
 
 
@@ -1843,6 +1865,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     workflow_job_count = int(workflow_info.get("job_count") or 0)
     jobs = workflow.get("jobs") if isinstance(workflow.get("jobs"), list) else []
     job_rows = []
+    failed_job_alerts = []
     for job in jobs:
         if not isinstance(job, dict):
             continue
@@ -1854,6 +1877,10 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         frames = job.get("frames")
         frames_label = str(frames) if frames is not None else "-"
         error = str(job.get("error") or "")
+        if str(job.get("status") or "") == "failed":
+            failed_job_alerts.append(
+                f"{job.get('job_id') or '-'} / {job.get('type') or '-'} / {error or job.get('error_summary') or '-'}"
+            )
         job_rows.append(
             "<tr>"
             f"<td class=\"mono\">{html_escape(job.get('job_id') or '-')}</td>"
@@ -1867,6 +1894,45 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             "</tr>"
         )
     workflow_jobs_html = "\n".join(job_rows) if job_rows else "<tr><td colspan=\"8\" class=\"empty\">No workflow jobs yet.</td></tr>"
+    workflow_artifacts = workflow.get("workflow_artifacts") if isinstance(workflow.get("workflow_artifacts"), list) else []
+    segments = workflow.get("segments") if isinstance(workflow.get("segments"), list) else []
+
+    def latest_artifact(kinds: set) -> str:
+        for artifact in reversed(workflow_artifacts):
+            if isinstance(artifact, dict) and str(artifact.get("kind") or "") in kinds:
+                return str(artifact.get("uri") or "")
+        return ""
+
+    auto_2d_uri = latest_artifact({"pred_2d", "auto_2d"})
+    mano_episode_uri = latest_artifact({"mano_episode"})
+    qc_report_uri = latest_artifact({"qc_report"})
+    failed_segment_count = len(segments)
+    segment_rows = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        frame_range = f"{segment.get('start_frame', '-')}-{segment.get('end_frame', '-')}"
+        error = str(segment.get("error") or "")
+        segment_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{html_escape(segment.get('segment_id') or '-')}</td>"
+            f"<td class=\"num\">{html_escape(frame_range)}</td>"
+            f"<td>{render_status_badge(str(segment.get('status') or '-'))}</td>"
+            f"<td class=\"mono\">{html_escape(segment.get('lease_owner') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(segment.get('manual_2d_uri') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(segment.get('mano_patch_uri') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(error or '-')}</td>"
+            "</tr>"
+        )
+    segments_html = "\n".join(segment_rows) if segment_rows else "<tr><td colspan=\"7\" class=\"empty\">No failed QC segments.</td></tr>"
+    failed_alert_html = ""
+    if failed_job_alerts:
+        failed_alert_html = (
+            "<div class=\"notice bad\">Worker failure: "
+            + html_escape(" | ".join(failed_job_alerts[:5]))
+            + (" ..." if len(failed_job_alerts) > 5 else "")
+            + "</div>"
+        )
     fields = [
         ("Reservation ID", reservation_id),
         ("Task", task_name),
@@ -1931,9 +1997,19 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         f"<div>Upload bytes</div><div class=\"mono\">{html_escape(format_bytes(upload_copied))} / {html_escape(format_bytes(upload_total))}</div>"
         f"<div>Upload files</div><div class=\"mono\">{html_escape(upload_files_done)} / {html_escape(upload_files_total)}</div>"
         f"<div>NAS URI</div><div class=\"mono\">{html_escape(upload_nas_uri or '-')}</div>"
+        f"<div>Auto 2D</div><div class=\"mono\">{html_escape(auto_2d_uri or '-')}</div>"
+        f"<div>Episode MANO</div><div class=\"mono\">{html_escape(mano_episode_uri or '-')}</div>"
+        f"<div>QC report</div><div class=\"mono\">{html_escape(qc_report_uri or '-')}</div>"
+        f"<div>Failed segments</div><div class=\"mono\">{html_escape(failed_segment_count)}</div>"
         f"<div>Upload error</div><div class=\"mono\">{html_escape(upload_error or '-')}</div>"
         f"<div>Backend file access</div><div class=\"muted\">{html_escape(storage_note)}</div>"
         + "</div></section>"
+        + failed_alert_html
+        + "<section><h2>QC Failed Segments</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>Lease Owner</th>"
+        "<th>Manual 2D</th><th>MANO Patch</th><th>Error</th></tr></thead><tbody>"
+        + segments_html
+        + "</tbody></table></div></section>"
         "<section><h2>Workflow Jobs</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Job</th><th>Type</th><th>Status</th><th class=\"num\">Batch</th>"
         "<th class=\"num\">Frames</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
@@ -2080,6 +2156,19 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not job_id or "/" in job_id:
                     raise BackendError(HTTPStatus.NOT_FOUND, "label job not found")
                 self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
+                return
+
+            if parsed.path == "/api/v1/label/tasks":
+                self._json_response(HTTPStatus.OK, self.workflow.label_tasks())
+                return
+
+            label_task_prefix = "/api/v1/label/tasks/"
+            if parsed.path.startswith(label_task_prefix) and parsed.path.endswith("/episodes"):
+                raw_name = parsed.path[len(label_task_prefix):-len("/episodes")]
+                task_name = unquote(raw_name.strip("/")).strip()
+                if not task_name:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "label task not found")
+                self._json_response(HTTPStatus.OK, self.workflow.label_task_episodes(task_name))
                 return
 
             collection_upload_prefix = "/api/v1/collection/episodes/"
@@ -2269,19 +2358,36 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.OK, self.workflow.create_dev_job(body))
             elif parsed.path == "/api/v1/jobs/lease":
                 self._json_response(HTTPStatus.OK, self.workflow.lease_job(body))
+            elif parsed.path == "/api/v1/label/segments/lease":
+                self._json_response(HTTPStatus.OK, self.workflow.lease_label_segment(body))
             elif parsed.path == "/api/v1/label/jobs/lease":
-                self._json_response(HTTPStatus.OK, self.workflow.lease_job(body, forced_type="manual_label"))
+                self._json_response(HTTPStatus.OK, self.workflow.lease_label_segment(body))
             else:
+                segment_action = self._path_job_action(parsed.path, "/api/v1/label/segments")
                 label_action = self._path_job_action(parsed.path, "/api/v1/label/jobs")
                 job_action = self._path_job_action(parsed.path, "/api/v1/jobs")
-                if label_action is not None:
+                if segment_action is not None:
+                    segment_id, action = segment_action
+                    if action == "heartbeat":
+                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_segment(segment_id, body))
+                    elif action == "complete":
+                        self._json_response(HTTPStatus.OK, self.workflow.complete_label_segment(segment_id, body))
+                    elif action == "release":
+                        self._json_response(HTTPStatus.OK, self.workflow.release_label_segment(segment_id, body))
+                    elif action == "fail":
+                        self._json_response(HTTPStatus.OK, self.workflow.fail_label_segment(segment_id, body))
+                    else:
+                        raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+                elif label_action is not None:
                     job_id, action = label_action
                     if action == "heartbeat":
-                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_job(job_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_segment(job_id, body))
                     elif action == "complete":
-                        self._json_response(HTTPStatus.OK, self.workflow.complete_job(job_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.complete_label_segment(job_id, body))
                     elif action == "release":
-                        self._json_response(HTTPStatus.OK, self.workflow.release_job(job_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.release_label_segment(job_id, body))
+                    elif action == "fail":
+                        self._json_response(HTTPStatus.OK, self.workflow.fail_label_segment(job_id, body))
                     else:
                         raise BackendError(HTTPStatus.NOT_FOUND, "not found")
                 elif job_action is not None:

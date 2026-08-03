@@ -11,6 +11,8 @@ EPISODE_STATUSES = {
     "uploaded",
     "auto_labeling",
     "auto_labeled",
+    "mano_optimizing",
+    "mano_optimized",
     "qc_running",
     "qc_passed",
     "qc_failed",
@@ -19,12 +21,16 @@ EPISODE_STATUSES = {
     "manual_label_pending",
     "manual_labeling",
     "manual_labeled",
+    "manual_correction_pending",
+    "manual_correction_running",
+    "segment_mano_optimizing",
     "finalized",
 }
 
 JOB_TYPES = {
     "upload",
     "auto_label",
+    "mano_opt",
     "qc",
     "review",
     "manual_label",
@@ -32,8 +38,19 @@ JOB_TYPES = {
 
 CONTROLLED_STAGE_JOB_TYPES = {
     "auto_label",
+    "mano_opt",
     "qc",
-    "manual_label",
+    "manual_segment",
+}
+
+SEGMENT_STATUSES = {
+    "pending_manual",
+    "manual_labeling",
+    "manual_labeled",
+    "mano_queued",
+    "mano_running",
+    "mano_succeeded",
+    "failed",
 }
 
 JOB_STATUSES = {
@@ -64,7 +81,7 @@ def require_job_type(value: str) -> str:
 
 
 def require_stage_job_type(value: str) -> str:
-    value = require_job_type(value)
+    value = str(value or "").strip()
     if value not in CONTROLLED_STAGE_JOB_TYPES:
         raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported workflow stage: {value}")
     return value
@@ -81,6 +98,13 @@ def require_episode_status(value: str) -> str:
     value = str(value or "").strip()
     if value not in EPISODE_STATUSES:
         raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported episode status: {value}")
+    return value
+
+
+def require_segment_status(value: str) -> str:
+    value = str(value or "").strip()
+    if value not in SEGMENT_STATUSES:
+        raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported segment status: {value}")
     return value
 
 

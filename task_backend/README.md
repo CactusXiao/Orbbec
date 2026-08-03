@@ -267,8 +267,9 @@ uploader leases this job, copies local data to the virtual NAS, updates progress
 registers a `nas_episode` artifact, and marks the episode `uploaded` only after
 the verified copy completes. `auto_label` jobs are created only after an
 explicit push from the dashboard, task page, episode page, or workflow API.
-Manual labeling completion stops at
-`manual_labeled`; any later review or return flow is left to a future policy.
+The main workflow is `uploaded -> auto_label -> mano_opt -> qc -> finalized`.
+When QC fails, the backend creates failed-frame segments for manual correction;
+each corrected segment then gets only a segment-level `mano_opt` patch job.
 
 Upload status can be read by reservation/episode ID:
 
@@ -298,20 +299,22 @@ POST /api/v1/jobs/{job_id}/release
 {"type":"auto_label","worker_id":"auto_label_stub_01","lease_seconds":300}
 ```
 
-Manual labeling uses a narrower API:
+Manual correction leases failed QC segments, not episode jobs:
 
 ```text
-POST /api/v1/label/jobs/lease
-GET  /api/v1/label/jobs/{job_id}
-POST /api/v1/label/jobs/{job_id}/heartbeat
-POST /api/v1/label/jobs/{job_id}/complete
-POST /api/v1/label/jobs/{job_id}/release
+GET  /api/v1/label/tasks
+GET  /api/v1/label/tasks/<task_name>/episodes
+POST /api/v1/label/segments/lease
+POST /api/v1/label/segments/{segment_id}/heartbeat
+POST /api/v1/label/segments/{segment_id}/complete
+POST /api/v1/label/segments/{segment_id}/release
+POST /api/v1/label/segments/{segment_id}/fail
 ```
 
 Lease semantics:
 
-- only `queued` jobs, or jobs with an expired lease, can be leased;
-- `auto_label`, `qc`, and `manual_label` leases are paused by default and return
+- only queued jobs/segments, or work with an expired lease, can be leased;
+- `auto_label`, `mano_opt`, `qc`, and `manual_segment` leases are paused by default and return
   `HTTP 409` with `leasing disabled for job type: <type>` until enabled;
 - lease writes `lease_owner`, `lease_until`, and `status=leased`;
 - heartbeat extends the lease and may mark the job `running`;
@@ -322,7 +325,7 @@ Lease semantics:
 Workflow stage controls and snapshots:
 
 ```text
-GET  /api/v1/workflow/stages/<auto_label|qc|manual_label>
+GET  /api/v1/workflow/stages/<auto_label|mano_opt|qc|manual_segment>
 POST /api/v1/workflow/stages/<job_type>/enable
 POST /api/v1/workflow/stages/<job_type>/disable
 ```
@@ -337,9 +340,10 @@ The push body may target one `episode_id`, one `task_name`, or all eligible
 episodes with `{"scope":"all"}`. An episode is eligible when it is `uploaded`,
 has a NAS/data URI, and has no existing `auto_label` job.
 
-`manual_label` lease moves the Episode to `manual_labeling`; successful
-completion moves it to `manual_labeled` and can register a `corrected_2d`
-artifact.
+`manual_segment` lease moves the Episode to `manual_correction_running`.
+Successful segment completion registers `manual_2d` and queues a segment-level
+`mano_opt`; when all failed segments have `mano_succeeded`, the Episode becomes
+`finalized`.
 
 ## Development Manual Label Jobs
 
@@ -363,13 +367,12 @@ curl -s http://127.0.0.1:8765/api/v1/dev/label/jobs \
     "cameras": ["camera_01", "camera_02"],
     "frames": [120, 121, 122, 123],
     "rgb_path_template": "{camera}/RGB/{frame:05d}.png",
-    "prediction_dir": "pred_2d",
-    "correction_dir": "corrected_2d"
+    "prediction_dir": "pred_2d"
   }'
 ```
 
-The endpoint converts `local_path` to a `local://` data URI. It is for local
-smoke tests and should be replaced by QC/worker-generated jobs later.
+The endpoint converts `local_path` to a `local://` data URI and creates a
+`pending_manual` segment for local smoke tests.
 
 There is also a development-only generic helper for stubbing `upload`,
 `auto_label`, `qc`, or `review` jobs:
@@ -378,10 +381,13 @@ There is also a development-only generic helper for stubbing `upload`,
 POST /api/v1/dev/jobs
 ```
 
-Completing an `auto_label` job registers or accepts `pred_2d` and queues `qc`
-after all auto-label batches for that episode succeed. Completing a `qc` job
-registers or accepts `qc_report`; `{"result":{"passed":false}}` leaves the
-episode `qc_failed` and queues one `manual_label` job.
+Completing an `auto_label` job registers or accepts `pred_2d` and queues
+episode-level `mano_opt` after all auto-label batches for that episode succeed.
+Completing episode `mano_opt` registers `mano_episode` and queues `qc`.
+Completing `qc` with `{"result":{"passed":true}}` finalizes the episode.
+Completing `qc` with `passed:false` registers `qc_report`, creates failed
+segments from the returned closed intervals, and moves the episode to
+`manual_correction_pending`.
 
 ## Label Frontend
 
@@ -395,9 +401,9 @@ the backend URL and operator ID:
 }
 ```
 
-Click `Refresh Tasks` to load queued `manual_label` jobs from the backend. The
-GUI groups them by `task_name`; select a task and click `Get Selected Task` to
-lease only that task's manual-label job through `/api/v1/label/jobs/lease`.
+Click `Refresh Tasks` to load queued correction segments from the backend. The
+GUI groups them by `task_name`; select a task, select an episode, and click
+`Get Selected Episode` to lease that episode's next segment by `start_frame`.
 Legacy JSONL remains available for debugging, but it is no longer the default
 task source.
 
@@ -406,7 +412,7 @@ Config page and the Task Select page. It launches the same `python3 -m
 label.main` GUI as a separate window and pre-fills the backend URL from the
 collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
 `subject_id` as the operator hint. NAS/local path mapping is owned by the
-backend: it resolves `data_uri` into `resolved_data_path` in the leased job
+backend: it resolves `data_uri` into `resolved_data_path` in the leased segment
 payload. For non-virtual NAS prefixes, configure the backend with
 `ORBBEC_URI_MOUNTS_JSON`.
 
@@ -417,23 +423,24 @@ requires no mount mapping. A NAS-style URI such as
 backend-configured mount prefix.
 
 Label confirmation writes corrected 2D arrays to the `correction_dir` returned
-by the backend payload. The default remains:
+by the backend payload. For segment work the default is:
 
 ```text
-corrected_2d/<camera>/<frame:05d>.npy
+manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
 ```
 
-After all frames in the leased job are complete, the GUI calls the backend
-complete endpoint and registers a `corrected_2d` artifact. The local progress
+After all frames in the leased segment are complete, the GUI calls the backend
+complete endpoint and registers a `manual_2d` artifact. The local progress
 CSV is retained only as a temporary cache/legacy aid.
 
 ## Artifact Kinds
 
 Current artifact kind names:
 
-- `pred_2d`: automatic or manual pre-label 2D output.
-- `corrected_2d`: human-corrected 2D output.
-- `kp3d`: 3D output.
+- `pred_2d` / `auto_2d`: automatic 2D output.
+- `manual_2d`: human-corrected segment 2D output.
+- `mano_episode`: episode-level MANO output from automatic 2D.
+- `mano_segment_patch`: segment MANO patch after manual correction.
 - `qc_report`: quality-control report.
 
 If an existing auto-label pipeline emits `kp2d`, adapt it at the artifact

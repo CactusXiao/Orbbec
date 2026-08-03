@@ -34,6 +34,7 @@ class CorrectionTask:
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png"
     prediction_dir: str = "pred_2d"
     correction_dir: str = "corrected_2d"
+    mano_projection_dir: str = "mano/episode/projected_2d"
     episode_path: Optional[str] = None
 
     @property
@@ -272,6 +273,7 @@ def correction_task_from_backend_payload(
         rgb_path_template=str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
         prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
         correction_dir=str(payload.get("correction_dir") or "corrected_2d"),
+        mano_projection_dir=str(payload.get("mano_projection_dir") or "mano/episode/projected_2d"),
         episode_path=str(episode_dir),
     )
 
@@ -355,7 +357,7 @@ def save_correction_progress(jsonl_path: str, records: Dict[str, CorrectionProgr
 
 def load_prediction_bundle(task: CorrectionTask, *, mode: str = "pred") -> PredictionBundle:
     mode = (mode or "pred").strip().lower()
-    if mode not in {"pred", "correct", "last", "scratch"}:
+    if mode not in {"mano", "pred", "correct", "last", "scratch"}:
         raise ValueError(f"Unsupported label mode: {mode}")
 
     episode_dir = task.episode_dir()
@@ -375,6 +377,8 @@ def _source_dir_for_mode(task: CorrectionTask, mode: str) -> Path:
     episode_dir = task.episode_dir()
     if mode in {"correct", "last"}:
         return episode_dir / task.correction_dir
+    if mode == "mano":
+        return episode_dir / task.mano_projection_dir
     return episode_dir / task.prediction_dir
 
 

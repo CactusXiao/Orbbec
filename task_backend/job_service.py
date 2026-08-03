@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import json
 import re
+import shutil
 import time
 import uuid
 from http import HTTPStatus
@@ -23,10 +24,13 @@ except ImportError:  # pragma: no cover - script execution fallback
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
 AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
 STAGE_ARTIFACT_KINDS = {
-    "auto_label": {"pred_2d"},
+    "auto_label": {"pred_2d", "auto_2d"},
+    "mano_opt": {"mano_episode", "mano_segment_patch"},
     "qc": {"qc_report"},
-    "manual_label": {"corrected_2d"},
+    "manual_label": {"manual_2d", "corrected_2d"},
+    "manual_segment": {"manual_2d"},
 }
+FINAL_3D_SOURCES_REL_PATH = "workflow/final_3d_sources.json"
 
 
 def now_iso() -> str:
@@ -242,7 +246,7 @@ class JobService:
             subject_id=subject_id,
             task_name=task_name,
             episode_index=episode_index,
-            status="manual_label_pending",
+            status="manual_correction_pending",
             data_uri=data_uri,
             local_capture_path=str(episode_path) if episode_path is not None else local_path,
             frame_count=frame_count,
@@ -250,30 +254,34 @@ class JobService:
             metadata=metadata,
         )
 
-        job_id = str(payload_in.get("job_id") or _new_id("manual_label")).strip()
-        job_payload = {
-            "job_id": job_id,
-            "episode_id": episode["episode_id"],
-            "subject_id": episode["subject_id"],
-            "task_name": episode["task_name"],
-            "data_uri": episode["data_uri"],
-            "cameras": cameras,
-            "frames": frames,
-            "rgb_path_template": str(payload_in.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-            "prediction_dir": str(payload_in.get("prediction_dir") or "pred_2d"),
-            "correction_dir": str(payload_in.get("correction_dir") or "corrected_2d"),
+        start_frame = _optional_int(payload_in.get("start_frame"))
+        end_frame = _optional_int(payload_in.get("end_frame"))
+        if start_frame is None or end_frame is None:
+            if frames:
+                start_frame = min(frames)
+                end_frame = max(frames)
+            else:
+                start_frame = 0
+                end_frame = 0
+        segment_id = str(payload_in.get("segment_id") or payload_in.get("job_id") or _new_id("segment")).strip()
+        segment_metadata = {
+            "created_by": "dev_label_segment",
             "reason": str(payload_in.get("reason") or "dev_created"),
             "priority": priority,
+            "rgb_path_template": str(payload_in.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
+            "prediction_dir": str(payload_in.get("prediction_dir") or "pred_2d"),
         }
         extra_payload = json_object(payload_in.get("payload"), "payload")
-        job_payload.update(extra_payload)
-        job = self._create_job_once(
-            job_id=job_id,
-            job_type="manual_label",
+        segment_metadata.update(extra_payload)
+        segment = self.store.create_segment(
+            segment_id=segment_id,
             episode_id=episode["episode_id"],
-            payload=job_payload,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            status="pending_manual",
+            metadata=segment_metadata,
         )
-        return self.enrich_job(job)
+        return self.enrich_segment(segment)
 
     def create_dev_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload_in = dict(body or {})
@@ -401,11 +409,15 @@ class JobService:
                 "result": result,
             },
             "artifacts": upload_artifacts,
+            "workflow_artifacts": artifacts,
+            "segments": self.store.segments_for_episode(episode_id),
             "jobs": [_compact_job(job) for job in all_jobs],
         }
 
     def workflow_stage(self, job_type: str) -> Dict[str, Any]:
         job_type = require_stage_job_type(job_type)
+        if job_type == "manual_segment":
+            return self._manual_segment_stage()
         control = self.store.get_stage_control(job_type)
         jobs = self.store.jobs_by_type(job_type)
         now = now_iso()
@@ -439,6 +451,53 @@ class JobService:
             elif status in {"leased", "running"}:
                 active.append(item)
             elif status in TERMINAL_JOB_STATUSES:
+                completed.append(item)
+
+        completed.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("job_id") or "")), reverse=True)
+        return {
+            "job_type": job_type,
+            "control": control,
+            "lease_status": "开放" if control.get("lease_enabled") else "暂停",
+            "stats": counts,
+            "active": active,
+            "queued": queued,
+            "completed": completed,
+            "generated_at": now,
+        }
+
+    def _manual_segment_stage(self) -> Dict[str, Any]:
+        job_type = "manual_segment"
+        control = self.store.get_stage_control(job_type)
+        segments = self.store.list_segments()
+        now = now_iso()
+        counts = {
+            "queued": 0,
+            "leased_running": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "canceled": 0,
+            "total": len(segments),
+        }
+        active: List[Dict[str, Any]] = []
+        queued: List[Dict[str, Any]] = []
+        completed: List[Dict[str, Any]] = []
+        for segment in segments:
+            status = str(segment.get("status") or "")
+            if status == "pending_manual":
+                counts["queued"] += 1
+            elif status == "manual_labeling":
+                counts["leased_running"] += 1
+            elif status in {"manual_labeled", "mano_queued", "mano_running", "mano_succeeded"}:
+                counts["succeeded"] += 1
+            elif status == "failed":
+                counts["failed"] += 1
+
+            item = self._stage_segment_item(segment, now)
+            if status == "pending_manual":
+                queued.append(item)
+            elif status == "manual_labeling":
+                active.append(item)
+            else:
                 completed.append(item)
 
         completed.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("job_id") or "")), reverse=True)
@@ -502,6 +561,185 @@ class JobService:
             "episodes": outcomes,
         }
 
+    def label_tasks(self) -> Dict[str, Any]:
+        segments = self.store.list_segments(statuses=["pending_manual", "manual_labeling"])
+        groups: Dict[str, Dict[str, Any]] = {}
+        subject_sets: Dict[str, set] = {}
+        episode_sets: Dict[str, set] = {}
+        for segment in segments:
+            episode = self.store.get_episode(str(segment.get("episode_id") or "")) or {}
+            task_name = str(episode.get("task_name") or "Unspecified")
+            group = groups.setdefault(
+                task_name,
+                {
+                    "task_name": task_name,
+                    "segments": 0,
+                    "pending_segments": 0,
+                    "leased_segments": 0,
+                    "frames": 0,
+                    "oldest_created_at": "",
+                },
+            )
+            subjects = subject_sets.setdefault(task_name, set())
+            episodes = episode_sets.setdefault(task_name, set())
+            group["segments"] += 1
+            if segment.get("status") == "pending_manual":
+                group["pending_segments"] += 1
+            elif segment.get("status") == "manual_labeling":
+                group["leased_segments"] += 1
+            group["frames"] += self._segment_frame_count(segment)
+            created_at = str(segment.get("created_at") or "")
+            if created_at and (not group["oldest_created_at"] or created_at < group["oldest_created_at"]):
+                group["oldest_created_at"] = created_at
+            if episode.get("subject_id"):
+                subjects.add(str(episode.get("subject_id")))
+            if segment.get("episode_id"):
+                episodes.add(str(segment.get("episode_id")))
+        out = []
+        for task_name, group in groups.items():
+            subjects = sorted(subject_sets.get(task_name, set()))
+            episodes = sorted(episode_sets.get(task_name, set()))
+            group["subjects"] = subjects
+            group["subject_summary"] = ", ".join(subjects)
+            group["episodes"] = len(episodes)
+            out.append(group)
+        out.sort(key=lambda item: (str(item.get("task_name") or ""), str(item.get("oldest_created_at") or "")))
+        return {"tasks": out, "generated_at": now_iso()}
+
+    def label_task_episodes(self, task_name: str) -> Dict[str, Any]:
+        task_name = str(task_name or "").strip()
+        if not task_name:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "task_name is required")
+        segments = self.store.list_segments(task_name=task_name, statuses=["pending_manual", "manual_labeling"])
+        groups: Dict[str, Dict[str, Any]] = {}
+        for segment in segments:
+            episode_id = str(segment.get("episode_id") or "")
+            episode = self.store.get_episode(episode_id) or {}
+            group = groups.setdefault(
+                episode_id,
+                {
+                    "episode_id": episode_id,
+                    "task_name": task_name,
+                    "subject_id": str(episode.get("subject_id") or ""),
+                    "episode_index": episode.get("episode_index"),
+                    "episode_status": str(episode.get("status") or ""),
+                    "episode_base_uri": str(episode.get("data_uri") or ""),
+                    "pending_segments": 0,
+                    "leased_segments": 0,
+                    "frames": 0,
+                    "first_start_frame": None,
+                    "oldest_created_at": "",
+                },
+            )
+            if segment.get("status") == "pending_manual":
+                group["pending_segments"] += 1
+            elif segment.get("status") == "manual_labeling":
+                group["leased_segments"] += 1
+            group["frames"] += self._segment_frame_count(segment)
+            start_frame = _optional_int(segment.get("start_frame"))
+            if start_frame is not None and (group["first_start_frame"] is None or start_frame < group["first_start_frame"]):
+                group["first_start_frame"] = start_frame
+            created_at = str(segment.get("created_at") or "")
+            if created_at and (not group["oldest_created_at"] or created_at < group["oldest_created_at"]):
+                group["oldest_created_at"] = created_at
+        episodes = list(groups.values())
+        episodes.sort(
+            key=lambda item: (
+                str(item.get("subject_id") or ""),
+                item.get("episode_index") is None,
+                item.get("episode_index") if item.get("episode_index") is not None else 0,
+                str(item.get("oldest_created_at") or ""),
+                str(item.get("episode_id") or ""),
+            )
+        )
+        return {"task_name": task_name, "episodes": episodes, "generated_at": now_iso()}
+
+    def lease_label_segment(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.store.get_stage_control("manual_segment").get("lease_enabled"):
+            raise WorkflowError(HTTPStatus.CONFLICT, "leasing disabled for workflow stage: manual_segment")
+        owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
+        lease_seconds = _optional_int(body.get("lease_seconds")) or 600
+        task_name = str(body.get("task_name") or body.get("task") or "").strip()
+        subject_id = str(body.get("subject_id") or body.get("subject") or "").strip()
+        episode_id = str(body.get("episode_id") or body.get("episode") or "").strip()
+        segment = self.store.lease_segment(
+            lease_owner=owner,
+            lease_seconds=lease_seconds,
+            task_name=task_name,
+            subject_id=subject_id,
+            episode_id=episode_id,
+        )
+        if segment is None:
+            if episode_id:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"no pending manual segment is available for episode: {episode_id}")
+            if task_name:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"no pending manual segment is available for task: {task_name}")
+            raise WorkflowError(HTTPStatus.NOT_FOUND, "no pending manual segment is available")
+        self.store.update_episode_status(str(segment.get("episode_id") or ""), "manual_correction_running", {"active_segment_id": segment.get("segment_id")})
+        return self.enrich_segment(segment)
+
+    def heartbeat_label_segment(self, segment_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
+        lease_seconds = _optional_int(body.get("lease_seconds")) or 600
+        segment = self.store.heartbeat_segment(segment_id=segment_id, lease_owner=owner, lease_seconds=lease_seconds)
+        return self.enrich_segment(segment)
+
+    def release_label_segment(self, segment_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        reason = str(body.get("reason") or "")
+        segment, released = self.store.release_segment(segment_id=segment_id, reason=reason)
+        if released and segment.get("episode_id"):
+            self.store.update_episode_status(str(segment.get("episode_id")), "manual_correction_pending")
+        enriched = self.enrich_segment(segment)
+        enriched["released"] = released
+        return enriched
+
+    def complete_label_segment(self, segment_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        segment = self.store.get_segment(segment_id)
+        if segment is None:
+            raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+        episode_id = str(segment.get("episode_id") or "")
+        result = json_object(body.get("result"), "result")
+        artifacts = self._artifacts_from_body(body)
+        manual_uri = self._manual_2d_uri_from_segment_completion(segment, result, artifacts)
+        if not any(str(artifact.get("kind") or "") == "manual_2d" for artifact in artifacts) and manual_uri:
+            self.store.register_artifact(
+                episode_id=episode_id,
+                kind="manual_2d",
+                uri=manual_uri,
+                metadata={
+                    "segment_id": segment_id,
+                    "source": "manual_segment",
+                    "operator_id": result.get("operator_id") or segment.get("lease_owner") or "",
+                },
+            )
+        for artifact in artifacts:
+            if str(artifact.get("kind") or "") == "manual_2d":
+                self._register_artifact_from_payload(episode_id, artifact)
+        cleanup_manifest = json_object(body.get("cleanup_manifest") or result.get("cleanup_manifest"), "cleanup_manifest")
+        metadata = {
+            "operator_id": result.get("operator_id") or segment.get("lease_owner") or "",
+            "frames_completed": result.get("frames_completed") or [],
+        }
+        updated = self.store.complete_segment_manual(
+            segment_id=segment_id,
+            manual_2d_uri=manual_uri,
+            manual_job_id=str(result.get("manual_job_id") or segment.get("manual_job_id") or ""),
+            cleanup_manifest=cleanup_manifest,
+            metadata=metadata,
+        )
+        self._create_mano_segment_job(updated, result)
+        self._refresh_final_3d_sources_manifest(episode_id, "manual_segment_completed")
+        return self.enrich_segment(self.store.get_segment(segment_id) or updated)
+
+    def fail_label_segment(self, segment_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        error = str(body.get("error") or body.get("message") or "segment failed")
+        result = json_object(body.get("result"), "result")
+        cleanup_manifest = json_object(body.get("cleanup_manifest") or result.get("cleanup_manifest"), "cleanup_manifest")
+        self._cleanup_manifest_outputs(cleanup_manifest)
+        segment = self.store.fail_segment(segment_id=segment_id, error=error, cleanup_manifest=cleanup_manifest, metadata={"result": result})
+        self._refresh_final_3d_sources_manifest(str(segment.get("episode_id") or ""), "manual_segment_failed")
+        return self.enrich_segment(segment)
+
     def heartbeat_job(self, job_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         owner = str(body.get("lease_owner") or body.get("operator_id") or body.get("worker_id") or "").strip()
         lease_seconds = _optional_int(body.get("lease_seconds")) or 300
@@ -533,13 +771,14 @@ class JobService:
         error = str(body.get("error") or body.get("message") or "job failed")
         result = json_object(body.get("result"), "result")
         job = self.store.fail_job(job_id=job_id, error=error, result=result)
+        cleanup_manifest = json_object(body.get("cleanup_manifest") or result.get("cleanup_manifest"), "cleanup_manifest")
+        self._cleanup_manifest_outputs(cleanup_manifest)
+        self._after_job_fail(job, error, result)
         return self.enrich_job(job)
 
     def release_job(self, job_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         reason = str(body.get("reason") or "")
         job, released = self.store.release_job(job_id=job_id, reason=reason)
-        if released and job.get("episode_id") and job.get("type") == "manual_label":
-            self.store.update_episode_status(job["episode_id"], "manual_label_pending")
         enriched = self.enrich_job(job)
         enriched["released"] = released
         return enriched
@@ -635,6 +874,155 @@ class JobService:
             "payload": payload,
         }
 
+    def enrich_segment(self, segment: Dict[str, Any]) -> Dict[str, Any]:
+        episode_id = str(segment.get("episode_id") or "")
+        episode = self.store.get_episode(episode_id) if episode_id else None
+        artifacts = self.store.artifacts_for_episode(episode_id) if episode_id else []
+        payload = self._segment_label_payload(segment, episode or {}, artifacts)
+        resolved_data_path = self.resolve_data_path(
+            str(payload.get("episode_base_uri") or payload.get("data_uri") or ""),
+            str((episode or {}).get("local_capture_path") or ""),
+        )
+        if resolved_data_path:
+            payload["resolved_data_path"] = resolved_data_path
+        return {
+            "segment": segment,
+            "episode": episode,
+            "artifacts": artifacts,
+            "payload": payload,
+        }
+
+    def _segment_label_payload(
+        self,
+        segment: Dict[str, Any],
+        episode: Dict[str, Any],
+        artifacts: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        episode_id = str(segment.get("episode_id") or episode.get("episode_id") or "")
+        data_uri = str(episode.get("data_uri") or "")
+        start_frame = _optional_int(segment.get("start_frame")) or 0
+        end_frame = _optional_int(segment.get("end_frame")) or start_frame
+        segment_id = str(segment.get("segment_id") or "")
+        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"}) or uri_join(data_uri, "pred_2d")
+        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
+        manual_output_uri = str(segment.get("manual_2d_uri") or "") or uri_join(data_uri, "manual_2d", "segments", segment_id)
+        segment_metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        prediction_dir = str(segment_metadata.get("prediction_dir") or "").strip() or self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d")
+        rgb_path_template = str(segment_metadata.get("rgb_path_template") or "").strip() or self._payload_field_for_episode_context(
+            episode_id,
+            "rgb_path_template",
+            "{camera}/RGB/{frame:05d}.png",
+        )
+        cameras = self._cameras_for_episode_context(episode_id, episode, {})
+        return {
+            "segment_id": segment_id,
+            "manual_job_id": str(segment.get("manual_job_id") or ""),
+            "episode_id": episode_id,
+            "task_name": str(episode.get("task_name") or ""),
+            "subject_id": str(episode.get("subject_id") or ""),
+            "episode_base_uri": data_uri,
+            "data_uri": data_uri,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "frames": list(range(start_frame, end_frame + 1)),
+            "cameras": cameras,
+            "pred_2d_uri": pred_uri,
+            "pred_uri": pred_uri,
+            "mano_episode_uri": mano_episode_uri,
+            "mano_projection_dir": "mano/episode/projected_2d",
+            "manual_2d_output_uri": manual_output_uri,
+            "manual_2d_uri": manual_output_uri,
+            "prediction_dir": prediction_dir,
+            "correction_dir": f"manual_2d/segments/{segment_id}",
+            "manual_2d_dir": f"manual_2d/segments/{segment_id}",
+            "rgb_path_template": rgb_path_template,
+            "status": str(segment.get("status") or ""),
+        }
+
+    @staticmethod
+    def _latest_artifact_uri(artifacts: List[Dict[str, Any]], kinds: set) -> str:
+        for artifact in reversed(artifacts):
+            if str(artifact.get("kind") or "") in kinds and str(artifact.get("uri") or ""):
+                return str(artifact.get("uri") or "")
+        return ""
+
+    @staticmethod
+    def _segment_frame_count(segment: Dict[str, Any]) -> int:
+        start_frame = _optional_int(segment.get("start_frame")) or 0
+        end_frame = _optional_int(segment.get("end_frame")) or start_frame
+        return max(0, end_frame - start_frame + 1)
+
+    def _manual_2d_uri_from_segment_completion(
+        self,
+        segment: Dict[str, Any],
+        result: Dict[str, Any],
+        artifacts: List[Dict[str, Any]],
+    ) -> str:
+        for artifact in artifacts:
+            if str(artifact.get("kind") or "") == "manual_2d" and str(artifact.get("uri") or ""):
+                return str(artifact.get("uri"))
+        uri = str(result.get("manual_2d_uri") or result.get("manual_2d_output_uri") or "").strip()
+        if uri:
+            return uri
+        episode = self.store.get_episode(str(segment.get("episode_id") or "")) or {}
+        data_uri = str(episode.get("data_uri") or "")
+        segment_id = str(segment.get("segment_id") or "")
+        return uri_join(data_uri, "manual_2d", "segments", segment_id) if data_uri and segment_id else ""
+
+    def _create_mano_segment_job(self, segment: Dict[str, Any], result: Dict[str, Any]) -> None:
+        segment_id = str(segment.get("segment_id") or "")
+        episode_id = str(segment.get("episode_id") or "")
+        if not segment_id or not episode_id:
+            return
+        existing_job_id = str(segment.get("mano_job_id") or "")
+        if existing_job_id:
+            existing_job = self.store.get_job(existing_job_id)
+            if existing_job is not None and str(existing_job.get("status") or "") not in {"failed", "canceled"}:
+                return
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            return
+        artifacts = self.store.artifacts_for_episode(episode_id)
+        start_frame = _optional_int(segment.get("start_frame")) or 0
+        end_frame = _optional_int(segment.get("end_frame")) or start_frame
+        base_id = _stable_id_part(segment_id, "segment")
+        job_id = str(result.get("mano_job_id") or f"mano_opt_{base_id}")
+        data_uri = str(episode.get("data_uri") or "")
+        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"}) or uri_join(data_uri, "pred_2d")
+        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
+        payload = {
+            "job_id": job_id,
+            "episode_id": episode_id,
+            "segment_id": segment_id,
+            "subject_id": episode.get("subject_id"),
+            "task_name": episode.get("task_name"),
+            "data_uri": data_uri,
+            "cameras": self._cameras_for_episode_context(episode_id, episode, {}),
+            "frames": list(range(start_frame, end_frame + 1)),
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "scope": "segment",
+            "mano_scope": "segment",
+            "input_2d_uri": str(segment.get("manual_2d_uri") or ""),
+            "manual_2d_uri": str(segment.get("manual_2d_uri") or ""),
+            "pred_uri": pred_uri,
+            "mano_episode_uri": mano_episode_uri,
+            "output_uri": uri_join(data_uri, "mano", "segments", segment_id) if data_uri else "",
+            "mano_output_dir": f"mano/segments/{segment_id}",
+            "rgb_path_template": self._payload_field_for_episode_context(
+                episode_id,
+                "rgb_path_template",
+                "{camera}/RGB/{frame:05d}.png",
+                result,
+            ),
+            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
+            "manual_2d_dir": f"manual_2d/segments/{segment_id}",
+            "reason": "manual_segment_completed",
+        }
+        self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
+        self.store.mark_segment_mano_queued(segment_id=segment_id, mano_job_id=job_id)
+        self.store.update_episode_status(episode_id, "segment_mano_optimizing", {"active_job_id": job_id})
+
     def resolve_data_path(self, data_uri: str, local_capture_path: str = "") -> str:
         local_capture_path = str(local_capture_path or "").strip()
         if local_capture_path:
@@ -678,7 +1066,7 @@ class JobService:
         cameras = _as_str_list(episode.get("cameras"))
         if cameras:
             return cameras
-        for job_type in ("auto_label", "qc", "manual_label", "upload"):
+        for job_type in ("auto_label", "mano_opt", "qc", "manual_label", "upload"):
             for job in self.store.jobs_for_episode(episode_id, job_type):
                 cameras = _as_str_list((job.get("payload") or {}).get("cameras"))
                 if cameras:
@@ -700,7 +1088,7 @@ class JobService:
             frames = _as_int_list((payload or {}).get("frames"))
             if frames:
                 return frames
-        for job_type in ("manual_label", "qc", "auto_label", "upload"):
+        for job_type in ("manual_label", "mano_opt", "qc", "auto_label", "upload"):
             for job in self.store.jobs_for_episode(episode_id, job_type):
                 frames = _as_int_list((job.get("payload") or {}).get("frames"))
                 if frames:
@@ -728,7 +1116,7 @@ class JobService:
             value = str((payload or {}).get(key) or "").strip()
             if value:
                 return value
-        for job_type in ("manual_label", "qc", "auto_label", "upload"):
+        for job_type in ("manual_label", "mano_opt", "qc", "auto_label", "upload"):
             for job in self.store.jobs_for_episode(episode_id, job_type):
                 value = str((job.get("payload") or {}).get(key) or "").strip()
                 if value:
@@ -783,6 +1171,59 @@ class JobService:
             "artifact_summary": self._artifact_summary(relevant_artifacts),
         }
 
+    def _stage_segment_item(self, segment: Dict[str, Any], now: str) -> Dict[str, Any]:
+        episode_id = str(segment.get("episode_id") or "")
+        episode = self.store.get_episode(episode_id) if episode_id else None
+        lease_until = str(segment.get("lease_until") or "")
+        status = str(segment.get("status") or "")
+        lease_expired = bool(lease_until and lease_until <= now and status == "manual_labeling")
+        start_frame = _optional_int(segment.get("start_frame")) or 0
+        end_frame = _optional_int(segment.get("end_frame")) or start_frame
+        frames_count = max(0, end_frame - start_frame + 1)
+        error = str(segment.get("error") or "")
+        artifact_parts = []
+        if segment.get("manual_2d_uri"):
+            artifact_parts.append(f"manual_2d: {segment.get('manual_2d_uri')}")
+        if segment.get("mano_patch_uri"):
+            artifact_parts.append(f"mano_segment_patch: {segment.get('mano_patch_uri')}")
+        result = {
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "manual_job_id": segment.get("manual_job_id") or "",
+            "mano_job_id": segment.get("mano_job_id") or "",
+        }
+        if error:
+            result["error"] = error
+        return {
+            "job_id": str(segment.get("segment_id") or ""),
+            "segment_id": str(segment.get("segment_id") or ""),
+            "type": "manual_segment",
+            "status": status,
+            "episode_id": episode_id,
+            "episode_url": f"/episodes/{quote(episode_id, safe='')}" if episode_id else "",
+            "subject_id": str((episode or {}).get("subject_id") or ""),
+            "task_name": str((episode or {}).get("task_name") or ""),
+            "episode_index": (episode or {}).get("episode_index"),
+            "episode_status": str((episode or {}).get("status") or ""),
+            "lease_owner": str(segment.get("lease_owner") or ""),
+            "lease_until": lease_until,
+            "lease_expired": lease_expired,
+            "created_at": str(segment.get("created_at") or ""),
+            "updated_at": str(segment.get("updated_at") or ""),
+            "waiting_seconds": _elapsed_seconds_since(segment.get("created_at")) if status == "pending_manual" else None,
+            "attempt": 0,
+            "batch_index": None,
+            "batch_count": None,
+            "frames_count": frames_count,
+            "frames": list(range(start_frame, end_frame + 1)),
+            "result": result,
+            "result_summary": _short_summary(result),
+            "error": error,
+            "error_summary": _short_summary(error),
+            "artifacts": [],
+            "artifact_summary": self._artifact_summary_text(artifact_parts),
+        }
+
     @staticmethod
     def _relevant_artifacts_for_job(job_type: str, artifacts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         kinds = STAGE_ARTIFACT_KINDS.get(job_type, set())
@@ -801,6 +1242,12 @@ class JobService:
             parts.append(f"+{len(artifacts) - 5} more")
         return _short_summary("; ".join(parts))
 
+    @staticmethod
+    def _artifact_summary_text(parts: List[str]) -> str:
+        if not parts:
+            return ""
+        return _short_summary("; ".join(parts[:5]) + (f"; +{len(parts) - 5} more" if len(parts) > 5 else ""))
+
     def _create_job_once(self, *, job_id: str, job_type: str, episode_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         existing = self.store.get_job(job_id)
         if existing is not None:
@@ -811,8 +1258,16 @@ class JobService:
         episode_id = str(job.get("episode_id") or "")
         if not episode_id:
             return
+        payload = dict(job.get("payload") or {})
+        if str(job.get("type") or "") == "mano_opt" and str(payload.get("scope") or payload.get("mano_scope") or "") == "segment":
+            segment_id = str(payload.get("segment_id") or "").strip()
+            if segment_id:
+                self.store.mark_segment_mano_running(segment_id=segment_id, mano_job_id=str(job.get("job_id") or ""))
+                self.store.update_episode_status(episode_id, "segment_mano_optimizing", {"active_job_id": job.get("job_id")})
+            return
         status_by_type = {
             "auto_label": "auto_labeling",
+            "mano_opt": "mano_optimizing",
             "qc": "qc_running",
             "manual_label": "manual_labeling",
         }
@@ -851,34 +1306,145 @@ class JobService:
             if self.auto_label_after_upload:
                 self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
-            if not any(str(artifact.get("kind") or "") == "pred_2d" for artifact in artifacts) and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts) and payload.get("data_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="pred_2d",
                     uri=uri_join(str(payload.get("data_uri")), str(payload.get("prediction_dir") or "pred_2d")),
-                    metadata={"source_job_id": job.get("job_id"), "compatibility": "kp2d may map to pred_2d"},
+                    metadata={"source_job_id": job.get("job_id")},
                 )
             if self._all_episode_jobs_succeeded(episode_id, "auto_label"):
                 self.store.update_episode_status(episode_id, "auto_labeled")
+                self._create_mano_episode_job_from_existing_episode(episode_id, result)
+        elif job_type == "mano_opt":
+            scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
+            if scope == "segment":
+                self._complete_segment_mano_job(job, result, artifacts)
+            else:
+                if not any(str(artifact.get("kind") or "") == "mano_episode" for artifact in artifacts):
+                    self._register_default_mano_episode(episode_id, job, result)
+                self.store.update_episode_status(episode_id, "mano_optimized")
+                self._refresh_final_3d_sources_manifest(episode_id, "mano_episode_completed")
                 self._create_qc_job_from_existing_episode(episode_id, result)
         elif job_type == "qc":
             if not any(str(artifact.get("kind") or "") == "qc_report" for artifact in artifacts):
                 self._register_default_qc_report(episode_id, job, result)
             passed = _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed"))
-            self.store.update_episode_status(episode_id, "qc_passed" if passed else "qc_failed")
-            if not passed:
-                self._create_manual_label_from_existing_episode(episode_id, result)
+            if passed:
+                self.store.update_episode_status(episode_id, "finalized", {"qc_status": "passed"})
+                self._refresh_final_3d_sources_manifest(episode_id, "qc_passed")
+            else:
+                self.store.update_episode_status(episode_id, "qc_failed", {"qc_status": "failed"})
+                created = self._create_segments_from_qc_failure(episode_id, job, result)
+                self.store.update_episode_status(
+                    episode_id,
+                    "manual_correction_pending",
+                    {"qc_status": "failed", "failed_segment_count": len(created)},
+                )
+                self._refresh_final_3d_sources_manifest(episode_id, "qc_failed")
         elif job_type == "review":
             self.store.update_episode_status(episode_id, "review_passed")
         elif job_type == "manual_label":
-            if not any(str(artifact.get("kind") or "") == "corrected_2d" for artifact in artifacts) and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") in {"manual_2d", "corrected_2d"} for artifact in artifacts) and payload.get("data_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
-                    kind="corrected_2d",
-                    uri=uri_join(str(payload.get("data_uri")), str(payload.get("correction_dir") or "corrected_2d")),
+                    kind="manual_2d",
+                    uri=uri_join(str(payload.get("data_uri")), str(payload.get("correction_dir") or "manual_2d")),
                     metadata={"source_job_id": job.get("job_id")},
                 )
             self.store.update_episode_status(episode_id, "manual_labeled")
+
+    def _after_job_fail(self, job: Dict[str, Any], error: str, result: Dict[str, Any]) -> None:
+        episode_id = str(job.get("episode_id") or "")
+        job_type = str(job.get("type") or "")
+        payload = dict(job.get("payload") or {})
+        if job_type == "mano_opt" and str(payload.get("scope") or payload.get("mano_scope") or "") == "segment":
+            segment_id = str(payload.get("segment_id") or "").strip()
+            if segment_id:
+                self._retry_segment_mano_job(job, segment_id, error, result)
+            return
+        if episode_id:
+            metadata = {
+                "failed_job_id": job.get("job_id"),
+                "failed_job_type": job_type,
+                "worker_error": error,
+                "cleanup_manifest": result.get("cleanup_manifest") or {},
+            }
+            current = self.store.get_episode(episode_id)
+            if current is not None:
+                self.store.update_episode_status(episode_id, str(current.get("status") or "uploaded"), metadata)
+
+    def _retry_segment_mano_job(
+        self,
+        failed_job: Dict[str, Any],
+        segment_id: str,
+        error: str,
+        result: Dict[str, Any],
+    ) -> None:
+        segment = self.store.get_segment(segment_id)
+        if segment is None:
+            return
+        metadata = dict(segment.get("metadata") or {})
+        retry_count = int(metadata.get("mano_retry_count") or 0) + 1
+        metadata.update(
+            {
+                "last_mano_error": error,
+                "last_failed_mano_job_id": failed_job.get("job_id"),
+                "mano_retry_count": retry_count,
+                "last_mano_fail_result": result,
+            }
+        )
+        # Preserve the manual 2D output and only queue a replacement MANO patch job for this segment.
+        with self.store.connect() as conn:
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'manual_labeled', metadata_json = ?, error = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (json.dumps(metadata, ensure_ascii=False, sort_keys=True), str(error or "mano_opt failed"), now_iso(), segment_id),
+            )
+        retry_result = {"mano_job_id": f"mano_opt_{_stable_id_part(segment_id, 'segment')}_r{retry_count:03d}"}
+        self._create_mano_segment_job(self.store.get_segment(segment_id) or segment, retry_result)
+        self._refresh_final_3d_sources_manifest(str(segment.get("episode_id") or ""), "segment_mano_requeued")
+
+    def _cleanup_manifest_outputs(self, manifest: Dict[str, Any]) -> None:
+        if not isinstance(manifest, dict) or not manifest:
+            return
+        candidates: List[str] = []
+        for key in ("tmp_uri", "tmp_dir", "attempt_uri", "attempt_dir"):
+            value = str(manifest.get(key) or "").strip()
+            if value:
+                candidates.append(value)
+        for key in ("paths", "uris", "outputs", "attempt_outputs", "cleanup_paths"):
+            value = manifest.get(key)
+            if isinstance(value, list):
+                candidates.extend(str(item or "").strip() for item in value if str(item or "").strip())
+        for value in candidates:
+            path = self._cleanup_path_from_uri(value)
+            if path is None:
+                continue
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.exists():
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+
+    def _cleanup_path_from_uri(self, value: str) -> Optional[Path]:
+        value = str(value or "").strip()
+        if not value:
+            return None
+        parsed = urlparse(value)
+        if not parsed.scheme:
+            return Path(value).expanduser().resolve()
+        if parsed.scheme == "local":
+            return Path(path_from_local_uri(value)).expanduser().resolve()
+        resolved = self.resolve_data_path(value, "")
+        if resolved:
+            return Path(resolved).expanduser().resolve()
+        return None
 
     def _create_auto_label_jobs_from_upload(
         self,
@@ -1051,6 +1617,52 @@ class JobService:
                 frames.append(frame)
         return frames
 
+    def _create_mano_episode_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
+        for job in self.store.jobs_for_episode(episode_id, "mano_opt"):
+            payload = dict(job.get("payload") or {})
+            if str(payload.get("scope") or payload.get("mano_scope") or "episode") == "episode":
+                return
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            return
+        cameras = self._cameras_for_episode_context(episode_id, episode, result)
+        frames = _as_int_list(result.get("frames")) or self._frames_for_episode_context(
+            episode_id,
+            episode,
+            cameras,
+            result,
+        )
+        pred_artifacts = self._prediction_artifacts_for_episode(episode_id)
+        pred_uri = str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else uri_join(str(episode.get("data_uri") or ""), "pred_2d")
+        base_id = _stable_id_part(episode_id, "episode")
+        job_id = str(result.get("mano_job_id") or result.get("mano_episode_job_id") or f"mano_opt_{base_id}_episode")
+        data_uri = str(episode.get("data_uri") or "")
+        payload = {
+            "job_id": job_id,
+            "episode_id": episode["episode_id"],
+            "subject_id": episode["subject_id"],
+            "task_name": episode["task_name"],
+            "data_uri": data_uri,
+            "cameras": cameras,
+            "frames": frames,
+            "scope": "episode",
+            "mano_scope": "episode",
+            "input_2d_uri": pred_uri,
+            "pred_uri": pred_uri,
+            "pred_artifacts": pred_artifacts,
+            "output_uri": uri_join(data_uri, "mano", "episode") if data_uri else "",
+            "mano_output_dir": "mano/episode",
+            "rgb_path_template": self._payload_field_for_episode_context(
+                episode_id,
+                "rgb_path_template",
+                "{camera}/RGB/{frame:05d}.png",
+                result,
+            ),
+            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
+            "reason": "auto_label_succeeded",
+        }
+        self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
+
     def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
         if self.store.jobs_for_episode(episode_id, "qc"):
             return
@@ -1064,7 +1676,8 @@ class JobService:
             cameras,
             result,
         )
-        pred_artifacts = self._relevant_artifacts_for_job("auto_label", self.store.artifacts_for_episode(episode_id))
+        pred_artifacts = self._prediction_artifacts_for_episode(episode_id)
+        mano_artifacts = [item for item in self.store.artifacts_for_episode(episode_id) if str(item.get("kind") or "") == "mano_episode"]
         base_id = _stable_id_part(episode_id, "episode")
         job_id = str(result.get("qc_job_id") or f"qc_{base_id}")
         payload = {
@@ -1077,6 +1690,9 @@ class JobService:
             "frames": frames,
             "pred_artifacts": pred_artifacts,
             "pred_uri": str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else "",
+            "mano_episode_artifacts": mano_artifacts,
+            "mano_episode_uri": str(mano_artifacts[-1].get("uri") or "") if mano_artifacts else "",
+            "qc_report_uri": uri_join(str(episode.get("data_uri") or ""), "qc", "qc_report.json") if episode.get("data_uri") else "",
             "rgb_path_template": self._payload_field_for_episode_context(
                 episode_id,
                 "rgb_path_template",
@@ -1084,10 +1700,32 @@ class JobService:
                 result,
             ),
             "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
-            "correction_dir": self._payload_field_for_episode_context(episode_id, "correction_dir", "corrected_2d", result),
-            "reason": "auto_label_succeeded",
+            "reason": "mano_episode_succeeded",
         }
         self._create_job_once(job_id=job_id, job_type="qc", episode_id=episode_id, payload=payload)
+
+    def _prediction_artifacts_for_episode(self, episode_id: str) -> List[Dict[str, Any]]:
+        return [
+            item
+            for item in self.store.artifacts_for_episode(episode_id)
+            if str(item.get("kind") or "") in {"pred_2d", "auto_2d"}
+        ]
+
+    def _register_default_mano_episode(self, episode_id: str, job: Dict[str, Any], result: Dict[str, Any]) -> None:
+        episode = self.store.get_episode(episode_id)
+        payload = dict(job.get("payload") or {})
+        uri = str(result.get("mano_episode_uri") or result.get("output_uri") or payload.get("output_uri") or "").strip()
+        data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
+        if not uri and data_uri:
+            uri = uri_join(data_uri, "mano", "episode")
+        if not uri:
+            return
+        self.store.register_artifact(
+            episode_id=episode_id,
+            kind="mano_episode",
+            uri=uri,
+            metadata={"source_job_id": job.get("job_id"), "scope": "episode"},
+        )
 
     def _register_default_qc_report(self, episode_id: str, job: Dict[str, Any], result: Dict[str, Any]) -> None:
         episode = self.store.get_episode(episode_id)
@@ -1095,7 +1733,7 @@ class JobService:
         report_uri = str(result.get("qc_report_uri") or result.get("report_uri") or "").strip()
         data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
         if not report_uri and data_uri:
-            report_uri = uri_join(data_uri, "qc_report.json")
+            report_uri = uri_join(data_uri, "qc", "qc_report.json")
         if not report_uri:
             return
         self.store.register_artifact(
@@ -1108,41 +1746,239 @@ class JobService:
             },
         )
 
-    def _create_manual_label_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
-        if self.store.jobs_for_episode(episode_id, "manual_label"):
-            return
+    def _create_segments_from_qc_failure(
+        self,
+        episode_id: str,
+        job: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
         episode = self.store.get_episode(episode_id)
         if episode is None:
-            return
-        cameras = self._cameras_for_episode_context(episode_id, episode, result)
+            return []
+        payload = dict(job.get("payload") or {})
+        cameras = self._cameras_for_episode_context(episode_id, episode, result, payload)
         frames = _as_int_list(result.get("frames")) or self._frames_for_episode_context(
             episode_id,
             episode,
             cameras,
             result,
+            payload,
         )
+        intervals = self._qc_failure_segments(result, frames)
         base_id = _stable_id_part(episode_id, "episode")
-        job_id = str(result.get("manual_label_job_id") or f"manual_label_{base_id}")
-        payload = {
-            "job_id": job_id,
-            "episode_id": episode["episode_id"],
-            "subject_id": episode["subject_id"],
-            "task_name": episode["task_name"],
-            "data_uri": episode["data_uri"],
-            "cameras": cameras,
-            "frames": frames,
-            "rgb_path_template": self._payload_field_for_episode_context(
-                episode_id,
-                "rgb_path_template",
-                "{camera}/RGB/{frame:05d}.png",
-                result,
-            ),
-            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
-            "correction_dir": self._payload_field_for_episode_context(episode_id, "correction_dir", "corrected_2d", result),
-            "reason": "qc_failed",
-            "priority": _optional_int(result.get("priority")) or 50,
+        created: List[Dict[str, Any]] = []
+        for index, (start_frame, end_frame, metadata) in enumerate(intervals, 1):
+            segment_id = str(metadata.get("segment_id") or metadata.get("id") or "").strip()
+            if not segment_id:
+                segment_id = f"segment_{base_id}_{int(start_frame):05d}_{int(end_frame):05d}_{index:03d}"
+            segment = self.store.create_segment(
+                segment_id=segment_id,
+                episode_id=episode_id,
+                start_frame=int(start_frame),
+                end_frame=int(end_frame),
+                status="pending_manual",
+                metadata={
+                    "source_qc_job_id": job.get("job_id"),
+                    "reason": metadata.get("reason") or metadata.get("label") or "qc_failed",
+                    "score": metadata.get("score"),
+                },
+            )
+            created.append(segment)
+        return created
+
+    def _qc_failure_segments(self, result: Dict[str, Any], frames: Sequence[int]) -> List[Tuple[int, int, Dict[str, Any]]]:
+        raw = None
+        for key in ("segments", "failed_segments", "qc_failed_segments", "failure_segments"):
+            if isinstance(result.get(key), list):
+                raw = result.get(key)
+                break
+        intervals: List[Tuple[int, int, Dict[str, Any]]] = []
+        if isinstance(raw, list):
+            for item in raw:
+                metadata: Dict[str, Any] = {}
+                start_value: Any = None
+                end_value: Any = None
+                if isinstance(item, dict):
+                    metadata = dict(item)
+                    start_value = item.get("start_frame", item.get("start", item.get("first_frame")))
+                    end_value = item.get("end_frame", item.get("end", item.get("last_frame", start_value)))
+                elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                    start_value, end_value = item[0], item[1]
+                if isinstance(start_value, bool) or isinstance(end_value, bool):
+                    continue
+                try:
+                    start_frame = int(start_value)
+                    end_frame = int(end_value)
+                except (TypeError, ValueError):
+                    continue
+                if end_frame < start_frame:
+                    start_frame, end_frame = end_frame, start_frame
+                intervals.append((start_frame, end_frame, metadata))
+        if intervals:
+            intervals.sort(key=lambda item: (item[0], item[1]))
+            return intervals
+        clean_frames = [int(frame) for frame in frames if not isinstance(frame, bool)]
+        if clean_frames:
+            return [(min(clean_frames), max(clean_frames), {"reason": "qc_failed_without_segments"})]
+        return [(0, 0, {"reason": "qc_failed_without_segments"})]
+
+    def _complete_segment_mano_job(
+        self,
+        job: Dict[str, Any],
+        result: Dict[str, Any],
+        artifacts: List[Dict[str, Any]],
+    ) -> None:
+        payload = dict(job.get("payload") or {})
+        episode_id = str(job.get("episode_id") or payload.get("episode_id") or "")
+        segment_id = str(payload.get("segment_id") or result.get("segment_id") or "").strip()
+        if not episode_id or not segment_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "segment mano_opt job requires episode_id and segment_id")
+        patch_uri = ""
+        for artifact in artifacts:
+            if str(artifact.get("kind") or "") == "mano_segment_patch" and str(artifact.get("uri") or ""):
+                patch_uri = str(artifact.get("uri") or "")
+                break
+        if not patch_uri:
+            patch_uri = str(result.get("mano_patch_uri") or result.get("mano_segment_patch_uri") or result.get("output_uri") or payload.get("output_uri") or "").strip()
+        if not patch_uri:
+            episode = self.store.get_episode(episode_id)
+            data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
+            patch_uri = uri_join(data_uri, "mano", "segments", segment_id) if data_uri else ""
+        if not any(str(artifact.get("kind") or "") == "mano_segment_patch" for artifact in artifacts) and patch_uri:
+            self.store.register_artifact(
+                episode_id=episode_id,
+                kind="mano_segment_patch",
+                uri=patch_uri,
+                metadata={"source_job_id": job.get("job_id"), "segment_id": segment_id, "scope": "segment"},
+            )
+        self.store.complete_segment_mano(segment_id=segment_id, mano_patch_uri=patch_uri, mano_job_id=str(job.get("job_id") or ""))
+        segments = self.store.segments_for_episode(episode_id)
+        if segments and all(str(segment.get("status") or "") == "mano_succeeded" for segment in segments):
+            self.store.update_episode_status(episode_id, "finalized", {"manual_segments_succeeded": len(segments)})
+        else:
+            self.store.update_episode_status(episode_id, "segment_mano_optimizing", {"active_job_id": job.get("job_id")})
+        self._refresh_final_3d_sources_manifest(episode_id, "segment_mano_completed")
+
+    def _refresh_final_3d_sources_manifest(self, episode_id: str, reason: str) -> None:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            return
+        try:
+            self._write_final_3d_sources_manifest(episode_id, reason)
+        except Exception as exc:  # pragma: no cover - manifest failures should not strand completed jobs
+            print(f"[workflow] failed to update final 3d sources manifest for {episode_id}: {exc}", flush=True)
+
+    def _write_final_3d_sources_manifest(self, episode_id: str, reason: str) -> None:
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            return
+        data_uri = str(episode.get("data_uri") or "").strip().rstrip("/")
+        if not data_uri:
+            return
+        episode_path = self.resolve_data_path(data_uri, "")
+        if not episode_path:
+            return
+
+        artifacts = self.store.artifacts_for_episode(episode_id)
+        segments = self.store.segments_for_episode(episode_id)
+        metadata = episode.get("metadata") if isinstance(episode.get("metadata"), dict) else {}
+        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
+        qc_report_uri = self._latest_artifact_uri(artifacts, {"qc_report"})
+        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"})
+
+        overrides = []
+        for segment in segments:
+            segment_id = str(segment.get("segment_id") or "")
+            start_frame = _optional_int(segment.get("start_frame")) or 0
+            end_frame = _optional_int(segment.get("end_frame")) or start_frame
+            status = str(segment.get("status") or "")
+            manual_2d_uri = str(segment.get("manual_2d_uri") or "")
+            mano_patch_uri = str(segment.get("mano_patch_uri") or "")
+            expected_manual_2d_uri = uri_join(data_uri, "manual_2d", "segments", segment_id) if segment_id else ""
+            expected_mano_patch_uri = uri_join(data_uri, "mano", "segments", segment_id) if segment_id else ""
+            overrides.append(
+                {
+                    "segment_id": segment_id,
+                    "start_frame": start_frame,
+                    "end_frame": end_frame,
+                    "source": "manual_segment",
+                    "status": "ready" if status == "mano_succeeded" and mano_patch_uri else status,
+                    "segment_status": status,
+                    "manual_2d_uri": manual_2d_uri,
+                    "manual_2d_relative_path": self._relative_data_uri_path(data_uri, manual_2d_uri),
+                    "expected_manual_2d_uri": expected_manual_2d_uri,
+                    "expected_manual_2d_relative_path": self._relative_data_uri_path(data_uri, expected_manual_2d_uri),
+                    "mano_patch_uri": mano_patch_uri,
+                    "relative_path": self._relative_data_uri_path(data_uri, mano_patch_uri),
+                    "expected_mano_patch_uri": expected_mano_patch_uri,
+                    "expected_mano_patch_relative_path": self._relative_data_uri_path(data_uri, expected_mano_patch_uri),
+                }
+            )
+
+        manifest = {
+            "schema_version": 1,
+            "kind": "orbbec_final_3d_sources",
+            "episode_id": episode_id,
+            "subject_id": str(episode.get("subject_id") or ""),
+            "task_name": str(episode.get("task_name") or ""),
+            "episode_index": episode.get("episode_index"),
+            "episode_status": str(episode.get("status") or ""),
+            "data_uri": data_uri,
+            "manifest_uri": uri_join(data_uri, FINAL_3D_SOURCES_REL_PATH),
+            "updated_at": now_iso(),
+            "updated_reason": str(reason or ""),
+            "base_2d": {
+                "source": "auto_label",
+                "uri": pred_uri,
+                "relative_path": self._relative_data_uri_path(data_uri, pred_uri),
+            },
+            "base_3d": {
+                "source": "auto_episode",
+                "uri": mano_episode_uri,
+                "relative_path": self._relative_data_uri_path(data_uri, mano_episode_uri),
+                "status": "ready" if mano_episode_uri else "missing",
+            },
+            "qc": {
+                "status": str(metadata.get("qc_status") or ""),
+                "report_uri": qc_report_uri,
+                "relative_path": self._relative_data_uri_path(data_uri, qc_report_uri),
+            },
+            "overrides": overrides,
+            "ready_override_count": sum(1 for item in overrides if item.get("status") == "ready"),
+            "reconstruction_rule": {
+                "default": "base_3d",
+                "override_when": "overrides.status == ready and frame in [start_frame, end_frame]",
+            },
         }
-        self._create_job_once(job_id=job_id, job_type="manual_label", episode_id=episode_id, payload=payload)
+
+        manifest_path = Path(episode_path).expanduser().resolve() / FINAL_3D_SOURCES_REL_PATH
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(manifest_path)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _relative_data_uri_path(data_uri: str, uri: str) -> str:
+        data_uri = str(data_uri or "").strip().rstrip("/")
+        uri = str(uri or "").strip().rstrip("/")
+        if not data_uri or not uri:
+            return ""
+        if uri == data_uri:
+            return "."
+        prefix = data_uri + "/"
+        if uri.startswith(prefix):
+            return uri[len(prefix):]
+        return ""
 
     def _register_artifact_from_payload(self, episode_id: str, artifact: Dict[str, Any]) -> None:
         kind = str(artifact.get("kind") or "").strip()

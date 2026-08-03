@@ -16,6 +16,7 @@ try:
         WorkflowError,
         require_episode_status,
         require_job_status,
+        require_segment_status,
         require_stage_job_type,
         require_job_type,
     )
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - script execution fallback
         WorkflowError,
         require_episode_status,
         require_job_status,
+        require_segment_status,
         require_stage_job_type,
         require_job_type,
     )
@@ -82,7 +84,8 @@ class WorkflowStore:
 
     def initialize(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(self.db_path), timeout=30.0) as conn:
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        try:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.executescript(
                 """
@@ -135,6 +138,33 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS idx_jobs_episode
                     ON jobs(episode_id);
 
+                CREATE TABLE IF NOT EXISTS segments (
+                    segment_id TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL,
+                    start_frame INTEGER NOT NULL,
+                    end_frame INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    manual_job_id TEXT NOT NULL DEFAULT '',
+                    mano_job_id TEXT NOT NULL DEFAULT '',
+                    manual_2d_uri TEXT NOT NULL DEFAULT '',
+                    mano_patch_uri TEXT NOT NULL DEFAULT '',
+                    lease_owner TEXT NOT NULL DEFAULT '',
+                    lease_until TEXT NOT NULL DEFAULT '',
+                    cleanup_manifest_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    manual_completed_at TEXT NOT NULL DEFAULT '',
+                    mano_completed_at TEXT NOT NULL DEFAULT '',
+                    failed_at TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_segments_episode_status
+                    ON segments(episode_id, status, start_frame);
+                CREATE INDEX IF NOT EXISTS idx_segments_status_created
+                    ON segments(status, created_at);
+
                 CREATE TABLE IF NOT EXISTS workflow_stage_controls (
                     job_type TEXT PRIMARY KEY,
                     lease_enabled INTEGER NOT NULL DEFAULT 0,
@@ -142,7 +172,7 @@ class WorkflowStore:
                     updated_by TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
                 );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 """
             )
             timestamp = now_iso()
@@ -155,6 +185,9 @@ class WorkflowStore:
                     """,
                     (job_type, timestamp),
                 )
+            conn.commit()
+        finally:
+            conn.close()
 
     def create_or_update_episode(
         self,
@@ -678,6 +711,378 @@ class WorkflowStore:
                 raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"released job not found: {job_id}")
             return updated, True
 
+    def create_segment(
+        self,
+        *,
+        segment_id: Optional[str] = None,
+        episode_id: str,
+        start_frame: int,
+        end_frame: int,
+        status: str = "pending_manual",
+        manual_job_id: str = "",
+        mano_job_id: str = "",
+        manual_2d_uri: str = "",
+        mano_patch_uri: str = "",
+        cleanup_manifest: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        status = require_segment_status(status)
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
+        start_frame = int(start_frame)
+        end_frame = int(end_frame)
+        if end_frame < start_frame:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "segment end_frame must be >= start_frame")
+        segment_id = str(segment_id or "").strip() or _new_id("segment")
+        with self.connect() as conn:
+            if self._get_episode_unlocked(conn, episode_id) is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+            existing = self._get_segment_unlocked(conn, segment_id)
+            if existing is not None:
+                return existing
+            now = now_iso()
+            conn.execute(
+                """
+                INSERT INTO segments (
+                    segment_id, episode_id, start_frame, end_frame, status,
+                    manual_job_id, mano_job_id, manual_2d_uri, mano_patch_uri,
+                    lease_owner, lease_until, cleanup_manifest_json, metadata_json,
+                    error, created_at, updated_at, manual_completed_at, mano_completed_at, failed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, '', ?, ?, '', '', '')
+                """,
+                (
+                    segment_id,
+                    episode_id,
+                    start_frame,
+                    end_frame,
+                    status,
+                    str(manual_job_id or ""),
+                    str(mano_job_id or ""),
+                    str(manual_2d_uri or ""),
+                    str(mano_patch_uri or ""),
+                    _json_dumps(cleanup_manifest or {}),
+                    _json_dumps(metadata or {}),
+                    now,
+                    now,
+                ),
+            )
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"created segment not found: {segment_id}")
+            return segment
+
+    def get_segment(self, segment_id: str) -> Optional[Dict[str, Any]]:
+        with self.connect() as conn:
+            return self._get_segment_unlocked(conn, segment_id)
+
+    def segments_for_episode(self, episode_id: str, statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            return []
+        clauses = ["episode_id = ?"]
+        params: List[Any] = [episode_id]
+        if statuses:
+            clean_statuses = [require_segment_status(status) for status in statuses]
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            params.extend(clean_statuses)
+        query = "SELECT * FROM segments WHERE " + " AND ".join(clauses)
+        query += " ORDER BY start_frame, end_frame, segment_id"
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_segment(row) for row in rows]
+
+    def list_segments(
+        self,
+        *,
+        task_name: str = "",
+        subject_id: str = "",
+        episode_id: str = "",
+        statuses: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        task_name = str(task_name or "").strip()
+        subject_id = str(subject_id or "").strip()
+        episode_id = str(episode_id or "").strip()
+        if task_name:
+            clauses.append("episodes.task_name = ?")
+            params.append(task_name)
+        if subject_id:
+            clauses.append("episodes.subject_id = ?")
+            params.append(subject_id)
+        if episode_id:
+            clauses.append("segments.episode_id = ?")
+            params.append(episode_id)
+        if statuses:
+            clean_statuses = [require_segment_status(status) for status in statuses]
+            placeholders = ", ".join("?" for _ in clean_statuses)
+            clauses.append(f"segments.status IN ({placeholders})")
+            params.extend(clean_statuses)
+        query = """
+            SELECT segments.* FROM segments
+            JOIN episodes ON episodes.episode_id = segments.episode_id
+        """
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += """
+            ORDER BY episodes.task_name, episodes.subject_id,
+                     episodes.episode_index IS NULL, episodes.episode_index,
+                     episodes.created_at, episodes.episode_id,
+                     segments.start_frame, segments.end_frame, segments.segment_id
+        """
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_segment(row) for row in rows]
+
+    def lease_segment(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int = 600,
+        task_name: str = "",
+        subject_id: str = "",
+        episode_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        lease_owner = str(lease_owner or "").strip()
+        if not lease_owner:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "lease_owner is required")
+        lease_seconds = max(1, int(lease_seconds or 600))
+        task_name = str(task_name or "").strip()
+        subject_id = str(subject_id or "").strip()
+        episode_id = str(episode_id or "").strip()
+        now = now_iso()
+        lease_until = _future_iso(lease_seconds)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            params: List[Any] = []
+            query = """
+                SELECT segments.* FROM segments
+                JOIN episodes ON episodes.episode_id = segments.episode_id
+                WHERE segments.status IN ('pending_manual', 'manual_labeling')
+            """
+            if task_name:
+                query += " AND episodes.task_name = ?"
+                params.append(task_name)
+            if subject_id:
+                query += " AND episodes.subject_id = ?"
+                params.append(subject_id)
+            if episode_id:
+                query += " AND segments.episode_id = ?"
+                params.append(episode_id)
+            query += """
+                ORDER BY episodes.task_name, episodes.subject_id,
+                         episodes.episode_index IS NULL, episodes.episode_index,
+                         episodes.created_at, episodes.episode_id,
+                         segments.start_frame, segments.end_frame, segments.segment_id
+            """
+            rows = conn.execute(query, tuple(params)).fetchall()
+            selected: Optional[sqlite3.Row] = None
+            for row in rows:
+                status = str(row["status"])
+                row_lease_until = str(row["lease_until"] or "")
+                if status == "pending_manual" or not row_lease_until or row_lease_until <= now:
+                    selected = row
+                    break
+            if selected is None:
+                return None
+            segment_id = str(selected["segment_id"])
+            manual_job_id = str(selected["manual_job_id"] or "") or f"manual_label_{segment_id}"
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'manual_labeling', lease_owner = ?, lease_until = ?,
+                    manual_job_id = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (lease_owner, lease_until, manual_job_id, now, segment_id),
+            )
+            return self._get_segment_unlocked(conn, segment_id)
+
+    def heartbeat_segment(
+        self,
+        *,
+        segment_id: str,
+        lease_owner: str = "",
+        lease_seconds: int = 600,
+    ) -> Dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            if segment.get("status") not in {"pending_manual", "manual_labeling"}:
+                return segment
+            if lease_owner and segment.get("lease_owner") and segment.get("lease_owner") != lease_owner:
+                raise WorkflowError(HTTPStatus.CONFLICT, "segment is leased by another owner")
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'manual_labeling', lease_until = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (_future_iso(max(1, int(lease_seconds or 600))), now_iso(), segment_id),
+            )
+            return self._get_segment_unlocked(conn, segment_id) or segment
+
+    def release_segment(self, *, segment_id: str, reason: str = "") -> Tuple[Dict[str, Any], bool]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            if segment.get("status") != "manual_labeling":
+                return segment, False
+            metadata = dict(segment.get("metadata") or {})
+            if reason:
+                metadata["last_release_reason"] = reason
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'pending_manual', lease_owner = '', lease_until = '',
+                    metadata_json = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (_json_dumps(metadata), now_iso(), segment_id),
+            )
+            updated = self._get_segment_unlocked(conn, segment_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"released segment not found: {segment_id}")
+            return updated, True
+
+    def complete_segment_manual(
+        self,
+        *,
+        segment_id: str,
+        manual_2d_uri: str,
+        manual_job_id: str = "",
+        cleanup_manifest: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        manual_2d_uri = str(manual_2d_uri or "").strip()
+        if not manual_2d_uri:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "manual_2d_uri is required")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            merged_metadata = dict(segment.get("metadata") or {})
+            if metadata:
+                merged_metadata.update(metadata)
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'manual_labeled', manual_2d_uri = ?, manual_job_id = ?,
+                    lease_owner = '', lease_until = '', cleanup_manifest_json = ?,
+                    metadata_json = ?, error = '', manual_completed_at = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (
+                    manual_2d_uri,
+                    str(manual_job_id or segment.get("manual_job_id") or ""),
+                    _json_dumps(cleanup_manifest or segment.get("cleanup_manifest") or {}),
+                    _json_dumps(merged_metadata),
+                    now_iso(),
+                    now_iso(),
+                    segment_id,
+                ),
+            )
+            updated = self._get_segment_unlocked(conn, segment_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"completed segment not found: {segment_id}")
+            return updated
+
+    def mark_segment_mano_queued(self, *, segment_id: str, mano_job_id: str) -> Dict[str, Any]:
+        return self._set_segment_status_fields(segment_id=segment_id, status="mano_queued", mano_job_id=mano_job_id)
+
+    def mark_segment_mano_running(self, *, segment_id: str, mano_job_id: str) -> Dict[str, Any]:
+        return self._set_segment_status_fields(segment_id=segment_id, status="mano_running", mano_job_id=mano_job_id)
+
+    def complete_segment_mano(self, *, segment_id: str, mano_patch_uri: str, mano_job_id: str = "") -> Dict[str, Any]:
+        mano_patch_uri = str(mano_patch_uri or "").strip()
+        if not mano_patch_uri:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "mano_patch_uri is required")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            timestamp = now_iso()
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'mano_succeeded', mano_patch_uri = ?, mano_job_id = ?,
+                    error = '', mano_completed_at = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (mano_patch_uri, str(mano_job_id or segment.get("mano_job_id") or ""), timestamp, timestamp, segment_id),
+            )
+            updated = self._get_segment_unlocked(conn, segment_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"completed segment not found: {segment_id}")
+            return updated
+
+    def fail_segment(
+        self,
+        *,
+        segment_id: str,
+        error: str,
+        cleanup_manifest: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            merged_metadata = dict(segment.get("metadata") or {})
+            if metadata:
+                merged_metadata.update(metadata)
+            timestamp = now_iso()
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = 'failed', lease_owner = '', lease_until = '',
+                    cleanup_manifest_json = ?, metadata_json = ?, error = ?,
+                    failed_at = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (
+                    _json_dumps(cleanup_manifest or segment.get("cleanup_manifest") or {}),
+                    _json_dumps(merged_metadata),
+                    str(error or "segment failed"),
+                    timestamp,
+                    timestamp,
+                    segment_id,
+                ),
+            )
+            updated = self._get_segment_unlocked(conn, segment_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"failed segment not found: {segment_id}")
+            return updated
+
+    def _set_segment_status_fields(self, *, segment_id: str, status: str, mano_job_id: str = "") -> Dict[str, Any]:
+        status = require_segment_status(status)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            segment = self._get_segment_unlocked(conn, segment_id)
+            if segment is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
+            conn.execute(
+                """
+                UPDATE segments
+                SET status = ?, mano_job_id = ?, updated_at = ?
+                WHERE segment_id = ?
+                """,
+                (status, str(mano_job_id or segment.get("mano_job_id") or ""), now_iso(), segment_id),
+            )
+            updated = self._get_segment_unlocked(conn, segment_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"updated segment not found: {segment_id}")
+            return updated
+
     def _get_episode_unlocked(self, conn: sqlite3.Connection, episode_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()
         return self._row_to_episode(row) if row is not None else None
@@ -685,6 +1090,10 @@ class WorkflowStore:
     def _get_job_unlocked(self, conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         return self._row_to_job(row) if row is not None else None
+
+    def _get_segment_unlocked(self, conn: sqlite3.Connection, segment_id: str) -> Optional[Dict[str, Any]]:
+        row = conn.execute("SELECT * FROM segments WHERE segment_id = ?", (segment_id,)).fetchone()
+        return self._row_to_segment(row) if row is not None else None
 
     @staticmethod
     def _row_to_episode(row: sqlite3.Row) -> Dict[str, Any]:
@@ -728,6 +1137,30 @@ class WorkflowStore:
             "attempt": int(row["attempt"] or 0),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _row_to_segment(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "segment_id": row["segment_id"],
+            "episode_id": row["episode_id"],
+            "start_frame": int(row["start_frame"]),
+            "end_frame": int(row["end_frame"]),
+            "status": row["status"],
+            "manual_job_id": row["manual_job_id"] or "",
+            "mano_job_id": row["mano_job_id"] or "",
+            "manual_2d_uri": row["manual_2d_uri"] or "",
+            "mano_patch_uri": row["mano_patch_uri"] or "",
+            "lease_owner": row["lease_owner"] or "",
+            "lease_until": row["lease_until"] or "",
+            "cleanup_manifest": _json_loads(row["cleanup_manifest_json"], {}),
+            "metadata": _json_loads(row["metadata_json"], {}),
+            "error": row["error"] or "",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "manual_completed_at": row["manual_completed_at"] or "",
+            "mano_completed_at": row["mano_completed_at"] or "",
+            "failed_at": row["failed_at"] or "",
         }
 
     @staticmethod

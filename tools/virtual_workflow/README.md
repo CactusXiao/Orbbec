@@ -15,11 +15,13 @@ modify the existing `task_backend` or `label` modules.
   NAS. Upload completion marks episodes `uploaded`; pushing auto-label is a
   separate dashboard/API action.
 - Auto-label workers that write placeholder 2D prediction `.npy` files, then
-  let the backend enqueue a `qc` job.
+  let the backend enqueue an episode-level `mano_opt` job.
+- MANO workers that write placeholder episode MANO outputs and segment patch
+  outputs.
 - QC workers that randomly pass or fail. Failed QC lets the backend create a
-  queued `manual_label` job so the label frontend can lease it.
-- Optional manual label workers that complete queued manual jobs with
-  placeholder corrected `.npy` artifacts.
+  set of `pending_manual` segments so the label frontend can lease them.
+- Optional manual workers that complete queued segments with placeholder
+  `manual_2d` artifacts.
 
 ## Start Backend
 
@@ -35,7 +37,7 @@ with `--backend-url` or `ORBBEC_TASK_BACKEND_URL`.
 ## Seed Existing Label Data Into Manual Label Queue
 
 This reads `label/task.jsonl`, materializes local NAS placeholder data, and
-creates queued `manual_label` jobs through `/api/v1/dev/label/jobs`.
+creates queued manual segments through `/api/v1/dev/label/jobs`.
 
 ```bash
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
@@ -64,9 +66,11 @@ Run the virtual upload, auto-label, and QC workers:
 ```bash
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/auto_label/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/mano_opt/enable \
+  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/qc/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
-curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_label/enable \
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_segment/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
 
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
@@ -78,7 +82,7 @@ curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
   -H 'Content-Type: application/json' -d '{"scope":"all","pushed_by":"virtual_workflow"}'
 
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers auto-label,qc \
+  --workers auto-label,mano-opt,qc \
   --qc-fail-rate 0.8 \
   --max-iterations 20 \
   --stop-after-idle-rounds 3

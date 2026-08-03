@@ -48,8 +48,24 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             try:
                 host, port = server.server_address
                 base_url = f"http://{host}:{port}"
+                service.store.create_or_update_episode(
+                    episode_id="episode_000456",
+                    subject_id="S001",
+                    task_name="pick_object",
+                    episode_index=1,
+                    status="manual_correction_pending",
+                    data_uri="local://" + str(episode_dir),
+                    cameras=["camera_01"],
+                    frame_count=2,
+                )
+                service.store.create_segment(
+                    segment_id="segment_000456_120_121",
+                    episode_id="episode_000456",
+                    start_frame=120,
+                    end_frame=121,
+                )
                 req = Request(
-                    base_url + "/api/v1/workflow/stages/manual_label/enable",
+                    base_url + "/api/v1/workflow/stages/manual_segment/enable",
                     data=json.dumps({"updated_by": "smoke"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -59,27 +75,25 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 self.assertTrue(enabled["control"]["lease_enabled"])
 
                 client = LabelBackendClient(f"http://{host}:{port}", timeout_seconds=5)
-                created = client.create_dev_label_job(
-                    {
-                        "local_path": str(episode_dir),
-                        "subject_id": "S001",
-                        "task_name": "pick_object",
-                        "episode_id": "episode_000456",
-                        "cameras": ["camera_01"],
-                        "frames": [120, 121],
-                    }
-                )
-                self.assertEqual(created["job"]["status"], "queued")
+                tasks = client.queued_label_tasks()
+                self.assertEqual(tasks[0]["task_name"], "pick_object")
+                episodes = client.label_task_episodes("pick_object")
+                self.assertEqual(episodes[0]["episode_id"], "episode_000456")
 
-                leased = client.lease_label_job("labeler_01", lease_seconds=60)
-                job_id = leased["payload"]["job_id"]
-                self.assertEqual(leased["job"]["status"], "leased")
+                leased = client.lease_label_segment("labeler_01", lease_seconds=60, task_name="pick_object", episode_id="episode_000456")
+                job_id = leased["payload"]["segment_id"]
+                self.assertEqual(leased["segment"]["status"], "manual_labeling")
                 self.assertEqual(UriResolver().resolve(leased["payload"]["data_uri"]), episode_dir.resolve())
+                self.assertEqual(leased["payload"]["frames"], [120, 121])
 
-                completed = client.complete_label_job(job_id, result={"ok": True})
-                self.assertEqual(completed["job"]["status"], "succeeded")
+                completed = client.complete_label_job(
+                    job_id,
+                    result={"ok": True, "operator_id": "labeler_01"},
+                    artifacts=[{"kind": "manual_2d", "uri": "local://" + str(episode_dir / "manual_2d" / "segments" / job_id)}],
+                )
+                self.assertEqual(completed["segment"]["status"], "mano_queued")
 
-                with urlopen(base_url + "/api/v1/workflow/stages/manual_label", timeout=5) as resp:
+                with urlopen(base_url + "/api/v1/workflow/stages/manual_segment", timeout=5) as resp:
                     stage = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(stage["stats"]["succeeded"], 1)
             finally:
