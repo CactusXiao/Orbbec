@@ -37,8 +37,32 @@ From the repository root:
 python3 task_backend/server.py
 ```
 
-The default backend URL used by the tool is `http://127.0.0.1:8765`. Override it
-with `--backend-url` or `ORBBEC_TASK_BACKEND_URL`.
+The tool loads `./.env` by default before reading command defaults. Shell
+environment variables override values from the file.
+
+Use the same `.env` file for backend and worker configuration:
+
+```dotenv
+ORBBEC_TASK_BACKEND_HOST=0.0.0.0
+ORBBEC_TASK_BACKEND_PORT=8765
+ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state_fullflow
+ORBBEC_VIRTUAL_NAS_ENABLED=1
+ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state_fullflow/virtual_nas
+ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
+ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
+
+ORBBEC_VIRTUAL_WORKFLOW_WORKERS=all
+ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT=./task_backend_state_fullflow/virtual_nas
+ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX=nas://orbbec-virtual
+ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE=0.5
+ORBBEC_VIRTUAL_WORKFLOW_MAX_ITERATIONS=0
+ORBBEC_VIRTUAL_WORKFLOW_STOP_AFTER_IDLE_ROUNDS=0
+ORBBEC_VIRTUAL_WORKFLOW_IDLE_SLEEP=1.0
+ORBBEC_VIRTUAL_WORKFLOW_IDLE_LOG_INTERVAL=30
+```
+
+For deterministic manual-label flow validation, set
+`ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE=1.0`.
 
 ## Seed Existing Label Data Into Manual Label Queue
 
@@ -62,18 +86,14 @@ task, and the backend returns a resolved local path for `nas://orbbec-virtual`.
 Start the backend, then open the existing main-menu `Collection` page/app and
 capture an episode normally. Collection confirm creates an `upload` job.
 
-Run the virtual upload worker against the same NAS root and URI prefix as the
-backend:
+Start all virtual workers once. They read backend URL, NAS settings, QC rate,
+loop limits, and worker selection from `.env`:
 
 ```bash
-python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers upload \
-  --max-iterations 20 \
-  --stop-after-idle-rounds 3
+python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers
 ```
 
-Enable the controlled stages, push uploaded episodes into auto-label, and run
-the virtual auto-label, MANO, and QC workers:
+Enable the controlled stages and push uploaded episodes into auto-label:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/auto_label/enable \
@@ -87,12 +107,6 @@ curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_segment/enab
 
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
   -H 'Content-Type: application/json' -d '{"scope":"all","pushed_by":"virtual_workflow"}'
-
-python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers auto-label,mano-opt,qc \
-  --qc-fail-rate 0.5 \
-  --max-iterations 20 \
-  --stop-after-idle-rounds 3
 ```
 
 If QC fails, open the existing main-menu `Label` page/app. The label frontend
@@ -103,15 +117,9 @@ episode path, and writes:
 manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
 ```
 
-After the Label frontend completes a segment, run the virtual MANO worker again
-to consume the real `manual_2d` files and write the segment patch:
-
-```bash
-python3 tools/virtual_workflow/orbbec_virtual_workflow.py run-workers \
-  --workers mano-opt \
-  --max-iterations 20 \
-  --stop-after-idle-rounds 3
-```
+After the Label frontend completes a segment, the already-running virtual
+workers consume the new segment-level `mano_opt` job and write the segment
+patch.
 
 Repeat Label completion and `mano-opt` until the episode finalizes. The backend
 keeps the final NAS source map at:
@@ -137,9 +145,17 @@ Then run the same virtual worker commands above.
 
 ## Useful Options
 
-- `--nas-root PATH`: local directory for the virtual NAS. It must match the
-  backend mount for `--nas-uri-prefix`.
-- `--nas-uri-prefix URI`: NAS URI prefix, default `nas://orbbec-virtual`.
+- `ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT`: local directory for the virtual NAS. It
+  must match the backend mount for `ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX`.
+- `ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX`: NAS URI prefix, default
+  `nas://orbbec-virtual`.
+- `ORBBEC_VIRTUAL_WORKFLOW_WORKERS`: `default`, `all`, or comma list:
+  `upload,auto-label,mano-opt,qc`.
+- `ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE`: QC failure probability.
+- `ORBBEC_VIRTUAL_WORKFLOW_STOP_AFTER_IDLE_ROUNDS`: use `0` for a long-running
+  worker process.
+- `ORBBEC_VIRTUAL_WORKFLOW_IDLE_LOG_INTERVAL`: print one idle log every N idle
+  rounds; use `0` to silence idle logs.
 - `seed-label --frames-per-segment N`: split one JSONL task into manual-label segments.
 - `seed-label --max-jobs N`: seed only the first N manual-label segments.
 - `--copy-source`: copy real episode folders if they exist.

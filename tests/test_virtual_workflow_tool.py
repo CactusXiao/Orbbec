@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -29,12 +31,48 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     handle_mano_opt_once,
     handle_qc_once,
     handle_upload_once,
+    build_parser,
+    load_env_defaults,
     virtual_failed_segments,
     write_placeholder_rgb_image,
 )
 
 
 class VirtualWorkflowToolSmokeTest(unittest.TestCase):
+    def test_run_workers_defaults_load_from_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env_file = tmp_path / ".env"
+            env_file.write_text(
+                "\n".join(
+                    [
+                        "ORBBEC_TASK_BACKEND_URL=http://127.0.0.1:9999",
+                        f"ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT={tmp_path / 'nas'}",
+                        "ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX=nas://orbbec-test",
+                        "ORBBEC_VIRTUAL_WORKFLOW_WORKERS=all",
+                        "ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE=1.0",
+                        "ORBBEC_VIRTUAL_WORKFLOW_MAX_ITERATIONS=0",
+                        "ORBBEC_VIRTUAL_WORKFLOW_STOP_AFTER_IDLE_ROUNDS=0",
+                        "ORBBEC_VIRTUAL_WORKFLOW_IDLE_LOG_INTERVAL=30",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                load_env_defaults(env_file)
+                args = build_parser().parse_args(["run-workers"])
+
+            self.assertEqual(args.backend_url, "http://127.0.0.1:9999")
+            self.assertEqual(args.nas_root, tmp_path / "nas")
+            self.assertEqual(args.nas_uri_prefix, "nas://orbbec-test")
+            self.assertEqual(args.workers, "all")
+            self.assertEqual(args.qc_fail_rate, 1.0)
+            self.assertEqual(args.max_iterations, 0)
+            self.assertEqual(args.stop_after_idle_rounds, 0)
+            self.assertEqual(args.idle_log_interval, 30)
+
     def test_virtual_upload_does_not_precreate_auto_label_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

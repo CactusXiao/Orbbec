@@ -74,6 +74,107 @@ MIN_DETECTION_LANDMARKS = 6
 LANDMARK_NORMALIZED_MARGIN = 0.18
 
 
+def strip_env_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, ch in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if ch == "#" and not in_single and not in_double:
+            if index == 0 or value[index - 1].isspace():
+                return value[:index].rstrip()
+    return value
+
+
+def unquote_env_value(value: str) -> str:
+    value = strip_env_comment(value.strip())
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        inner = value[1:-1]
+        if value[0] == '"':
+            inner = inner.replace(r"\\", "\\").replace(r"\"", '"')
+        return inner
+    return value
+
+
+def load_env_file(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    result: Dict[str, str] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                raise ValueError(f"invalid .env line {line_no}: missing '='")
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
+                raise ValueError(f"invalid .env line {line_no}: invalid key {key!r}")
+            result[key] = unquote_env_value(value)
+    return result
+
+
+def load_env_defaults(path: Path) -> Dict[str, str]:
+    values = load_env_file(path)
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+    return values
+
+
+def env_text(default: str, *keys: str) -> str:
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return value
+    return default
+
+
+def env_int(default: int, *keys: str) -> int:
+    value = env_text("", *keys)
+    if value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid integer env value for {', '.join(keys)}: {value!r}") from exc
+
+
+def env_float(default: float, *keys: str) -> float:
+    value = env_text("", *keys)
+    if value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid float env value for {', '.join(keys)}: {value!r}") from exc
+
+
+def env_bool(default: bool, *keys: str) -> bool:
+    value = env_text("", *keys)
+    if value == "":
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean env value for {', '.join(keys)}: {value!r}")
+
+
 class BackendError(RuntimeError):
     pass
 
@@ -1403,7 +1504,9 @@ def run_workers(args: argparse.Namespace) -> int:
             idle_rounds = 0
         else:
             idle_rounds += 1
-            print_event("worker_idle", iteration=iteration, idle_rounds=idle_rounds, workers=workers)
+            idle_log_interval = max(0, int(getattr(args, "idle_log_interval", 1) or 0))
+            if idle_log_interval and (idle_rounds == 1 or idle_rounds % idle_log_interval == 0):
+                print_event("worker_idle", iteration=iteration, idle_rounds=idle_rounds, workers=workers)
         if args.max_iterations and iteration >= args.max_iterations:
             print_event("worker_run_done", processed=processed, reason="max_iterations")
             return 0
@@ -1414,14 +1517,42 @@ def run_workers(args: argparse.Namespace) -> int:
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--backend-url", default=os.environ.get("ORBBEC_TASK_BACKEND_URL", "http://127.0.0.1:8765"))
-    parser.add_argument("--timeout", type=float, default=10.0)
-    parser.add_argument("--nas-root", type=Path, default=Path("task_backend_state/virtual_nas"))
-    parser.add_argument("--nas-uri-prefix", default="nas://orbbec-virtual")
+    parser.add_argument(
+        "--backend-url",
+        default=env_text(
+            "http://127.0.0.1:8765",
+            "ORBBEC_VIRTUAL_WORKFLOW_BACKEND_URL",
+            "ORBBEC_TASK_BACKEND_URL",
+            "TASK_BACKEND_URL",
+        ),
+    )
+    parser.add_argument("--timeout", type=float, default=env_float(10.0, "ORBBEC_VIRTUAL_WORKFLOW_TIMEOUT"))
+    parser.add_argument(
+        "--nas-root",
+        type=Path,
+        default=Path(
+            env_text(
+                "task_backend_state/virtual_nas",
+                "ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT",
+                "ORBBEC_VIRTUAL_NAS_ROOT",
+                "TASK_BACKEND_VIRTUAL_NAS_ROOT",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--nas-uri-prefix",
+        default=env_text(
+            "nas://orbbec-virtual",
+            "ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX",
+            "ORBBEC_VIRTUAL_NAS_URI_PREFIX",
+            "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX",
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Virtual NAS, auto-label, QC, and label workers for Orbbec backend testing.")
+    parser.add_argument("--env-file", type=Path, default=Path(os.environ.get("ORBBEC_VIRTUAL_WORKFLOW_ENV_FILE", ".env")), help="Path to .env defaults. The file is loaded before command defaults are built.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     seed_label = sub.add_parser("seed-label", help="Queue manual correction segments from an existing label JSONL file.")
@@ -1445,24 +1576,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     workers = sub.add_parser("run-workers", help="Run virtual upload, auto-label, MANO, and QC workers. Manual labeling stays in the real label frontend.")
     add_common_args(workers)
-    workers.add_argument("--workers", default="default", help="default, all, or comma list: upload,auto-label,mano-opt,qc")
-    workers.add_argument("--worker-id", default="")
-    workers.add_argument("--lease-seconds", type=int, default=300)
-    workers.add_argument("--qc-fail-rate", type=float, default=0.5)
-    workers.add_argument("--copy-source", action="store_true")
-    workers.add_argument("--max-materialized-frames", type=int, default=0)
-    workers.add_argument("--once", action="store_true")
-    workers.add_argument("--max-iterations", type=int, default=0)
-    workers.add_argument("--stop-after-idle-rounds", type=int, default=1)
-    workers.add_argument("--idle-sleep", type=float, default=1.0)
+    workers.add_argument("--workers", default=env_text("default", "ORBBEC_VIRTUAL_WORKFLOW_WORKERS"), help="default, all, or comma list: upload,auto-label,mano-opt,qc")
+    workers.add_argument("--worker-id", default=env_text("", "ORBBEC_VIRTUAL_WORKFLOW_WORKER_ID"))
+    workers.add_argument("--lease-seconds", type=int, default=env_int(300, "ORBBEC_VIRTUAL_WORKFLOW_LEASE_SECONDS"))
+    workers.add_argument("--qc-fail-rate", type=float, default=env_float(0.5, "ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE"))
+    workers.add_argument("--copy-source", action="store_true", default=env_bool(False, "ORBBEC_VIRTUAL_WORKFLOW_COPY_SOURCE"))
+    workers.add_argument("--max-materialized-frames", type=int, default=env_int(0, "ORBBEC_VIRTUAL_WORKFLOW_MAX_MATERIALIZED_FRAMES"))
+    workers.add_argument("--once", action="store_true", default=env_bool(False, "ORBBEC_VIRTUAL_WORKFLOW_ONCE"))
+    workers.add_argument("--max-iterations", type=int, default=env_int(0, "ORBBEC_VIRTUAL_WORKFLOW_MAX_ITERATIONS"))
+    workers.add_argument("--stop-after-idle-rounds", type=int, default=env_int(1, "ORBBEC_VIRTUAL_WORKFLOW_STOP_AFTER_IDLE_ROUNDS"))
+    workers.add_argument("--idle-sleep", type=float, default=env_float(1.0, "ORBBEC_VIRTUAL_WORKFLOW_IDLE_SLEEP"))
+    workers.add_argument("--idle-log-interval", type=int, default=env_int(1, "ORBBEC_VIRTUAL_WORKFLOW_IDLE_LOG_INTERVAL"))
     workers.set_defaults(func=run_workers)
 
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    env_file = Path(os.environ.get("ORBBEC_VIRTUAL_WORKFLOW_ENV_FILE", ".env"))
+    clean_args: List[str] = []
+    skip_next = False
+    for index, item in enumerate(raw_args):
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--env-file" and index + 1 < len(raw_args):
+            env_file = Path(raw_args[index + 1])
+            skip_next = True
+            continue
+        if item.startswith("--env-file="):
+            env_file = Path(item.split("=", 1)[1])
+            continue
+        clean_args.append(item)
+    raw_args = clean_args
+    try:
+        load_env_defaults(env_file)
+    except ValueError as exc:
+        print_event("error", message=str(exc))
+        return 1
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_args)
     try:
         return int(args.func(args))
     except (BackendError, ValueError, OSError) as exc:
