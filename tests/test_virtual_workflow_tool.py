@@ -82,7 +82,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self._write_capture_episode(capture_dir, frames=60, cameras=["00", "01"])
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, auto_label_batch_size=100, uri_mounts={nas_prefix: str(nas_root)})
+            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
             registry = TaskInstanceRegistry(tmp_path / "backend_state", seed_task_files=[])
             runtime = BackendRuntime(registry, service)
             server = TaskHTTPServer(("127.0.0.1", 0), RequestHandler, runtime)
@@ -126,6 +126,10 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                     service.set_stage_leasing(stage, True, {"updated_by": "smoke"})
                 pushed = service.push_auto_label({"episode_id": "episode_full", "pushed_by": "smoke"})
                 self.assertEqual(pushed["created_jobs"], 1)
+                auto_jobs = store.jobs_for_episode("episode_full", "auto_label")
+                self.assertEqual(len(auto_jobs), 1)
+                self.assertEqual(auto_jobs[0]["payload"]["scope"], "episode")
+                self.assertEqual(auto_jobs[0]["payload"]["frames"], list(range(60)))
 
                 self.assertTrue(handle_auto_label_once(client, nas, args))
                 self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())

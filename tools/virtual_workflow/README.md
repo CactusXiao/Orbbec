@@ -49,7 +49,7 @@ creates queued manual segments through `/api/v1/dev/label/jobs`.
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
   --jsonl label/task.jsonl \
   --use-nas \
-  --frames-per-job 32 \
+  --frames-per-segment 32 \
   --max-jobs 3 \
   --limit 1
 ```
@@ -140,8 +140,8 @@ Then run the same virtual worker commands above.
 - `--nas-root PATH`: local directory for the virtual NAS. It must match the
   backend mount for `--nas-uri-prefix`.
 - `--nas-uri-prefix URI`: NAS URI prefix, default `nas://orbbec-virtual`.
-- `seed-label --frames-per-job N`: split one JSONL task into frame batches.
-- `seed-label --max-jobs N`: seed only the first N manual-label batches.
+- `seed-label --frames-per-segment N`: split one JSONL task into manual-label segments.
+- `seed-label --max-jobs N`: seed only the first N manual-label segments.
 - `--copy-source`: copy real episode folders if they exist.
 - `--max-materialized-frames N`: limit generated placeholder frames for faster
   tests. `0` means all frames listed in the input payload.

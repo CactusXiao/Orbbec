@@ -145,8 +145,7 @@ def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "attempt": _optional_int(job.get("attempt")) or 0,
         "created_at": str(job.get("created_at") or ""),
         "updated_at": str(job.get("updated_at") or ""),
-        "batch_index": _optional_int(payload.get("batch_index")),
-        "batch_count": _optional_int(payload.get("batch_count")),
+        "scope": str(payload.get("scope") or payload.get("label_scope") or payload.get("mano_scope") or ""),
         "frames": len(payload.get("frames") or []) if isinstance(payload.get("frames"), list) else None,
     }
     if result.get("error"):
@@ -203,12 +202,10 @@ class JobService:
         store: WorkflowStore,
         *,
         auto_label_after_upload: bool = False,
-        auto_label_batch_size: int = 200,
         uri_mounts: Optional[Mapping[str, Any]] = None,
     ):
         self.store = store
         self.auto_label_after_upload = bool(auto_label_after_upload)
-        self.auto_label_batch_size = max(1, int(auto_label_batch_size or 200))
         self.uri_mounts = _normalize_uri_mounts(uri_mounts)
 
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1131,8 +1128,6 @@ class JobService:
         result = dict(job.get("result") or {})
         job_type = str(job.get("type") or "")
         relevant_artifacts = self._relevant_artifacts_for_job(job_type, artifacts)
-        batch_index = _optional_int(payload.get("batch_index"))
-        batch_count = _optional_int(payload.get("batch_count"))
         frames = payload.get("frames")
         frames_count = len(frames) if isinstance(frames, list) else None
         lease_until = str(job.get("lease_until") or "")
@@ -1159,8 +1154,7 @@ class JobService:
             "updated_at": str(job.get("updated_at") or ""),
             "waiting_seconds": _elapsed_seconds_since(job.get("created_at")) if str(job.get("status") or "") == "queued" else None,
             "attempt": _optional_int(job.get("attempt")) or 0,
-            "batch_index": batch_index,
-            "batch_count": batch_count,
+            "scope": str(payload.get("scope") or payload.get("label_scope") or payload.get("mano_scope") or ""),
             "frames_count": frames_count,
             "frames": frames if isinstance(frames, list) else [],
             "result": result,
@@ -1212,8 +1206,7 @@ class JobService:
             "updated_at": str(segment.get("updated_at") or ""),
             "waiting_seconds": _elapsed_seconds_since(segment.get("created_at")) if status == "pending_manual" else None,
             "attempt": 0,
-            "batch_index": None,
-            "batch_count": None,
+            "scope": "segment",
             "frames_count": frames_count,
             "frames": list(range(start_frame, end_frame + 1)),
             "result": result,
@@ -1474,8 +1467,8 @@ class JobService:
                 "uploaded",
                 {
                     "auto_label_after_upload": True,
-                    "auto_label_batch_count": len(created),
-                    "auto_label_batch_size": self.auto_label_batch_size,
+                    "auto_label_job_count": len(created),
+                    "auto_label_scope": "episode",
                 },
             )
 
@@ -1520,8 +1513,8 @@ class JobService:
                 {
                     "auto_label_pushed_at": now_iso(),
                     "auto_label_pushed_by": pushed_by,
-                    "auto_label_batch_count": len(jobs),
-                    "auto_label_batch_size": self.auto_label_batch_size,
+                    "auto_label_job_count": len(jobs),
+                    "auto_label_scope": "episode",
                 },
             )
         return {
@@ -1564,43 +1557,27 @@ class JobService:
             if frame_count:
                 frames = list(range(frame_count))
 
-        batches = self._frame_batches(frames, self.auto_label_batch_size)
-        if not batches:
-            batches = [[]]
-        batch_count = len(batches)
         base_id = _stable_id_part(episode_id, "episode")
-        created: List[Dict[str, Any]] = []
-        for index, batch_frames in enumerate(batches, 1):
-            job_id = f"auto_label_{base_id}_b{index:04d}"
-            payload = {
-                "job_id": job_id,
-                "episode_id": episode_id,
-                "subject_id": episode.get("subject_id"),
-                "task_name": episode.get("task_name"),
-                "data_uri": data_uri,
-                "local_capture_path": local_path,
-                "cameras": cameras,
-                "frames": batch_frames,
-                "batch_index": index,
-                "batch_count": batch_count,
-                "batch_size": self.auto_label_batch_size,
-                "rgb_path_template": str(source_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-                "prediction_dir": str(source_payload.get("prediction_dir") or "pred_2d"),
-                "correction_dir": str(source_payload.get("correction_dir") or "corrected_2d"),
-                "reason": reason,
-            }
-            if pushed_by:
-                payload["pushed_by"] = pushed_by
-            created.append(self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload=payload))
-        return created
-
-    @staticmethod
-    def _frame_batches(frames: Sequence[int], batch_size: int) -> List[List[int]]:
-        clean_frames = [int(frame) for frame in frames if not isinstance(frame, bool)]
-        if not clean_frames:
-            return []
-        size = max(1, int(batch_size or 1))
-        return [clean_frames[i : i + size] for i in range(0, len(clean_frames), size)]
+        job_id = f"auto_label_{base_id}_episode"
+        payload = {
+            "job_id": job_id,
+            "episode_id": episode_id,
+            "subject_id": episode.get("subject_id"),
+            "task_name": episode.get("task_name"),
+            "data_uri": data_uri,
+            "local_capture_path": local_path,
+            "cameras": cameras,
+            "frames": frames,
+            "scope": "episode",
+            "label_scope": "episode",
+            "rgb_path_template": str(source_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
+            "prediction_dir": str(source_payload.get("prediction_dir") or "pred_2d"),
+            "correction_dir": str(source_payload.get("correction_dir") or "corrected_2d"),
+            "reason": reason,
+        }
+        if pushed_by:
+            payload["pushed_by"] = pushed_by
+        return [self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload=payload)]
 
     def _all_episode_jobs_succeeded(self, episode_id: str, job_type: str) -> bool:
         jobs = self.store.jobs_for_episode(episode_id, job_type)

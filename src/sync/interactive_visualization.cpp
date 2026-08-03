@@ -840,7 +840,7 @@ private:
         std::ostringstream oss;
         oss.setf(std::ios::fixed);
         oss << std::setprecision(9);
-        oss << "{\"type\":\"frame_batch\",\"frame_id\":" << req.frameId << ",\"timestamp_us\":" << req.captureTsUs << ",\"cameras\":[";
+        oss << "{\"type\":\"frame\",\"frame_id\":" << req.frameId << ",\"timestamp_us\":" << req.captureTsUs << ",\"cameras\":[";
         uint64_t payloadOffset = 0;
         for(size_t i = 0; i < req.cameras.size(); ++i) {
             const auto &cam = req.cameras[i];

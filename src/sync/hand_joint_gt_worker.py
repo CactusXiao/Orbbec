@@ -830,7 +830,7 @@ class HandGtWorker:
             "joints": joints_out,
         }
 
-    def process_frame_batch(self, meta: Dict, payload: bytes) -> Dict:
+    def process_frame(self, meta: Dict, payload: bytes) -> Dict:
         self._frame_index += 1
         frame_timestamp_us = int(meta.get("timestamp_us", 0))
         timestamp_s = frame_timestamp_us * 1e-6 if frame_timestamp_us > 0 else time.perf_counter()
@@ -890,7 +890,7 @@ def main():
             write_message({"ok": True, "status": "shutdown", "visible_hands": 0, "hands": []})
             break
         try:
-            response = worker.process_frame_batch(meta, payload or b"")
+            response = worker.process_frame(meta, payload or b"")
         except Exception as exc:  # noqa: BLE001
             response = {
                 "ok": False,

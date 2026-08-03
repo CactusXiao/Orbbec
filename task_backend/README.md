@@ -59,8 +59,6 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # Upload success waits for an explicit push before queuing auto_label jobs.
 # Set this to 1 only for legacy fully automatic local tests:
 # ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
-# ORBBEC_AUTO_LABEL_BATCH_SIZE=200
-
 # Optional seed file for the setup page:
 # ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
 # ORBBEC_TASK_BACKEND_STATE_FILE=./task_backend_state/progress_state.json
@@ -222,9 +220,8 @@ have to match any path on the backend machine.
    workflow database.
 9. Upload success marks the episode `uploaded`. It does not queue
    `auto_label` by default.
-10. A dashboard, task-page, episode-page, or API push creates batched
-    `auto_label` jobs according to `ORBBEC_AUTO_LABEL_BATCH_SIZE`. Repeating
-    the push for the same episode is idempotent.
+10. A dashboard, task-page, episode-page, or API push creates one episode-level
+    `auto_label` job. Repeating the push for the same episode is idempotent.
 11. The collection UI returns to READY/IDLE after backend confirm succeeds. It
    keeps polling upload progress by reservation ID and displays the latest NAS
    status without blocking the next capture.
@@ -381,8 +378,8 @@ There is also a development-only generic helper for stubbing `upload`,
 POST /api/v1/dev/jobs
 ```
 
-Completing an `auto_label` job registers or accepts `pred_2d` and queues
-episode-level `mano_opt` after all auto-label batches for that episode succeed.
+Completing the episode-level `auto_label` job registers or accepts `pred_2d`
+and queues one episode-level `mano_opt`.
 Completing episode `mano_opt` registers `mano_episode` and queues `qc`.
 Completing `qc` with `{"result":{"passed":true}}` finalizes the episode.
 Completing `qc` with `passed:false` registers `qc_report`, creates failed

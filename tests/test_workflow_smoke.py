@@ -23,7 +23,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             (source / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, auto_label_batch_size=1)
+            service = JobService(store)
             service.record_collection_confirm(
                 {
                     "reservation_id": "reservation_001",
@@ -55,8 +55,11 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
 
             pushed = service.push_auto_label({"episode_id": "reservation_001", "pushed_by": "smoke"})
             self.assertEqual(pushed["pushed"], 1)
-            self.assertEqual(pushed["created_jobs"], 2)
-            self.assertEqual(len(store.jobs_for_episode("reservation_001", "auto_label")), 2)
+            self.assertEqual(pushed["created_jobs"], 1)
+            auto_jobs = store.jobs_for_episode("reservation_001", "auto_label")
+            self.assertEqual(len(auto_jobs), 1)
+            self.assertEqual(auto_jobs[0]["payload"]["scope"], "episode")
+            self.assertEqual(auto_jobs[0]["payload"]["frames"], [1, 2])
             self.assertIn("/episodes/reservation_001", render_workflow_stage_page(service.workflow_stage("auto_label")))
 
     def test_auto_label_mano_episode_qc_pass_finalizes_episode(self) -> None:
@@ -64,7 +67,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_pass"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, auto_label_batch_size=10)
+            service = JobService(store)
             self._create_uploaded_episode(store, tmp_path, "episode_pass", frames=2)
 
             service.push_auto_label({"episode_id": "episode_pass", "pushed_by": "smoke"})
@@ -115,7 +118,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_fail"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, auto_label_batch_size=10)
+            service = JobService(store)
             self._create_uploaded_episode(store, tmp_path, "episode_fail", frames=30, cameras=["00", "01"])
             self._advance_to_qc_job(service, store, "episode_fail")
 

@@ -1704,12 +1704,11 @@ def render_task_detail(model: Dict[str, Any]) -> str:
     return render_layout(task_name, body)
 
 
-def stage_batch_label(item: Dict[str, Any]) -> str:
-    batch_index = item.get("batch_index")
-    batch_count = item.get("batch_count")
-    if batch_index is None or batch_count is None:
-        return "-"
-    return f"{batch_index}/{batch_count}"
+def stage_scope_label(item: Dict[str, Any]) -> str:
+    scope = str(item.get("scope") or "").strip()
+    if scope:
+        return scope
+    return "-"
 
 
 def stage_frames_label(item: Dict[str, Any]) -> str:
@@ -1757,7 +1756,7 @@ def render_workflow_stage_page(stage: Dict[str, Any]) -> str:
             f"<td>{render_status_badge('expired' if item.get('lease_expired') else 'active')}</td>"
             f"<td class=\"mono\">{html_escape(item.get('updated_at') or '-')}</td>"
             f"<td class=\"num\">{html_escape(item.get('attempt') or 0)}</td>"
-            f"<td class=\"num\">{html_escape(stage_batch_label(item))}</td>"
+            f"<td class=\"num\">{html_escape(stage_scope_label(item))}</td>"
             f"<td class=\"num\">{html_escape(stage_frames_label(item))}</td>"
             "</tr>"
         )
@@ -1775,7 +1774,7 @@ def render_workflow_stage_page(stage: Dict[str, Any]) -> str:
             f"<td>{stage_subject_cell(item)}</td>"
             f"<td class=\"mono\">{html_escape(item.get('created_at') or '-')}</td>"
             f"<td class=\"num\">{html_escape(format_duration(float(wait)) if wait is not None else '-')}</td>"
-            f"<td class=\"num\">{html_escape(stage_batch_label(item))}</td>"
+            f"<td class=\"num\">{html_escape(stage_scope_label(item))}</td>"
             f"<td class=\"num\">{html_escape(stage_frames_label(item))}</td>"
             "</tr>"
         )
@@ -1817,12 +1816,12 @@ def render_workflow_stage_page(stage: Dict[str, Any]) -> str:
         "<section><h2>Active Leases</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Job</th><th>Episode</th><th>Subject / Task / Episode</th><th>Lease Owner</th>"
         "<th>Lease Until</th><th>Expired</th><th>Updated</th><th class=\"num\">Attempt</th>"
-        "<th class=\"num\">Batch</th><th class=\"num\">Frames</th></tr></thead><tbody>"
+        "<th class=\"num\">Scope</th><th class=\"num\">Frames</th></tr></thead><tbody>"
         + active_html
         + "</tbody></table></div></section>"
         "<section><h2>Queued</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Job</th><th>Episode</th><th>Subject / Task / Episode</th><th>Created</th>"
-        "<th class=\"num\">Waiting</th><th class=\"num\">Batch</th><th class=\"num\">Frames</th></tr></thead><tbody>"
+        "<th class=\"num\">Waiting</th><th class=\"num\">Scope</th><th class=\"num\">Frames</th></tr></thead><tbody>"
         + queued_html
         + "</tbody></table></div></section>"
         "<section><h2>Completed</h2><div class=\"wide\"><table>"
@@ -1869,11 +1868,9 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     for job in jobs:
         if not isinstance(job, dict):
             continue
-        batch_index = job.get("batch_index")
-        batch_count = job.get("batch_count")
-        batch_label = "-"
-        if batch_index is not None and batch_count is not None:
-            batch_label = f"{batch_index}/{batch_count}"
+        scope_label = str(job.get("scope") or "").strip()
+        if not scope_label:
+            scope_label = "-"
         frames = job.get("frames")
         frames_label = str(frames) if frames is not None else "-"
         error = str(job.get("error") or "")
@@ -1886,7 +1883,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             f"<td class=\"mono\">{html_escape(job.get('job_id') or '-')}</td>"
             f"<td>{html_escape(job.get('type') or '-')}</td>"
             f"<td>{render_status_badge(str(job.get('status') or '-'))}</td>"
-            f"<td class=\"num\">{html_escape(batch_label)}</td>"
+            f"<td class=\"num\">{html_escape(scope_label)}</td>"
             f"<td class=\"num\">{html_escape(frames_label)}</td>"
             f"<td class=\"mono\">{html_escape(job.get('lease_owner') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(job.get('updated_at') or '-')}</td>"
@@ -2011,7 +2008,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + segments_html
         + "</tbody></table></div></section>"
         "<section><h2>Workflow Jobs</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>Job</th><th>Type</th><th>Status</th><th class=\"num\">Batch</th>"
+        "<thead><tr><th>Job</th><th>Type</th><th>Status</th><th class=\"num\">Scope</th>"
         "<th class=\"num\">Frames</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
         + workflow_jobs_html
         + "</tbody></table></div></section>"
@@ -2516,17 +2513,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "ORBBEC_AUTO_LABEL_AFTER_UPLOAD",
         "TASK_BACKEND_AUTO_LABEL_AFTER_UPLOAD",
     )
-    auto_label_batch_size = env_int(
-        env,
-        200,
-        "ORBBEC_AUTO_LABEL_BATCH_SIZE",
-        "TASK_BACKEND_AUTO_LABEL_BATCH_SIZE",
-    )
     workflow_store = WorkflowStore(workflow_db)
     workflow_service = JobService(
         workflow_store,
         auto_label_after_upload=auto_label_after_upload,
-        auto_label_batch_size=auto_label_batch_size,
         uri_mounts=uri_mounts,
     )
     virtual_nas_uploader = VirtualNasUploader(
@@ -2544,7 +2534,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
-    print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} batch_size={auto_label_batch_size}", file=sys.stderr)
+    print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} auto_label_scope=episode", file=sys.stderr)
     print(f"[task-backend] virtual_nas={'enabled' if virtual_nas_enabled else 'disabled'} root={virtual_nas_root} uri={virtual_nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] uri_mounts={uri_mounts}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)

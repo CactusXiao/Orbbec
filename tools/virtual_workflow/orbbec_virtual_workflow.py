@@ -296,8 +296,8 @@ def task_with_frames(task: LabelTask, frames: Sequence[int]) -> LabelTask:
     )
 
 
-def split_task_frames(task: LabelTask, frames_per_job: int = 0) -> List[LabelTask]:
-    size = int(frames_per_job or 0)
+def split_task_segments(task: LabelTask, frames_per_segment: int = 0) -> List[LabelTask]:
+    size = int(frames_per_segment or 0)
     if size <= 0 or len(task.frames) <= size:
         return [task]
     return [task_with_frames(task, task.frames[i : i + size]) for i in range(0, len(task.frames), size)]
@@ -1066,24 +1066,24 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
     count = 0
     stop = False
     for task in load_label_tasks(args.jsonl, args.limit):
-        batches = split_task_frames(task, args.frames_per_job)
-        for batch_index, batch_task in enumerate(batches, 1):
+        segments = split_task_segments(task, args.frames_per_segment)
+        for segment_index, segment_task in enumerate(segments, 1):
             if args.max_jobs and count >= args.max_jobs:
                 stop = True
                 break
             if args.use_nas:
-                data_uri = nas.materialize_task(batch_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
+                data_uri = nas.materialize_task(segment_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
                 local_path = ""
             else:
                 data_uri = local_uri_from_path(task.episode_dir)
                 local_path = str(task.episode_dir)
-            suffix = f"_b{batch_index:04d}" if len(batches) > 1 else ""
+            suffix = f"_s{segment_index:04d}" if len(segments) > 1 else ""
             job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}{suffix}"
-            body = payload_from_task(batch_task, data_uri, job_id, "seeded_from_label_jsonl")
+            body = payload_from_task(segment_task, data_uri, job_id, "seeded_from_label_jsonl")
             body["payload"] = {
-                "batch_index": batch_index,
-                "batch_count": len(batches),
-                "frames_per_job": int(args.frames_per_job or 0),
+                "segment_index": segment_index,
+                "segment_count": len(segments),
+                "frames_per_segment": int(args.frames_per_segment or 0),
             }
             if local_path:
                 body["local_path"] = local_path
@@ -1095,9 +1095,9 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
                 segment_id=segment.get("segment_id", job_id),
                 episode_id=task.episode_id,
                 data_uri=data_uri,
-                frames=len(batch_task.frames),
-                batch_index=batch_index,
-                batch_count=len(batches),
+                frames=len(segment_task.frames),
+                segment_index=segment_index,
+                segment_count=len(segments),
                 status=segment.get("status"),
             )
         if stop:
@@ -1429,7 +1429,7 @@ def build_parser() -> argparse.ArgumentParser:
     seed_label.add_argument("--jsonl", type=Path, default=Path("label/task.jsonl"))
     seed_label.add_argument("--limit", type=int, default=0)
     seed_label.add_argument("--max-jobs", type=int, default=0, help="Stop after seeding this many manual label jobs.")
-    seed_label.add_argument("--frames-per-job", type=int, default=0, help="Split each JSONL task into batches of N frames. 0 keeps one job per task.")
+    seed_label.add_argument("--frames-per-segment", type=int, default=0, help="Split each JSONL task into manual-label segments of N frames. 0 keeps one segment per task.")
     seed_label.add_argument("--job-prefix", default="seeded_manual")
     seed_label.add_argument("--use-nas", action="store_true", help="Materialize tasks under the virtual NAS and use nas:// URIs.")
     seed_label.add_argument("--copy-source", action="store_true", help="Copy real source episode folders when they exist.")
