@@ -34,7 +34,7 @@ class CorrectionTask:
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png"
     prediction_dir: str = "pred_2d"
     correction_dir: str = "corrected_2d"
-    mano_projection_dir: str = "mano/episode/projected_2d"
+    mano_episode_dir: str = "mano/episode"
     episode_path: Optional[str] = None
 
     @property
@@ -273,9 +273,22 @@ def correction_task_from_backend_payload(
         rgb_path_template=str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
         prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
         correction_dir=str(payload.get("correction_dir") or "corrected_2d"),
-        mano_projection_dir=str(payload.get("mano_projection_dir") or "mano/episode/projected_2d"),
+        mano_episode_dir=_mano_episode_dir_from_payload(payload),
         episode_path=str(episode_dir),
     )
+
+
+def _mano_episode_dir_from_payload(payload: Dict[str, Any]) -> str:
+    explicit = str(payload.get("mano_episode_dir") or payload.get("mano_output_dir") or "").strip().strip("/")
+    if explicit:
+        return explicit
+    data_uri = str(payload.get("data_uri") or payload.get("episode_base_uri") or "").strip().rstrip("/")
+    mano_uri = str(payload.get("mano_episode_uri") or "").strip().rstrip("/")
+    if data_uri and mano_uri and (mano_uri == data_uri or mano_uri.startswith(data_uri + "/")):
+        rel = mano_uri[len(data_uri):].strip("/")
+        if rel:
+            return rel
+    return "mano/episode"
 
 
 def progress_csv_path(jsonl_path: str) -> Path:
@@ -378,7 +391,7 @@ def _source_dir_for_mode(task: CorrectionTask, mode: str) -> Path:
     if mode in {"correct", "last"}:
         return episode_dir / task.correction_dir
     if mode == "mano":
-        return episode_dir / task.mano_projection_dir
+        return episode_dir / task.mano_episode_dir
     return episode_dir / task.prediction_dir
 
 

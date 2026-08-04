@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -65,6 +65,47 @@ class ManoViewRuntime:
         self._torch = None
         self._smplx = None
         self._models: Dict[int, object] = {}
+        self._joints_cache: Dict[Tuple[str, str, int], Optional[np.ndarray]] = {}
+
+    def project_mano_frame(
+        self,
+        *,
+        episode_dir: Path,
+        mano_dir: Path,
+        cam_id: str,
+        frame_idx: int,
+    ) -> Optional[Tuple[HandPoints, HandVisible]]:
+        joints_3d = self._load_mano_frame_joints(mano_dir, int(frame_idx))
+        if joints_3d is None:
+            return None
+        return self.project_skeleton(episode_dir=episode_dir, cam_id=cam_id, joints_3d=joints_3d)
+
+    def has_mano_frame(
+        self,
+        *,
+        mano_dir: Path,
+        frame_idx: int,
+    ) -> bool:
+        return self._load_mano_frame_joints(mano_dir, int(frame_idx)) is not None
+
+    def _load_mano_frame_joints(self, mano_dir: Path, frame_idx: int) -> Optional[np.ndarray]:
+        meta_path = _mano_metadata_path(mano_dir)
+        if meta_path is None:
+            return None
+        try:
+            stat_key = str(meta_path.stat().st_mtime_ns)
+        except OSError:
+            stat_key = "missing"
+        cache_key = (str(meta_path.resolve()), stat_key, int(frame_idx))
+        if cache_key in self._joints_cache:
+            cached = self._joints_cache[cache_key]
+            return None if cached is None else cached.copy()
+        try:
+            joints = load_mano_frame_joints(mano_dir, int(frame_idx), meta_path=meta_path)
+        except Exception:
+            joints = None
+        self._joints_cache[cache_key] = None if joints is None else joints.copy()
+        return joints
 
     def build_mesh(
         self,
@@ -116,7 +157,8 @@ class ManoViewRuntime:
         for hand in range(_HAND_COUNT):
             pts_2d = project_points(cam, joints_3d[hand])
             points.append([(float(x), float(y)) for x, y in pts_2d])
-            visible.append([bool(np.all(np.isfinite(pt))) for pt in pts_2d])
+            valid = np.isfinite(pts_2d).all(axis=1) & (pts_2d[:, 0] >= 0.0)
+            visible.append([bool(v) for v in valid])
         return points, visible
 
     def project_mesh(
@@ -282,6 +324,98 @@ def _mano_model_candidates(hand: int) -> List[Path]:
     return [path for path in candidates if path.exists()]
 
 
+def _mano_metadata_path(mano_dir: Path) -> Optional[Path]:
+    for name in ("mano_episode.json", "mano_patch.json", "joints_3d.json"):
+        path = mano_dir / name
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def load_mano_frame_joints(mano_dir: Path, frame_idx: int, *, meta_path: Optional[Path] = None) -> Optional[np.ndarray]:
+    meta_path = meta_path or _mano_metadata_path(mano_dir)
+    if meta_path is None:
+        return None
+    with meta_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if not isinstance(meta, Mapping):
+        return None
+    joints = _load_mano_frame_joints_from_npy(mano_dir, meta, int(frame_idx))
+    if joints is None:
+        joints = _load_mano_frame_joints_from_json(meta, int(frame_idx))
+    if joints is None:
+        return None
+    arr = np.asarray(joints, dtype=np.float32)
+    if arr.shape != (_HAND_COUNT, _JOINT_COUNT, 3):
+        return None
+    return arr
+
+
+def _load_mano_frame_joints_from_npy(mano_dir: Path, meta: Mapping[str, Any], frame_idx: int) -> Optional[np.ndarray]:
+    raw_file = str(meta.get("joints_3d_file") or meta.get("joints_file") or "joints_3d.npy").strip()
+    if not raw_file:
+        return None
+    npy_path = Path(raw_file)
+    if not npy_path.is_absolute():
+        npy_path = mano_dir / npy_path
+    if not npy_path.exists() or not npy_path.is_file():
+        return None
+    frames = _frames_from_mano_meta(meta)
+    try:
+        arr = np.load(npy_path)
+    except Exception:
+        return None
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.shape == (_HAND_COUNT, _JOINT_COUNT, 3):
+        return arr if not frames or int(frames[0]) == int(frame_idx) else None
+    if arr.ndim != 4 or arr.shape[1:] != (_HAND_COUNT, _JOINT_COUNT, 3):
+        return None
+    if frames:
+        try:
+            pos = frames.index(int(frame_idx))
+        except ValueError:
+            return None
+    else:
+        pos = int(frame_idx)
+    if pos < 0 or pos >= arr.shape[0]:
+        return None
+    return arr[pos]
+
+
+def _load_mano_frame_joints_from_json(meta: Mapping[str, Any], frame_idx: int) -> Optional[Any]:
+    joints_obj = meta.get("joints_3d")
+    if isinstance(joints_obj, Mapping):
+        for key in (f"{int(frame_idx):05d}", str(int(frame_idx))):
+            if key in joints_obj:
+                return joints_obj[key]
+        return None
+    if isinstance(joints_obj, list):
+        frames = _frames_from_mano_meta(meta)
+        if frames:
+            try:
+                return joints_obj[frames.index(int(frame_idx))]
+            except (ValueError, IndexError):
+                return None
+        if 0 <= int(frame_idx) < len(joints_obj):
+            return joints_obj[int(frame_idx)]
+    return None
+
+
+def _frames_from_mano_meta(meta: Mapping[str, Any]) -> List[int]:
+    value = meta.get("frames")
+    if not isinstance(value, list):
+        return []
+    frames: List[int] = []
+    for item in value:
+        if isinstance(item, bool):
+            continue
+        try:
+            frames.append(int(item))
+        except (TypeError, ValueError):
+            pass
+    return frames
+
+
 def load_episode_cameras(episode_dir: Path, camera_ids: List[str]) -> Dict[str, CameraParams]:
     cam_path = episode_dir / "camera_params.json"
     ext_path = episode_dir / "extrinsics.json"
@@ -430,11 +564,38 @@ def _normalized_reprojection_loss(torch, joints, camera_tensors, obs_tensors):
 
 
 def project_points(cam: CameraParams, points_3d: np.ndarray) -> np.ndarray:
-    import cv2
+    points = np.asarray(points_3d, dtype=np.float64).reshape(-1, 3)
+    valid = np.isfinite(points).all(axis=1) & ~np.all(points == -1.0, axis=1)
+    out = np.full((len(points), 2), -1.0, dtype=np.float32)
+    if not np.any(valid):
+        return out
+    try:
+        import cv2
 
-    rvec, _ = cv2.Rodrigues(cam.r)
-    pts, _ = cv2.projectPoints(points_3d.astype(np.float64), rvec, cam.t.reshape(3, 1), cam.k, cam.dist)
-    return pts.reshape(-1, 2)
+        rvec, _ = cv2.Rodrigues(cam.r)
+        pts, _ = cv2.projectPoints(points[valid], rvec, cam.t.reshape(3, 1), cam.k, cam.dist)
+        out[valid] = pts.reshape(-1, 2).astype(np.float32)
+        return out
+    except Exception:
+        cam_points = (cam.r @ points[valid].T).T + cam.t.reshape(1, 3)
+        z = cam_points[:, 2]
+        cam_valid = np.isfinite(cam_points).all(axis=1) & (np.abs(z) > 1e-8)
+        if not np.any(cam_valid):
+            return out
+        x = cam_points[cam_valid, 0] / z[cam_valid]
+        y = cam_points[cam_valid, 1] / z[cam_valid]
+        dist = np.zeros(5, dtype=np.float64)
+        raw_dist = np.asarray(cam.dist, dtype=np.float64).reshape(-1)
+        dist[: min(5, raw_dist.shape[0])] = raw_dist[:5]
+        k1, k2, p1, p2, k3 = [float(v) for v in dist]
+        r2 = x * x + y * y
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
+        x_dist = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+        y_dist = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+        original_indices = np.flatnonzero(valid)[cam_valid]
+        out[original_indices, 0] = cam.k[0, 0] * x_dist + cam.k[0, 2]
+        out[original_indices, 1] = cam.k[1, 1] * y_dist + cam.k[1, 2]
+        return out
 
 
 def mesh_edges(faces: np.ndarray) -> List[Tuple[int, int]]:

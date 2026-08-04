@@ -932,7 +932,7 @@ class JobService:
             "pred_2d_uri": pred_uri,
             "pred_uri": pred_uri,
             "mano_episode_uri": mano_episode_uri,
-            "mano_projection_dir": "mano/episode/projected_2d",
+            "mano_episode_dir": self._relative_data_uri_path(data_uri, mano_episode_uri) or "mano/episode",
             "manual_2d_output_uri": manual_output_uri,
             "manual_2d_uri": manual_output_uri,
             "prediction_dir": prediction_dir,
@@ -1013,6 +1013,7 @@ class JobService:
             "mano_episode_uri": mano_episode_uri,
             "output_uri": uri_join(data_uri, "mano", "segments", segment_id) if data_uri else "",
             "mano_output_dir": f"mano/segments/{segment_id}",
+            "mano_episode_dir": self._relative_data_uri_path(data_uri, mano_episode_uri) or "mano/episode",
             "rgb_path_template": self._payload_field_for_episode_context(
                 episode_id,
                 "rgb_path_template",
@@ -1802,6 +1803,11 @@ class JobService:
             "pred_uri": str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else "",
             "mano_episode_artifacts": mano_artifacts,
             "mano_episode_uri": str(mano_artifacts[-1].get("uri") or "") if mano_artifacts else "",
+            "mano_episode_dir": self._relative_data_uri_path(
+                str(episode.get("data_uri") or ""),
+                str(mano_artifacts[-1].get("uri") or "") if mano_artifacts else "",
+            )
+            or "mano/episode",
             "qc_report_uri": uri_join(str(episode.get("data_uri") or ""), "qc", "qc_report.json") if episode.get("data_uri") else "",
             "rgb_path_template": self._payload_field_for_episode_context(
                 episode_id,

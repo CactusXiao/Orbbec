@@ -830,6 +830,60 @@ def invisible_hand_values() -> List[float]:
     return [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
 
 
+def virtual_mano_3d_values(frame: int, variant: str = "episode") -> List[float]:
+    rng = _stable_rng("mano_3d", frame, variant)
+    scale = 0.075
+    centers = ((-0.085, 0.055, 0.72), (0.085, 0.055, 0.72))
+    values: List[float] = []
+    for hand_idx, center in enumerate(centers):
+        mirror = -1.0 if hand_idx == 1 else 1.0
+        drift_x = ((int(frame) % 17) - 8) * 0.001
+        drift_y = ((int(frame) % 11) - 5) * 0.0008
+        for joint_idx, (tx, ty) in enumerate(_HAND_TEMPLATE):
+            x = center[0] + mirror * tx * scale + drift_x + rng.uniform(-0.0015, 0.0015)
+            y = center[1] + ty * scale + drift_y + rng.uniform(-0.0015, 0.0015)
+            z = center[2] + joint_idx * 0.001 + rng.uniform(-0.001, 0.001)
+            values.extend((x, y, z))
+    return values
+
+
+def write_mano_3d_artifact(out: Path, frames: Sequence[int], cameras: Sequence[str], *, segment_id: str = "") -> None:
+    clean_frames = [int(frame) for frame in frames or [0]]
+    out.mkdir(parents=True, exist_ok=True)
+    values: List[float] = []
+    variant = "segment" if segment_id else "episode"
+    for frame in clean_frames:
+        values.extend(virtual_mano_3d_values(frame, variant))
+    write_float32_npy(out / "joints_3d.npy", values, shape=(len(clean_frames), _HAND_COUNT, _JOINT_COUNT, 3))
+    manifest_name = "mano_patch.json" if segment_id else "mano_episode.json"
+    manifest = {
+        "schema_version": 1,
+        "kind": "orbbec_mano_3d_segment_patch" if segment_id else "orbbec_mano_3d_episode",
+        "mock": True,
+        "segment_id": str(segment_id or ""),
+        "frames": clean_frames,
+        "cameras": list(cameras),
+        "joints_3d_file": "joints_3d.npy",
+    }
+    (out / manifest_name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def require_2d_inputs_available(source_dir: Path, cameras: Sequence[str], frames: Sequence[int], *, label: str) -> None:
+    missing: List[str] = []
+    for cam in cameras or ["00"]:
+        for frame in frames or [0]:
+            path = source_dir / str(cam) / f"{int(frame):05d}.npy"
+            if not path.exists() or not path.is_file():
+                missing.append(str(path))
+                if len(missing) >= 3:
+                    break
+        if len(missing) >= 3:
+            break
+    if missing:
+        suffix = "" if len(missing) < 3 else " ..."
+        raise FileNotFoundError(f"{label} input npy is required for MANO 3D optimization: {', '.join(missing)}{suffix}")
+
+
 def write_virtual_hand_npy(
     path: Path,
     *,
@@ -969,30 +1023,6 @@ def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDete
             mode="src_sync_hand_joint_gt_worker",
         )
     return detector
-
-
-def copy_or_write_projected_npy(
-    out_path: Path,
-    source_path: Optional[Path],
-    episode_dir: Path,
-    cam: str,
-    frame: int,
-    *,
-    rgb_path_template: str = "",
-    variant: str = "mano",
-) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if source_path is not None and source_path.exists() and source_path.is_file():
-        shutil.copyfile(source_path, out_path)
-        return
-    write_frame_hand_npy(out_path, episode_dir, cam, frame, rgb_path_template=rgb_path_template, variant=variant)
-
-
-def copy_required_projected_npy(out_path: Path, source_path: Path, cam: str, frame: int) -> None:
-    if not source_path.exists() or not source_path.is_file():
-        raise FileNotFoundError(f"manual_2d npy is required for segment MANO camera={cam} frame={frame}: {source_path}")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source_path, out_path)
 
 
 class NasSimulator:
@@ -1150,16 +1180,9 @@ class NasSimulator:
         rgb_path_template: str = "",
     ) -> str:
         base = self.local_path_for_uri(data_uri)
+        require_2d_inputs_available(base / prediction_dir, cameras, frames, label="pred_2d")
         out = base / "mano" / "episode"
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "mano_episode.json").write_text(
-            json.dumps({"mock": True, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                source = base / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-                copy_or_write_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, base, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="mano")
+        write_mano_3d_artifact(out, frames, cameras)
         return uri_join(data_uri, "mano", "episode")
 
     def write_mano_segment_patch(
@@ -1173,17 +1196,10 @@ class NasSimulator:
         rgb_path_template: str = "",
     ) -> str:
         base = self.local_path_for_uri(data_uri)
-        out = base / "mano" / "segments" / clean_id(segment_id, "segment")
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "mano_patch.json").write_text(
-            json.dumps({"mock": True, "segment_id": segment_id, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
         source_dir = self.manual_2d_source_path(data_uri, segment_id, manual_2d_dir, manual_2d_uri)
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                source = source_dir / str(cam) / f"{int(frame):05d}.npy"
-                copy_required_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, str(cam), int(frame))
+        require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
+        out = base / "mano" / "segments" / clean_id(segment_id, "segment")
+        write_mano_3d_artifact(out, frames, cameras, segment_id=segment_id)
         return uri_join(data_uri, "mano", "segments", segment_id)
 
     def manual_2d_source_path(self, data_uri: str, segment_id: str, manual_2d_dir: str = "", manual_2d_uri: str = "") -> Path:
@@ -1340,21 +1356,13 @@ def write_mano_artifact_for_payload(
     if episode_path is not None:
         if scope == "segment":
             out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "mano_patch.json").write_text(json.dumps({"mock": True, "segment_id": segment_id, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
-            for cam in cameras or ["00"]:
-                for frame in frames or [0]:
-                    source = source_dir / str(cam) / f"{int(frame):05d}.npy"
-                    copy_required_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, str(cam), int(frame))
+            require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
+            write_mano_3d_artifact(out, frames, cameras, segment_id=segment_id)
             return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
         out = episode_path / "mano" / "episode"
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "mano_episode.json").write_text(json.dumps({"mock": True, "frames": list(frames), "cameras": list(cameras)}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                source = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-                copy_or_write_projected_npy(out / "projected_2d" / str(cam) / f"{int(frame):05d}.npy", source, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="mano")
+        require_2d_inputs_available(episode_path / prediction_dir, cameras, frames, label="pred_2d")
+        write_mano_3d_artifact(out, frames, cameras)
         return "mano_episode", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode")
     if scope == "segment":
         return "mano_segment_patch", uri_join(data_uri, "mano", "segments", segment_id)
@@ -1381,6 +1389,39 @@ def manual_2d_source_path_for_payload(
     return episode_path / (manual_2d_dir or f"manual_2d/segments/{segment_id}")
 
 
+def mano_3d_path_for_payload(nas: NasSimulator, payload: Json, episode: Optional[Json]) -> Tuple[str, Optional[Path]]:
+    data_uri = str(payload.get("data_uri") or (episode or {}).get("data_uri") or "").rstrip("/")
+    mano_uri = str(payload.get("mano_episode_uri") or "").rstrip("/")
+    if not mano_uri and data_uri:
+        mano_uri = uri_join(data_uri, "mano", "episode")
+    if mano_uri.startswith(nas.uri_prefix):
+        return mano_uri, nas.local_path_for_uri(mano_uri)
+    if mano_uri.startswith("local://"):
+        return mano_uri, path_from_local_uri(mano_uri)
+    episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        if data_uri and mano_uri.startswith(data_uri + "/"):
+            return mano_uri, episode_path / mano_uri[len(data_uri):].lstrip("/")
+        return mano_uri or uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode"), episode_path / "mano" / "episode"
+    return mano_uri, None
+
+
+def mano_3d_artifact_ready(path: Optional[Path], frames: Sequence[int]) -> bool:
+    if path is None or not path.exists() or not path.is_dir():
+        return False
+    manifest = path / "mano_episode.json"
+    joints = path / "joints_3d.npy"
+    if not manifest.exists() or not manifest.is_file() or not joints.exists() or not joints.is_file():
+        return False
+    try:
+        obj = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    available = set(as_int_list(obj.get("frames")))
+    requested = {int(frame) for frame in frames if not isinstance(frame, bool)}
+    return not requested or requested.issubset(available)
+
+
 def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optional[Json], result: Json) -> str:
     data_uri = str(payload.get("data_uri") or (episode or {}).get("data_uri") or "")
     report = {
@@ -1393,6 +1434,8 @@ def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optio
         "segments": result.get("segments") if isinstance(result.get("segments"), list) else [],
         "reason": str(result.get("reason") or ""),
         "virtual_worker": str(result.get("virtual_worker") or ""),
+        "mano_3d_uri": str(result.get("mano_3d_uri") or ""),
+        "mano_3d_checked": bool(result.get("mano_3d_checked")),
     }
     if data_uri.startswith(nas.uri_prefix):
         out = nas.local_path_for_uri(data_uri) / "qc" / "qc_report.json"
@@ -1666,6 +1709,9 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     frames = frames_from_payload(payload, episode, nas, cameras_from_payload(payload, episode, nas))
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
+    mano_uri, mano_path = mano_3d_path_for_payload(nas, payload, episode)
+    if not mano_3d_artifact_ready(mano_path, frames):
+        raise BackendError(f"qc requires episode MANO 3D result with joints_3d.npy: {mano_uri or mano_path or 'missing'}")
     failed_segments = [] if passed else virtual_failed_segments(frames)
     result = {
         "passed": passed,
@@ -1674,6 +1720,8 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
         "segments": failed_segments,
         "reason": "virtual_qc_pass" if passed else "virtual_qc_failed_needs_manual_segments",
         "virtual_worker": owner,
+        "mano_3d_uri": mano_uri,
+        "mano_3d_checked": True,
     }
     qc_report_uri = write_qc_report_for_payload(nas, payload, episode, result)
     client.complete_job(

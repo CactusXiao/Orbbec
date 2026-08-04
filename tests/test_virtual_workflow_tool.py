@@ -295,12 +295,14 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 self.assertTrue(handle_auto_label_once(client, nas, args))
                 self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())
                 self.assertTrue(handle_mano_opt_once(client, nas, args))
-                self.assertTrue((episode_dir / "mano" / "episode" / "projected_2d" / "00" / "00000.npy").exists())
+                self.assertTrue((episode_dir / "mano" / "episode" / "joints_3d.npy").exists())
+                self.assertFalse((episode_dir / "mano" / "episode" / "projected_2d").exists())
 
                 random.seed(7)
                 self.assertTrue(handle_qc_once(client, nas, args))
                 qc_report = json.loads((episode_dir / "qc" / "qc_report.json").read_text(encoding="utf-8"))
                 self.assertFalse(qc_report["passed"])
+                self.assertTrue(qc_report["mano_3d_checked"])
                 segments = store.segments_for_episode("episode_full")
                 self.assertGreaterEqual(len(segments), 2)
                 self.assertLessEqual(len(segments), 3)
@@ -393,7 +395,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
         payload = dict(leased.get("payload") or {})
         segment = dict(leased.get("segment") or {})
         task = correction_task_from_backend_payload(payload)
-        bundle = load_prediction_bundle(task, mode="mano")
+        bundle = load_prediction_bundle(task, mode="pred")
         for frame in task.frames:
             for cam in task.cameras:
                 points, visible = view_state_from_bundle(bundle, int(frame), cam)

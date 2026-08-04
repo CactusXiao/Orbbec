@@ -903,6 +903,11 @@ class LabelPage(ttk.Frame):
             self._view_states = {}
             return
         frame_idx = task.frames[self._frame_pos]
+        if self._mode == "mano":
+            self._view_states = {
+                cam_id: self._build_initial_view_state(frame_idx, cam_id, self._mode) for cam_id in self._camera_ids
+            }
+            return
         if self._mode == "tracking":
             self._view_states = self._build_tracking_source_states(frame_idx)
             self._make_all_view_states_displayable(frame_idx)
@@ -924,6 +929,8 @@ class LabelPage(ttk.Frame):
                 return points, visible
             if source == "tracking":
                 return points, visible
+            if source == "mano":
+                return points, visible
             return self._fill_missing_points(points, frame_idx, cam_id), visible
 
         if source == "scratch":
@@ -934,6 +941,11 @@ class LabelPage(ttk.Frame):
             errors: List[str] = []
             state = self._build_tracking_view_state(frame_idx, cam_id, errors)
             self._show_tracking_errors_once(frame_idx, errors)
+            return state
+        if source == "mano":
+            state = self._build_mano_3d_view_state(frame_idx, cam_id)
+            if state is None:
+                return self._hidden_points(), self._none_visible()
             return state
 
         bundle = self._ensure_bundle(source)
@@ -981,6 +993,20 @@ class LabelPage(ttk.Frame):
             return self._replace_unusable_points(mediapipe_points, template)
         merged = self._merge_missing_points(pred_points, mediapipe_points)
         return self._replace_unusable_points(merged, template)
+
+    def _build_mano_3d_view_state(self, frame_idx: int, cam_id: str) -> Optional[Tuple[HandPoints, HandVisible]]:
+        task = self._active_task
+        if task is None:
+            return None
+        try:
+            return self._mano_runtime_instance().project_mano_frame(
+                episode_dir=task.episode_dir(),
+                mano_dir=task.episode_dir() / task.mano_episode_dir,
+                cam_id=cam_id,
+                frame_idx=frame_idx,
+            )
+        except Exception:
+            return None
 
     def _apply_initial_display_fallback(
         self,
@@ -1097,6 +1123,20 @@ class LabelPage(ttk.Frame):
         source = self._normalize_source(source)
         if source in {"scratch", "tracking"}:
             return False
+        if source == "mano":
+            task = self._active_task
+            if task is None:
+                return True
+            try:
+                state = self._mano_runtime_instance().project_mano_frame(
+                    episode_dir=task.episode_dir(),
+                    mano_dir=task.episode_dir() / task.mano_episode_dir,
+                    cam_id=cam_id,
+                    frame_idx=frame_idx,
+                )
+            except Exception:
+                return True
+            return state is None
         bundle = self._ensure_bundle(source)
         return source_frame_path(bundle, frame_idx, cam_id) is None
 
@@ -1199,6 +1239,8 @@ class LabelPage(ttk.Frame):
 
     def _ensure_bundle(self, source: str) -> PredictionBundle:
         source = self._normalize_source(source)
+        if source == "mano":
+            raise ValueError("MANO mode uses episode 3D results and does not load a 2D prediction bundle.")
         if source == "tracking":
             raise ValueError("Tracking mode uses runtime CoTracker results and does not load a prediction bundle.")
         bundle = self._bundles.get(source)
@@ -1488,9 +1530,10 @@ class LabelPage(ttk.Frame):
         state = self._view_states.get(cam_id)
         if state is None:
             state = self._build_initial_view_state(frame_idx, cam_id, source)
-            fallback = self._display_fallback_points(frame_idx, cam_id)
-            points0, visible0 = state
-            state = (self._replace_unusable_points(self._merge_missing_points(points0, fallback), fallback), visible0)
+            if source != "mano":
+                fallback = self._display_fallback_points(frame_idx, cam_id)
+                points0, visible0 = state
+                state = (self._replace_unusable_points(self._merge_missing_points(points0, fallback), fallback), visible0)
             self._view_states[cam_id] = state
         points, visible = state
 
