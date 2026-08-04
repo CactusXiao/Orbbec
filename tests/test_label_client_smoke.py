@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import numpy as np
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -9,8 +11,9 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, UriResolver, grouped_label_tasks
-from label.storage import correction_task_from_backend_payload
+from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
+from label.video_frames import ensure_decoded_rgb_frames
 from task_backend.job_service import JobService
 from task_backend.server import BackendRuntime, RequestHandler, TaskHTTPServer, TaskInstanceRegistry
 from task_backend.workflow_store import WorkflowStore
@@ -85,6 +88,8 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 self.assertEqual(leased["segment"]["status"], "manual_labeling")
                 self.assertEqual(UriResolver().resolve(leased["payload"]["data_uri"]), episode_dir.resolve())
                 self.assertEqual(leased["payload"]["frames"], [120, 121])
+                self.assertTrue(leased["payload"]["episode_media"]["requires_rgb_video_decode"])
+                self.assertIn("camera_01", leased["payload"]["episode_media"]["cameras"])
 
                 completed = client.complete_label_job(
                     job_id,
@@ -135,6 +140,66 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             )
             self.assertEqual(task.cameras, ["00", "01"])
             self.assertEqual(task.frames, [1, 2])
+
+    def test_backend_payload_h265_decodes_to_label_cache(self) -> None:
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            episode_dir = tmp_path / "S001" / "pick_object" / "episode_001"
+            rgb_dir = episode_dir / "camera_01" / "RGB"
+            rgb_dir.mkdir(parents=True)
+            video_path = rgb_dir / "rgb.h265"
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=32x24:rate=1:duration=3",
+                    "-frames:v",
+                    "3",
+                    "-c:v",
+                    "libx265",
+                    "-x265-params",
+                    "log-level=error",
+                    str(video_path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                self.skipTest(f"ffmpeg cannot create h265 fixture: {result.stderr.strip()}")
+            (rgb_dir / "rgb.h265.timestamps.csv").write_text(
+                "video_frame_index,frame_index,rgb_timestamp_us\n"
+                "0,120,1000\n"
+                "1,121,2000\n"
+                "2,122,3000\n",
+                encoding="utf-8",
+            )
+            payload = {
+                "resolved_data_path": str(episode_dir),
+                "data_uri": "local://" + str(episode_dir),
+                "subject_id": "S001",
+                "task_name": "pick_object",
+                "episode_id": "episode_001",
+                "segment_id": "segment_001",
+                "cameras": ["camera_01"],
+                "frames": [120, 122],
+            }
+            task = correction_task_from_backend_payload(payload)
+            decoded = ensure_decoded_rgb_frames(task, payload, cache_root=tmp_path / "cache")
+            first = find_frame_path(decoded.episode_dir(), "camera_01", 120, decoded.rgb_path_template)
+            last = find_frame_path(decoded.episode_dir(), "camera_01", 122, decoded.rgb_path_template)
+            self.assertIsNotNone(first)
+            self.assertIsNotNone(last)
+            self.assertTrue(first.exists())  # type: ignore[union-attr]
+            self.assertTrue(last.exists())  # type: ignore[union-attr]
 
     def test_backend_payload_missing_context_uses_backend_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

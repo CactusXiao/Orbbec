@@ -9,6 +9,8 @@ fixture for the current server and frontends.
 from __future__ import annotations
 
 import argparse
+import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -16,13 +18,15 @@ import random
 import re
 import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request, urlopen
@@ -40,6 +44,8 @@ except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
 
 Json = Dict[str, Any]
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
+_RGB_VIDEO_CANDIDATES = ("rgb.h265", "rgb.hevc", "rgb.mp4", "rgb.mkv", "rgb.mov")
+_VIDEO_SUFFIXES = {".h265", ".hevc", ".mp4", ".mkv", ".mov"}
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
 _FALLBACK_IMAGE_SIZE = (640, 480)
@@ -526,6 +532,268 @@ def find_rgb_frame_path(episode_dir: Path, cam: str, frame: int, rgb_path_templa
             if child.is_file() and child.name.startswith(prefix):
                 return child
     return None
+
+
+def ensure_rgb_frames_from_video_for_payload(
+    nas: "NasSimulator",
+    payload: Json,
+    episode: Optional[Json],
+    cameras: Sequence[str],
+    frames: Sequence[int],
+) -> str:
+    episode_dir = source_path_from_payload(payload, episode, nas)
+    if episode_dir is None:
+        return str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
+    current_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
+    needed = [
+        str(cam) for cam in cameras
+        if any(find_rgb_frame_path(episode_dir, str(cam), int(frame), current_template) is None for frame in frames)
+    ]
+    if not needed:
+        return current_template
+
+    cache_root = _worker_frame_cache_root()
+    cache_dir = cache_root / _worker_frame_cache_key(episode_dir, payload)
+    failures: List[str] = []
+    for cam in needed:
+        try:
+            video_path, timestamp_path = _locate_rgb_video_for_worker(episode_dir, cam, payload)
+            frame_map = _load_worker_video_frame_map(timestamp_path)
+            _decode_worker_rgb_frames(
+                video_path=video_path,
+                timestamp_path=timestamp_path,
+                frame_map=frame_map,
+                frames=frames,
+                out_dir=cache_dir / cam,
+            )
+        except Exception as exc:
+            failures.append(f"{cam}: {exc}")
+    if failures:
+        raise BackendError("failed to decode RGB frames from H265 video: " + "; ".join(failures))
+    return str((cache_dir / "{camera}" / "{frame:05d}.png").resolve())
+
+
+def _worker_frame_cache_root() -> Path:
+    raw = env_text("", "ORBBEC_VIRTUAL_WORKFLOW_FRAME_CACHE_DIR", "ORBBEC_LABEL_FRAME_CACHE_DIR")
+    base = Path(raw).expanduser() if raw else Path.home() / ".cache" / "orbbec_virtual_workflow" / "rgb_frames"
+    base.mkdir(parents=True, exist_ok=True)
+    return base.resolve()
+
+
+def _worker_frame_cache_key(episode_dir: Path, payload: Json) -> str:
+    parts = [
+        str(episode_dir.expanduser().resolve()),
+        str(payload.get("episode_id") or ""),
+        str(payload.get("job_id") or payload.get("segment_id") or ""),
+        str(payload.get("data_uri") or payload.get("episode_base_uri") or ""),
+    ]
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:20]
+
+
+def _locate_rgb_video_for_worker(episode_dir: Path, cam: str, payload: Json) -> Tuple[Path, Optional[Path]]:
+    media_match = _rgb_video_from_episode_media(episode_dir, cam, payload)
+    if media_match is not None:
+        return media_match
+    params_match = _rgb_video_from_camera_params(episode_dir, cam)
+    if params_match is not None:
+        return params_match
+    rgb_dir = episode_dir / str(cam) / "RGB"
+    for name in _RGB_VIDEO_CANDIDATES:
+        candidate = rgb_dir / name
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve(), _worker_timestamp_sidecar(candidate)
+    if rgb_dir.exists() and rgb_dir.is_dir():
+        videos = sorted(path for path in rgb_dir.iterdir() if path.is_file() and path.suffix.lower() in _VIDEO_SUFFIXES)
+        if videos:
+            return videos[0].resolve(), _worker_timestamp_sidecar(videos[0])
+    raise FileNotFoundError(f"RGB H265 video not found under {rgb_dir}")
+
+
+def _rgb_video_from_episode_media(episode_dir: Path, cam: str, payload: Json) -> Optional[Tuple[Path, Optional[Path]]]:
+    media = payload.get("episode_media")
+    if not isinstance(media, dict):
+        return None
+    cameras = media.get("cameras")
+    if not isinstance(cameras, dict):
+        return None
+    cam_obj = cameras.get(str(cam))
+    if not isinstance(cam_obj, dict):
+        return None
+    rgb_obj = cam_obj.get("rgb") or cam_obj.get("RGB")
+    if not isinstance(rgb_obj, dict):
+        return None
+    video_path = _path_from_worker_media_obj(episode_dir, rgb_obj, ("path", "local_path", "resolved_path"))
+    if video_path is None:
+        storage_file = str(rgb_obj.get("storage_file") or rgb_obj.get("storageFile") or "").strip()
+        if storage_file:
+            video_path = _worker_storage_path(episode_dir, cam, "RGB", storage_file)
+    if video_path is None or not video_path.exists():
+        return None
+    timestamp_path = _path_from_worker_media_obj(
+        episode_dir,
+        rgb_obj,
+        ("timestamp_path", "timestamp_local_path", "timestamp_resolved_path"),
+    )
+    if timestamp_path is None:
+        timestamp_file = str(rgb_obj.get("timestamp_file") or rgb_obj.get("timestampFile") or "").strip()
+        if timestamp_file:
+            timestamp_path = _worker_storage_path(episode_dir, cam, "RGB", timestamp_file)
+    if timestamp_path is None:
+        timestamp_path = _worker_timestamp_sidecar(video_path)
+    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
+
+
+def _path_from_worker_media_obj(episode_dir: Path, obj: Json, keys: Sequence[str]) -> Optional[Path]:
+    for key in keys:
+        raw = str(obj.get(key) or "").strip()
+        if raw:
+            return Path(raw).expanduser().resolve()
+    uri = str(obj.get("uri") or "").strip()
+    base_uri = str(obj.get("episode_uri") or obj.get("episode_base_uri") or "").strip().rstrip("/")
+    if uri and base_uri and (uri == base_uri or uri.startswith(base_uri + "/")):
+        return (episode_dir / unquote(uri[len(base_uri):].lstrip("/"))).resolve()
+    return None
+
+
+def _rgb_video_from_camera_params(episode_dir: Path, cam: str) -> Optional[Tuple[Path, Optional[Path]]]:
+    cam_obj = _worker_camera_params(episode_dir, cam)
+    if not isinstance(cam_obj, dict):
+        return None
+    rgb_obj = cam_obj.get("RGB") or cam_obj.get("rgb")
+    if not isinstance(rgb_obj, dict):
+        return None
+    storage_file = str(rgb_obj.get("storageFile") or rgb_obj.get("storage_file") or "").strip()
+    if not storage_file:
+        return None
+    video_path = _worker_storage_path(episode_dir, cam, "RGB", storage_file)
+    if not video_path.exists():
+        return None
+    timestamp_file = str(rgb_obj.get("timestampFile") or rgb_obj.get("timestamp_file") or "").strip()
+    timestamp_path = _worker_storage_path(episode_dir, cam, "RGB", timestamp_file) if timestamp_file else _worker_timestamp_sidecar(video_path)
+    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
+
+
+def _worker_camera_params(episode_dir: Path, cam: str) -> Json:
+    for path in (episode_dir / "camera_params.json", episode_dir / str(cam) / "camera_params.json"):
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        cam_obj = obj.get(str(cam))
+        if isinstance(cam_obj, dict):
+            return cam_obj
+        if isinstance(obj.get("RGB"), dict) or isinstance(obj.get("rgb"), dict):
+            return obj
+    return {}
+
+
+def _worker_storage_path(episode_dir: Path, cam: str, stream: str, storage_file: str) -> Path:
+    raw = unquote(str(storage_file or "").strip())
+    p = Path(raw)
+    if p.is_absolute():
+        return p.expanduser().resolve()
+    candidates = [
+        episode_dir / str(cam) / stream / p,
+        episode_dir / str(cam) / p,
+        episode_dir / p,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _worker_timestamp_sidecar(video_path: Path) -> Optional[Path]:
+    candidate = Path(str(video_path) + ".timestamps.csv")
+    return candidate if candidate.exists() else candidate
+
+
+def _load_worker_video_frame_map(timestamp_path: Optional[Path]) -> Dict[int, int]:
+    if timestamp_path is None or not timestamp_path.exists() or not timestamp_path.is_file():
+        return {}
+    out: Dict[int, int] = {}
+    try:
+        with timestamp_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    video_idx = int(str(row.get("video_frame_index") or "").strip())
+                    frame_idx = int(str(row.get("frame_index") or "").strip())
+                except (TypeError, ValueError):
+                    continue
+                out[frame_idx] = video_idx
+    except Exception:
+        return {}
+    return out
+
+
+def _decode_worker_rgb_frames(
+    *,
+    video_path: Path,
+    timestamp_path: Optional[Path],
+    frame_map: Mapping[int, int],
+    frames: Sequence[int],
+    out_dir: Path,
+) -> None:
+    requested = sorted({int(frame) for frame in frames if not isinstance(frame, bool)})
+    out_dir.mkdir(parents=True, exist_ok=True)
+    missing: List[Tuple[int, int]] = []
+    for frame in requested:
+        target = out_dir / f"{frame:05d}.png"
+        if target.exists() and target.is_file():
+            continue
+        if frame_map:
+            if frame not in frame_map:
+                raise ValueError(f"frame {frame} is absent from {timestamp_path}")
+            video_idx = int(frame_map[frame])
+        else:
+            video_idx = int(frame)
+        missing.append((frame, video_idx))
+    if not missing:
+        return
+
+    missing.sort(key=lambda item: item[1])
+    with tempfile.TemporaryDirectory(prefix="decode_", dir=str(out_dir)) as tmp_name:
+        tmp = Path(tmp_name)
+        _run_worker_ffmpeg_select(video_path, [video_idx for _, video_idx in missing], tmp / "%06d.png")
+        outputs = sorted(tmp.glob("*.png"))
+        if len(outputs) != len(missing):
+            raise RuntimeError(f"ffmpeg decoded {len(outputs)} frame(s), expected {len(missing)} from {video_path}")
+        for output_path, (frame, _video_idx) in zip(outputs, missing):
+            target = out_dir / f"{frame:05d}.png"
+            tmp_target = out_dir / f".{target.name}.{os.getpid()}.tmp"
+            shutil.move(str(output_path), str(tmp_target))
+            os.replace(tmp_target, target)
+
+
+def _run_worker_ffmpeg_select(video_path: Path, video_indices: Sequence[int], output_pattern: Path) -> None:
+    ffmpeg = env_text("ffmpeg", "ORBBEC_VIRTUAL_WORKFLOW_FFMPEG", "ORBBEC_LABEL_FFMPEG")
+    selects = "+".join(f"eq(n\\,{int(idx)})" for idx in video_indices)
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(video_path),
+        "-vf",
+        f"select={selects}",
+        "-vsync",
+        "0",
+        str(output_pattern),
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg not found; set ORBBEC_VIRTUAL_WORKFLOW_FFMPEG or install ffmpeg") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg failed for {video_path}: {detail}")
 
 
 def image_size_for_frame(episode_dir: Path, cam: str, frame: int, rgb_path_template: str = "") -> Tuple[int, int]:
@@ -1328,6 +1596,8 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
+    payload = dict(payload)
+    payload["rgb_path_template"] = ensure_rgb_frames_from_video_for_payload(nas, payload, episode, cameras, frames)
     prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
     pred_uri = write_prediction_artifact_for_payload(nas, payload, episode, cameras, frames, prediction_dir, hand_gt_detector_for_args(args))
     client.complete_job(

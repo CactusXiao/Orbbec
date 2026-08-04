@@ -187,6 +187,11 @@ def _local_episode_path(data_uri: str, local_path: str) -> Optional[Path]:
     return None
 
 
+def _stream_storage_obj(camera_obj: Mapping[str, Any], stream_name: str) -> Dict[str, Any]:
+    value = camera_obj.get(stream_name) or camera_obj.get(stream_name.lower()) or {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _infer_subject_task_episode(path: Optional[Path]) -> Tuple[str, str, str]:
     if path is None:
         return "", "", ""
@@ -864,6 +869,7 @@ class JobService:
             )
             if frames:
                 payload["frames"] = frames
+            payload.setdefault("episode_media", self._episode_media_payload(episode, cameras))
         return {
             "job": job,
             "episode": episode,
@@ -933,6 +939,7 @@ class JobService:
             "correction_dir": f"manual_2d/segments/{segment_id}",
             "manual_2d_dir": f"manual_2d/segments/{segment_id}",
             "rgb_path_template": rgb_path_template,
+            "episode_media": self._episode_media_payload(episode, cameras),
             "status": str(segment.get("status") or ""),
         }
 
@@ -1019,6 +1026,132 @@ class JobService:
         self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
         self.store.mark_segment_mano_queued(segment_id=segment_id, mano_job_id=job_id)
         self.store.update_episode_status(episode_id, "segment_mano_optimizing", {"active_job_id": job_id})
+
+    def _episode_media_payload(self, episode: Dict[str, Any], cameras: Sequence[str]) -> Dict[str, Any]:
+        data_uri = str(episode.get("data_uri") or "").strip().rstrip("/")
+        episode_path = self._resolved_episode_path(data_uri, "")
+        media_cameras: Dict[str, Any] = {}
+        for camera in cameras:
+            cam = str(camera or "").strip()
+            if not cam:
+                continue
+            cam_params = self._camera_params_for_media(episode_path, cam)
+            rgb_params = _stream_storage_obj(cam_params, "RGB")
+            depth_params = _stream_storage_obj(cam_params, "Depth")
+            media_cameras[cam] = {
+                "rgb": self._stream_media_payload(
+                    data_uri=data_uri,
+                    episode_path=episode_path,
+                    camera=cam,
+                    stream="RGB",
+                    default_file="rgb.h265",
+                    default_encoding="h265",
+                    params=rgb_params,
+                ),
+                "depth": self._stream_media_payload(
+                    data_uri=data_uri,
+                    episode_path=episode_path,
+                    camera=cam,
+                    stream="Depth",
+                    default_file="depth.mkv",
+                    default_encoding="ffv1_mkv",
+                    params=depth_params,
+                ),
+            }
+        return {
+            "schema_version": 1,
+            "kind": "orbbec_episode_media",
+            "episode_id": str(episode.get("episode_id") or ""),
+            "episode_uri": data_uri,
+            "requires_rgb_video_decode": True,
+            "rgb_frame_files_required": False,
+            "cameras": media_cameras,
+        }
+
+    def _stream_media_payload(
+        self,
+        *,
+        data_uri: str,
+        episode_path: Optional[Path],
+        camera: str,
+        stream: str,
+        default_file: str,
+        default_encoding: str,
+        params: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        storage_file = str(params.get("storageFile") or params.get("storage_file") or default_file).strip() or default_file
+        timestamp_file = str(params.get("timestampFile") or params.get("timestamp_file") or "").strip()
+        if not timestamp_file:
+            timestamp_file = storage_file + ".timestamps.csv"
+        storage_encoding = str(params.get("storageEncoding") or params.get("storage_encoding") or default_encoding).strip() or default_encoding
+        path = self._storage_file_path(episode_path, camera, stream, storage_file)
+        timestamp_path = self._storage_file_path(episode_path, camera, stream, timestamp_file)
+        return {
+            "encoding": storage_encoding,
+            "storage_file": storage_file,
+            "timestamp_file": timestamp_file,
+            "uri": self._storage_file_uri(data_uri, camera, stream, storage_file),
+            "timestamp_uri": self._storage_file_uri(data_uri, camera, stream, timestamp_file),
+            "path": str(path) if path is not None and path.exists() else "",
+            "timestamp_path": str(timestamp_path) if timestamp_path is not None and timestamp_path.exists() else "",
+            "width": _optional_int(params.get("width")),
+            "height": _optional_int(params.get("height")),
+            "fps": _optional_int(params.get("fps")),
+        }
+
+    def _camera_params_for_media(self, episode_path: Optional[Path], camera: str) -> Dict[str, Any]:
+        if episode_path is None:
+            return {}
+        for path in (episode_path / "camera_params.json", episode_path / camera / "camera_params.json"):
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                parsed = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            cam_obj = parsed.get(camera)
+            if isinstance(cam_obj, dict):
+                return cam_obj
+            if isinstance(parsed.get("RGB"), dict) or isinstance(parsed.get("Depth"), dict):
+                return parsed
+        return {}
+
+    @staticmethod
+    def _storage_file_path(
+        episode_path: Optional[Path],
+        camera: str,
+        stream: str,
+        storage_file: str,
+    ) -> Optional[Path]:
+        if episode_path is None:
+            return None
+        raw = unquote(str(storage_file or "").strip())
+        if not raw:
+            return None
+        p = Path(raw)
+        if p.is_absolute():
+            return p.expanduser().resolve()
+        candidates = [
+            episode_path / camera / stream / p,
+            episode_path / camera / p,
+            episode_path / p,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+        return candidates[0].resolve()
+
+    @staticmethod
+    def _storage_file_uri(data_uri: str, camera: str, stream: str, storage_file: str) -> str:
+        data_uri = str(data_uri or "").strip().rstrip("/")
+        storage_file = str(storage_file or "").strip().strip("/")
+        if not data_uri or not storage_file:
+            return ""
+        if "/" in storage_file:
+            return uri_join(data_uri, camera, storage_file)
+        return uri_join(data_uri, camera, stream, storage_file)
 
     def resolve_data_path(self, data_uri: str, local_capture_path: str = "") -> str:
         local_capture_path = str(local_capture_path or "").strip()

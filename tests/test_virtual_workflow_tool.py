@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import random
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -33,6 +35,7 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     handle_qc_once,
     handle_upload_once,
     build_parser,
+    find_rgb_frame_path,
     load_env_defaults,
     virtual_hand_values,
     virtual_failed_segments,
@@ -48,6 +51,14 @@ class FakeHandGtDetector:
 
     def close(self) -> None:
         pass
+
+
+class StrictImageHandGtDetector(FakeHandGtDetector):
+    def detect_values(self, episode_dir: Path, cam: str, frame: int, *, rgb_path_template: str = "") -> list[float]:
+        path = find_rgb_frame_path(episode_dir, cam, frame, rgb_path_template)
+        if path is None:
+            raise BackendError(f"strict detector missing decoded RGB frame: camera={cam} frame={frame}")
+        return super().detect_values(episode_dir, cam, frame, rgb_path_template=rgb_path_template)
 
 
 class VirtualWorkflowToolSmokeTest(unittest.TestCase):
@@ -128,6 +139,59 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
 
             with self.assertRaisesRegex(BackendError, "requires interaction handGT detector"):
                 nas.write_prediction_artifact(data_uri, ["00"], [0])
+
+    def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
+        if shutil.which("ffmpeg") is None:
+            self.skipTest("ffmpeg is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "virtual_nas"
+            nas_prefix = "nas://orbbec-test"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_video"
+            if not self._write_h265_rgb_video(episode_dir / "00" / "RGB", frames=3, frame_offset=10):
+                self.skipTest("ffmpeg cannot create h265 fixture")
+
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
+            registry = TaskInstanceRegistry(tmp_path / "backend_state", seed_task_files=[])
+            runtime = BackendRuntime(registry, service)
+            server = TaskHTTPServer(("127.0.0.1", 0), RequestHandler, runtime)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                host, port = server.server_address
+                client = BackendClient(f"http://{host}:{port}", timeout=5)
+                nas = NasSimulator(nas_root, nas_prefix)
+                service.store.create_or_update_episode(
+                    episode_id="episode_video",
+                    subject_id="S001",
+                    task_name="pick_object",
+                    episode_index=1,
+                    status="uploaded",
+                    data_uri=f"{nas_prefix}/S001/pick_object/episode_video",
+                    frame_count=3,
+                    cameras=["00"],
+                    metadata={"nas_uri": f"{nas_prefix}/S001/pick_object/episode_video"},
+                )
+                service.set_stage_leasing("auto_label", True, {"updated_by": "smoke"})
+                pushed = service.push_auto_label({"episode_id": "episode_video", "pushed_by": "smoke"})
+                self.assertEqual(pushed["created_jobs"], 1)
+                auto_job = store.jobs_for_episode("episode_video", "auto_label")[0]
+                self.assertEqual(auto_job["payload"]["frames"], [0, 1, 2])
+
+                args = argparse.Namespace(
+                    worker_id="video_smoke",
+                    lease_seconds=60,
+                    max_materialized_frames=0,
+                    _interaction_hand_gt_detector=StrictImageHandGtDetector(),
+                )
+                self.assertTrue(handle_auto_label_once(client, nas, args))
+                self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())
+                self.assertFalse((episode_dir / "00" / "RGB" / "00000.png").exists())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
     def test_virtual_failed_segments_use_random_ten_to_twenty_frame_ranges(self) -> None:
         random.seed(123)
@@ -259,6 +323,41 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
         for cam in cameras:
             for frame in range(frames):
                 write_placeholder_rgb_image(episode_dir / cam / "RGB" / f"{frame:05d}.png")
+
+    @staticmethod
+    def _write_h265_rgb_video(rgb_dir: Path, *, frames: int, frame_offset: int = 0) -> bool:
+        rgb_dir.mkdir(parents=True, exist_ok=True)
+        video_path = rgb_dir / "rgb.h265"
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                f"testsrc=size=32x24:rate=1:duration={int(frames)}",
+                "-frames:v",
+                str(int(frames)),
+                "-c:v",
+                "libx265",
+                "-x265-params",
+                "log-level=error",
+                str(video_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            return False
+        rows = ["video_frame_index,frame_index,rgb_timestamp_us"]
+        for idx in range(frames):
+            rows.append(f"{idx},{idx},{int(frame_offset + idx)}")
+        (rgb_dir / "rgb.h265.timestamps.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        return True
 
     @staticmethod
     def _complete_segment_with_real_label_storage(label_client: LabelBackendClient, leased: dict) -> None:

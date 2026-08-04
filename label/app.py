@@ -32,6 +32,7 @@ try:
     from .theme import Theme, apply_theme
     from .mano_view import ManoMeshResult, ManoViewRuntime
     from .tracking import CoTrackerRuntime
+    from .video_frames import ensure_decoded_rgb_frames
 except Exception:
     from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
@@ -57,6 +58,7 @@ except Exception:
     from theme import Theme, apply_theme
     from mano_view import ManoMeshResult, ManoViewRuntime
     from tracking import CoTrackerRuntime
+    from video_frames import ensure_decoded_rgb_frames
 
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
@@ -584,6 +586,7 @@ class LabelPage(ttk.Frame):
     def _set_backend_session(self, session: LabelJobSession) -> bool:
         try:
             task = correction_task_from_backend_payload(session.payload, mounts=session.mounts)
+            task = ensure_decoded_rgb_frames(task, session.payload)
             progress_ref = task.episode_dir() / f".{session.job_id}.jsonl"
             progress = load_correction_progress(str(progress_ref), [task])
             save_correction_progress(str(progress_ref), progress)
