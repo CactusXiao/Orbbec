@@ -63,7 +63,7 @@
         "failReprojThreshPx": 8.0
     },
     "outputDir": "./collection_000",
-    "durationSec": 5,
+    "durationSec": 0,
     "maxFrames": 1000,
     "collectFps": 30,
     "enableSync": true,
@@ -85,7 +85,7 @@
         "timeoutMs": 3000
     },
     "voiceFeedback": {
-        "_comment": "Voice prompts for collection mode. speakerDevice is used by the default Linux command as the ALSA aplay -D value, for example default, hw:1,0, or plughw:1,0. Optional command supports {text} and {device}, for example: espeak --stdout {text} | aplay -q -D {device}",
+        "_comment": "Voice prompts for collection mode. record_tick uses a buzzer tone instead of speech, and record_elapsed is generated dynamically every 15 seconds. speakerDevice is used by the default Linux command as the ALSA aplay -D value, for example default, hw:1,0, or plughw:1,0. Optional command supports {text} and {device}, for example: espeak --stdout {text} | aplay -q -D {device}",
         "enabled": true,
         "speakerDevice": "default",
         "command": "",
@@ -94,7 +94,7 @@
             "enter": "enter",
             "enter_failed": "enter failed",
             "start": "start",
-            "record_tick": "di",
+            "record_tick": "",
             "start_failed": "start failed",
             "stop": "stop",
             "confirm": "confirm",

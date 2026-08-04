@@ -739,7 +739,7 @@ static std::string presetLabel(int w, int h, int fps) {
 static constexpr int kCollectionFixedWidth = 640;
 static constexpr int kCollectionFixedHeight = 400;
 static constexpr int kCollectionFixedFps = 30;
-static constexpr int kCollectionFixedMaxDurationSec = 120;
+static constexpr int kCollectionFixedMaxDurationSec = 0;
 
 struct CollectionConfigUi {
     bool enableMultiview = true;
@@ -1190,17 +1190,42 @@ public:
         if(!cfg_.enabled) {
             return;
         }
+        const bool beepMessage = isBeepMessage(messageKey);
         std::string text = fallbackText;
         auto it = cfg_.messages.find(messageKey);
         if(it != cfg_.messages.end()) {
             text = it->second;
         }
         text = trimString(std::move(text));
-        if(text.empty()) {
+        if(text.empty() && !beepMessage) {
             return;
         }
         {
             std::lock_guard<std::mutex> lock(mtx_);
+            if(beepMessage) {
+                const bool voicePendingOrPlaying = speakingNonBeep_
+                                                   || std::any_of(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
+                                                          return !isBeepMessage(message.key);
+                                                      });
+                const bool beepPending = std::any_of(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
+                    return isBeepMessage(message.key);
+                });
+                if(voicePendingOrPlaying || beepPending) {
+                    return;
+                }
+            }
+            else {
+                queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
+                                 return isBeepMessage(message.key);
+                             }),
+                             queue_.end());
+                if(messageKey == "record_elapsed") {
+                    queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
+                                     return message.key == "record_elapsed";
+                                 }),
+                                 queue_.end());
+                }
+            }
             queue_.push_back(VoiceMessage{ messageKey, std::move(text) });
         }
         cv_.notify_one();
@@ -1228,6 +1253,30 @@ public:
     }
 
 private:
+    static bool isBeepMessage(const std::string &messageKey) {
+        return messageKey == "record_tick";
+    }
+
+    static bool containsNonAscii(const std::string &text) {
+        return std::any_of(text.begin(), text.end(), [](unsigned char c) {
+            return c >= 0x80;
+        });
+    }
+
+    std::string buildBeepCommand() const {
+#if defined(__APPLE__)
+        return "(if command -v osascript >/dev/null 2>&1; then osascript -e 'beep 1'; else printf '\\a'; fi)";
+#else
+        const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
+        const std::string qDevice = shellQuote(device);
+        return "(if command -v beep >/dev/null 2>&1; then "
+               "beep -f 1200 -l 80; "
+               "elif command -v timeout >/dev/null 2>&1 && command -v speaker-test >/dev/null 2>&1; then "
+               "timeout 0.12s speaker-test -D " + qDevice + " -t sine -f 1200 -l 1 >/dev/null 2>&1 || true; "
+               "else printf '\\a'; fi)";
+#endif
+    }
+
     std::string buildCommand(const std::string &text) const {
         const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
         const std::string qText = shellQuote(text);
@@ -1252,34 +1301,55 @@ private:
         cmd << qText << "; fi";
         return cmd.str();
 #else
+        if(containsNonAscii(text)) {
+            return "(if command -v spd-say >/dev/null 2>&1 && spd-say -w -- " + qText + "; then :; "
+                   "elif command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
+                   "espeak --stdout " + qText + " | aplay -q -D " + qDevice + "; "
+                   "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; fi)";
+        }
         return "(if command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
                "espeak --stdout " + qText + " | aplay -q -D " + qDevice + "; "
                "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; "
-               "elif command -v spd-say >/dev/null 2>&1; then spd-say -- " + qText + "; fi)";
+               "elif command -v spd-say >/dev/null 2>&1; then spd-say -w -- " + qText + "; fi)";
 #endif
     }
 
     void workerLoop() {
         while(true) {
+            std::string key;
             std::string text;
+            bool nonBeepMessage = false;
             {
                 std::unique_lock<std::mutex> lock(mtx_);
                 cv_.wait(lock, [&]() { return stopping_ || !queue_.empty(); });
                 if(stopping_ && queue_.empty()) {
                     return;
                 }
+                key = std::move(queue_.front().key);
+                nonBeepMessage = !isBeepMessage(key);
                 text = std::move(queue_.front().text);
                 queue_.pop_front();
+                if(nonBeepMessage) {
+                    speakingNonBeep_ = true;
+                }
             }
 
-            const std::string cmd = buildCommand(text);
+            const std::string cmd = isBeepMessage(key) ? buildBeepCommand() : buildCommand(text);
             if(cmd.empty()) {
+                if(nonBeepMessage) {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    speakingNonBeep_ = false;
+                }
                 continue;
             }
             const int rc = std::system(cmd.c_str());
+            if(nonBeepMessage) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                speakingNonBeep_ = false;
+            }
             if(rc != 0 && !warnedFailure_) {
                 warnedFailure_ = true;
-                std::cerr << "[collection][voice] playback command failed once. text=" << text << std::endl;
+                std::cerr << "[collection][voice] playback command failed once. key=" << key << " text=" << text << std::endl;
             }
         }
     }
@@ -1290,6 +1360,7 @@ private:
     std::deque<VoiceMessage>  queue_;
     std::thread               worker_;
     bool                      stopping_ = false;
+    bool                      speakingNonBeep_ = false;
     bool                      warnedFailure_ = false;
 };
 
@@ -8636,14 +8707,25 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
     bool recordTickActive = false;
     std::chrono::steady_clock::time_point nextRecordTick{};
+    std::chrono::steady_clock::time_point nextRecordElapsedAnnouncement{};
+    auto formatRecordElapsedAnnouncement = [](int64_t elapsedSeconds) {
+        elapsedSeconds = std::max<int64_t>(0, elapsedSeconds);
+        const int64_t minutes = elapsedSeconds / 60;
+        const int64_t seconds = elapsedSeconds % 60;
+        return "已采集" + std::to_string(minutes) + "分" + std::to_string(seconds) + "秒";
+    };
     auto startRecordingTick = [&]() {
+        const auto now = std::chrono::steady_clock::now();
         recordTickActive = true;
-        nextRecordTick = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        nextRecordTick = now + std::chrono::seconds(1);
+        nextRecordElapsedAnnouncement = now + std::chrono::seconds(15);
     };
     auto stopRecordingTick = [&]() {
         recordTickActive = false;
         nextRecordTick = {};
+        nextRecordElapsedAnnouncement = {};
         voice.clearPending("record_tick");
+        voice.clearPending("record_elapsed");
     };
     auto updateRecordingTick = [&]() {
         if(captureState != CaptureState::RECORDING || !recorder.isRecording()) {
@@ -8656,7 +8738,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         if(!recordTickActive) {
             recordTickActive = true;
             nextRecordTick = now + std::chrono::seconds(1);
+            nextRecordElapsedAnnouncement = now + std::chrono::seconds(15);
             return;
+        }
+        if(now >= nextRecordElapsedAnnouncement) {
+            const auto elapsedSeconds = static_cast<int64_t>(std::floor(std::max(0.0, recorder.currentRecordingSeconds())));
+            announce("record_elapsed", formatRecordElapsedAnnouncement(elapsedSeconds));
+            do {
+                nextRecordElapsedAnnouncement += std::chrono::seconds(15);
+            } while(now >= nextRecordElapsedAnnouncement + std::chrono::milliseconds(200));
         }
         if(now >= nextRecordTick) {
             announce("record_tick", "di");
