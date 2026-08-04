@@ -4,7 +4,6 @@
 
 namespace sync_app {
 
-int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel);
+int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoRecorder *sharedEgoRecorder = nullptr);
 
 }
-

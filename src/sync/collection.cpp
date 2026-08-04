@@ -2664,8 +2664,10 @@ public:
         std::string message;
     };
 
-    explicit MultiDeviceStreamingRecorder(AppConfig baseCfg)
-        : cfg_(std::move(baseCfg)) {
+    explicit MultiDeviceStreamingRecorder(AppConfig baseCfg, EgoRecorder *sharedEgoRecorder = nullptr)
+        : cfg_(std::move(baseCfg)),
+          egoRecorder_(sharedEgoRecorder ? *sharedEgoRecorder : ownedEgoRecorder_),
+          ownsEgoRecorder_(sharedEgoRecorder == nullptr) {
         const size_t baseQueue = cfg_.queueCapacity > 0 ? static_cast<size_t>(cfg_.queueCapacity) : 1024;
         recordQueueMax_ = cfg_.recordQueueCapacity > 0 ? static_cast<size_t>(cfg_.recordQueueCapacity) : std::max<size_t>(16384, baseQueue * 16);
         coordQueueMax_ = cfg_.coordQueueCapacity > 0 ? static_cast<size_t>(cfg_.coordQueueCapacity) : std::max<size_t>(8192, baseQueue * 8);
@@ -3416,13 +3418,26 @@ public:
                 egoCfg.maxBufferedFrames = static_cast<size_t>(std::max(2048, ui.maxDurationInt() * std::max(1, ui.fpsInt()) * 2));
             }
             std::string egoError;
-            if(!egoRecorder_.start(egoCfg, &egoError)) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                captureInfoLine_ = "Ego server start failed: " + egoError;
-                return false;
+            if(ownsEgoRecorder_) {
+                if(!egoRecorder_.start(egoCfg, &egoError)) {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    captureInfoLine_ = "Ego server start failed: " + egoError;
+                    return false;
+                }
+                egoStatusLine = "Ego server listening on " + egoCfg.host + ":" + std::to_string(egoCfg.port);
+                std::cerr << "[collection] " << egoStatusLine << std::endl;
             }
-            egoStatusLine = "Ego server listening on " + egoCfg.host + ":" + std::to_string(egoCfg.port);
-            std::cerr << "[collection] " << egoStatusLine << std::endl;
+            else {
+                if(!egoRecorder_.isRunning()) {
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    captureInfoLine_ = "Ego server is not ready from menu";
+                    return false;
+                }
+                egoStatusLine = egoRecorder_.isConnected()
+                                  ? "Ego client connected"
+                                  : ("Ego server listening on " + egoCfg.host + ":" + std::to_string(egoCfg.port) + ", waiting for PICO");
+                std::cerr << "[collection] using shared " << egoStatusLine << std::endl;
+            }
         }
 
         if(!multiviewEnabled_) {
@@ -3443,7 +3458,7 @@ public:
         auto deviceList = ctx_.queryDeviceList();
         if(!deviceList || deviceList->deviceCount() == 0) {
             fisheyeRecorder_.stop();
-            if(!egoWasRunning) {
+            if(!egoWasRunning && ownsEgoRecorder_) {
                 egoRecorder_.stop();
             }
             std::lock_guard<std::mutex> lock(mtx_);
@@ -3456,7 +3471,7 @@ public:
         auto selected = selectDevicesWithPipeline(deviceList, cfg_);
         if(selected.empty()) {
             fisheyeRecorder_.stop();
-            if(!egoWasRunning) {
+            if(!egoWasRunning && ownsEgoRecorder_) {
                 egoRecorder_.stop();
             }
             std::lock_guard<std::mutex> lock(mtx_);
@@ -4010,7 +4025,9 @@ public:
         if(!capturing_.load()) {
             fisheyeRecorder_.stop();
             if(closeEgoTcp) {
-                egoRecorder_.stop();
+                if(ownsEgoRecorder_) {
+                    egoRecorder_.stop();
+                }
             }
             activeFisheyeCameraCount_ = 0;
             activeFisheyeCameraIds_.clear();
@@ -4062,7 +4079,9 @@ public:
         }
         fisheyeRecorder_.stop();
         if(closeEgoTcp) {
-            egoRecorder_.stop();
+            if(ownsEgoRecorder_) {
+                egoRecorder_.stop();
+            }
         }
         capturing_.store(false);
         recording_.store(false);
@@ -7993,7 +8012,9 @@ private:
     std::vector<std::string> activeFisheyeCameraIds_;
     FisheyeRecorder fisheyeRecorder_;
     bool            egoEnabled_ = false;
-    EgoRecorder     egoRecorder_;
+    EgoRecorder     ownedEgoRecorder_;
+    EgoRecorder    &egoRecorder_;
+    bool            ownsEgoRecorder_ = true;
 
     mutable std::mutex mtx_;
     std::unordered_map<std::string, DeviceBuffer> buffers_;
@@ -8550,7 +8571,7 @@ static ExitConfirmModalActions drawExitConfirmModal(cv::Mat &ui,
 
 }  // namespace
 
-int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
+int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoRecorder *sharedEgoRecorder) {
     (void)cancel;
 
     collectionInstallCrashHandlerOnce();
@@ -8567,7 +8588,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel) {
     CollectionPage page = CollectionPage::Config;
     CollectionConfigUi cfgUi;
     CollectionCaptureUi capUi;
-    MultiDeviceStreamingRecorder recorder(cfg);
+    MultiDeviceStreamingRecorder recorder(cfg, sharedEgoRecorder);
     TaskBackendClient backendClient(cfg.taskBackend.baseUrl, cfg.taskBackend.timeoutMs);
     const std::string collectionClientId = makeCollectionClientId();
     EpisodeReservationUi currentReservation;

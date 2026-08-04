@@ -9,6 +9,7 @@
 #include "calibration.hpp"
 
 #include <cmath>
+#include <utility>
 
 namespace sync_app {
 
@@ -323,6 +324,112 @@ static std::string ellipsizeTextToWidth(const std::string &text, int maxWidthPx,
     return suffix;
 }
 
+class MenuPicoConnection {
+public:
+    explicit MenuPicoConnection(EgoModuleConfig cfg)
+        : cfg_(std::move(cfg)) {
+        if(!cfg_.enabled) {
+            return;
+        }
+        if(cfg_.maxBufferedFrames == 0) {
+            cfg_.maxBufferedFrames = 8192;
+        }
+        worker_ = std::thread([this]() {
+            std::string error;
+            const bool ok = recorder_.start(cfg_, &error);
+            if(!ok) {
+                std::lock_guard<std::mutex> lock(errorMtx_);
+                startupError_ = error.empty() ? "unknown error" : error;
+            }
+            startupOk_.store(ok);
+            startupDone_.store(true);
+        });
+    }
+
+    ~MenuPicoConnection() {
+        waitForStartup();
+        recorder_.stop();
+    }
+
+    MenuPicoConnection(const MenuPicoConnection &) = delete;
+    MenuPicoConnection &operator=(const MenuPicoConnection &) = delete;
+
+    EgoRecorder *recorder() {
+        return &recorder_;
+    }
+
+    void waitForStartup() {
+        if(worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    std::string statusLine() const {
+        std::string line;
+        if(!cfg_.enabled) {
+            line = "PICO: disabled in config";
+        }
+        else if(!startupDone_.load()) {
+            line = "PICO: starting server on " + endpoint();
+        }
+        else if(!startupOk_.load()) {
+            std::lock_guard<std::mutex> lock(errorMtx_);
+            line = "PICO: start failed - " + startupError_;
+        }
+        else if(!recorder_.isRunning()) {
+            line = "PICO: server stopped";
+        }
+        else if(recorder_.isConnected()) {
+            std::string hello = recorder_.lastHelloSummary();
+            if(hello.size() > 54) {
+                hello = hello.substr(0, 51) + "...";
+            }
+            line = hello.empty() ? "PICO: connected" : ("PICO: connected " + hello);
+        }
+        else {
+            line = "PICO: waiting on " + endpoint();
+        }
+        return compactLine(line);
+    }
+
+    cv::Scalar statusColor() const {
+        if(!cfg_.enabled) {
+            return cv::Scalar(160, 160, 160);
+        }
+        if(!startupDone_.load()) {
+            return cv::Scalar(80, 190, 255);
+        }
+        if(!startupOk_.load() || !recorder_.isRunning()) {
+            return cv::Scalar(70, 70, 255);
+        }
+        if(recorder_.isConnected()) {
+            return cv::Scalar(90, 220, 120);
+        }
+        return cv::Scalar(80, 200, 255);
+    }
+
+private:
+    std::string endpoint() const {
+        return cfg_.host + ":" + std::to_string(cfg_.port);
+    }
+
+    static std::string compactLine(const std::string &line) {
+        constexpr size_t kMaxChars = 108;
+        if(line.size() <= kMaxChars) {
+            return line;
+        }
+        return line.substr(0, kMaxChars - 3) + "...";
+    }
+
+    EgoModuleConfig cfg_;
+    EgoRecorder recorder_;
+    std::thread worker_;
+    std::atomic_bool startupDone_{ false };
+    std::atomic_bool startupOk_{ false };
+    mutable std::mutex errorMtx_;
+    std::string startupError_;
+};
+
 }  // namespace sync_app
 
 int main(int argc, char **argv) {
@@ -341,6 +448,7 @@ int main(int argc, char **argv) {
         const fs::path configPathAbs = fs::absolute(configPath);
         std::cerr << "Using config: " << configPathAbs.string() << std::endl;
         AppConfig baseCfg = loadConfig(configPathAbs);
+        MenuPicoConnection menuPico(baseCfg.ego);
 
         InteractionConfigUi cfgUi;
         cfgUi.setDefaults(baseCfg);
@@ -382,11 +490,12 @@ int main(int argc, char **argv) {
 
             if(page == AppPage::Menu) {
                 cv::putText(ui, "Sync Menu", cv::Point(24, 48), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
-                cv::Rect b1(60, 92, 780, 76);
-                cv::Rect b2(60, 182, 780, 76);
-                cv::Rect b3(60, 272, 780, 76);
-                cv::Rect b4(60, 362, 780, 76);
-                cv::Rect b5(60, 452, 780, 76);
+                cv::putText(ui, menuPico.statusLine(), cv::Point(24, 78), cv::FONT_HERSHEY_DUPLEX, 0.56, menuPico.statusColor(), 1, cv::LINE_AA);
+                cv::Rect b1(60, 105, 780, 76);
+                cv::Rect b2(60, 193, 780, 76);
+                cv::Rect b3(60, 281, 780, 76);
+                cv::Rect b4(60, 369, 780, 76);
+                cv::Rect b5(60, 457, 780, 76);
                 if(uiButton(ui, b1, "Interaction", fm)) {
                     menuNotice.clear();
                     menuError.clear();
@@ -408,10 +517,11 @@ int main(int argc, char **argv) {
                     menuNotice.clear();
                     menuError.clear();
                     stopPlaceholderMode();
+                    menuPico.waitForStartup();
                     AppConfig cfg = baseCfg;
                     cfg.mode      = "collection";
                     cv::destroyWindow(winName);
-                    run_collection(cfg, nullptr);
+                    run_collection(cfg, nullptr, menuPico.recorder());
                     page = AppPage::Menu;
                     cv::namedWindow(winName, cv::WINDOW_NORMAL);
                     cv::resizeWindow(winName, 900, 640);
@@ -590,8 +700,9 @@ int main(int argc, char **argv) {
                 }
                 if(uiButton(ui, bStart, "Start Visualization", fm)) {
                     AppConfig cfg = cfgUi.buildCfg();
+                    menuPico.waitForStartup();
                     cv::destroyWindow(winName);
-                    const auto ex = run_interactive_visualization(cfg, nullptr);
+                    const auto ex = run_interactive_visualization(cfg, nullptr, menuPico.recorder());
                     if(ex == InteractiveExit::ReturnMenu) {
                         page = AppPage::Menu;
                     }

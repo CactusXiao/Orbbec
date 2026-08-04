@@ -10,7 +10,8 @@ enum class InteractiveExit {
     Quit
 };
 
-InteractiveExit run_interactive_visualization(const AppConfig &cfg, const std::atomic_bool *cancel);
+InteractiveExit run_interactive_visualization(const AppConfig &cfg,
+                                              const std::atomic_bool *cancel,
+                                              EgoRecorder *sharedEgoRecorder = nullptr);
 
 }
-
