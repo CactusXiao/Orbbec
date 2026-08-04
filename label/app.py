@@ -66,7 +66,7 @@ except Exception:
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
 SourceStateCache = Dict[Tuple[str, int, str, str], Tuple[HandPoints, HandVisible]]
-SOURCE_ORDER = ("mano", "pred", "correct", "last", "tracking", "scratch")
+SOURCE_ORDER = ("pred", "correct", "last", "tracking", "scratch", "mano")
 SOURCE_LABELS = {
     "mano": "MANO",
     "pred": "Pred",
@@ -438,7 +438,7 @@ class LabelPage(ttk.Frame):
         self._decode_generation: int = 0
         self._decode_thread: Optional[threading.Thread] = None
         self._decode_cache_dir: Optional[Path] = None
-        self._mode: str = "mano"
+        self._mode: str = "pred"
         self._tasks: List[CorrectionTask] = []
         self._tasks_by_key: Dict[str, CorrectionTask] = {}
         self._progress: Dict[str, CorrectionProgress] = {}
@@ -550,7 +550,7 @@ class LabelPage(ttk.Frame):
         self._jsonl_path = None
         self._backend_session = None
         self._backend_completed = False
-        self._mode = "mano"
+        self._mode = "pred"
         self._tasks = []
         self._tasks_by_key = {}
         self._progress = {}
@@ -589,7 +589,7 @@ class LabelPage(ttk.Frame):
         self._backend_session = None
         self._backend_completed = False
         self._jsonl_path = str(p)
-        return self._apply_session_tasks(tasks, progress, f"Tasks: {p}")
+        return self._apply_session_tasks(tasks, progress, f"Tasks: {p}", initial_source="pred")
 
     def _set_backend_session(self, session: LabelJobSession) -> bool:
         try:
@@ -606,7 +606,7 @@ class LabelPage(ttk.Frame):
         self._backend_session = session
         self._backend_completed = False
         self._jsonl_path = None
-        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...")
+        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...", initial_source="mano")
         if self._frame_status is not None:
             self._frame_status.configure(text="正在解码 RGB 帧...", fg=STATUS_TODO_COLOR)
         self._schedule_backend_heartbeat()
@@ -670,6 +670,7 @@ class LabelPage(ttk.Frame):
             progress,
             f"Backend job: {self._backend_session.job_id if self._backend_session else task.key}",
             auto_open_first=True,
+            initial_source="mano",
         )
 
     def _cleanup_decode_cache(self) -> None:
@@ -689,8 +690,9 @@ class LabelPage(ttk.Frame):
         info_prefix: str,
         *,
         auto_open_first: bool = False,
+        initial_source: str = "pred",
     ) -> bool:
-        self._mode = "mano"
+        self._mode = self._normalize_source(initial_source)
         self._tasks = tasks
         self._tasks_by_key = {t.key: t for t in tasks}
         self._progress = progress
@@ -884,7 +886,7 @@ class LabelPage(ttk.Frame):
 
     def _normalize_source(self, source: str) -> str:
         source = (source or "").strip().lower()
-        return source if source in SOURCE_ORDER else "mano"
+        return source if source in SOURCE_ORDER else "pred"
 
     def _copy_view_state(self, state: Tuple[HandPoints, HandVisible]) -> Tuple[HandPoints, HandVisible]:
         points, visible = state
@@ -903,11 +905,6 @@ class LabelPage(ttk.Frame):
             self._view_states = {}
             return
         frame_idx = task.frames[self._frame_pos]
-        if self._mode == "mano":
-            self._view_states = {
-                cam_id: self._build_initial_view_state(frame_idx, cam_id, self._mode) for cam_id in self._camera_ids
-            }
-            return
         if self._mode == "tracking":
             self._view_states = self._build_tracking_source_states(frame_idx)
             self._make_all_view_states_displayable(frame_idx)
@@ -929,8 +926,6 @@ class LabelPage(ttk.Frame):
                 return points, visible
             if source == "tracking":
                 return points, visible
-            if source == "mano":
-                return points, visible
             return self._fill_missing_points(points, frame_idx, cam_id), visible
 
         if source == "scratch":
@@ -946,7 +941,10 @@ class LabelPage(ttk.Frame):
             state = self._build_mano_3d_view_state(frame_idx, cam_id)
             if state is None:
                 return self._hidden_points(), self._none_visible()
-            return state
+            points, visible = state
+            fallback_points = self._display_fallback_points(frame_idx, cam_id)
+            points = self._apply_initial_display_fallback(points, visible, fallback_points)
+            return points, visible
 
         bundle = self._ensure_bundle(source)
         fallback_points = self._display_fallback_points(frame_idx, cam_id)
@@ -1293,7 +1291,7 @@ class LabelPage(ttk.Frame):
         return label
 
     def _source_button_text(self) -> str:
-        return f"2D Source: {self._source_label()}"
+        return f"View Source: {self._source_label()}"
 
     def _update_source_button(self) -> None:
         if self._source_btn is not None:
@@ -1530,10 +1528,9 @@ class LabelPage(ttk.Frame):
         state = self._view_states.get(cam_id)
         if state is None:
             state = self._build_initial_view_state(frame_idx, cam_id, source)
-            if source != "mano":
-                fallback = self._display_fallback_points(frame_idx, cam_id)
-                points0, visible0 = state
-                state = (self._replace_unusable_points(self._merge_missing_points(points0, fallback), fallback), visible0)
+            fallback = self._display_fallback_points(frame_idx, cam_id)
+            points0, visible0 = state
+            state = (self._replace_unusable_points(self._merge_missing_points(points0, fallback), fallback), visible0)
             self._view_states[cam_id] = state
         points, visible = state
 

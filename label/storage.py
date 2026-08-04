@@ -370,7 +370,7 @@ def save_correction_progress(jsonl_path: str, records: Dict[str, CorrectionProgr
 
 def load_prediction_bundle(task: CorrectionTask, *, mode: str = "pred") -> PredictionBundle:
     mode = (mode or "pred").strip().lower()
-    if mode not in {"mano", "pred", "correct", "last", "scratch"}:
+    if mode not in {"pred", "correct", "last", "scratch"}:
         raise ValueError(f"Unsupported label mode: {mode}")
 
     episode_dir = task.episode_dir()
@@ -390,8 +390,6 @@ def _source_dir_for_mode(task: CorrectionTask, mode: str) -> Path:
     episode_dir = task.episode_dir()
     if mode in {"correct", "last"}:
         return episode_dir / task.correction_dir
-    if mode == "mano":
-        return episode_dir / task.mano_episode_dir
     return episode_dir / task.prediction_dir
 
 
@@ -478,7 +476,7 @@ def _sample_for(bundle: PredictionBundle, frame_idx: int, cam_id: str) -> Predic
         cam_id=str(cam_id),
         frame_idx=int(frame_idx),
         source_path=source_frame_path(bundle, frame_idx, cam_id),
-        corrected_path=bundle.corrected_dir / str(cam_id) / _corrected_name(bundle.pred_dir, cam_id, frame_idx),
+        corrected_path=bundle.corrected_dir / str(cam_id) / _corrected_name(bundle.prediction_dir, cam_id, frame_idx),
     )
     bundle.samples[key] = sample
     return sample
