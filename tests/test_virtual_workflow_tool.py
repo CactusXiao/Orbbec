@@ -18,6 +18,7 @@ from label.backend_client import LabelBackendClient
 from label.storage import (
     apply_view_state_to_corrected,
     correction_task_from_backend_payload,
+    load_frame_visibility,
     load_prediction_bundle,
     save_corrected_array,
     view_state_from_bundle,
@@ -59,6 +60,11 @@ class StrictImageHandGtDetector(FakeHandGtDetector):
         if path is None:
             raise BackendError(f"strict detector missing decoded RGB frame: camera={cam} frame={frame}")
         return super().detect_values(episode_dir, cam, frame, rgb_path_template=rgb_path_template)
+
+
+class NoHandDetector(FakeHandGtDetector):
+    def detect_values(self, _episode_dir: Path, cam: str, frame: int, *, rgb_path_template: str = "") -> list[float] | None:
+        return None
 
 
 class VirtualWorkflowToolSmokeTest(unittest.TestCase):
@@ -139,6 +145,29 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
 
             with self.assertRaisesRegex(BackendError, "requires interaction handGT detector"):
                 nas.write_prediction_artifact(data_uri, ["00"], [0])
+
+    def test_auto_label_no_hand_writes_invisible_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "virtual_nas", "nas://orbbec-test")
+            task = LabelTask(
+                root=tmp_path / "captures",
+                subject="S001",
+                task="pick_object",
+                episode="episode_001",
+                cameras=["00"],
+                frames=[0],
+            )
+            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.local_path_for_uri(data_uri)
+
+            nas.write_prediction_artifact(data_uri, ["00"], [0], detector=NoHandDetector())
+
+            pred = np.load(episode_dir / "pred_2d" / "00" / "00000.npy")
+            visible = load_frame_visibility(episode_dir / "pred_2d", "00", 0)
+            self.assertEqual(pred.shape, (2, 21, 2))
+            self.assertTrue(np.all(pred == -1))
+            self.assertEqual(visible, [[False] * 21, [False] * 21])
 
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
         if shutil.which("ffmpeg") is None:

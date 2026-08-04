@@ -826,6 +826,10 @@ def virtual_hand_values(cam: str, frame: int, width: int, height: int, variant: 
     return values
 
 
+def invisible_hand_values() -> List[float]:
+    return [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
+
+
 def write_virtual_hand_npy(
     path: Path,
     *,
@@ -915,7 +919,7 @@ class InteractionHandGtDetector:
 
         width = float(rgb.shape[1])
         height = float(rgb.shape[0])
-        values = [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
+        values = invisible_hand_values()
         used_slots = set()
         bgr = np.ascontiguousarray(rgb[:, :, ::-1])
         cam_meta = {
@@ -932,7 +936,7 @@ class InteractionHandGtDetector:
         }
         detections = self._worker._detect_camera(cam_meta, bgr.tobytes())
         if not detections:
-            return None
+            return values
 
         for idx, inst in enumerate(detections[:_HAND_COUNT]):
             side = str(getattr(inst, "side_vote", "") or "")
@@ -951,7 +955,7 @@ class InteractionHandGtDetector:
                 x, y = point
                 values[base_index + joint_idx * 2] = max(0.0, min(width - 1.0, float(x)))
                 values[base_index + joint_idx * 2 + 1] = max(0.0, min(height - 1.0, float(y)))
-        return values if used_slots else None
+        return values if used_slots else invisible_hand_values()
 
 
 def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDetector:
@@ -1133,7 +1137,7 @@ class NasSimulator:
                     raise BackendError("auto_label requires interaction handGT detector")
                 values = detector.detect_values(base, str(cam), int(frame), rgb_path_template=rgb_path_template)
                 if values is None:
-                    raise BackendError(f"interaction handGT detected no hand: camera={cam} frame={int(frame):05d}")
+                    values = invisible_hand_values()
                 write_float32_npy(out, values)
         return uri_join(data_uri, prediction_dir)
 
@@ -1308,7 +1312,7 @@ def write_prediction_artifact_for_payload(
                     raise BackendError("auto_label requires interaction handGT detector")
                 values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
                 if values is None:
-                    raise BackendError(f"interaction handGT detected no hand: camera={cam} frame={int(frame):05d}")
+                    values = invisible_hand_values()
                 write_float32_npy(out, values)
         return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
     return uri_join(data_uri, prediction_dir)
