@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import locale
 import os
+import shutil
+import tempfile
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -432,6 +435,9 @@ class LabelPage(ttk.Frame):
         self._backend_session: Optional[LabelJobSession] = None
         self._backend_completed: bool = False
         self._heartbeat_after_id: Optional[str] = None
+        self._decode_generation: int = 0
+        self._decode_thread: Optional[threading.Thread] = None
+        self._decode_cache_dir: Optional[Path] = None
         self._mode: str = "mano"
         self._tasks: List[CorrectionTask] = []
         self._tasks_by_key: Dict[str, CorrectionTask] = {}
@@ -537,7 +543,9 @@ class LabelPage(ttk.Frame):
         ttk.Button(bottom, text="Back to Home", style="Secondary.TButton", command=self._back_home).pack(side="left")
 
     def on_hide(self) -> None:
+        self._decode_generation += 1
         self._cancel_backend_heartbeat()
+        self._cleanup_decode_cache()
         self._canvas.clear()
         self._jsonl_path = None
         self._backend_session = None
@@ -586,29 +594,101 @@ class LabelPage(ttk.Frame):
     def _set_backend_session(self, session: LabelJobSession) -> bool:
         try:
             task = correction_task_from_backend_payload(session.payload, mounts=session.mounts)
-            task = ensure_decoded_rgb_frames(task, session.payload)
-            progress_ref = task.episode_dir() / f".{session.job_id}.jsonl"
-            progress = load_correction_progress(str(progress_ref), [task])
-            save_correction_progress(str(progress_ref), progress)
         except Exception as exc:
             messagebox.showerror("Backend Task", str(exc))
             return False
 
+        self._decode_generation += 1
+        generation = self._decode_generation
+        self._cleanup_decode_cache()
+        cache_dir = Path(tempfile.mkdtemp(prefix=f"orbbec_label_{session.job_id}_"))
+        self._decode_cache_dir = cache_dir
         self._backend_session = session
         self._backend_completed = False
-        self._jsonl_path = str(progress_ref)
+        self._jsonl_path = None
+        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...")
+        if self._frame_status is not None:
+            self._frame_status.configure(text="正在解码 RGB 帧...", fg=STATUS_TODO_COLOR)
         self._schedule_backend_heartbeat()
-        return self._apply_session_tasks(
+
+        thread = threading.Thread(
+            target=self._decode_backend_session_worker,
+            args=(generation, session, task, cache_dir),
+            daemon=True,
+        )
+        self._decode_thread = thread
+        thread.start()
+        return True
+
+    def _decode_backend_session_worker(
+        self,
+        generation: int,
+        session: LabelJobSession,
+        task: CorrectionTask,
+        cache_dir: Path,
+    ) -> None:
+        try:
+            decoded_task = ensure_decoded_rgb_frames(task, session.payload, cache_root=cache_dir)
+            progress_ref = decoded_task.episode_dir() / f".{session.job_id}.jsonl"
+            progress = load_correction_progress(str(progress_ref), [decoded_task])
+            save_correction_progress(str(progress_ref), progress)
+        except Exception as exc:
+            self.after(0, lambda error=exc: self._finish_backend_decode(generation, None, None, "", error))
+            return
+        self.after(
+            0,
+            lambda: self._finish_backend_decode(
+                generation,
+                decoded_task,
+                progress,
+                str(progress_ref),
+                None,
+            ),
+        )
+
+    def _finish_backend_decode(
+        self,
+        generation: int,
+        task: Optional[CorrectionTask],
+        progress: Optional[Dict[str, CorrectionProgress]],
+        progress_ref: str,
+        error: Optional[BaseException],
+    ) -> None:
+        if generation != self._decode_generation:
+            return
+        if error is not None or task is None or progress is None:
+            message = str(error or "Failed to decode RGB frames.")
+            self._info.configure(text=f"Backend RGB decode failed: {message}")
+            if self._frame_status is not None:
+                self._frame_status.configure(text="RGB 解码失败", fg=STATUS_TODO_COLOR)
+            messagebox.showerror("Backend Task", message)
+            return
+
+        self._jsonl_path = progress_ref
+        self._apply_session_tasks(
             [task],
             progress,
-            f"Backend job: {session.job_id}",
+            f"Backend job: {self._backend_session.job_id if self._backend_session else task.key}",
+            auto_open_first=True,
         )
+
+    def _cleanup_decode_cache(self) -> None:
+        cache_dir = self._decode_cache_dir
+        self._decode_cache_dir = None
+        if cache_dir is None:
+            return
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     def _apply_session_tasks(
         self,
         tasks: List[CorrectionTask],
         progress: Dict[str, CorrectionProgress],
         info_prefix: str,
+        *,
+        auto_open_first: bool = False,
     ) -> bool:
         self._mode = "mano"
         self._tasks = tasks
@@ -634,7 +714,13 @@ class LabelPage(ttk.Frame):
         self._info.configure(text=f"{info_prefix}    View Source: {self._source_label()}")
         if self._frame_status is not None:
             self._frame_status.configure(text="")
-        self._canvas.clear()
+        if auto_open_first and self._tasks:
+            first_key = self._tasks[0].key
+            self._tree.selection_set(first_key)
+            self._tree.focus(first_key)
+            self._load_task(first_key)
+        else:
+            self._canvas.clear()
         return True
 
     def _schedule_backend_heartbeat(self) -> None:
