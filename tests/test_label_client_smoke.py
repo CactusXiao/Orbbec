@@ -22,6 +22,10 @@ from task_backend.workflow_store import WorkflowStore
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
     def test_mano_source_projects_episode_3d_result(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cv2 is not installed")
         with tempfile.TemporaryDirectory() as tmp:
             episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
             mano_dir = episode_dir / "mano" / "episode"
@@ -45,7 +49,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             )
             joints = np.zeros((1, 2, 21, 3), dtype=np.float32)
             joints[:, :, :, 2] = 1.0
-            joints[0, 1, 0] = -1.0
+            joints[0, 1, 0] = [0.1, 0.2, 1.0]
             np.save(mano_dir / "joints_3d.npy", joints)
             (mano_dir / "mano_episode.json").write_text(
                 json.dumps(
@@ -68,10 +72,12 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
 
             self.assertIsNotNone(projected)
             points, visible = projected  # type: ignore[misc]
-            self.assertEqual(points[0][0], (320.0, 200.0))
+            self.assertAlmostEqual(points[0][0][0], 320.0)
+            self.assertAlmostEqual(points[0][0][1], 200.0)
             self.assertTrue(visible[0][0])
-            self.assertFalse(visible[1][0])
-            self.assertEqual(points[1][0], (-1.0, -1.0))
+            self.assertAlmostEqual(points[1][0][0], 330.0)
+            self.assertAlmostEqual(points[1][0][1], 220.0)
+            self.assertTrue(visible[1][0])
 
     def test_grouped_label_tasks_by_task(self) -> None:
         groups = grouped_label_tasks(
@@ -178,7 +184,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_001"
-            for camera in ("00", "01"):
+            for camera in ("00", "01", "ego", "pico_ego"):
                 rgb = episode_dir / camera / "RGB"
                 rgb.mkdir(parents=True)
                 (rgb / "00001.png").write_bytes(b"rgb")
@@ -193,6 +199,22 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             )
             self.assertEqual(task.cameras, ["00", "01"])
             self.assertEqual(task.frames, [1, 2])
+
+    def test_backend_payload_filters_pico_views_from_explicit_cameras(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
+            payload = {
+                "resolved_data_path": str(episode_dir),
+                "subject_id": "S001",
+                "task_name": "pick_object",
+                "episode_id": "episode_001",
+                "cameras": ["00", "ego", "pico_ego", "fisheye_0", "camera_01"],
+                "frames": [1],
+            }
+
+            task = correction_task_from_backend_payload(payload)
+
+            self.assertEqual(task.cameras, ["00", "camera_01"])
 
     def test_backend_payload_h265_decodes_to_label_cache(self) -> None:
         if shutil.which("ffmpeg") is None:

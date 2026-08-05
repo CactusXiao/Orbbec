@@ -157,8 +157,7 @@ class ManoViewRuntime:
         for hand in range(_HAND_COUNT):
             pts_2d = project_points(cam, joints_3d[hand])
             points.append([(float(x), float(y)) for x, y in pts_2d])
-            valid = np.isfinite(pts_2d).all(axis=1) & (pts_2d[:, 0] >= 0.0)
-            visible.append([bool(v) for v in valid])
+            visible.append([bool(np.all(np.isfinite(pt))) for pt in pts_2d])
         return points, visible
 
     def project_mesh(
@@ -564,38 +563,11 @@ def _normalized_reprojection_loss(torch, joints, camera_tensors, obs_tensors):
 
 
 def project_points(cam: CameraParams, points_3d: np.ndarray) -> np.ndarray:
-    points = np.asarray(points_3d, dtype=np.float64).reshape(-1, 3)
-    valid = np.isfinite(points).all(axis=1) & ~np.all(points == -1.0, axis=1)
-    out = np.full((len(points), 2), -1.0, dtype=np.float32)
-    if not np.any(valid):
-        return out
-    try:
-        import cv2
+    import cv2
 
-        rvec, _ = cv2.Rodrigues(cam.r)
-        pts, _ = cv2.projectPoints(points[valid], rvec, cam.t.reshape(3, 1), cam.k, cam.dist)
-        out[valid] = pts.reshape(-1, 2).astype(np.float32)
-        return out
-    except Exception:
-        cam_points = (cam.r @ points[valid].T).T + cam.t.reshape(1, 3)
-        z = cam_points[:, 2]
-        cam_valid = np.isfinite(cam_points).all(axis=1) & (np.abs(z) > 1e-8)
-        if not np.any(cam_valid):
-            return out
-        x = cam_points[cam_valid, 0] / z[cam_valid]
-        y = cam_points[cam_valid, 1] / z[cam_valid]
-        dist = np.zeros(5, dtype=np.float64)
-        raw_dist = np.asarray(cam.dist, dtype=np.float64).reshape(-1)
-        dist[: min(5, raw_dist.shape[0])] = raw_dist[:5]
-        k1, k2, p1, p2, k3 = [float(v) for v in dist]
-        r2 = x * x + y * y
-        radial = 1.0 + k1 * r2 + k2 * r2 * r2 + k3 * r2 * r2 * r2
-        x_dist = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
-        y_dist = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
-        original_indices = np.flatnonzero(valid)[cam_valid]
-        out[original_indices, 0] = cam.k[0, 0] * x_dist + cam.k[0, 2]
-        out[original_indices, 1] = cam.k[1, 1] * y_dist + cam.k[1, 2]
-        return out
+    rvec, _ = cv2.Rodrigues(cam.r)
+    pts, _ = cv2.projectPoints(points_3d.astype(np.float64), rvec, cam.t.reshape(3, 1), cam.k, cam.dist)
+    return pts.reshape(-1, 2)
 
 
 def mesh_edges(faces: np.ndarray) -> List[Tuple[int, int]]:

@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - script execution fallback
 
 
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
+_NON_LABEL_CAMERA_TOKENS = ("ego", "pico", "fisheye")
 AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
 STAGE_ARTIFACT_KINDS = {
     "auto_label": {"pred_2d", "auto_2d"},
@@ -100,6 +101,18 @@ def _as_str_list(value: Any) -> List[str]:
     return out
 
 
+def _is_label_camera_id(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return not any(token in lowered for token in _NON_LABEL_CAMERA_TOKENS)
+
+
+def _label_camera_ids(value: Any) -> List[str]:
+    return [camera for camera in _as_str_list(value) if _is_label_camera_id(camera)]
+
+
 def _as_int_list(value: Any) -> List[int]:
     if not isinstance(value, list):
         return []
@@ -158,7 +171,7 @@ def _discover_cameras(episode_dir: Optional[Path]) -> List[str]:
         return []
     cameras = []
     for child in episode_dir.iterdir():
-        if child.is_dir() and (child / "RGB").is_dir():
+        if child.is_dir() and (child / "RGB").is_dir() and _is_label_camera_id(child.name):
             cameras.append(child.name)
     return sorted(cameras)
 
@@ -234,7 +247,7 @@ class JobService:
         episode_id = str(payload_in.get("episode_id") or inferred_episode or _new_id("episode")).strip()
         episode_index = _optional_int(payload_in.get("episode_index"))
 
-        cameras = _as_str_list(payload_in.get("cameras")) or _discover_cameras(episode_path)
+        cameras = _label_camera_ids(payload_in.get("cameras")) or _discover_cameras(episode_path)
         frames = _as_int_list(payload_in.get("frames")) or _discover_frames(episode_path, cameras)
         frame_count = _optional_int(payload_in.get("frame_count")) or len(frames) or None
         priority = _optional_int(payload_in.get("priority"))
@@ -305,7 +318,7 @@ class JobService:
                 data_uri=str(episode_obj.get("data_uri") or payload_in.get("data_uri") or ""),
                 local_capture_path=str(episode_obj.get("local_capture_path") or ""),
                 frame_count=_optional_int(episode_obj.get("frame_count")),
-                cameras=_as_str_list(episode_obj.get("cameras")),
+                cameras=_label_camera_ids(episode_obj.get("cameras")),
                 metadata=json_object(episode_obj.get("metadata"), "episode.metadata"),
             )
         job_id = str(payload_in.get("job_id") or _new_id(job_type)).strip()
@@ -848,7 +861,7 @@ class JobService:
             payload.setdefault("subject_id", episode.get("subject_id"))
             payload.setdefault("task_name", episode.get("task_name"))
             payload.setdefault("data_uri", episode.get("data_uri"))
-            payload.setdefault("cameras", episode.get("cameras") or [])
+            payload.setdefault("cameras", _label_camera_ids(episode.get("cameras") or []))
             payload.setdefault("local_capture_path", episode.get("local_capture_path") or "")
         resolved_data_path = self.resolve_data_path(
             str(payload.get("data_uri") or ""),
@@ -858,7 +871,7 @@ class JobService:
             payload.setdefault("resolved_data_path", resolved_data_path)
         if episode is not None:
             episode_id = str(episode.get("episode_id") or job.get("episode_id") or "")
-            cameras = _as_str_list(payload.get("cameras")) or self._cameras_for_episode_context(episode_id, episode, payload)
+            cameras = _label_camera_ids(payload.get("cameras")) or self._cameras_for_episode_context(episode_id, episode, payload)
             if cameras:
                 payload["cameras"] = cameras
             frames = _as_int_list(payload.get("frames")) or self._frames_for_episode_context(
@@ -1191,15 +1204,15 @@ class JobService:
         *payloads: Dict[str, Any],
     ) -> List[str]:
         for payload in payloads:
-            cameras = _as_str_list((payload or {}).get("cameras"))
+            cameras = _label_camera_ids((payload or {}).get("cameras"))
             if cameras:
                 return cameras
-        cameras = _as_str_list(episode.get("cameras"))
+        cameras = _label_camera_ids(episode.get("cameras"))
         if cameras:
             return cameras
         for job_type in ("auto_label", "mano_opt", "qc", "manual_label", "upload"):
             for job in self.store.jobs_for_episode(episode_id, job_type):
-                cameras = _as_str_list((job.get("payload") or {}).get("cameras"))
+                cameras = _label_camera_ids((job.get("payload") or {}).get("cameras"))
                 if cameras:
                     return cameras
         episode_path = self._resolved_episode_path(
@@ -1681,8 +1694,8 @@ class JobService:
         source_payload = dict(source_payload or {})
         episode_path = self._resolved_episode_path(str(episode.get("data_uri") or data_uri), local_path)
         cameras = (
-            _as_str_list(source_payload.get("cameras"))
-            or _as_str_list(episode.get("cameras"))
+            _label_camera_ids(source_payload.get("cameras"))
+            or _label_camera_ids(episode.get("cameras"))
             or _discover_cameras(episode_path)
         )
         frames = _as_int_list(source_payload.get("frames")) or _discover_frames(episode_path, cameras)

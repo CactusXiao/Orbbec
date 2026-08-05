@@ -20,6 +20,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             (source / "00" / "RGB").mkdir(parents=True)
             (source / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
             (source / "00" / "RGB" / "00002.png").write_bytes(b"rgb2")
+            (source / "ego" / "RGB").mkdir(parents=True)
+            (source / "ego" / "RGB" / "00001.png").write_bytes(b"pico")
             (source / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
@@ -60,6 +62,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(len(auto_jobs), 1)
             self.assertEqual(auto_jobs[0]["payload"]["scope"], "episode")
             self.assertEqual(auto_jobs[0]["payload"]["frames"], [1, 2])
+            self.assertEqual(auto_jobs[0]["payload"]["cameras"], ["00"])
             self.assertIn("/episodes/reservation_001", render_workflow_stage_page(service.workflow_stage("auto_label")))
 
     def test_auto_label_mano_episode_qc_pass_finalizes_episode(self) -> None:

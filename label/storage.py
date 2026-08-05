@@ -18,6 +18,7 @@ except Exception:
 
 
 _FRAME_RE = re.compile(r"^(\d{5})\.[^.]+$")
+_NON_LABEL_CAMERA_TOKENS = ("ego", "pico", "fisheye")
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
 
@@ -141,6 +142,18 @@ def _optional_str_list(obj: Dict, key: str) -> List[str]:
     return out
 
 
+def _is_label_camera_id(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return not any(token in lowered for token in _NON_LABEL_CAMERA_TOKENS)
+
+
+def _label_camera_ids(value: List[str]) -> List[str]:
+    return [camera for camera in value if _is_label_camera_id(camera)]
+
+
 def _as_int_list(obj: Dict, key: str, line_no: int) -> List[int]:
     value = obj.get(key)
     if not isinstance(value, list) or not value:
@@ -173,7 +186,7 @@ def _discover_cameras(episode_dir: Path) -> List[str]:
         return []
     cameras: List[str] = []
     for child in episode_dir.iterdir():
-        if child.is_dir() and (child / "RGB").is_dir():
+        if child.is_dir() and (child / "RGB").is_dir() and _is_label_camera_id(child.name):
             cameras.append(child.name)
     return sorted(cameras)
 
@@ -250,7 +263,7 @@ def correction_task_from_backend_payload(
         if not data_uri:
             raise ValueError("Backend label job payload must include `resolved_data_path` or `data_uri`.")
         episode_dir = resolver.resolve(data_uri)
-    cameras = _optional_str_list(payload, "cameras") or _discover_cameras(episode_dir)
+    cameras = _label_camera_ids(_optional_str_list(payload, "cameras")) or _discover_cameras(episode_dir)
     frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
     if not cameras:
         raise ValueError(
