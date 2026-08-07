@@ -3783,7 +3783,7 @@ private:
     }
 
     bool wantsPicoRgbPreview() const {
-        return imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Pico;
+        return imageType_ == ImageType::RGB && (cfg_.demo.active || rgbImageSource_ == RgbImageSource::Pico);
     }
 
     bool wantsEgoPreviewSession() const {
@@ -6192,14 +6192,23 @@ private:
             }
         };
 
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Orbbec ? "Orbbec*" : "Orbbec", ms)) {
-            setRgbSource(RgbImageSource::Orbbec);
+        if(cfg_.demo.active) {
+            cv::rectangle(canvas, cv::Rect(bx, by, bw, bh), cv::Scalar(34, 34, 34), cv::FILLED);
+            cv::rectangle(canvas, cv::Rect(bx, by, bw, bh), cv::Scalar(88, 88, 88), 1);
+            cv::putText(canvas, "PICO + Orbbec", cv::Point(bx + 8, by + 19), cv::FONT_HERSHEY_DUPLEX, 0.5,
+                        cv::Scalar(235, 235, 235), 1, cv::LINE_AA);
+            by += bh + 12;
         }
-        by += bh + 6;
-        if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Pico ? "PICO*" : "PICO", ms)) {
-            setRgbSource(RgbImageSource::Pico);
+        else {
+            if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Orbbec ? "Orbbec*" : "Orbbec", ms)) {
+                setRgbSource(RgbImageSource::Orbbec);
+            }
+            by += bh + 6;
+            if(uiButton(canvas, cv::Rect(bx, by, bw, bh), rgbImageSource_ == RgbImageSource::Pico ? "PICO*" : "PICO", ms)) {
+                setRgbSource(RgbImageSource::Pico);
+            }
+            by += bh + 12;
         }
-        by += bh + 12;
         cv::putText(canvas, "Overlay", cv::Point(layout_.camsRect.x + 10, by + 18), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         by += 26;
 
@@ -6466,6 +6475,160 @@ private:
         }
     }
 
+    void copyFitImage(cv::Mat &canvas, const cv::Mat &img, const cv::Rect &area) const {
+        if(img.empty() || area.width <= 0 || area.height <= 0 || img.cols <= 0 || img.rows <= 0) {
+            return;
+        }
+        double scale = std::min(static_cast<double>(area.width) / static_cast<double>(img.cols),
+                                static_cast<double>(area.height) / static_cast<double>(img.rows));
+        if(!(scale > 0.0)) {
+            scale = 1.0;
+        }
+        const int drawW = std::max(1, std::min(area.width, static_cast<int>(std::lround(static_cast<double>(img.cols) * scale))));
+        const int drawH = std::max(1, std::min(area.height, static_cast<int>(std::lround(static_cast<double>(img.rows) * scale))));
+        const cv::Rect roi(area.x + (area.width - drawW) / 2,
+                           area.y + (area.height - drawH) / 2,
+                           drawW,
+                           drawH);
+        if(roi.x < 0 || roi.y < 0 || roi.x + roi.width > canvas.cols || roi.y + roi.height > canvas.rows) {
+            return;
+        }
+        cv::Mat resized;
+        cv::resize(img, resized, cv::Size(drawW, drawH), 0.0, 0.0, cv::INTER_AREA);
+        resized.copyTo(canvas(roi));
+    }
+
+    void drawDemoCombinedRgbPanel(cv::Mat &canvas, const std::unordered_map<int, CachedFrameBundle> &frames) {
+        const int panelX = layout_.imgRect.x + 8;
+        const int panelW = std::max(1, layout_.imgRect.width - 16);
+        const int contentTop = layout_.imgRect.y + 40;
+        const int panelBottom = layout_.imgRect.y + layout_.imgRect.height - 8;
+        const int contentH = std::max(1, panelBottom - contentTop);
+        const int gap = 8;
+
+        const int minGridH = 3 * 74 + 2 * gap;
+        int picoH = std::max(120, static_cast<int>(std::lround(static_cast<double>(contentH) * 0.38)));
+        if(contentH > minGridH + gap + 80) {
+            picoH = std::min(picoH, contentH - minGridH - gap);
+        }
+        else {
+            picoH = std::max(70, contentH / 3);
+        }
+        picoH = std::min(picoH, std::max(1, contentH - gap - 3));
+
+        const cv::Rect picoTile(panelX, contentTop, panelW, picoH);
+        cv::rectangle(canvas, picoTile, cv::Scalar(24, 24, 24), cv::FILLED);
+        cv::rectangle(canvas, picoTile, cv::Scalar(78, 78, 78), 1);
+        const std::string picoLabel = latestPicoRgbVideoFrameIndex_ >= 0
+                                    ? ("PICO RGB frame " + std::to_string(latestPicoRgbVideoFrameIndex_))
+                                    : "PICO RGB";
+        cv::putText(canvas,
+                    ellipsizeTextToWidth(picoLabel, picoTile.width - 10, cv::FONT_HERSHEY_DUPLEX, 0.48, 1),
+                    cv::Point(picoTile.x + 5, picoTile.y + 17),
+                    cv::FONT_HERSHEY_DUPLEX,
+                    0.48,
+                    cv::Scalar(235, 235, 235),
+                    1,
+                    cv::LINE_AA);
+
+        const cv::Rect picoImgArea(picoTile.x + 4, picoTile.y + 22, std::max(1, picoTile.width - 8), std::max(1, picoTile.height - 44));
+        if(!latestPicoRgbFrame_.empty()) {
+            const double scale = std::min(static_cast<double>(picoImgArea.width) / static_cast<double>(latestPicoRgbFrame_.cols),
+                                          static_cast<double>(picoImgArea.height) / static_cast<double>(latestPicoRgbFrame_.rows));
+            const int drawW = std::max(1, std::min(picoImgArea.width, static_cast<int>(std::lround(static_cast<double>(latestPicoRgbFrame_.cols) * scale))));
+            const int drawH = std::max(1, std::min(picoImgArea.height, static_cast<int>(std::lround(static_cast<double>(latestPicoRgbFrame_.rows) * scale))));
+            cv::Mat picoDraw;
+            cv::resize(latestPicoRgbFrame_, picoDraw, cv::Size(drawW, drawH), 0.0, 0.0, cv::INTER_AREA);
+            const PicoHand2dResult hand2dResult = picoHand2dWorker_.latestResult();
+            drawPicoHand2dOverlay(picoDraw,
+                                  hand2dResult,
+                                  static_cast<double>(drawW) / static_cast<double>(latestPicoRgbFrame_.cols),
+                                  static_cast<double>(drawH) / static_cast<double>(latestPicoRgbFrame_.rows));
+            const cv::Rect roi(picoImgArea.x + (picoImgArea.width - drawW) / 2,
+                               picoImgArea.y + (picoImgArea.height - drawH) / 2,
+                               drawW,
+                               drawH);
+            if(roi.x >= 0 && roi.y >= 0 && roi.x + roi.width <= canvas.cols && roi.y + roi.height <= canvas.rows) {
+                picoDraw.copyTo(canvas(roi));
+            }
+        }
+        else {
+            cv::putText(canvas, "waiting", cv::Point(picoImgArea.x + 8, picoImgArea.y + std::max(24, picoImgArea.height / 2)),
+                        cv::FONT_HERSHEY_DUPLEX, 0.52, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+        }
+
+        std::string status = picoRgbStatusLine_;
+        const std::string handStatus = picoHand2dWorker_.statusLine();
+        if(!handStatus.empty()) {
+            status += status.empty() ? handStatus : (" | " + handStatus);
+        }
+        if(!status.empty()) {
+            status = ellipsizeTextToWidth(status, picoTile.width - 10, cv::FONT_HERSHEY_DUPLEX, 0.38, 1);
+            cv::putText(canvas, status, cv::Point(picoTile.x + 5, picoTile.y + picoTile.height - 8),
+                        cv::FONT_HERSHEY_DUPLEX, 0.38, cv::Scalar(185, 220, 255), 1, cv::LINE_AA);
+        }
+
+        std::vector<int> visibleDeviceIndices;
+        visibleDeviceIndices.reserve(devices_.size());
+        for(size_t i = 0; i < devices_.size(); ++i) {
+            if(isCameraEnabled(static_cast<int>(i))) {
+                visibleDeviceIndices.push_back(static_cast<int>(i));
+            }
+        }
+
+        const int cols = 2;
+        const int rows = 3;
+        const int gridY = picoTile.y + picoTile.height + gap;
+        const int gridH = std::max(1, panelBottom - gridY);
+        const int tileW = std::max(1, (panelW - gap * (cols - 1)) / cols);
+        const int tileH = std::max(1, (gridH - gap * (rows - 1)) / rows);
+
+        for(int slot = 0; slot < rows * cols; ++slot) {
+            const int row = slot / cols;
+            const int col = slot % cols;
+            const cv::Rect tile(panelX + col * (tileW + gap), gridY + row * (tileH + gap), tileW, tileH);
+            if(tile.y >= panelBottom) {
+                continue;
+            }
+            cv::rectangle(canvas, tile, cv::Scalar(24, 24, 24), cv::FILLED);
+            cv::rectangle(canvas, tile, cv::Scalar(78, 78, 78), 1);
+
+            int deviceIndex = -1;
+            if(slot < static_cast<int>(visibleDeviceIndices.size())) {
+                deviceIndex = visibleDeviceIndices[static_cast<size_t>(slot)];
+            }
+            std::string label = "Orbbec RGB";
+            cv::Mat img;
+            if(deviceIndex >= 0 && deviceIndex < static_cast<int>(devices_.size())) {
+                const auto &rt = devices_[static_cast<size_t>(deviceIndex)];
+                label = rt.cfg.index + " " + rt.cfg.sn;
+                auto it = frames.find(deviceIndex);
+                if(it != frames.end()) {
+                    img = visualizeObFrame(it->second.color);
+                }
+            }
+            cv::putText(canvas,
+                        ellipsizeTextToWidth(label, tile.width - 10, cv::FONT_HERSHEY_DUPLEX, 0.38, 1),
+                        cv::Point(tile.x + 5, tile.y + 14),
+                        cv::FONT_HERSHEY_DUPLEX,
+                        0.38,
+                        cv::Scalar(230, 230, 230),
+                        1,
+                        cv::LINE_AA);
+
+            const cv::Rect imgArea(tile.x + 3, tile.y + 18, std::max(1, tile.width - 6), std::max(1, tile.height - 21));
+            if(!img.empty()) {
+                copyFitImage(canvas, img, imgArea);
+            }
+            else {
+                cv::putText(canvas, "waiting", cv::Point(imgArea.x + 6, imgArea.y + std::max(20, imgArea.height / 2)),
+                            cv::FONT_HERSHEY_DUPLEX, 0.4, cv::Scalar(150, 150, 150), 1, cv::LINE_AA);
+            }
+        }
+
+        imageScrollY_ = 0;
+    }
+
     bool drawImagePanel(cv::Mat &canvas, CvMouseState &ms) {
         cv::rectangle(canvas, layout_.imgRect, cv::Scalar(16, 16, 16), cv::FILLED);
         cv::rectangle(canvas, layout_.imgRect, cv::Scalar(60, 60, 60), 1);
@@ -6481,7 +6644,7 @@ private:
             title += "Depth";
         }
         else if(imageType_ == ImageType::RGB) {
-            title += rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB" : "Orbbec RGB";
+            title += cfg_.demo.active ? "PICO + Orbbec RGB" : (rgbImageSource_ == RgbImageSource::Pico ? "PICO RGB" : "Orbbec RGB");
         }
         else if(imageType_ == ImageType::IRLeft) {
             title += "IR Left";
@@ -6494,6 +6657,12 @@ private:
         const int contentTop = layout_.imgRect.y + 40;
         int y = contentTop - imageScrollY_;
         int totalH = 0;
+        auto frames = snapshotFrames();
+
+        if(cfg_.demo.active && imageType_ == ImageType::RGB) {
+            drawDemoCombinedRgbPanel(canvas, frames);
+            return false;
+        }
 
         if(imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Pico) {
             const int targetW = std::max(1, layout_.imgRect.width - 20);
@@ -6550,7 +6719,6 @@ private:
             return false;
         }
 
-        auto frames = snapshotFrames();
         if(imageType_ == ImageType::RGB && rgbImageSource_ == RgbImageSource::Orbbec) {
             std::vector<int> visibleDeviceIndices;
             visibleDeviceIndices.reserve(devices_.size());
