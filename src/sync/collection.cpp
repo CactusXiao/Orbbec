@@ -1295,22 +1295,39 @@ private:
 #if defined(__APPLE__)
         std::ostringstream cmd;
         cmd << "if command -v say >/dev/null 2>&1; then say ";
+        if(containsNonAscii(text)) {
+            cmd << "-v Tingting ";
+        }
         if(!device.empty() && device != "default") {
             cmd << "-a " << qDevice << " ";
         }
         cmd << qText << "; fi";
         return cmd.str();
 #else
+        const std::string naturalChineseTts =
+            "(tmp=$(mktemp /tmp/orbbec-voice.XXXXXX.mp3); rm -f \"$tmp\"; "
+            "play_voice(){ "
+            "if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet \"$1\"; "
+            "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video \"$1\"; "
+            "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q \"$1\"; "
+            "else return 1; fi; "
+            "}; "
+            "if command -v edge-tts >/dev/null 2>&1 "
+            "&& edge-tts --voice zh-CN-XiaoxiaoNeural --text " + qText + " --write-media \"$tmp\" >/dev/null 2>&1 "
+            "&& play_voice \"$tmp\"; then rm -f \"$tmp\"; exit 0; fi; "
+            "rm -f \"$tmp\"; "
+            "if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- " + qText + "; "
+            "elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin " + qText + "; "
+            "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 " + qText + "; "
+            "elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 " + qText + "; fi)";
         if(containsNonAscii(text)) {
-            return "(if command -v spd-say >/dev/null 2>&1 && spd-say -w -- " + qText + "; then :; "
-                   "elif command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
-                   "espeak --stdout " + qText + " | aplay -q -D " + qDevice + "; "
-                   "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; fi)";
+            return naturalChineseTts;
         }
-        return "(if command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
+        return "(if command -v spd-say >/dev/null 2>&1 && spd-say -w -- " + qText + "; then :; "
+               "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -s 155 " + qText + "; "
+               "elif command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
                "espeak --stdout " + qText + " | aplay -q -D " + qDevice + "; "
-               "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; "
-               "elif command -v spd-say >/dev/null 2>&1; then spd-say -w -- " + qText + "; fi)";
+               "elif command -v espeak >/dev/null 2>&1; then espeak " + qText + "; fi)";
 #endif
     }
 
