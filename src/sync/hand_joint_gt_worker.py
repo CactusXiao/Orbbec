@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -16,6 +17,15 @@ try:
     import mediapipe as mp
 except ModuleNotFoundError:
     mp = None
+mp_hands = None
+if mp is not None:
+    try:
+        mp_hands = mp.solutions.hands
+    except AttributeError:
+        try:
+            from mediapipe.python.solutions import hands as mp_hands  # type: ignore
+        except (AttributeError, ImportError, ModuleNotFoundError):
+            mp_hands = None
 
 
 HEADER = struct.Struct("<IQ")
@@ -231,9 +241,9 @@ class HandGtWorker:
 
     @staticmethod
     def _create_hands():
-        if mp is None:
+        if mp_hands is None:
             raise RuntimeError("mediapipe is not installed")
-        return mp.solutions.hands.Hands(
+        return mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
             model_complexity=0,
@@ -353,17 +363,19 @@ class HandGtWorker:
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
 
         result = hands.process(rgb)
-        landmarks_list = result.multi_hand_landmarks or []
-        handedness_list = result.multi_handedness or []
+        landmarks_list = getattr(result, "multi_hand_landmarks", None) or []
+        handedness_list = getattr(result, "multi_handedness", None) or []
 
         detections: List[HandInstance] = []
         for idx, hand_landmarks in enumerate(landmarks_list):
             side_vote = None
             score = 0.0
-            if idx < len(handedness_list) and handedness_list[idx].classification:
-                cls = handedness_list[idx].classification[0]
-                side_vote = normalize_handedness(cls.label)
-                score = float(cls.score)
+            if idx < len(handedness_list):
+                classifications = getattr(handedness_list[idx], "classification", None) or []
+                if classifications:
+                    cls = classifications[0]
+                    side_vote = normalize_handedness(str(getattr(cls, "label", "")))
+                    score = float(getattr(cls, "score", 0.0))
 
             joints_orig: List[Optional[Tuple[float, float]]] = []
             joints_scaled: List[Optional[Tuple[float, float]]] = []
@@ -372,11 +384,13 @@ class HandGtWorker:
             xs_scaled = []
             ys_scaled = []
             valid_count = 0
-            for lm in hand_landmarks.landmark:
-                valid = (-LANDMARK_NORMALIZED_MARGIN) <= lm.x <= (1.0 + LANDMARK_NORMALIZED_MARGIN) and (-LANDMARK_NORMALIZED_MARGIN) <= lm.y <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
+            for lm in getattr(hand_landmarks, "landmark", []):
+                lm_x = float(getattr(lm, "x", 0.0))
+                lm_y = float(getattr(lm, "y", 0.0))
+                valid = (-LANDMARK_NORMALIZED_MARGIN) <= lm_x <= (1.0 + LANDMARK_NORMALIZED_MARGIN) and (-LANDMARK_NORMALIZED_MARGIN) <= lm_y <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
                 if valid:
-                    u_scaled = float(lm.x) * float(rgb_width)
-                    v_scaled = float(lm.y) * float(rgb_height)
+                    u_scaled = lm_x * float(rgb_width)
+                    v_scaled = lm_y * float(rgb_height)
                     u_orig = u_scaled * rgb_scale_x
                     v_orig = v_scaled * rgb_scale_y
                     joints_scaled.append((u_scaled, v_scaled))
@@ -932,26 +946,30 @@ class HandGtWorker:
         rgb = np.ascontiguousarray(bgr[:, :, ::-1])
         hands_detector = self._hands_for_camera("pico_rgb")
         result = hands_detector.process(rgb)
-        landmarks_list = result.multi_hand_landmarks or []
-        handedness_list = result.multi_handedness or []
+        landmarks_list = getattr(result, "multi_hand_landmarks", None) or []
+        handedness_list = getattr(result, "multi_handedness", None) or []
 
         hands = []
         for idx, hand_landmarks in enumerate(landmarks_list[:MAX_TRACKS]):
             side = ""
             score = 0.0
-            if idx < len(handedness_list) and handedness_list[idx].classification:
-                cls = handedness_list[idx].classification[0]
-                side = normalize_handedness(cls.label)
-                score = float(cls.score)
+            if idx < len(handedness_list):
+                classifications = getattr(handedness_list[idx], "classification", None) or []
+                if classifications:
+                    cls = classifications[0]
+                    side = normalize_handedness(str(getattr(cls, "label", "")))
+                    score = float(getattr(cls, "score", 0.0))
 
             joints = []
             xs = []
             ys = []
             valid_count = 0
-            for joint_index, lm in enumerate(hand_landmarks.landmark[:MAX_JOINTS]):
-                valid = (-LANDMARK_NORMALIZED_MARGIN) <= lm.x <= (1.0 + LANDMARK_NORMALIZED_MARGIN) and (-LANDMARK_NORMALIZED_MARGIN) <= lm.y <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
-                x = float(lm.x) * float(rgb_width) * rgb_scale_x
-                y = float(lm.y) * float(rgb_height) * rgb_scale_y
+            for joint_index, lm in enumerate(list(getattr(hand_landmarks, "landmark", []))[:MAX_JOINTS]):
+                lm_x = float(getattr(lm, "x", 0.0))
+                lm_y = float(getattr(lm, "y", 0.0))
+                valid = (-LANDMARK_NORMALIZED_MARGIN) <= lm_x <= (1.0 + LANDMARK_NORMALIZED_MARGIN) and (-LANDMARK_NORMALIZED_MARGIN) <= lm_y <= (1.0 + LANDMARK_NORMALIZED_MARGIN)
+                x = lm_x * float(rgb_width) * rgb_scale_x
+                y = lm_y * float(rgb_height) * rgb_scale_y
                 if valid:
                     xs.append(x)
                     ys.append(y)
@@ -961,7 +979,7 @@ class HandGtWorker:
                         "index": int(joint_index),
                         "valid": bool(valid),
                         "xy": [x, y],
-                        "z": float(lm.z),
+                        "z": float(getattr(lm, "z", 0.0)),
                     }
                 )
 
@@ -1022,12 +1040,15 @@ def main():
                 else:
                     response = worker.process_frame_batch(meta, payload or b"")
             except Exception as exc:  # noqa: BLE001
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                detail = str(exc).replace("\n", " ")[:180]
                 response = {
                     "ok": False,
                     "frame_id": int(meta.get("frame_id", 0)),
                     "timestamp_us": int(meta.get("timestamp_us", 0)),
                     "fps": 0.0,
-                    "status": f"worker error: {type(exc).__name__}",
+                    "status": f"worker error: {type(exc).__name__}: {detail}" if detail else f"worker error: {type(exc).__name__}",
                     "visible_hands": 0,
                     "hands": [],
                 }
