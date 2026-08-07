@@ -5,6 +5,7 @@
 #include "utils/utils.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <thread>
 #include <unordered_set>
 
 #if defined(__unix__) || defined(__APPLE__)
@@ -2682,7 +2684,7 @@ public:
         return lastRecordedSeconds_;
     }
 
-    bool autoStopIfTimeout() {
+    bool recordingReachedTimeout() const {
         if(!recording_.load()) {
             return false;
         }
@@ -2690,7 +2692,11 @@ public:
             return false;
         }
         const auto elapsed = std::chrono::steady_clock::now() - captureStartSteady_;
-        if(elapsed >= std::chrono::seconds(cfg_.durationSec)) {
+        return elapsed >= std::chrono::seconds(cfg_.durationSec);
+    }
+
+    bool autoStopIfTimeout() {
+        if(recordingReachedTimeout()) {
             stopRecording();
             return true;
         }
@@ -8281,6 +8287,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
     bool extrinsicReadyChecked = false;
     bool extrinsicReadyPassed = false;
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
+    std::thread stopRecordingThread;
+    std::atomic_bool stopRecordingActive{false};
+    std::atomic_bool stopRecordingDone{false};
     cfgUi.enableEgo = cfg.ego.enabled;
     if(cfg.demo.active) {
         cfgUi.enableMultiview = cfg.demo.collection.enableMultiview;
@@ -8324,6 +8333,43 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
     auto announce = [&](const std::string &messageKey, const std::string &fallbackText) {
         voice.say(messageKey, fallbackText);
+    };
+
+    auto joinFinishedStopRecordingThread = [&]() -> bool {
+        if(!stopRecordingDone.exchange(false)) {
+            return false;
+        }
+        if(stopRecordingThread.joinable()) {
+            stopRecordingThread.join();
+        }
+        stopRecordingActive.store(false);
+        return true;
+    };
+
+    auto waitStopRecordingThread = [&]() {
+        if(stopRecordingThread.joinable()) {
+            stopRecordingThread.join();
+        }
+        stopRecordingActive.store(false);
+        stopRecordingDone.store(false);
+    };
+
+    auto requestStopRecordingAsync = [&]() -> bool {
+        if(stopRecordingActive.load()) {
+            return false;
+        }
+        if(stopRecordingThread.joinable()) {
+            stopRecordingThread.join();
+        }
+        stopRecordingDone.store(false);
+        stopRecordingActive.store(true);
+        stopRecordingThread = std::thread([&recorder, &stopRecordingActive, &stopRecordingDone]() {
+            collectionSetStage("ui_stop_recording_worker");
+            recorder.stopRecording();
+            stopRecordingDone.store(true);
+            stopRecordingActive.store(false);
+        });
+        return true;
     };
 
     auto resetCameraReadyAnnouncement = [&]() {
@@ -8470,6 +8516,18 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         }
     };
 
+    auto beginStopRecordingUi = [&](std::string message, std::string logLine) {
+        const bool launched = requestStopRecordingAsync();
+        captureState = CaptureState::DRAINING;
+        capUi.msg = std::move(message);
+        if(!logLine.empty()) {
+            pushUiLog(std::move(logLine));
+        }
+        if(!launched && stopRecordingActive.load()) {
+            pushUiLog("Stop already in progress.");
+        }
+    };
+
     auto enterDeleteConfirm = [&]() {
         if(captureState != CaptureState::DELETE_CONFIRM) {
             announce("reset_select", "reset select");
@@ -8505,6 +8563,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         auto fm = beginFrame(ms);
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
+            waitStopRecordingThread();
             recorder.stopIfRunning();
             running = false;
             break;
@@ -8575,6 +8634,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             if(uiButton(ui, bBack, "Back to Menu", fm)) {
                 collectionSetStage("ui_back_menu");
                 announce("menu", "menu");
+                waitStopRecordingThread();
                 recorder.stopIfRunning();
                 running = false;
             }
@@ -8602,7 +8662,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         else {
             collectionSetStage("ui_page_capture");
 
-            if(!activeCameraFault.has_value()) {
+            if(joinFinishedStopRecordingThread()) {
+                pushUiLog("Recording stop completed.");
+            }
+
+            if(!activeCameraFault.has_value() && captureState == CaptureState::RECORDING && !stopRecordingActive.load()) {
                 auto fault = recorder.pollCameraStreamFault();
                 if(fault.has_value()) {
                     activeCameraFault = fault;
@@ -8612,16 +8676,15 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     capUi.msg = "Camera stream timeout. Choose an action.";
                     pushUiLog(fault->message);
                     announce("camera_fault", "camera error");
-                    if(captureState == CaptureState::RECORDING) {
-                        recorder.stopRecording();
-                        captureState = recorder.isDrainComplete() ? CaptureState::STOPPED_READY : CaptureState::DRAINING;
-                        pushUiLog("Camera fault fuse tripped. Recording stopped.");
-                    }
+                    beginStopRecordingUi("Camera stream timeout. Stopping recording...",
+                                         "Camera fault fuse tripped. Stopping recording.");
                 }
             }
 
             const bool cameraFaultActive = activeCameraFault.has_value();
-            const bool cameraFaultRestartBlocked = cameraFaultActive && recorder.hasCurrentSession() && !recorder.isDrainComplete();
+            const bool cameraFaultRestartBlocked = cameraFaultActive
+                                                && (stopRecordingActive.load()
+                                                    || (recorder.hasCurrentSession() && !recorder.isDrainComplete()));
             const auto cameraReadiness = recorder.cameraStreamReadiness();
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
                && capUi.currentTaskIdx != -1 && !extrinsicReadyChecked) {
@@ -8655,14 +8718,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 resetCameraReadyAnnouncement();
             }
 
-            if(!cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()) {
+            if(!cameraFaultActive && captureState == CaptureState::DRAINING
+               && !stopRecordingActive.load() && recorder.isDrainComplete()) {
                 updateReadyState();
                 if(pendingResetAfterDrain) {
                     pushUiLog("Reset requested. Review delete confirmation.");
                     enterDeleteConfirm();
                 }
             }
-            else if(cameraFaultActive && captureState == CaptureState::DRAINING && recorder.isDrainComplete()
+            else if(cameraFaultActive && captureState == CaptureState::DRAINING
+                    && !stopRecordingActive.load() && recorder.isDrainComplete()
                     && !cameraFaultDrainCompleteLogged) {
                 pushUiLog("Faulted episode is ready to delete before restart.");
                 cameraFaultDrainCompleteLogged = true;
@@ -8782,13 +8847,23 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 stateEmphasisLine = recorder.currentRecordingStatsLine();
                 break;
             case CaptureState::DRAINING:
-                sd = {"STOPPED", cv::Scalar(50, 200, 255), cv::Scalar(20, 40, 80)};
-                stateEmphasisLine = recorder.captureFrameSummaryLine();
-                stateFootnoteLine = "saving data";
-                {
-                    const std::string drain = recorder.drainStatusLine();
-                    if(!drain.empty()) {
-                        stateFootnoteLine += "  " + drain;
+                if(stopRecordingActive.load()) {
+                    sd = {"STOPPING", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                    stateEmphasisLine = recorder.currentRecordingStatsLine();
+                    if(stateEmphasisLine.empty()) {
+                        stateEmphasisLine = recorder.captureFrameSummaryLine();
+                    }
+                    stateFootnoteLine = "ending recording session";
+                }
+                else {
+                    sd = {"STOPPED", cv::Scalar(50, 200, 255), cv::Scalar(20, 40, 80)};
+                    stateEmphasisLine = recorder.captureFrameSummaryLine();
+                    stateFootnoteLine = "saving data";
+                    {
+                        const std::string drain = recorder.drainStatusLine();
+                        if(!drain.empty()) {
+                            stateFootnoteLine += "  " + drain;
+                        }
                     }
                 }
                 break;
@@ -9067,38 +9142,43 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 collectionSetStage("ui_camera_fault_exit");
                 announce("fault_exit", "exit");
                 if(recorder.isRecording()) {
-                    recorder.stopRecording();
+                    beginStopRecordingUi("Stopping recording before exit...",
+                                         "Exit requested. Stopping recording before deleting faulted episode.");
                 }
 
                 bool okToExit = true;
                 if(recorder.hasCurrentSession()) {
-                    capUi.msg = "Deleting faulted episode before exit...";
-                    pushUiLog("Exit requested. Deleting faulted episode before leaving collection.");
-                    collectionSetStage("ui_camera_fault_exit_wait_drain");
-                    while(!recorder.isDrainComplete()) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-                    }
-
-                    std::string error;
-                    if(recorder.discardCurrentSession(&error)) {
-                        pushUiLog("Faulted episode deleted.");
+                    if(!recorder.isDrainComplete() || stopRecordingActive.load()) {
+                        okToExit = false;
+                        capUi.msg = "Waiting for current episode to finish saving...";
+                        pushUiLog("Exit delayed: current episode is still saving.");
                     }
                     else {
-                        okToExit = false;
-                        capUi.msg = "Delete failed";
-                        pushUiLog("Delete failed before exit: " + error);
-                        std::cerr << "[collection][camera_fault] delete before exit failed: " << error << std::endl;
+                        capUi.msg = "Deleting faulted episode before exit...";
+                        pushUiLog("Exit requested. Deleting faulted episode before leaving collection.");
+
+                        std::string error;
+                        if(recorder.discardCurrentSession(&error)) {
+                            pushUiLog("Faulted episode deleted.");
+                        }
+                        else {
+                            okToExit = false;
+                            capUi.msg = "Delete failed";
+                            pushUiLog("Delete failed before exit: " + error);
+                            std::cerr << "[collection][camera_fault] delete before exit failed: " << error << std::endl;
+                        }
                     }
                 }
 
                 if(okToExit) {
+                    waitStopRecordingThread();
                     recorder.stopIfRunning();
                     running = false;
                 }
             }
             if(doFaultRestart && running) {
                 collectionSetStage("ui_camera_fault_restart");
-                if(recorder.hasCurrentSession() && !recorder.isDrainComplete()) {
+                if(stopRecordingActive.load() || (recorder.hasCurrentSession() && !recorder.isDrainComplete())) {
                     capUi.msg = "Waiting for current episode to finish saving...";
                     pushUiLog("Restart delayed: current episode is still saving.");
                     announce("fault_restart_wait", "waiting");
@@ -9118,6 +9198,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                         if(hadSession) {
                             pushUiLog("Faulted episode deleted.");
                         }
+                        waitStopRecordingThread();
                         recorder.stopIfRunning(false);
                         latestFrameCache.clear();
 
@@ -9142,6 +9223,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                             announce("fault_restart", "restart");
                         }
                         else {
+                            waitStopRecordingThread();
                             recorder.stopIfRunning(false);
                             capUi.msg = "Restart failed";
                             pushUiLog("Restart failed: " + startError);
@@ -9153,12 +9235,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             if(doBackMenu) {
                 collectionSetStage("ui_capture_back_menu");
                 announce("menu", "menu");
+                waitStopRecordingThread();
                 recorder.stopIfRunning();
                 running = false;
             }
             if(doBackCfg && !cfg.demo.active) {
                 collectionSetStage("ui_capture_back_config");
                 announce("config", "config");
+                waitStopRecordingThread();
                 recorder.stopIfRunning(false);
                 resetCameraReadyAnnouncement();
                 page = CollectionPage::Config;
@@ -9208,33 +9292,17 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             }
             if(doStop) {
                 collectionSetStage("ui_capture_stop");
-                recorder.stopRecording();
+                beginStopRecordingUi("Stopping recording...",
+                                     "Stop requested. Recording is ending in the background.");
                 announce("stop", "stop");
-                if(recorder.isDrainComplete()) {
-                    updateReadyState();
-                }
-                else {
-                    captureState = CaptureState::DRAINING;
-                    capUi.msg = "Saving data to disk...";
-                    pushUiLog("Stopped. Waiting for background save to finish.");
-                }
             }
             if(doReset) {
                 collectionSetStage("ui_capture_reset");
                 announce("reset", "reset");
                 if(captureState == CaptureState::RECORDING) {
-                    recorder.stopRecording();
                     pendingResetAfterDrain = true;
-                    if(recorder.isDrainComplete()) {
-                        updateReadyState();
-                        pushUiLog("Reset requested. Review delete confirmation.");
-                        enterDeleteConfirm();
-                    }
-                    else {
-                        captureState = CaptureState::DRAINING;
-                        capUi.msg = "Saving data to disk before reset...";
-                        pushUiLog("Reset requested during recording. Waiting for background save to finish.");
-                    }
+                    beginStopRecordingUi("Stopping recording before reset...",
+                                         "Reset requested during recording. Stopping in the background.");
                 }
                 else if(captureState == CaptureState::DRAINING) {
                     pendingResetAfterDrain = true;
@@ -9316,16 +9384,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             }
 
             // --- 超时自动停止 ---
-            if(captureState == CaptureState::RECORDING && recorder.autoStopIfTimeout()) {
-                if(recorder.isDrainComplete()) {
-                    updateReadyState();
-                    capUi.msg = "Auto-stopped by max duration";
-                }
-                else {
-                    captureState = CaptureState::DRAINING;
-                    capUi.msg = "Auto-stopped. Saving data to disk...";
-                }
-                pushUiLog("Auto stop by max duration");
+            if(captureState == CaptureState::RECORDING && recorder.recordingReachedTimeout()) {
+                beginStopRecordingUi("Auto-stopped. Stopping recording...",
+                                     "Auto stop by max duration. Recording is ending in the background.");
             }
 
             // --- 消息显示 ---
@@ -9358,6 +9419,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
     }
 
     collectionSetStage("ui_exit_done");
+    waitStopRecordingThread();
     cv::destroyWindow(winName);
     return 0;
 }
