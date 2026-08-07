@@ -6410,7 +6410,7 @@ private:
     }
 
     void drawPicoHand2dOverlay(cv::Mat &img, const PicoHand2dResult &result, double scaleX, double scaleY) const {
-        if(img.empty() || !result.valid || result.hands.empty()) {
+        if(img.empty() || result.hands.empty()) {
             return;
         }
         static const std::array<std::pair<int, int>, 23> edges = {
@@ -6436,7 +6436,13 @@ private:
         };
 
         for(const auto &hand: result.hands) {
-            if(!hand.visible || hand.joints.size() < 21) {
+            if(hand.joints.size() < 21) {
+                continue;
+            }
+            const bool hasDrawableJoint = std::any_of(hand.joints.begin(), hand.joints.end(), [&](const PicoHand2dJoint &joint) {
+                return validPoint(joint);
+            });
+            if(!hasDrawableJoint) {
                 continue;
             }
             const cv::Scalar skeletonColor = toScalar(gtSkeletonColorForSide(hand.side));

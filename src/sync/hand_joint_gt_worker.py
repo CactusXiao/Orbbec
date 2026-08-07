@@ -988,7 +988,13 @@ class HandGtWorker:
         self._last_time = now
 
         visible_hands = sum(1 for hand in hands if hand["visible"])
-        status = f"PICO hand2d {visible_hands} hand(s)" if visible_hands > 0 else "PICO hand2d no hands"
+        if visible_hands > 0:
+            status = f"PICO hand2d {visible_hands} hand(s)"
+        elif hands:
+            valid_joints = sum(int(hand.get("valid_joint_count", 0)) for hand in hands)
+            status = f"PICO hand2d partial ({valid_joints} joints)"
+        else:
+            status = "PICO hand2d no hands"
         return {
             "ok": True,
             "frame_id": int(meta.get("frame_id", 0)),
