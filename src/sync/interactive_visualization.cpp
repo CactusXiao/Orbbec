@@ -3337,7 +3337,7 @@ public:
         loadInitExtrinsicsIfNeeded();
         ivizSetStage("loadInitExtrinsics_ok");
         initializeFisheyes();
-        setGtVisualizationEnabled(true);
+        setGtVisualizationEnabled(!cfg_.demo.active || cfg_.demo.interaction.handGt);
 
         const std::string winName = "Interaction";
         cv::namedWindow(winName, cv::WINDOW_NORMAL);
@@ -3795,7 +3795,6 @@ private:
         picoHand2dWorker_.stop();
         latestPicoRgbFrame_.release();
         latestPicoRgbVideoFrameIndex_ = -1;
-        lastPicoHand2dSubmitUs_ = 0;
         lastPicoHand2dSubmitFrameIndex_ = -1;
         picoRgbStatusLine_ = "PICO RGB off";
     }
@@ -4726,11 +4725,11 @@ private:
         }
         GtInferenceRequest req = buildGtInferenceRequest(frames, frameId);
         if(req.cameras.empty()) {
-            gtWorker_.setIdleStatus("GT waiting for calibrated RGB cameras", true);
+            gtWorker_.setIdleStatus("GT waiting for calibrated RGB cameras", false);
             return;
         }
         if(req.cameras.size() < 2) {
-            gtWorker_.setIdleStatus("GT needs at least 2 calibrated RGB views", true);
+            gtWorker_.setIdleStatus("GT needs at least 2 calibrated RGB views", false);
             return;
         }
         gtWorker_.submitLatest(std::move(req));
@@ -4859,10 +4858,6 @@ private:
         if(lastPicoHand2dSubmitFrameIndex_ == latestPicoRgbVideoFrameIndex_) {
             return;
         }
-        if(lastPicoHand2dSubmitUs_ != 0 && nowUs > lastPicoHand2dSubmitUs_ && nowUs - lastPicoHand2dSubmitUs_ < 66000) {
-            return;
-        }
-
         PicoHand2dRequest req;
         req.frameId = static_cast<uint64_t>(std::max(0, latestPicoRgbVideoFrameIndex_));
         req.captureTsUs = nowUs;
@@ -4877,7 +4872,6 @@ private:
 
         picoHand2dWorker_.setScriptPath(resolveGtWorkerScriptPath());
         picoHand2dWorker_.submitLatest(std::move(req));
-        lastPicoHand2dSubmitUs_ = nowUs;
         lastPicoHand2dSubmitFrameIndex_ = latestPicoRgbVideoFrameIndex_;
     }
 
@@ -6215,7 +6209,7 @@ private:
         {
             const cv::Rect row(bx, by, bw, 30);
             if(row.y + row.height <= layout_.camsRect.y + layout_.camsRect.height) {
-                (void)uiCheckbox(canvas, row, true, "GT hand", ms);
+                (void)uiCheckbox(canvas, row, showGtJoints_, "GT hand", ms);
             }
             by += 34;
         }
@@ -6895,7 +6889,7 @@ private:
     }
 
 private:
-    static constexpr int gtWorkerMaxImageSide_ = 384;
+    static constexpr int gtWorkerMaxImageSide_ = 640;
     static constexpr int egoTagWorkerMaxImageSide_ = 640;
     static constexpr int picoHand2dWorkerMaxImageSide_ = 640;
     static constexpr size_t kMaxAlignedFrameQueueSize_ = 8;
@@ -6963,7 +6957,6 @@ private:
     LivePicoRgbFrameSource picoRgbFrameSource_;
     cv::Mat latestPicoRgbFrame_;
     int latestPicoRgbVideoFrameIndex_ = -1;
-    uint64_t lastPicoHand2dSubmitUs_ = 0;
     int lastPicoHand2dSubmitFrameIndex_ = -1;
     std::string picoRgbStatusLine_ = "PICO RGB off";
 };
