@@ -179,9 +179,21 @@ Array form is also accepted:
 "taskBackend": {
   "enabled": true,
   "baseUrl": "http://<backend-host>:8765",
-  "timeoutMs": 3000
+  "timeoutMs": 3000,
+  "nas": {
+    "enabled": true,
+    "serverIp": "192.168.50.177",
+    "shareName": "ego",
+    "sharePath": "//192.168.50.177/ego",
+    "mountPath": "/mnt/nas",
+    "uriPrefix": "nas://ego"
+  }
 }
 ```
+
+This `nas` block is frontend-visible deployment information for the collection
+app. Backend startup remains owned by `.env` (`ORBBEC_NAS_ROOT`,
+`ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_URI_MOUNTS_JSON`).
 
 Environment overrides:
 

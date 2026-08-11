@@ -662,6 +662,31 @@ AppConfig loadConfig(const fs::path &configPath) {
             if(auto v = getInt(backendObj, "timeoutMs")) {
                 cfg.taskBackend.timeoutMs = std::max(500, *v);
             }
+            if(auto *nasObj = cJSON_GetObjectItemCaseSensitive(backendObj, "nas")) {
+                if(cJSON_IsObject(nasObj)) {
+                    if(auto v = getBool(nasObj, "enabled")) {
+                        cfg.taskBackend.nas.enabled = *v;
+                    }
+                    if(auto v = getString(nasObj, "serverIp")) {
+                        cfg.taskBackend.nas.serverIp = trimString(*v);
+                    }
+                    if(auto v = getString(nasObj, "shareName")) {
+                        cfg.taskBackend.nas.shareName = trimString(*v);
+                    }
+                    if(auto v = getString(nasObj, "sharePath")) {
+                        cfg.taskBackend.nas.sharePath = trimString(*v);
+                    }
+                    if(auto v = getString(nasObj, "mountPath")) {
+                        cfg.taskBackend.nas.mountPath = resolveConfigRelativePath(trimString(*v));
+                    }
+                    else if(auto v = getString(nasObj, "root")) {
+                        cfg.taskBackend.nas.mountPath = resolveConfigRelativePath(trimString(*v));
+                    }
+                    if(auto v = getString(nasObj, "uriPrefix")) {
+                        cfg.taskBackend.nas.uriPrefix = trimString(*v);
+                    }
+                }
+            }
         }
     }
     if(const char *v = std::getenv("ORBBEC_TASK_BACKEND_URL")) {

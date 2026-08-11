@@ -82,7 +82,16 @@
         "_comment": "Backend-owned collection task/episode service. Start task_backend/server.py before entering collection.",
         "enabled": true,
         "baseUrl": "http://127.0.0.1:8765",
-        "timeoutMs": 3000
+        "timeoutMs": 3000,
+        "nas": {
+            "_comment": "Frontend-visible NAS deployment info. Backend startup still reads .env; Ubuntu mounts //192.168.50.177/ego at /mnt/nas.",
+            "enabled": true,
+            "serverIp": "192.168.50.177",
+            "shareName": "ego",
+            "sharePath": "//192.168.50.177/ego",
+            "mountPath": "/mnt/nas",
+            "uriPrefix": "nas://ego"
+        }
     },
     "voiceFeedback": {
         "_comment": "Ubuntu collection voice prompts. Chinese prompts prefer edge-tts zh-CN-XiaoxiaoNeural when installed (python3 -m pip install edge-tts; ffplay from ffmpeg), then fall back to spd-say, ekho, or espeak-ng. record_tick uses a buzzer tone instead of speech. speakerDevice is used by the fallback buzzer path.",

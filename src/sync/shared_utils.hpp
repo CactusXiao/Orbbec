@@ -154,10 +154,20 @@ struct VoiceFeedbackConfig {
     std::unordered_map<std::string, std::string> messages;
 };
 
+struct NasConfig {
+    bool        enabled   = true;
+    std::string serverIp;
+    std::string shareName;
+    std::string sharePath;
+    fs::path    mountPath = "/mnt/nas";
+    std::string uriPrefix = "nas://ego";
+};
+
 struct TaskBackendConfig {
     bool        enabled   = true;
     std::string baseUrl   = "http://127.0.0.1:8765";
     int         timeoutMs = 3000;
+    NasConfig   nas;
 };
 
 struct AppConfig {
