@@ -7,13 +7,13 @@ from pathlib import Path
 
 from task_backend.job_service import FINAL_3D_SOURCES_REL_PATH, JobService
 from task_backend.server import render_workflow_stage_page
-from task_backend.virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader
+from task_backend.nas_uploader import NasUploadConfig, NasUploader
 from task_backend.workflow_models import WorkflowError
 from task_backend.workflow_store import WorkflowStore
 
 
 class WorkflowStoreSmokeTest(unittest.TestCase):
-    def test_virtual_nas_uploader_keeps_auto_label_as_manual_push(self) -> None:
+    def test_nas_uploader_keeps_auto_label_as_manual_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
@@ -39,11 +39,11 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 }
             )
 
-            uploader = VirtualNasUploader(
+            uploader = NasUploader(
                 service,
-                VirtualNasUploadConfig(
-                    root=tmp_path / "virtual_nas",
-                    uri_prefix="nas://orbbec-virtual-test",
+                NasUploadConfig(
+                    root=tmp_path / "nas",
+                    uri_prefix="nas://ego-test",
                     worker_id="smoke_uploader",
                 ),
             )

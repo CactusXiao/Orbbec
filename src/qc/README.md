@@ -23,7 +23,7 @@ QC_TMP_DIR=./tmp
 QC_STATE_DIR=./qc_state
 QC_WORKER_MACHINE_ID=qc_machine_01
 QC_RANGE_MERGE_GAP_FRAMES=5
-QC_URI_MOUNTS_JSON={"nas://orbbec-virtual":"/mnt/orbbec-virtual"}
+QC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 ```
 
 ## 行为
@@ -34,4 +34,3 @@ QC_URI_MOUNTS_JSON={"nas://orbbec-virtual":"/mnt/orbbec-virtual"}
 - RGB H.265 会解码到 `QC_TMP_DIR/<episode_id>/<camera>/<frame>.png`。
 - QC 提交会先写 `<episode>/qc/qc_report.json`，再调用后端 complete。
 - “Episode 异常”提交为 `result_type=bad_episode`，不会创建人工返修 segment。
-

@@ -76,8 +76,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 "\n".join(
                     [
                         "ORBBEC_TASK_BACKEND_URL=http://127.0.0.1:9999",
-                        f"ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT={tmp_path / 'nas'}",
-                        "ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX=nas://orbbec-test",
+                        f"ORBBEC_WORKFLOW_NAS_ROOT={tmp_path / 'nas'}",
+                        "ORBBEC_WORKFLOW_NAS_URI_PREFIX=nas://orbbec-test",
                         "ORBBEC_VIRTUAL_WORKFLOW_WORKERS=all",
                         "ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE=1.0",
                         "ORBBEC_VIRTUAL_WORKFLOW_MAX_ITERATIONS=0",
@@ -102,12 +102,12 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertEqual(args.stop_after_idle_rounds, 0)
             self.assertEqual(args.idle_log_interval, 30)
 
-    def test_virtual_upload_does_not_precreate_auto_label_outputs(self) -> None:
+    def test_nas_upload_does_not_precreate_auto_label_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "captures"
             self._write_capture_episode(source / "S001" / "pick_object" / "episode_001", frames=1, cameras=["00"])
-            nas = NasSimulator(tmp_path / "virtual_nas", "nas://orbbec-test")
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
             task = LabelTask(
                 root=source,
                 subject="S001",
@@ -132,7 +132,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
     def test_auto_label_prediction_requires_handgt_detector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            nas = NasSimulator(tmp_path / "virtual_nas", "nas://orbbec-test")
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
             task = LabelTask(
                 root=tmp_path / "captures",
                 subject="S001",
@@ -149,7 +149,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
     def test_auto_label_no_hand_writes_invisible_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            nas = NasSimulator(tmp_path / "virtual_nas", "nas://orbbec-test")
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
             task = LabelTask(
                 root=tmp_path / "captures",
                 subject="S001",
@@ -174,7 +174,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.skipTest("ffmpeg is not installed")
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            nas_root = tmp_path / "virtual_nas"
+            nas_root = tmp_path / "nas"
             nas_prefix = "nas://orbbec-test"
             episode_dir = nas_root / "S001" / "pick_object" / "episode_video"
             if not self._write_h265_rgb_video(episode_dir / "00" / "RGB", frames=3, frame_offset=10):
@@ -236,7 +236,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
     def test_collection_virtual_workers_real_label_storage_full_failure_flow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            nas_root = tmp_path / "virtual_nas"
+            nas_root = tmp_path / "nas"
             nas_prefix = "nas://orbbec-test"
             capture_dir = tmp_path / "captures" / "S001" / "pick_object" / "episode_full"
             self._write_capture_episode(capture_dir, frames=60, cameras=["00", "01"])

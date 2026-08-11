@@ -16,17 +16,16 @@ extension of `task_backend/server.py`: the original collection API and JSON
 progress state remain compatible, while new workflow state is stored in
 `<dataRoot>/workflow.sqlite3` with Python's standard `sqlite3` module.
 
-NAS storage is represented by a built-in virtual NAS uploader for development
-and system validation. Collection still saves the episode locally first. After
-the frontend confirms the local save, the backend creates an `upload` job and a
-background worker copies that local episode directory into a backend-local
-virtual NAS directory. The server records upload progress, verifies copied file
-and byte counts, then switches the episode `data_uri` from `local://...` to
-`nas://...` only after the copy succeeds.
+NAS storage is represented by a real mounted NAS directory. Collection still
+saves the episode locally first. After the frontend confirms the local save, the
+backend creates an `upload` job and a background worker copies that local
+episode directory into the configured NAS root. The server records upload
+progress, verifies copied file and byte counts, then switches the episode
+`data_uri` from `local://...` to `nas://...` only after the copy succeeds.
 
 Automatic labeling and automatic QC remain decoupled worker stages. The server
 stores abstract URIs such as `local:///data/episode_001` or
-`nas://orbbec-virtual/S001/...`, job status, and artifact registrations, but it
+`nas://ego/S001/...`, job status, and artifact registrations, but it
 does not import model code or run QC/model inference itself.
 
 ## Start The Backend
@@ -49,12 +48,11 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 # Optional workflow SQLite override:
 # ORBBEC_WORKFLOW_DB=./task_backend_state/workflow.sqlite3
 
-# Optional virtual NAS override:
-# ORBBEC_VIRTUAL_NAS_ENABLED=1
-# ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state/virtual_nas
-# ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
-# Optional backend-owned URI mounts for label/manual workers:
-# ORBBEC_URI_MOUNTS_JSON={"nas://orbbec-dataset":"/Volumes/orbbec-dataset"}
+# Real NAS mount used by upload, label/manual workers, QC, and downstream jobs.
+ORBBEC_NAS_ENABLED=1
+ORBBEC_NAS_ROOT=/mnt/nas
+ORBBEC_NAS_URI_PREFIX=nas://ego
+ORBBEC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 
 # Upload success waits for an explicit push before queuing auto_label jobs.
 # Set this to 1 only for legacy fully automatic local tests:
@@ -215,7 +213,7 @@ have to match any path on the backend machine.
 6. Local capture writes to `captureSaveRoot/subjectId/taskName/episode_N`.
 7. Confirm finalizes local data, then confirms the reservation with an
    idempotency key.
-8. Backend confirm creates an `upload` job. The virtual NAS uploader copies the
+8. Backend confirm creates an `upload` job. The NAS uploader copies the
    already-saved local episode asynchronously and records progress in the
    workflow database.
 9. Upload success marks the episode `uploaded`. It does not queue
@@ -259,8 +257,8 @@ POST /api/v1/collection/episodes/release
 ```
 
 When collection confirms an episode, the workflow sidecar records an Episode
-with status `captured` and queues an `upload` job. The built-in virtual NAS
-uploader leases this job, copies local data to the virtual NAS, updates progress,
+with status `captured` and queues an `upload` job. The built-in NAS
+uploader leases this job, copies local data to the configured NAS root, updates progress,
 registers a `nas_episode` artifact, and marks the episode `uploaded` only after
 the verified copy completes. `auto_label` jobs are created only after an
 explicit push from the dashboard, task page, episode page, or workflow API.
@@ -410,8 +408,9 @@ label.main` GUI as a separate window and pre-fills the backend URL from the
 collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
 `subject_id` as the operator hint. NAS/local path mapping is owned by the
 backend: it resolves `data_uri` into `resolved_data_path` in the leased segment
-payload. For non-virtual NAS prefixes, configure the backend with
-`ORBBEC_URI_MOUNTS_JSON`. For uploaded episodes, segment label payloads resolve
+payload. Configure the backend with `ORBBEC_NAS_ROOT`,
+`ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_URI_MOUNTS_JSON`. For uploaded episodes,
+segment label payloads resolve
 the uploaded `data_uri` mount rather than the original collection
 `local_capture_path`, so human `manual_2d` outputs are written under the NAS
 episode directory.

@@ -59,10 +59,10 @@ def path_totals(root: Path) -> Tuple[int, int]:
 
 
 @dataclass
-class VirtualNasUploadConfig:
+class NasUploadConfig:
     enabled: bool = True
-    root: Path = Path("./task_backend_state/virtual_nas")
-    uri_prefix: str = "nas://orbbec-virtual"
+    root: Path = Path("/mnt/nas")
+    uri_prefix: str = "nas://ego"
     worker_id: str = ""
     poll_interval_seconds: float = 1.0
     lease_seconds: int = 300
@@ -70,21 +70,22 @@ class VirtualNasUploadConfig:
     chunk_bytes: int = 1024 * 1024
 
 
-class VirtualNasUploader:
-    def __init__(self, service: JobService, config: VirtualNasUploadConfig):
+class NasUploader:
+    def __init__(self, service: JobService, config: NasUploadConfig):
         self.service = service
         self.config = config
         self.config.root = self.config.root.expanduser().resolve()
         self.config.uri_prefix = self.config.uri_prefix.rstrip("/")
-        self.worker_id = self.config.worker_id or f"virtual_nas_uploader_{os.getpid()}"
+        self.worker_id = self.config.worker_id or f"nas_uploader_{os.getpid()}"
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if not self.config.enabled or self._thread is not None:
             return
-        self.config.root.mkdir(parents=True, exist_ok=True)
-        self._thread = threading.Thread(target=self._run, name="virtual-nas-uploader", daemon=True)
+        if not self.config.root.exists():
+            raise RuntimeError(f"NAS root does not exist or is not mounted: {self.config.root}")
+        self._thread = threading.Thread(target=self._run, name="nas-uploader", daemon=True)
         self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -98,7 +99,7 @@ class VirtualNasUploader:
             try:
                 did_work = self.process_one()
             except Exception as exc:  # pragma: no cover - defensive worker loop
-                print(f"[virtual-nas] worker error: {format_error(exc)}", flush=True)
+                print(f"[nas] worker error: {format_error(exc)}", flush=True)
                 did_work = False
             if not did_work:
                 self._stop.wait(max(0.1, float(self.config.poll_interval_seconds)))
@@ -139,7 +140,7 @@ class VirtualNasUploader:
                 if episode_id:
                     self.service.store.update_episode_status(episode_id, "captured", {"upload_error": error})
             except Exception as fail_exc:  # pragma: no cover - preserve root failure in logs
-                print(f"[virtual-nas] fail upload job {job_id}: {format_error(fail_exc)}", flush=True)
+                print(f"[nas] fail upload job {job_id}: {format_error(fail_exc)}", flush=True)
             return True
         return True
 
@@ -244,7 +245,7 @@ class VirtualNasUploader:
             "files_total": files_total,
             "total_bytes": total_bytes,
             "completed_at": now_iso(),
-            "virtual_nas": True,
+            "storage_backend": "nas",
         }
         (tmp / ".orbbec_upload_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -329,7 +330,7 @@ class VirtualNasUploader:
 
     def _local_path_for_uri(self, uri: str) -> Path:
         if not uri.startswith(self.config.uri_prefix):
-            raise ValueError(f"URI does not belong to virtual NAS: {uri}")
+            raise ValueError(f"URI does not belong to NAS: {uri}")
         suffix = uri[len(self.config.uri_prefix):].strip("/")
         return (self.config.root / suffix).resolve()
 

@@ -170,7 +170,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             payload = {
                 "data_uri": "nas://orbbec-test/S001/pick_object/episode_001",
-                "resolved_data_path": str(tmp_path / "virtual_nas" / "S001" / "pick_object" / "episode_001"),
+                "resolved_data_path": str(tmp_path / "nas" / "S001" / "pick_object" / "episode_001"),
                 "subject_id": "S001",
                 "task_name": "pick_object",
                 "episode_id": "episode_001",

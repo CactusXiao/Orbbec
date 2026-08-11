@@ -1026,7 +1026,7 @@ def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDete
 
 
 class NasSimulator:
-    def __init__(self, root: Path, uri_prefix: str = "nas://orbbec-virtual"):
+    def __init__(self, root: Path, uri_prefix: str = "nas://ego"):
         self.root = root.expanduser().resolve()
         self.uri_prefix = uri_prefix.rstrip("/")
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1034,7 +1034,7 @@ class NasSimulator:
     def local_path_for_uri(self, uri: str) -> Path:
         uri = str(uri or "").rstrip("/")
         if not uri.startswith(self.uri_prefix):
-            raise ValueError(f"URI does not belong to this virtual NAS: {uri}")
+            raise ValueError(f"URI does not belong to this NAS root: {uri}")
         suffix = uri[len(self.uri_prefix):].lstrip("/")
         return (self.root / unquote(suffix)).resolve()
 
@@ -1139,7 +1139,7 @@ class NasSimulator:
                     if not pred_path.exists():
                         write_frame_hand_npy(pred_path, dst, cam, int(frame), rgb_path_template=rgb_path_template, variant="pred")
         metadata = {
-            "virtual_nas": True,
+            "storage_backend": "nas",
             "subject_id": subject,
             "task_name": task_name,
             "episode": episode,
@@ -1148,7 +1148,7 @@ class NasSimulator:
             "materialized_frames": selected_frames,
             "created_at_ms": now_ms(),
         }
-        (dst / "virtual_episode.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (dst / "nas_episode.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def write_prediction_artifact(
         self,
@@ -1870,26 +1870,26 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=Path(
             env_text(
-                "task_backend_state/virtual_nas",
-                "ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT",
-                "ORBBEC_VIRTUAL_NAS_ROOT",
-                "TASK_BACKEND_VIRTUAL_NAS_ROOT",
+                "/mnt/nas",
+                "ORBBEC_WORKFLOW_NAS_ROOT",
+                "ORBBEC_NAS_ROOT",
+                "TASK_BACKEND_NAS_ROOT",
             )
         ),
     )
     parser.add_argument(
         "--nas-uri-prefix",
         default=env_text(
-            "nas://orbbec-virtual",
-            "ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX",
-            "ORBBEC_VIRTUAL_NAS_URI_PREFIX",
-            "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX",
+            "nas://ego",
+            "ORBBEC_WORKFLOW_NAS_URI_PREFIX",
+            "ORBBEC_NAS_URI_PREFIX",
+            "TASK_BACKEND_NAS_URI_PREFIX",
         ),
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Virtual NAS, auto-label, QC, and label workers for Orbbec backend testing.")
+    parser = argparse.ArgumentParser(description="NAS-backed auto-label, QC, and label workers for Orbbec backend testing.")
     parser.add_argument("--env-file", type=Path, default=Path(os.environ.get("ORBBEC_VIRTUAL_WORKFLOW_ENV_FILE", ".env")), help="Path to .env defaults. The file is loaded before command defaults are built.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -1900,7 +1900,7 @@ def build_parser() -> argparse.ArgumentParser:
     seed_label.add_argument("--max-jobs", type=int, default=0, help="Stop after seeding this many manual label jobs.")
     seed_label.add_argument("--frames-per-segment", type=int, default=0, help="Split each JSONL task into manual-label segments of N frames. 0 keeps one segment per task.")
     seed_label.add_argument("--job-prefix", default="seeded_manual")
-    seed_label.add_argument("--use-nas", action="store_true", help="Materialize tasks under the virtual NAS and use nas:// URIs.")
+    seed_label.add_argument("--use-nas", action="store_true", help="Materialize tasks under the configured NAS root and use nas:// URIs.")
     seed_label.add_argument("--copy-source", action="store_true", help="Copy real source episode folders when they exist.")
     seed_label.add_argument("--max-materialized-frames", type=int, default=0, help="0 means materialize all frames.")
     seed_label.set_defaults(func=seed_manual_label_jobs)

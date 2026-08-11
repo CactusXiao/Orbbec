@@ -24,7 +24,7 @@ class VirtualWorkflowSmokeTest(unittest.TestCase):
                 (rgb / "00001.png").write_bytes(b"rgb")
                 (rgb / "00002.png").write_bytes(b"rgb")
 
-            nas = NasSimulator(tmp_path / "virtual_nas")
+            nas = NasSimulator(tmp_path / "nas")
             payload = {
                 "data_uri": "local://" + str(episode_dir),
                 "resolved_data_path": str(episode_dir),

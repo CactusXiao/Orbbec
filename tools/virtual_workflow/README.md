@@ -1,20 +1,18 @@
-# Virtual Workflow Test Tools
+# Workflow Test Tools
 
 This directory contains a standalone Python fixture for checking the current
-task backend and frontends without depending on real NAS, auto-label, or QC
-systems.
+task backend and frontends against the configured NAS mount and placeholder
+auto-label/QC workers.
 
 The tool talks to the backend only through HTTP APIs. It does not import or
 modify the existing `task_backend` or `label` modules.
 
-## What It Simulates
+## What It Provides
 
-- A local NAS, stored under `task_backend_state/virtual_nas` by default,
-  exposed as `nas://orbbec-virtual/...`. This matches the backend's default
-  virtual NAS mount.
-- Upload workers that copy or materialize a captured episode into the virtual
-  NAS. Upload completion marks episodes `uploaded`; pushing auto-label is a
-  separate dashboard/API action.
+- A NAS root, defaulting to `/mnt/nas`, exposed as `nas://ego/...`.
+- Upload workers that copy or materialize a captured episode into the
+  configured NAS root. Upload completion marks episodes `uploaded`; pushing
+  auto-label is a separate dashboard/API action.
 - Auto-label workers that write `(2,21,2)` prediction `.npy` files by reusing
   `src/sync/hand_joint_gt_worker.py`. The virtual worker requires the same
   MediaPipe/Python environment as interaction handGT; missing dependencies,
@@ -47,14 +45,15 @@ Use the same `.env` file for backend and worker configuration:
 ORBBEC_TASK_BACKEND_HOST=0.0.0.0
 ORBBEC_TASK_BACKEND_PORT=8765
 ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state_fullflow
-ORBBEC_VIRTUAL_NAS_ENABLED=1
-ORBBEC_VIRTUAL_NAS_ROOT=./task_backend_state_fullflow/virtual_nas
-ORBBEC_VIRTUAL_NAS_URI_PREFIX=nas://orbbec-virtual
+ORBBEC_NAS_ENABLED=1
+ORBBEC_NAS_ROOT=/mnt/nas
+ORBBEC_NAS_URI_PREFIX=nas://ego
+ORBBEC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
 
 ORBBEC_VIRTUAL_WORKFLOW_WORKERS=all
-ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT=./task_backend_state_fullflow/virtual_nas
-ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX=nas://orbbec-virtual
+ORBBEC_WORKFLOW_NAS_ROOT=/mnt/nas
+ORBBEC_WORKFLOW_NAS_URI_PREFIX=nas://ego
 ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE=0.5
 ORBBEC_VIRTUAL_WORKFLOW_MAX_ITERATIONS=0
 ORBBEC_VIRTUAL_WORKFLOW_STOP_AFTER_IDLE_ROUNDS=0
@@ -67,7 +66,7 @@ For deterministic manual-label flow validation, set
 
 ## Seed Existing Label Data Into Manual Label Queue
 
-This reads `label/task.jsonl`, materializes local NAS placeholder data, and
+This reads `label/task.jsonl`, materializes NAS placeholder data, and
 creates queued manual segments through `/api/v1/dev/label/jobs`.
 
 ```bash
@@ -80,7 +79,7 @@ python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
 ```
 
 The label frontend does not need a mount mapping. It requests the next backend
-task, and the backend returns a resolved local path for `nas://orbbec-virtual`.
+task, and the backend returns a resolved local path for `nas://ego`.
 
 ## Real Collection And Label Flow
 
@@ -142,14 +141,13 @@ python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-captured \
   --limit 1
 ```
 
-Then run the same virtual worker commands above.
+Then run the same workflow worker commands above.
 
 ## Useful Options
 
-- `ORBBEC_VIRTUAL_WORKFLOW_NAS_ROOT`: local directory for the virtual NAS. It
-  must match the backend mount for `ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX`.
-- `ORBBEC_VIRTUAL_WORKFLOW_NAS_URI_PREFIX`: NAS URI prefix, default
-  `nas://orbbec-virtual`.
+- `ORBBEC_WORKFLOW_NAS_ROOT`: local directory for the NAS mount. It must match
+  the backend mount for `ORBBEC_WORKFLOW_NAS_URI_PREFIX`.
+- `ORBBEC_WORKFLOW_NAS_URI_PREFIX`: NAS URI prefix, default `nas://ego`.
 - `ORBBEC_VIRTUAL_WORKFLOW_WORKERS`: `default`, `all`, or comma list:
   `upload,auto-label,mano-opt,qc`.
 - `ORBBEC_VIRTUAL_WORKFLOW_QC_FAIL_RATE`: QC failure probability.

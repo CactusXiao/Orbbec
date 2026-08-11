@@ -30,12 +30,12 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     from .job_service import JobService
-    from .virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader
+    from .nas_uploader import NasUploadConfig, NasUploader
     from .workflow_models import WorkflowError
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
-    from virtual_nas_uploader import VirtualNasUploadConfig, VirtualNasUploader  # type: ignore
+    from nas_uploader import NasUploadConfig, NasUploader  # type: ignore
     from workflow_models import WorkflowError  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
@@ -2501,12 +2501,28 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     workflow_db_env = env_path(env, "ORBBEC_WORKFLOW_DB", "TASK_BACKEND_WORKFLOW_DB")
     workflow_db = (workflow_db_env or (data_root / "workflow.sqlite3")).expanduser().resolve()
-    virtual_nas_enabled = env_bool(env, True, "ORBBEC_VIRTUAL_NAS_ENABLED", "TASK_BACKEND_VIRTUAL_NAS_ENABLED")
-    virtual_nas_root_env = env_path(env, "ORBBEC_VIRTUAL_NAS_ROOT", "TASK_BACKEND_VIRTUAL_NAS_ROOT")
-    virtual_nas_root = (virtual_nas_root_env or (data_root / "virtual_nas")).expanduser().resolve()
-    virtual_nas_uri_prefix = env_get(env, "ORBBEC_VIRTUAL_NAS_URI_PREFIX", "TASK_BACKEND_VIRTUAL_NAS_URI_PREFIX") or "nas://orbbec-virtual"
+    nas_enabled = env_bool(
+        env,
+        True,
+        "ORBBEC_NAS_ENABLED",
+        "TASK_BACKEND_NAS_ENABLED",
+    )
+    nas_root_env = env_path(
+        env,
+        "ORBBEC_NAS_ROOT",
+        "TASK_BACKEND_NAS_ROOT",
+    )
+    nas_root = (nas_root_env or Path("/mnt/nas")).expanduser().resolve()
+    nas_uri_prefix = (
+        env_get(
+            env,
+            "ORBBEC_NAS_URI_PREFIX",
+            "TASK_BACKEND_NAS_URI_PREFIX",
+        )
+        or "nas://ego"
+    )
     uri_mounts = env_json_object(env, "ORBBEC_URI_MOUNTS_JSON", "TASK_BACKEND_URI_MOUNTS_JSON")
-    uri_mounts.setdefault(virtual_nas_uri_prefix.rstrip("/"), str(virtual_nas_root))
+    uri_mounts.setdefault(nas_uri_prefix.rstrip("/"), str(nas_root))
     auto_label_after_upload = env_bool(
         env,
         False,
@@ -2519,12 +2535,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         auto_label_after_upload=auto_label_after_upload,
         uri_mounts=uri_mounts,
     )
-    virtual_nas_uploader = VirtualNasUploader(
+    nas_uploader = NasUploader(
         workflow_service,
-        VirtualNasUploadConfig(
-            enabled=virtual_nas_enabled,
-            root=virtual_nas_root,
-            uri_prefix=virtual_nas_uri_prefix,
+        NasUploadConfig(
+            enabled=nas_enabled,
+            root=nas_root,
+            uri_prefix=nas_uri_prefix,
         ),
     )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
@@ -2535,7 +2551,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
     print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} auto_label_scope=episode", file=sys.stderr)
-    print(f"[task-backend] virtual_nas={'enabled' if virtual_nas_enabled else 'disabled'} root={virtual_nas_root} uri={virtual_nas_uri_prefix}", file=sys.stderr)
+    print(f"[task-backend] nas={'enabled' if nas_enabled else 'disabled'} root={nas_root} uri={nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] uri_mounts={uri_mounts}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
@@ -2543,12 +2559,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     server = TaskHTTPServer((host, port), RequestHandler, runtime)
     try:
-        virtual_nas_uploader.start()
+        nas_uploader.start()
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[task-backend] stopping", file=sys.stderr)
     finally:
-        virtual_nas_uploader.stop()
+        nas_uploader.stop()
         server.server_close()
     return 0
 
