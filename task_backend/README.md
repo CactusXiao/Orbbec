@@ -33,6 +33,7 @@ does not import model code or run QC/model inference itself.
 From the repository root:
 
 ```bash
+cp .env.example .env
 python3 task_backend/server.py
 ```
 
