@@ -338,14 +338,22 @@ class JobService:
         lease_seconds = _optional_int(body.get("lease_seconds")) or 300
         task_name = str(body.get("task_name") or body.get("task") or "").strip()
         subject_id = str(body.get("subject_id") or body.get("subject") or "").strip()
+        episode_id = str(body.get("episode_id") or body.get("episode") or "").strip()
+        job_id = str(body.get("job_id") or "").strip()
         job = self.store.lease_job(
             job_type=job_type,
             lease_owner=owner,
             lease_seconds=lease_seconds,
             task_name=task_name,
             subject_id=subject_id,
+            episode_id=episode_id,
+            job_id=job_id,
         )
         if job is None:
+            if job_id:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available for job: {job_id}")
+            if episode_id:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available for episode: {episode_id}")
             if task_name:
                 raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available for task: {task_name}")
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"no queued {job_type} job is available")
@@ -1469,6 +1477,24 @@ class JobService:
         elif job_type == "qc":
             if not any(str(artifact.get("kind") or "") == "qc_report" for artifact in artifacts):
                 self._register_default_qc_report(episode_id, job, result)
+            result_type = str(result.get("result_type") or result.get("qc_result_type") or "").strip().lower()
+            bad_episode = (
+                result_type in {"bad_episode", "abnormal_episode", "episode_abnormal", "episode_exception"}
+                or _truthy_bool(result.get("bad_episode"))
+                or _truthy_bool(result.get("episode_abnormal"))
+                or _truthy_bool(result.get("abnormal_episode"))
+            )
+            if bad_episode:
+                self.store.update_episode_status(
+                    episode_id,
+                    "qc_bad_episode",
+                    {
+                        "qc_status": "bad_episode",
+                        "bad_episode_job_id": job.get("job_id"),
+                        "bad_episode_reason": str(result.get("reason") or result.get("abnormal_reason") or "bad_episode"),
+                    },
+                )
+                return
             passed = _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed"))
             if passed:
                 self.store.update_episode_status(episode_id, "finalized", {"qc_status": "passed"})

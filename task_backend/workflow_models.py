@@ -16,6 +16,7 @@ EPISODE_STATUSES = {
     "qc_running",
     "qc_passed",
     "qc_failed",
+    "qc_bad_episode",
     "review_pending",
     "review_passed",
     "manual_label_pending",

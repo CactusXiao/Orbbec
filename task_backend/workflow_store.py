@@ -528,6 +528,8 @@ class WorkflowStore:
         lease_seconds: int = 300,
         task_name: str = "",
         subject_id: str = "",
+        episode_id: str = "",
+        job_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         job_type = require_job_type(job_type)
         lease_owner = str(lease_owner or "").strip()
@@ -535,6 +537,8 @@ class WorkflowStore:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "lease_owner is required")
         task_name = str(task_name or "").strip()
         subject_id = str(subject_id or "").strip()
+        episode_id = str(episode_id or "").strip()
+        job_id = str(job_id or "").strip()
         lease_seconds = max(1, int(lease_seconds or 300))
         now = now_iso()
         lease_until = _future_iso(lease_seconds)
@@ -552,6 +556,12 @@ class WorkflowStore:
             if subject_id:
                 query += " AND episodes.subject_id = ?"
                 params.append(subject_id)
+            if episode_id:
+                query += " AND jobs.episode_id = ?"
+                params.append(episode_id)
+            if job_id:
+                query += " AND jobs.job_id = ?"
+                params.append(job_id)
             query += " ORDER BY jobs.created_at, jobs.job_id"
             rows = conn.execute(query, tuple(params)).fetchall()
             selected: Optional[sqlite3.Row] = None

@@ -211,6 +211,58 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(manifest["ready_override_count"], 2)
             self.assertTrue(all(item["status"] == "ready" for item in manifest["overrides"]))
 
+    def test_qc_bad_episode_does_not_create_manual_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            self._create_uploaded_episode(store, tmp_path, "episode_bad", frames=30)
+            self._advance_to_qc_job(service, store, "episode_bad")
+
+            qc_job = store.jobs_for_episode("episode_bad", "qc")[0]
+            service.complete_job(
+                qc_job["job_id"],
+                {
+                    "result": {
+                        "passed": False,
+                        "qc_passed": False,
+                        "result_type": "bad_episode",
+                        "bad_episode": True,
+                        "reason": "sensor_data_unusable",
+                        "segments": [],
+                    }
+                },
+            )
+
+            self.assertEqual(store.get_episode("episode_bad")["status"], "qc_bad_episode")  # type: ignore[index]
+            self.assertEqual(store.segments_for_episode("episode_bad"), [])
+
+    def test_qc_lease_can_target_exact_episode_or_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store)
+            self._create_uploaded_episode(store, tmp_path, "episode_a", frames=3, episode_index=1)
+            self._create_uploaded_episode(store, tmp_path, "episode_b", frames=3, episode_index=2)
+            self._advance_to_qc_job(service, store, "episode_a")
+            self._advance_to_qc_job(service, store, "episode_b")
+            service.set_stage_leasing("qc", True, {"updated_by": "smoke"})
+            target_job = store.jobs_for_episode("episode_b", "qc")[0]
+
+            leased = service.lease_job(
+                {
+                    "type": "qc",
+                    "worker_id": "qc_worker",
+                    "lease_seconds": 60,
+                    "episode_id": "episode_b",
+                    "job_id": target_job["job_id"],
+                }
+            )
+
+            self.assertEqual(leased["job"]["episode_id"], "episode_b")
+            self.assertEqual(leased["job"]["job_id"], target_job["job_id"])
+            self.assertEqual(store.jobs_for_episode("episode_a", "qc")[0]["status"], "queued")
+
     def test_manual_segment_lease_orders_by_task_episode_and_start_frame(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

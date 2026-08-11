@@ -1325,13 +1325,37 @@ def write_prediction_artifact_for_payload(
             for frame in frames or [0]:
                 out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
                 if detector is None:
-                    raise BackendError("auto_label requires interaction handGT detector")
-                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
-                if values is None:
-                    values = invisible_hand_values()
-                write_float32_npy(out, values)
+                    write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
+                else:
+                    values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
+                    if values is None:
+                        values = invisible_hand_values()
+                    write_float32_npy(out, values)
         return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
     return uri_join(data_uri, prediction_dir)
+
+
+def write_corrected_artifact_for_payload(
+    nas: NasSimulator,
+    payload: Json,
+    episode: Optional[Json],
+    cameras: Sequence[str],
+    frames: Sequence[int],
+    correction_dir: str,
+) -> str:
+    data_uri = str(payload.get("data_uri") or "")
+    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
+    if data_uri.startswith(nas.uri_prefix):
+        episode_path = nas.local_path_for_uri(data_uri)
+    else:
+        episode_path = source_path_from_payload(payload, episode, nas)
+    if episode_path is not None:
+        for cam in cameras or ["00"]:
+            for frame in frames or [0]:
+                out = episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy"
+                write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="manual")
+        return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
+    return uri_join(data_uri, correction_dir)
 
 
 def write_mano_artifact_for_payload(
