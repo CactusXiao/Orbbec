@@ -40,6 +40,7 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     load_env_defaults,
     virtual_hand_values,
     virtual_failed_segments,
+    write_float32_npy,
     write_placeholder_rgb_image,
 )
 
@@ -47,8 +48,14 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
 class FakeHandGtDetector:
     available = True
 
-    def detect_values(self, _episode_dir: Path, cam: str, frame: int, *, rgb_path_template: str = "") -> list[float]:
-        return virtual_hand_values(cam, frame, 640, 480, "pred")
+    def detect_values(self, episode_dir: Path, cam: str, frame: int, *, rgb_path_template: str = "") -> list[float]:
+        width, height = VirtualWorkflowToolSmokeTest._frame_size(episode_dir, cam, frame, rgb_path_template)
+        target = VirtualWorkflowToolSmokeTest._synthetic_3d_hands(frame)
+        values: list[float] = []
+        for hand in range(2):
+            for joint in range(21):
+                values.extend(VirtualWorkflowToolSmokeTest._project_test_point(target[hand, joint], cam, width=width, height=height))
+        return values
 
     def close(self) -> None:
         pass
@@ -168,6 +175,39 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertEqual(pred.shape, (2, 21, 2))
             self.assertTrue(np.all(pred == -1))
             self.assertEqual(visible, [[False] * 21, [False] * 21])
+
+    def test_mano_worker_triangulates_2d_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
+            task = LabelTask(
+                root=tmp_path / "captures",
+                subject="S001",
+                task="pick_object",
+                episode="episode_001",
+                cameras=["00", "01"],
+                frames=[0],
+            )
+            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.local_path_for_uri(data_uri)
+            self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
+            target = self._synthetic_3d_hands(0)
+            for cam in task.cameras:
+                pred = np.full((2, 21, 2), -1.0, dtype=np.float32)
+                for hand in range(2):
+                    for joint in range(21):
+                        pred[hand, joint] = self._project_test_point(target[hand, joint], cam)
+                write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
+
+            uri = nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+
+            self.assertEqual(uri, data_uri + "/mano/episode")
+            joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
+            manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
+            self.assertEqual(joints.shape, (1, 2, 21, 3))
+            self.assertFalse(manifest["mock"])
+            self.assertEqual(manifest["model"], "dlt_triangulation_from_2d")
+            self.assertTrue(np.allclose(joints[0, 0, 0], target[0, 0], atol=1e-4), joints[0, 0, 0])
 
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
         if shutil.which("ffmpeg") is None:
@@ -351,9 +391,63 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
 
     @staticmethod
     def _write_capture_episode(episode_dir: Path, *, frames: int, cameras: list[str]) -> None:
+        VirtualWorkflowToolSmokeTest._write_camera_calibration(episode_dir, cameras)
         for cam in cameras:
             for frame in range(frames):
                 write_placeholder_rgb_image(episode_dir / cam / "RGB" / f"{frame:05d}.png")
+
+    @staticmethod
+    def _write_camera_calibration(episode_dir: Path, cameras: list[str], *, width: int = 64, height: int = 48) -> None:
+        camera_params = {}
+        extrinsics = {}
+        for index, cam in enumerate(cameras):
+            camera_params[cam] = {
+                "RGB": {
+                    "intrinsic": {"fx": float(width), "fy": float(width), "cx": float(width) * 0.5, "cy": float(height) * 0.5},
+                    "distortion": {},
+                }
+            }
+            extrinsics[cam] = {
+                "rotation": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "translation": [float(index) * 0.1, 0.0, 0.0],
+            }
+        episode_dir.mkdir(parents=True, exist_ok=True)
+        (episode_dir / "camera_params.json").write_text(json.dumps(camera_params), encoding="utf-8")
+        (episode_dir / "extrinsics.json").write_text(json.dumps(extrinsics), encoding="utf-8")
+
+    @staticmethod
+    def _synthetic_3d_hands(frame: int) -> np.ndarray:
+        target = np.zeros((2, 21, 3), dtype=np.float32)
+        drift_x = (int(frame) % 17 - 8) * 0.001
+        drift_y = (int(frame) % 11 - 5) * 0.001
+        for hand in range(2):
+            for joint in range(21):
+                target[hand, joint] = [
+                    -0.08 + hand * 0.16 + joint * 0.001 + drift_x,
+                    -0.03 + joint * 0.002 + drift_y,
+                    1.0 + joint * 0.001,
+                ]
+        return target
+
+    @staticmethod
+    def _project_test_point(point: object, cam: str, *, width: int = 640, height: int = 480) -> list[float]:
+        xyz = np.asarray(point, dtype=np.float64)
+        tx = 0.0 if str(cam) == "00" else 0.1
+        cam_xyz = xyz + np.asarray([tx, 0.0, 0.0], dtype=np.float64)
+        return [float(width * cam_xyz[0] / cam_xyz[2] + width * 0.5), float(width * cam_xyz[1] / cam_xyz[2] + height * 0.5)]
+
+    @staticmethod
+    def _frame_size(episode_dir: Path, cam: str, frame: int, rgb_path_template: str = "") -> tuple[int, int]:
+        path = find_rgb_frame_path(episode_dir, cam, frame, rgb_path_template)
+        if path is None:
+            return 640, 480
+        try:
+            from tools.virtual_workflow.orbbec_virtual_workflow import read_image_size
+
+            size = read_image_size(path)
+        except Exception:
+            size = None
+        return size or (640, 480)
 
     @staticmethod
     def _write_h265_rgb_video(rgb_dir: Path, *, frames: int, frame_offset: int = 0) -> bool:

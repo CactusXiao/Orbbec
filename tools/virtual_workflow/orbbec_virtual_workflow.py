@@ -49,6 +49,8 @@ _VIDEO_SUFFIXES = {".h265", ".hevc", ".mp4", ".mkv", ".mov"}
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
 _FALLBACK_IMAGE_SIZE = (640, 480)
+_MANO_REPROJ_ERROR_MAX_PX = 14.0
+_MANO_REPROJ_OUTLIER_MAX_PX = 20.0
 _HAND_TEMPLATE = (
     (0.00, 0.00),
     (-0.18, -0.14),
@@ -456,6 +458,15 @@ def write_float32_npy(path: Path, values: Sequence[float], shape: Tuple[int, ...
     path.write_bytes(b"\x93NUMPY" + bytes([1, 0]) + struct.pack("<H", len(full_header)) + full_header + data)
 
 
+def load_float32_npy(path: Path) -> "np.ndarray":
+    if np is None:
+        raise BackendError("MANO 3D optimization requires numpy in the worker Python environment")
+    try:
+        return np.load(path)
+    except Exception as exc:
+        raise BackendError(f"failed to load npy: {path}") from exc
+
+
 def _stable_rng(*parts: Any) -> random.Random:
     seed = zlib.crc32("|".join(str(part) for part in parts).encode("utf-8")) & 0xFFFFFFFF
     return random.Random(seed)
@@ -830,40 +841,214 @@ def invisible_hand_values() -> List[float]:
     return [-1.0] * (_HAND_COUNT * _JOINT_COUNT * 2)
 
 
-def virtual_mano_3d_values(frame: int, variant: str = "episode") -> List[float]:
-    rng = _stable_rng("mano_3d", frame, variant)
-    scale = 0.075
-    centers = ((-0.085, 0.055, 0.72), (0.085, 0.055, 0.72))
-    values: List[float] = []
-    for hand_idx, center in enumerate(centers):
-        mirror = -1.0 if hand_idx == 1 else 1.0
-        drift_x = ((int(frame) % 17) - 8) * 0.001
-        drift_y = ((int(frame) % 11) - 5) * 0.0008
-        for joint_idx, (tx, ty) in enumerate(_HAND_TEMPLATE):
-            x = center[0] + mirror * tx * scale + drift_x + rng.uniform(-0.0015, 0.0015)
-            y = center[1] + ty * scale + drift_y + rng.uniform(-0.0015, 0.0015)
-            z = center[2] + joint_idx * 0.001 + rng.uniform(-0.001, 0.001)
-            values.extend((x, y, z))
-    return values
+def _load_camera_model(episode_dir: Path, cameras: Sequence[str]) -> Dict[str, Json]:
+    cam_path = episode_dir / "camera_params.json"
+    ext_path = episode_dir / "extrinsics.json"
+    if not cam_path.exists() or not cam_path.is_file() or not ext_path.exists() or not ext_path.is_file():
+        raise FileNotFoundError(f"MANO 3D optimization requires camera_params.json and extrinsics.json in {episode_dir}")
+    cam_obj = json.loads(cam_path.read_text(encoding="utf-8"))
+    ext_obj = json.loads(ext_path.read_text(encoding="utf-8"))
+    out: Dict[str, Json] = {}
+    for cam in cameras:
+        cam_id = str(cam)
+        if cam_id not in cam_obj or cam_id not in ext_obj:
+            raise KeyError(f"Missing camera parameters for camera {cam_id}")
+        rgb = cam_obj[cam_id].get("RGB") or {}
+        intr = rgb.get("intrinsic") or {}
+        dist = rgb.get("distortion") or {}
+        k = np.asarray(
+            [
+                [float(intr["fx"]), 0.0, float(intr["cx"])],
+                [0.0, float(intr["fy"]), float(intr["cy"])],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        dist_coeffs = np.asarray(
+            [
+                float(dist.get("k1", 0.0)),
+                float(dist.get("k2", 0.0)),
+                float(dist.get("p1", 0.0)),
+                float(dist.get("p2", 0.0)),
+                float(dist.get("k3", 0.0)),
+            ],
+            dtype=np.float64,
+        )
+        r = np.asarray(ext_obj[cam_id]["rotation"], dtype=np.float64).reshape(3, 3)
+        t = np.asarray(ext_obj[cam_id]["translation"], dtype=np.float64).reshape(3)
+        out[cam_id] = {"k": k, "dist": dist_coeffs, "r": r, "t": t, "projection": k @ np.hstack((r, t.reshape(3, 1)))}
+    return out
 
 
-def write_mano_3d_artifact(out: Path, frames: Sequence[int], cameras: Sequence[str], *, segment_id: str = "") -> None:
+def _project_world_to_image(world_xyz: "np.ndarray", projection: "np.ndarray") -> Optional["np.ndarray"]:
+    homog = np.asarray([world_xyz[0], world_xyz[1], world_xyz[2], 1.0], dtype=np.float64)
+    proj = projection @ homog
+    if abs(float(proj[2])) < 1e-8:
+        return None
+    return np.asarray([float(proj[0] / proj[2]), float(proj[1] / proj[2])], dtype=np.float64)
+
+
+def _triangulate_dlt(observations: Sequence[Tuple[float, float, "np.ndarray"]]) -> Optional["np.ndarray"]:
+    rows = []
+    for u, v, projection in observations:
+        rows.append(float(u) * projection[2, :] - projection[0, :])
+        rows.append(float(v) * projection[2, :] - projection[1, :])
+    a = np.asarray(rows, dtype=np.float64)
+    _, _, vh = np.linalg.svd(a, full_matrices=False)
+    x = vh[-1, :]
+    if abs(float(x[3])) < 1e-8:
+        return None
+    xyz = x[:3] / x[3]
+    positive_depth = 0
+    homog = np.asarray([xyz[0], xyz[1], xyz[2], 1.0], dtype=np.float64)
+    for _, _, projection in observations:
+        proj = projection @ homog
+        if abs(float(proj[2])) < 1e-8:
+            return None
+        if proj[2] > 0.0:
+            positive_depth += 1
+    if positive_depth < 2:
+        return None
+    return xyz
+
+
+def _compute_reprojection_errors(xyz: "np.ndarray", observations: Sequence[Tuple[float, float, "np.ndarray"]]) -> List[float]:
+    errors: List[float] = []
+    for u, v, projection in observations:
+        projected = _project_world_to_image(xyz, projection)
+        if projected is None:
+            return []
+        errors.append(float(np.linalg.norm(projected - np.asarray([u, v], dtype=np.float64))))
+    return errors
+
+
+def _triangulate_joint_with_reprojection_filter(observations: Sequence[Tuple[float, float, "np.ndarray"]]) -> Tuple[Optional["np.ndarray"], float, int]:
+    if len(observations) < 2:
+        return None, 0.0, 0
+    xyz = _triangulate_dlt(observations)
+    if xyz is None:
+        return None, 0.0, 0
+    errors = _compute_reprojection_errors(xyz, observations)
+    if not errors:
+        return None, 0.0, 0
+    median_error = float(np.median(np.asarray(errors, dtype=np.float64)))
+    filtered = []
+    for obs, error in zip(observations, errors):
+        if error > _MANO_REPROJ_OUTLIER_MAX_PX:
+            continue
+        if median_error > 1e-6 and error > 2.5 * median_error:
+            continue
+        filtered.append(obs)
+    if len(filtered) < 2:
+        return None, 0.0, 0
+    refined = _triangulate_dlt(filtered)
+    if refined is None:
+        return None, 0.0, 0
+    refined_errors = _compute_reprojection_errors(refined, filtered)
+    if not refined_errors:
+        return None, 0.0, 0
+    avg_error = float(sum(refined_errors) / len(refined_errors))
+    if avg_error > _MANO_REPROJ_ERROR_MAX_PX:
+        return None, avg_error, len(filtered)
+    return refined, avg_error, len(filtered)
+
+
+def _load_2d_view(source_dir: Path, cam: str, frame: int) -> "np.ndarray":
+    path = source_dir / str(cam) / f"{int(frame):05d}.npy"
+    arr = load_float32_npy(path)
+    if arr.shape != (_HAND_COUNT, _JOINT_COUNT, 2):
+        raise ValueError(f"Expected 2D npy shape (2,21,2), got {arr.shape}: {path}")
+    return np.asarray(arr, dtype=np.float64)
+
+
+def _triangulate_frame_joints(source_dir: Path, camera_model: Dict[str, Json], frame: int) -> Tuple["np.ndarray", List[float], int]:
+    joints = np.full((_HAND_COUNT, _JOINT_COUNT, 3), np.nan, dtype=np.float32)
+    views = {cam: _load_2d_view(source_dir, cam, int(frame)) for cam in camera_model}
+    reproj_errors: List[float] = []
+    used_observations = 0
+    missing = 0
+    for hand in range(_HAND_COUNT):
+        for joint in range(_JOINT_COUNT):
+            observations = []
+            for cam, model in camera_model.items():
+                pt = views[cam][hand, joint]
+                if not np.all(np.isfinite(pt)):
+                    continue
+                if float(pt[0]) < 0.0 or float(pt[1]) < 0.0:
+                    continue
+                observations.append((float(pt[0]), float(pt[1]), model["projection"]))
+            xyz, error, obs_count = _triangulate_joint_with_reprojection_filter(observations)
+            if xyz is None:
+                missing += 1
+                continue
+            joints[hand, joint] = xyz.astype(np.float32)
+            reproj_errors.append(float(error))
+            used_observations += int(obs_count)
+    if missing:
+        raise ValueError(f"MANO 3D optimization failed for frame {int(frame)}: {missing} joints have fewer than 2 valid inlier views")
+    return joints, reproj_errors, used_observations
+
+
+def triangulate_mano_3d_artifact(
+    episode_dir: Path,
+    source_dir: Path,
+    frames: Sequence[int],
+    cameras: Sequence[str],
+) -> Tuple["np.ndarray", Json]:
+    if np is None:
+        raise BackendError("MANO 3D optimization requires numpy in the worker Python environment")
+    clean_frames = [int(frame) for frame in frames or [0]]
+    camera_model = _load_camera_model(episode_dir, cameras)
+    joints_by_frame = []
+    all_errors: List[float] = []
+    used_observations = 0
+    for frame in clean_frames:
+        joints, errors, obs_count = _triangulate_frame_joints(source_dir, camera_model, frame)
+        joints_by_frame.append(joints)
+        all_errors.extend(errors)
+        used_observations += int(obs_count)
+    metrics = {
+        "valid_joint_count": int(len(clean_frames) * _HAND_COUNT * _JOINT_COUNT),
+        "used_observation_count": int(used_observations),
+        "mean_reprojection_error_px": float(sum(all_errors) / len(all_errors)) if all_errors else 0.0,
+        "max_reprojection_error_px": float(max(all_errors)) if all_errors else 0.0,
+    }
+    return np.stack(joints_by_frame, axis=0).astype(np.float32), metrics
+
+
+def path_relative_text(path: Path, base: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def write_mano_3d_artifact(
+    out: Path,
+    frames: Sequence[int],
+    cameras: Sequence[str],
+    *,
+    source_dir: Path,
+    episode_dir: Path,
+    segment_id: str = "",
+) -> None:
     clean_frames = [int(frame) for frame in frames or [0]]
     out.mkdir(parents=True, exist_ok=True)
-    values: List[float] = []
-    variant = "segment" if segment_id else "episode"
-    for frame in clean_frames:
-        values.extend(virtual_mano_3d_values(frame, variant))
-    write_float32_npy(out / "joints_3d.npy", values, shape=(len(clean_frames), _HAND_COUNT, _JOINT_COUNT, 3))
+    joints_3d, metrics = triangulate_mano_3d_artifact(episode_dir, source_dir, clean_frames, cameras)
+    write_float32_npy(out / "joints_3d.npy", joints_3d.reshape(-1).tolist(), shape=joints_3d.shape)
     manifest_name = "mano_patch.json" if segment_id else "mano_episode.json"
     manifest = {
         "schema_version": 1,
         "kind": "orbbec_mano_3d_segment_patch" if segment_id else "orbbec_mano_3d_episode",
-        "mock": True,
+        "mock": False,
         "segment_id": str(segment_id or ""),
         "frames": clean_frames,
         "cameras": list(cameras),
         "joints_3d_file": "joints_3d.npy",
+        "coordinate_system": "world_from_extrinsics_json",
+        "model": "dlt_triangulation_from_2d",
+        "source_2d": path_relative_text(source_dir, episode_dir),
+        "metrics": metrics,
     }
     (out / manifest_name).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -1180,9 +1365,10 @@ class NasSimulator:
         rgb_path_template: str = "",
     ) -> str:
         base = self.local_path_for_uri(data_uri)
-        require_2d_inputs_available(base / prediction_dir, cameras, frames, label="pred_2d")
+        source_dir = base / prediction_dir
+        require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
         out = base / "mano" / "episode"
-        write_mano_3d_artifact(out, frames, cameras)
+        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base)
         return uri_join(data_uri, "mano", "episode")
 
     def write_mano_segment_patch(
@@ -1199,7 +1385,7 @@ class NasSimulator:
         source_dir = self.manual_2d_source_path(data_uri, segment_id, manual_2d_dir, manual_2d_uri)
         require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
         out = base / "mano" / "segments" / clean_id(segment_id, "segment")
-        write_mano_3d_artifact(out, frames, cameras, segment_id=segment_id)
+        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base, segment_id=segment_id)
         return uri_join(data_uri, "mano", "segments", segment_id)
 
     def manual_2d_source_path(self, data_uri: str, segment_id: str, manual_2d_dir: str = "", manual_2d_uri: str = "") -> Path:
@@ -1382,11 +1568,12 @@ def write_mano_artifact_for_payload(
             out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
             source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
             require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
-            write_mano_3d_artifact(out, frames, cameras, segment_id=segment_id)
+            write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path, segment_id=segment_id)
             return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
         out = episode_path / "mano" / "episode"
-        require_2d_inputs_available(episode_path / prediction_dir, cameras, frames, label="pred_2d")
-        write_mano_3d_artifact(out, frames, cameras)
+        source_dir = episode_path / prediction_dir
+        require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
+        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path)
         return "mano_episode", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode")
     if scope == "segment":
         return "mano_segment_patch", uri_join(data_uri, "mano", "segments", segment_id)
@@ -1706,7 +1893,7 @@ def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argpars
             "virtual_worker": owner,
             "output_uri": uri,
         },
-        artifacts=[{"kind": kind, "uri": uri, "metadata": {"worker_id": owner, "mock": True, "scope": scope}}],
+        artifacts=[{"kind": kind, "uri": uri, "metadata": {"worker_id": owner, "mock": False, "scope": scope}}],
     )
     print_event(
         "mano_opt_completed",
