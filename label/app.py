@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 try:
     from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
-    from .hand_init import MediaPipeHandInitializer
     from .storage import (
         CorrectionProgress,
         CorrectionTask,
@@ -22,8 +21,6 @@ try:
         correction_task_from_backend_payload,
         ensure_correction_progress,
         find_frame_path,
-        load_frame_points,
-        load_frame_visibility,
         load_correction_progress,
         load_correction_tasks,
         load_prediction_bundle,
@@ -39,7 +36,6 @@ try:
 except Exception:
     from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
-    from hand_init import MediaPipeHandInitializer
     from storage import (
         CorrectionProgress,
         CorrectionTask,
@@ -48,8 +44,6 @@ except Exception:
         correction_task_from_backend_payload,
         ensure_correction_progress,
         find_frame_path,
-        load_frame_points,
-        load_frame_visibility,
         load_correction_progress,
         load_correction_tasks,
         load_prediction_bundle,
@@ -66,14 +60,13 @@ except Exception:
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
 SourceStateCache = Dict[Tuple[str, int, str, str], Tuple[HandPoints, HandVisible]]
-SOURCE_ORDER = ("pred", "correct", "last", "tracking", "scratch", "mano")
+SOURCE_ORDER = ("mano", "pred", "correct", "last", "tracking")
 SOURCE_LABELS = {
     "mano": "MANO",
     "pred": "Pred",
     "correct": "Correct",
     "last": "Last",
     "tracking": "Tracking",
-    "scratch": "Scratch",
 }
 STATUS_DONE_COLOR = "#46d36b"
 STATUS_TODO_COLOR = "#ff5c5c"
@@ -451,7 +444,6 @@ class LabelPage(ttk.Frame):
         self._frame_pos: int = 0
         self._view_states: ViewStateByCam = {}
         self._source_state_cache: SourceStateCache = {}
-        self._hand_initializer = MediaPipeHandInitializer()
         self._tracker: Optional[CoTrackerRuntime] = None
         self._mano_runtime: Optional[ManoViewRuntime] = None
         self._mano_mesh: Optional[ManoMeshResult] = None
@@ -565,7 +557,6 @@ class LabelPage(ttk.Frame):
         self._source_state_cache = {}
         self._reset_visualizations()
         self._tracking_notice_keys = set()
-        self._hand_initializer.close()
         if self._frame_status is not None:
             self._frame_status.configure(text="")
 
@@ -880,7 +871,7 @@ class LabelPage(ttk.Frame):
             return
 
         self._frame_pos = max(0, min(self._frame_pos, task.total_frames - 1))
-        self._load_current_source_states()
+        self._view_states = {}
         self._cam_idx = max(0, min(self._cam_idx, max(0, len(self._camera_ids) - 1)))
         self._refresh_view()
 
@@ -907,31 +898,32 @@ class LabelPage(ttk.Frame):
         frame_idx = task.frames[self._frame_pos]
         if self._mode == "tracking":
             self._view_states = self._build_tracking_source_states(frame_idx)
-            self._make_all_view_states_displayable(frame_idx)
             return
         self._view_states = {
             cam_id: self._build_initial_view_state(frame_idx, cam_id, self._mode) for cam_id in self._camera_ids
         }
-        self._make_all_view_states_displayable(frame_idx)
+
+    def _ensure_all_view_states_loaded(self, frame_idx: int) -> None:
+        task = self._active_task
+        if task is None:
+            return
+        if self._mode == "tracking":
+            errors: List[str] = []
+            for cam_id in self._camera_ids:
+                if cam_id not in self._view_states:
+                    self._view_states[cam_id] = self._build_tracking_view_state(frame_idx, cam_id, errors)
+            self._show_tracking_errors_once(frame_idx, errors)
+            return
+        for cam_id in self._camera_ids:
+            if cam_id not in self._view_states:
+                self._view_states[cam_id] = self._build_initial_view_state(frame_idx, cam_id, self._mode)
 
     def _build_initial_view_state(self, frame_idx: int, cam_id: str, source: str) -> Tuple[HandPoints, HandVisible]:
         source = self._normalize_source(source)
         cache_key = self._source_cache_key(cam_id, source)
         if cache_key is not None and cache_key in self._source_state_cache:
-            cached = self._copy_view_state(self._source_state_cache[cache_key])
-            points, visible = cached
-            if source == "scratch":
-                if self._has_hidden_points(points):
-                    points = self._merge_missing_points(points, self._mediapipe_points(frame_idx, cam_id))
-                return points, visible
-            if source == "tracking":
-                return points, visible
-            return self._fill_missing_points(points, frame_idx, cam_id), visible
+            return self._copy_view_state(self._source_state_cache[cache_key])
 
-        if source == "scratch":
-            points = self._mediapipe_points(frame_idx, cam_id)
-            visible = self._initial_visibility(frame_idx, cam_id)
-            return points, visible
         if source == "tracking":
             errors: List[str] = []
             state = self._build_tracking_view_state(frame_idx, cam_id, errors)
@@ -941,56 +933,13 @@ class LabelPage(ttk.Frame):
             state = self._build_mano_3d_view_state(frame_idx, cam_id)
             if state is None:
                 return self._hidden_points(), self._none_visible()
-            points, visible = state
-            fallback_points = self._display_fallback_points(frame_idx, cam_id)
-            points = self._apply_initial_display_fallback(points, visible, fallback_points)
-            return points, visible
+            return state
 
         bundle = self._ensure_bundle(source)
-        fallback_points = self._display_fallback_points(frame_idx, cam_id)
         if self._is_source_missing(source, frame_idx, cam_id):
-            return fallback_points, self._none_visible()
+            return self._hidden_points(), self._none_visible()
 
-        visible = None if source in {"correct", "last"} else self._initial_visibility(frame_idx, cam_id)
-        points, visible = view_state_from_bundle(
-            bundle,
-            frame_idx,
-            cam_id,
-            default_points=fallback_points,
-            default_visible=visible,
-        )
-        points = self._apply_initial_display_fallback(points, visible, fallback_points)
-        return points, visible
-
-    @staticmethod
-    def _has_hidden_points(points: HandPoints) -> bool:
-        for hand in range(min(2, len(points))):
-            for joint in range(min(21, len(points[hand]))):
-                if LabelPage._is_hidden_point(points[hand][joint]):
-                    return True
-        return False
-
-    def _fill_missing_points(self, points: HandPoints, frame_idx: int, cam_id: str) -> HandPoints:
-        if not self._has_hidden_points(points):
-            return [[(float(x), float(y)) for (x, y) in hand] for hand in points]
-        return self._merge_missing_points(points, self._display_fallback_points(frame_idx, cam_id))
-
-    def _display_fallback_points(self, frame_idx: int, cam_id: str) -> HandPoints:
-        if self._active_task is None:
-            return self._empty_points()
-        pred_points = load_frame_points(
-            self._active_task.episode_dir() / self._active_task.prediction_dir,
-            cam_id,
-            frame_idx,
-        )
-        if pred_points is not None and not self._has_hidden_points(pred_points):
-            return pred_points
-        mediapipe_points = self._mediapipe_points(frame_idx, cam_id)
-        template = self._template_points(frame_idx, cam_id)
-        if pred_points is None:
-            return self._replace_unusable_points(mediapipe_points, template)
-        merged = self._merge_missing_points(pred_points, mediapipe_points)
-        return self._replace_unusable_points(merged, template)
+        return view_state_from_bundle(bundle, frame_idx, cam_id)
 
     def _build_mano_3d_view_state(self, frame_idx: int, cam_id: str) -> Optional[Tuple[HandPoints, HandVisible]]:
         task = self._active_task
@@ -1006,112 +955,6 @@ class LabelPage(ttk.Frame):
         except Exception:
             return None
 
-    def _apply_initial_display_fallback(
-        self,
-        points: HandPoints,
-        visible: HandVisible,
-        fallback: HandPoints,
-    ) -> HandPoints:
-        out = [[(float(x), float(y)) for (x, y) in hand] for hand in points]
-        for hand in range(min(2, len(out), len(visible), len(fallback))):
-            for joint in range(min(21, len(out[hand]), len(visible[hand]), len(fallback[hand]))):
-                if not visible[hand][joint] or self._is_hidden_point(out[hand][joint]):
-                    x, y = fallback[hand][joint]
-                    out[hand][joint] = (float(x), float(y))
-        return out
-
-    @staticmethod
-    def _merge_missing_points(points: HandPoints, fallback: HandPoints) -> HandPoints:
-        out = [[(float(x), float(y)) for (x, y) in hand] for hand in points]
-        for hand in range(min(2, len(out), len(fallback))):
-            for joint in range(min(21, len(out[hand]), len(fallback[hand]))):
-                if LabelPage._is_hidden_point(out[hand][joint]):
-                    x, y = fallback[hand][joint]
-                    out[hand][joint] = (float(x), float(y))
-        return out
-
-    def _replace_unusable_points(self, points: HandPoints, fallback: HandPoints) -> HandPoints:
-        out = [[(float(x), float(y)) for (x, y) in hand] for hand in points]
-        for hand in range(min(2, len(out), len(fallback))):
-            all_zero = all(
-                float(out[hand][joint][0]) == 0.0 and float(out[hand][joint][1]) == 0.0
-                for joint in range(min(21, len(out[hand])))
-            )
-            for joint in range(min(21, len(out[hand]), len(fallback[hand]))):
-                if self._is_hidden_point(out[hand][joint]) or all_zero:
-                    x, y = fallback[hand][joint]
-                    out[hand][joint] = (float(x), float(y))
-        return out
-
-    def _make_all_view_states_displayable(self, frame_idx: int) -> None:
-        for cam_id, state in list(self._view_states.items()):
-            points, visible = state
-            fallback = self._display_fallback_points(frame_idx, cam_id)
-            points = self._merge_missing_points(points, fallback)
-            points = self._replace_unusable_points(points, fallback)
-            self._view_states[cam_id] = (points, visible)
-
-    def _template_points(self, frame_idx: int, cam_id: str) -> HandPoints:
-        width = 848.0
-        height = 480.0
-        if self._active_task is not None:
-            img_path = find_frame_path(
-                self._active_task.episode_dir(),
-                cam_id,
-                frame_idx,
-                self._active_task.rgb_path_template,
-            )
-            if img_path is not None:
-                try:
-                    from PIL import Image
-
-                    with Image.open(img_path) as im:
-                        width, height = float(im.size[0]), float(im.size[1])
-                except Exception:
-                    pass
-        centers = ((width * 0.42, height * 0.52), (width * 0.58, height * 0.52))
-        scale = max(18.0, min(width, height) * 0.08)
-        return [
-            [
-                (
-                    float(centers[hand][0] + self._template_joint_offset(hand, joint)[0] * scale),
-                    float(centers[hand][1] + self._template_joint_offset(hand, joint)[1] * scale),
-                )
-                for joint in range(21)
-            ]
-            for hand in range(2)
-        ]
-
-    @staticmethod
-    def _template_joint_offset(hand: int, joint: int) -> Tuple[float, float]:
-        base = (
-            (0.0, 0.55),
-            (-0.45, 0.10),
-            (-0.68, -0.14),
-            (-0.82, -0.36),
-            (-0.94, -0.58),
-            (-0.28, 0.02),
-            (-0.34, -0.32),
-            (-0.38, -0.62),
-            (-0.40, -0.88),
-            (0.0, -0.02),
-            (0.0, -0.38),
-            (0.0, -0.70),
-            (0.0, -0.98),
-            (0.28, 0.02),
-            (0.34, -0.32),
-            (0.38, -0.62),
-            (0.40, -0.88),
-            (0.48, 0.12),
-            (0.62, -0.14),
-            (0.72, -0.38),
-            (0.82, -0.60),
-        )
-        x, y = base[joint]
-        if hand == 0:
-            x = -x
-        return x, y
-
     @staticmethod
     def _is_hidden_point(point: Tuple[float, float]) -> bool:
         x, y = point
@@ -1119,7 +962,7 @@ class LabelPage(ttk.Frame):
 
     def _is_source_missing(self, source: str, frame_idx: int, cam_id: str) -> bool:
         source = self._normalize_source(source)
-        if source in {"scratch", "tracking"}:
+        if source == "tracking":
             return False
         if source == "mano":
             task = self._active_task
@@ -1137,30 +980,6 @@ class LabelPage(ttk.Frame):
             return state is None
         bundle = self._ensure_bundle(source)
         return source_frame_path(bundle, frame_idx, cam_id) is None
-
-    def _mediapipe_points(self, frame_idx: int, cam_id: str) -> HandPoints:
-        self._hand_initializer.ensure_available()
-        if self._active_task is None:
-            return self._hand_initializer.empty_points()
-        img_path = find_frame_path(
-            self._active_task.episode_dir(),
-            cam_id,
-            frame_idx,
-            self._active_task.rgb_path_template,
-        )
-        return self._hand_initializer.points_from_image(img_path)
-
-    def _initial_visibility(self, frame_idx: int, cam_id: str) -> HandVisible:
-        if self._active_task is None:
-            return self._none_visible()
-        episode_dir = self._active_task.episode_dir()
-        visible = load_frame_visibility(episode_dir / self._active_task.correction_dir, cam_id, int(frame_idx) - 1)
-        if visible is not None:
-            return visible
-        visible = load_frame_visibility(episode_dir / self._active_task.prediction_dir, cam_id, frame_idx)
-        if visible is not None:
-            return visible
-        return self._none_visible()
 
     def _empty_points(self) -> HandPoints:
         return [[(0.0, 0.0) for _ in range(21)] for _ in range(2)]
@@ -1246,8 +1065,6 @@ class LabelPage(ttk.Frame):
             return bundle
         if self._active_task is None:
             raise ValueError("No active task.")
-        if source == "scratch":
-            self._hand_initializer.ensure_available()
         bundle = load_prediction_bundle(self._active_task, mode=source)
         self._bundles[source] = bundle
         if self._active_bundle is None or source == "pred":
@@ -1284,11 +1101,22 @@ class LabelPage(ttk.Frame):
         source = self._normalize_source(source or self._mode)
         return SOURCE_LABELS[source]
 
-    def _source_status_label(self, source: str, frame_idx: int, cam_id: str) -> str:
+    def _view_source_status(self, source: str, frame_idx: int, cam_id: str, visible: HandVisible) -> str:
+        source = self._normalize_source(source)
         label = self._source_label(source)
+        if source in {"mano", "tracking"}:
+            return label if self._has_any_visible(visible) else f"{label} (missing)"
         if self._is_source_missing(source, frame_idx, cam_id):
             return f"{label} (missing)"
         return label
+
+    @staticmethod
+    def _has_any_visible(visible: HandVisible) -> bool:
+        for hand in visible:
+            for item in hand:
+                if item:
+                    return True
+        return False
 
     def _source_button_text(self) -> str:
         return f"View Source: {self._source_label()}"
@@ -1372,10 +1200,7 @@ class LabelPage(ttk.Frame):
         self._reset_mano()
         self._cache_current_source_state()
         frame_idx = task.frames[self._frame_pos]
-        for cam_id in self._camera_ids:
-            if cam_id not in self._view_states:
-                self._view_states[cam_id] = self._build_initial_view_state(frame_idx, cam_id, self._mode)
-        self._make_all_view_states_displayable(frame_idx)
+        self._ensure_all_view_states_loaded(frame_idx)
 
         missing = self._incomplete_joint_count(min_views=2)
         if missing > 0:
@@ -1430,10 +1255,7 @@ class LabelPage(ttk.Frame):
         self._reset_skeleton()
         self._cache_current_source_state()
         frame_idx = task.frames[self._frame_pos]
-        for cam_id in self._camera_ids:
-            if cam_id not in self._view_states:
-                self._view_states[cam_id] = self._build_initial_view_state(frame_idx, cam_id, self._mode)
-        self._make_all_view_states_displayable(frame_idx)
+        self._ensure_all_view_states_loaded(frame_idx)
 
         missing = self._incomplete_joint_count(min_views=2)
         if missing > 0:
@@ -1495,17 +1317,18 @@ class LabelPage(ttk.Frame):
         self._cache_current_source_state()
         self._reset_visualizations()
         self._mode = new_source
+        self._view_states = {}
         try:
-            self._load_current_source_states()
+            self._refresh_view()
         except Exception as exc:
             self._mode = old_source
-            self._load_current_source_states()
+            self._view_states = {}
             self._update_source_button()
+            self._refresh_view()
             messagebox.showerror("Error", str(exc))
             return
 
         self._update_source_button()
-        self._refresh_view()
 
     def _active_cam_id(self) -> Optional[str]:
         if not self._camera_ids:
@@ -1528,17 +1351,14 @@ class LabelPage(ttk.Frame):
         state = self._view_states.get(cam_id)
         if state is None:
             state = self._build_initial_view_state(frame_idx, cam_id, source)
-            fallback = self._display_fallback_points(frame_idx, cam_id)
-            points0, visible0 = state
-            state = (self._replace_unusable_points(self._merge_missing_points(points0, fallback), fallback), visible0)
             self._view_states[cam_id] = state
         points, visible = state
 
-        self._update_source_button()
-        self._canvas.set_hand_state(points, visible)
-        self._canvas.set_count_base(self._visibility_counts(exclude_cam=cam_id))
         img_path = find_frame_path(task.episode_dir(), cam_id, frame_idx, task.rgb_path_template)
         self._canvas.set_image(img_path)
+        self._canvas.set_hand_state(points, visible)
+        self._canvas.set_count_base(self._visibility_counts(exclude_cam=cam_id))
+        self._update_source_button()
         self._refresh_visual_overlays()
 
         rec = self._progress.get(task.key)
@@ -1548,7 +1368,7 @@ class LabelPage(ttk.Frame):
             text=(
                 f"Task: {task.display_name}    Camera: {cam_id} ({self._cam_idx + 1}/{len(self._camera_ids)})    "
                 f"Frame: {frame_idx} ({self._frame_pos + 1}/{task.total_frames})    "
-                f"View Source: {self._source_status_label(source, frame_idx, cam_id)}    Done: {done}/{task.total_frames}"
+                f"View Source: {self._view_source_status(source, frame_idx, cam_id, visible)}    Done: {done}/{task.total_frames}"
             )
         )
         if self._frame_status is not None:
@@ -1640,9 +1460,7 @@ class LabelPage(ttk.Frame):
             return
 
         self._cache_current_source_state()
-        for cam_id in self._camera_ids:
-            if cam_id not in self._view_states:
-                self._view_states[cam_id] = self._build_initial_view_state(task.frames[self._frame_pos], cam_id, self._mode)
+        self._ensure_all_view_states_loaded(task.frames[self._frame_pos])
         missing = self._incomplete_joint_count(min_views=2)
         if missing > 0:
             messagebox.showwarning("Notice", f"未标注完全：还有 {missing} 个关节点的可见视角数少于 2。")

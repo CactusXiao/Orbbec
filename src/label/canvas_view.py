@@ -31,6 +31,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._points: List[Tuple[int, int]] = []
         self._point_items: List[int] = []
         self._message_item: Optional[int] = None
+        self._pending_fit_after_id: Optional[str] = None
 
         self._dragging = False
         self._drag_last: Tuple[int, int] = (0, 0)
@@ -45,6 +46,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self.bind("<Configure>", self._on_resize)
 
     def clear(self) -> None:
+        self._cancel_pending_fit()
         self._img_path = None
         self._base_image = None
         self._imgtk = None
@@ -57,6 +59,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._show_message("No image")
 
     def set_image(self, path: Optional[Path]) -> None:
+        self._cancel_pending_fit()
         self._img_path = path
         self._base_image = None
         self._imgtk = None
@@ -78,9 +81,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
             return
 
         self._hide_message()
-        self._fit_to_canvas()
-        self._render_image()
-        self._render_points()
+        self._fit_and_render_image()
 
     def set_points(self, pts: List[Tuple[int, int]]) -> None:
         self._points = [(int(x), int(y)) for (x, y) in pts]
@@ -124,11 +125,33 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self.delete(self._message_item)
             self._message_item = None
 
+    def _cancel_pending_fit(self) -> None:
+        if self._pending_fit_after_id is None:
+            return
+        try:
+            self.after_cancel(self._pending_fit_after_id)
+        except Exception:
+            pass
+        self._pending_fit_after_id = None
+
+    def _fit_and_render_image(self) -> None:
+        if self._base_image is None:
+            return
+        if self.winfo_width() <= 1 or self.winfo_height() <= 1:
+            self._pending_fit_after_id = self.after(16, self._fit_and_render_image)
+            return
+        self._pending_fit_after_id = None
+        self._fit_to_canvas()
+        self._render_image()
+        self._render_points()
+
     def _on_resize(self, _evt) -> None:
         if self._base_image is None:
             if self._message_item is not None:
                 self._show_message(self.itemcget(self._message_item, "text") or "")
             return
+        self._cancel_pending_fit()
+        self._fit_to_canvas()
         self._render_image()
         self._render_points()
 

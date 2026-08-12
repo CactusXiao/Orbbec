@@ -1,6 +1,5 @@
 Pillow==9.0
 numpy==1.23
-mediapipe==0.10.35
 torch
 opencv-python
 smplx

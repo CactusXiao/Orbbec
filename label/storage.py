@@ -383,7 +383,7 @@ def save_correction_progress(jsonl_path: str, records: Dict[str, CorrectionProgr
 
 def load_prediction_bundle(task: CorrectionTask, *, mode: str = "pred") -> PredictionBundle:
     mode = (mode or "pred").strip().lower()
-    if mode not in {"pred", "correct", "last", "scratch"}:
+    if mode not in {"pred", "correct", "last"}:
         raise ValueError(f"Unsupported label mode: {mode}")
 
     episode_dir = task.episode_dir()
@@ -460,8 +460,6 @@ def find_optional_prediction_frame_path(pred_dir: Path, cam_id: str, frame_idx: 
 
 
 def source_frame_path(bundle: PredictionBundle, frame_idx: int, cam_id: str) -> Optional[Path]:
-    if bundle.mode == "scratch":
-        return None
     return find_optional_prediction_frame_path(bundle.pred_dir, cam_id, _source_frame_idx(bundle.mode, frame_idx))
 
 
@@ -472,15 +470,6 @@ def load_frame_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Option
     arr = _load_prediction_view(path)
     _validate_prediction_view(arr, path)
     return _visibility_from_array(np.asarray(arr, dtype=float)).astype(bool).tolist()
-
-
-def load_frame_points(base_dir: Path, cam_id: str, frame_idx: int) -> Optional[List[List[Tuple[float, float]]]]:
-    path = find_optional_prediction_frame_path(base_dir, cam_id, frame_idx)
-    if path is None:
-        return None
-    arr = _load_prediction_view(path)
-    _validate_prediction_view(arr, path)
-    return _array_to_points(np.asarray(arr, dtype=float))
 
 
 def _sample_for(bundle: PredictionBundle, frame_idx: int, cam_id: str) -> PredictionSample:
@@ -513,9 +502,6 @@ def view_state_from_bundle(
     bundle: PredictionBundle,
     frame_idx: int,
     cam_id: str,
-    *,
-    default_points: Optional[List[List[Tuple[float, float]]]] = None,
-    default_visible: Optional[List[List[bool]]] = None,
 ) -> Tuple[List[List[Tuple[float, float]]], List[List[bool]]]:
     sample = _sample_for(bundle, frame_idx, cam_id)
     if sample.source_path is not None:
@@ -523,25 +509,18 @@ def view_state_from_bundle(
         _validate_prediction_view(pred, sample.source_path)
         points_view = np.asarray(pred, dtype=float)
     else:
-        points_view = _points_to_array(default_points) if default_points is not None else _empty_points_array()
+        points_view = _empty_points_array()
 
     key = (sample.cam_id, sample.frame_idx)
     if key in bundle.pending:
         points_view = np.asarray(bundle.pending[key], dtype=float)
         visible = _visibility_from_array(points_view)
-    elif default_visible is not None:
-        visible = _visible_to_array(default_visible)
     elif sample.source_path is not None:
         visible = _visibility_from_array(points_view)
     else:
         visible = np.zeros((_HAND_COUNT, _JOINT_COUNT), dtype=bool)
 
-    points = points_view.copy()
-    if default_points is not None:
-        fallback_view = _points_to_array(default_points)
-        missing = _missing_points(points)
-        points[missing] = fallback_view[missing]
-    return _array_to_points(points), visible.astype(bool).tolist()
+    return _array_to_points(points_view.copy()), visible.astype(bool).tolist()
 
 
 def apply_view_state_to_corrected(
@@ -584,20 +563,6 @@ def apply_view_state_to_corrected(
 
 def _empty_points_array() -> np.ndarray:
     return np.zeros((_HAND_COUNT, _JOINT_COUNT, 2), dtype=float)
-
-
-def _points_to_array(points: List[List[Tuple[float, float]]]) -> np.ndarray:
-    arr = np.asarray(points, dtype=float)
-    if arr.shape != (_HAND_COUNT, _JOINT_COUNT, 2):
-        raise ValueError(f"Expected default points shape (2,21,2), got {arr.shape}.")
-    return arr
-
-
-def _visible_to_array(visible: List[List[bool]]) -> np.ndarray:
-    arr = np.asarray(visible, dtype=bool)
-    if arr.shape != (_HAND_COUNT, _JOINT_COUNT):
-        raise ValueError(f"Expected default visibility shape (2,21), got {arr.shape}.")
-    return arr
 
 
 def _missing_points(arr: np.ndarray) -> np.ndarray:
