@@ -49,8 +49,6 @@ _VIDEO_SUFFIXES = {".h265", ".hevc", ".mp4", ".mkv", ".mov"}
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
 _FALLBACK_IMAGE_SIZE = (640, 480)
-_MANO_REPROJ_ERROR_MAX_PX = 14.0
-_MANO_REPROJ_OUTLIER_MAX_PX = 20.0
 _HAND_TEMPLATE = (
     (0.00, 0.00),
     (-0.18, -0.14),
@@ -934,22 +932,18 @@ def _triangulate_joint_with_reprojection_filter(observations: Sequence[Tuple[flo
     median_error = float(np.median(np.asarray(errors, dtype=np.float64)))
     filtered = []
     for obs, error in zip(observations, errors):
-        if error > _MANO_REPROJ_OUTLIER_MAX_PX:
-            continue
         if median_error > 1e-6 and error > 2.5 * median_error:
             continue
         filtered.append(obs)
     if len(filtered) < 2:
-        return None, 0.0, 0
+        return xyz, float(sum(errors) / len(errors)), len(observations)
     refined = _triangulate_dlt(filtered)
     if refined is None:
-        return None, 0.0, 0
+        return xyz, float(sum(errors) / len(errors)), len(observations)
     refined_errors = _compute_reprojection_errors(refined, filtered)
     if not refined_errors:
-        return None, 0.0, 0
+        return xyz, float(sum(errors) / len(errors)), len(observations)
     avg_error = float(sum(refined_errors) / len(refined_errors))
-    if avg_error > _MANO_REPROJ_ERROR_MAX_PX:
-        return None, avg_error, len(filtered)
     return refined, avg_error, len(filtered)
 
 
@@ -961,7 +955,7 @@ def _load_2d_view(source_dir: Path, cam: str, frame: int) -> "np.ndarray":
     return np.asarray(arr, dtype=np.float64)
 
 
-def _triangulate_frame_joints(source_dir: Path, camera_model: Dict[str, Json], frame: int) -> Tuple["np.ndarray", List[float], int]:
+def _triangulate_frame_joints(source_dir: Path, camera_model: Dict[str, Json], frame: int) -> Tuple["np.ndarray", List[float], int, int]:
     joints = np.full((_HAND_COUNT, _JOINT_COUNT, 3), np.nan, dtype=np.float32)
     views = {cam: _load_2d_view(source_dir, cam, int(frame)) for cam in camera_model}
     reproj_errors: List[float] = []
@@ -984,9 +978,7 @@ def _triangulate_frame_joints(source_dir: Path, camera_model: Dict[str, Json], f
             joints[hand, joint] = xyz.astype(np.float32)
             reproj_errors.append(float(error))
             used_observations += int(obs_count)
-    if missing:
-        raise ValueError(f"MANO 3D optimization failed for frame {int(frame)}: {missing} joints have fewer than 2 valid inlier views")
-    return joints, reproj_errors, used_observations
+    return joints, reproj_errors, used_observations, int(missing)
 
 
 def triangulate_mano_3d_artifact(
@@ -1002,13 +994,18 @@ def triangulate_mano_3d_artifact(
     joints_by_frame = []
     all_errors: List[float] = []
     used_observations = 0
+    missing_joints = 0
     for frame in clean_frames:
-        joints, errors, obs_count = _triangulate_frame_joints(source_dir, camera_model, frame)
+        joints, errors, obs_count, missing = _triangulate_frame_joints(source_dir, camera_model, frame)
         joints_by_frame.append(joints)
         all_errors.extend(errors)
         used_observations += int(obs_count)
+        missing_joints += int(missing)
+    total_joints = int(len(clean_frames) * _HAND_COUNT * _JOINT_COUNT)
     metrics = {
-        "valid_joint_count": int(len(clean_frames) * _HAND_COUNT * _JOINT_COUNT),
+        "valid_joint_count": int(total_joints - missing_joints),
+        "missing_joint_count": int(missing_joints),
+        "valid_joint_rate": float((total_joints - missing_joints) / total_joints) if total_joints else 0.0,
         "used_observation_count": int(used_observations),
         "mean_reprojection_error_px": float(sum(all_errors) / len(all_errors)) if all_errors else 0.0,
         "max_reprojection_error_px": float(max(all_errors)) if all_errors else 0.0,

@@ -209,6 +209,64 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertEqual(manifest["model"], "dlt_triangulation_from_2d")
             self.assertTrue(np.allclose(joints[0, 0, 0], target[0, 0], atol=1e-4), joints[0, 0, 0])
 
+    def test_mano_worker_keeps_missing_joints_as_nan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
+            task = LabelTask(
+                root=tmp_path / "captures",
+                subject="S001",
+                task="pick_object",
+                episode="episode_001",
+                cameras=["00", "01"],
+                frames=[0],
+            )
+            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.local_path_for_uri(data_uri)
+            self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
+            target = self._synthetic_3d_hands(0)
+            for cam in task.cameras:
+                pred = np.full((2, 21, 2), -1.0, dtype=np.float32)
+                for joint in range(21):
+                    pred[0, joint] = self._project_test_point(target[0, joint], cam)
+                write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
+
+            nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+
+            joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
+            manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
+            self.assertTrue(np.all(np.isfinite(joints[0, 0])))
+            self.assertTrue(np.all(np.isnan(joints[0, 1])))
+            self.assertEqual(manifest["metrics"]["valid_joint_count"], 21)
+            self.assertEqual(manifest["metrics"]["missing_joint_count"], 21)
+
+    def test_mano_worker_writes_all_nan_frame_when_no_joints_triangulate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
+            task = LabelTask(
+                root=tmp_path / "captures",
+                subject="S001",
+                task="pick_object",
+                episode="episode_001",
+                cameras=["00", "01"],
+                frames=[0],
+            )
+            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.local_path_for_uri(data_uri)
+            self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
+            pred = np.full((2, 21, 2), -1.0, dtype=np.float32)
+            for cam in task.cameras:
+                write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
+
+            nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+
+            joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
+            manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
+            self.assertTrue(np.all(np.isnan(joints)))
+            self.assertEqual(manifest["metrics"]["valid_joint_count"], 0)
+            self.assertEqual(manifest["metrics"]["missing_joint_count"], 42)
+
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
         if shutil.which("ffmpeg") is None:
             self.skipTest("ffmpeg is not installed")

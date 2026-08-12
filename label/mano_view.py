@@ -155,9 +155,13 @@ class ManoViewRuntime:
         points: HandPoints = []
         visible: HandVisible = []
         for hand in range(_HAND_COUNT):
-            pts_2d = project_points(cam, joints_3d[hand])
+            hand_joints = np.asarray(joints_3d[hand], dtype=np.float32)
+            finite_3d = np.all(np.isfinite(hand_joints), axis=1)
+            pts_2d = np.full((_JOINT_COUNT, 2), np.nan, dtype=np.float32)
+            if np.any(finite_3d):
+                pts_2d[finite_3d] = project_points(cam, hand_joints[finite_3d]).astype(np.float32)
             points.append([(float(x), float(y)) for x, y in pts_2d])
-            visible.append([bool(np.all(np.isfinite(pt))) for pt in pts_2d])
+            visible.append([bool(finite_3d[idx] and np.all(np.isfinite(pt))) for idx, pt in enumerate(pts_2d)])
         return points, visible
 
     def project_mesh(

@@ -79,6 +79,54 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertAlmostEqual(points[1][0][1], 220.0)
             self.assertTrue(visible[1][0])
 
+    def test_mano_source_hides_nan_3d_joints(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cv2 is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            mano_dir.mkdir(parents=True)
+            (episode_dir / "camera_params.json").write_text(
+                json.dumps(
+                    {
+                        "00": {
+                            "RGB": {
+                                "intrinsic": {"fx": 100.0, "fy": 100.0, "cx": 320.0, "cy": 200.0},
+                                "distortion": {},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (episode_dir / "extrinsics.json").write_text(
+                json.dumps({"00": {"rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0]}}),
+                encoding="utf-8",
+            )
+            joints = np.zeros((1, 2, 21, 3), dtype=np.float32)
+            joints[:, :, :, 2] = 1.0
+            joints[0, 1, 0] = [np.nan, np.nan, np.nan]
+            np.save(mano_dir / "joints_3d.npy", joints)
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps({"schema_version": 1, "kind": "orbbec_mano_3d_episode", "frames": [5], "joints_3d_file": "joints_3d.npy"}),
+                encoding="utf-8",
+            )
+
+            projected = ManoViewRuntime().project_mano_frame(
+                episode_dir=episode_dir,
+                mano_dir=mano_dir,
+                cam_id="00",
+                frame_idx=5,
+            )
+
+            self.assertIsNotNone(projected)
+            points, visible = projected  # type: ignore[misc]
+            self.assertFalse(visible[1][0])
+            self.assertTrue(np.isnan(points[1][0][0]))
+            self.assertTrue(np.isnan(points[1][0][1]))
+
     def test_grouped_label_tasks_by_task(self) -> None:
         groups = grouped_label_tasks(
             [
