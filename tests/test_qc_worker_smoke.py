@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+import numpy as np
 import tempfile
 import unittest
 from pathlib import Path
 
+from src.qc.media import prepare_qc_media
 from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, normalize_ranges
 
 
@@ -40,6 +43,87 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].episode_id, "episode_001")
             self.assertEqual(loaded[0].bad_frame_ranges, [(12, 15)])
+
+    def test_prepare_qc_media_uses_nas_episode_root_for_calibration_and_mano(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            (episode_dir / "00" / "RGB").mkdir(parents=True)
+            mano_dir.mkdir(parents=True)
+            (episode_dir / "00" / "RGB" / "00000.png").write_bytes(b"placeholder")
+            (episode_dir / "camera_params.json").write_text(
+                json.dumps(
+                    {
+                        "00": {
+                            "RGB": {
+                                "intrinsic": {"fx": 100.0, "fy": 100.0, "cx": 320.0, "cy": 200.0},
+                                "distortion": {},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (episode_dir / "extrinsics.json").write_text(
+                json.dumps({"00": {"rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0]}}),
+                encoding="utf-8",
+            )
+            joints = np.zeros((1, 2, 21, 3), dtype=np.float32)
+            joints[:, :, :, 2] = 1.0
+            np.save(mano_dir / "joints_3d.npy", joints)
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps({"schema_version": 1, "kind": "orbbec_mano_3d_episode", "frames": [0], "joints_3d_file": "joints_3d.npy"}),
+                encoding="utf-8",
+            )
+
+            media = prepare_qc_media(
+                {
+                    "episode_id": "episode_001",
+                    "subject_id": "S001",
+                    "task_name": "pick_object",
+                    "data_uri": "nas://ego/S001/pick_object/episode_001",
+                    "cameras": ["00"],
+                    "frames": [0],
+                    "mano_episode_dir": "mano/episode",
+                },
+                mounts={"nas://ego": str(nas_root)},
+                tmp_dir=tmp_path / "qc_tmp",
+            )
+
+            self.assertEqual(media.episode_dir, episode_dir.resolve())
+            self.assertEqual(media.mano_dir, mano_dir.resolve())
+            self.assertEqual(media.frame_path("00", 0), (episode_dir / "00" / "RGB" / "00000.png").resolve())
+
+    def test_prepare_qc_media_fails_when_collection_calibration_is_missing_at_episode_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            (episode_dir / "00" / "RGB").mkdir(parents=True)
+            mano_dir.mkdir(parents=True)
+            (episode_dir / "00" / "RGB" / "00000.png").write_bytes(b"placeholder")
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps({"schema_version": 1, "kind": "orbbec_mano_3d_episode", "frames": [0], "joints_3d_file": "joints_3d.npy"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "Collection calibration missing at episode root"):
+                prepare_qc_media(
+                    {
+                        "episode_id": "episode_001",
+                        "subject_id": "S001",
+                        "task_name": "pick_object",
+                        "data_uri": "nas://ego/S001/pick_object/episode_001",
+                        "cameras": ["00"],
+                        "frames": [0],
+                        "mano_episode_dir": "mano/episode",
+                    },
+                    mounts={"nas://ego": str(nas_root)},
+                    tmp_dir=tmp_path / "qc_tmp",
+                )
 
 
 if __name__ == "__main__":

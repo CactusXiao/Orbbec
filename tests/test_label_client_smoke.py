@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import numpy as np
 import shutil
 import subprocess
@@ -11,7 +12,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, UriResolver, grouped_label_tasks
-from label.mano_view import ManoViewRuntime
+from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
 from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
 from label.video_frames import ensure_decoded_rgb_frames
@@ -127,6 +128,76 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertTrue(np.isnan(points[1][0][0]))
             self.assertTrue(np.isnan(points[1][0][1]))
 
+    def test_mano_source_reloads_when_npy_changes(self) -> None:
+        try:
+            import cv2  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("cv2 is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            mano_dir.mkdir(parents=True)
+            (episode_dir / "camera_params.json").write_text(
+                json.dumps(
+                    {
+                        "00": {
+                            "RGB": {
+                                "intrinsic": {"fx": 100.0, "fy": 100.0, "cx": 320.0, "cy": 200.0},
+                                "distortion": {},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (episode_dir / "extrinsics.json").write_text(
+                json.dumps({"00": {"rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]], "translation": [0, 0, 0]}}),
+                encoding="utf-8",
+            )
+            joints_path = mano_dir / "joints_3d.npy"
+            joints = np.zeros((1, 2, 21, 3), dtype=np.float32)
+            joints[:, :, :, 2] = 1.0
+            np.save(joints_path, joints)
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps({"schema_version": 1, "kind": "orbbec_mano_3d_episode", "frames": [5], "joints_3d_file": "joints_3d.npy"}),
+                encoding="utf-8",
+            )
+            runtime = ManoViewRuntime()
+
+            first = runtime.project_mano_frame(episode_dir=episode_dir, mano_dir=mano_dir, cam_id="00", frame_idx=5)
+            self.assertIsNotNone(first)
+            points, _visible = first  # type: ignore[misc]
+            self.assertAlmostEqual(points[0][0][0], 320.0)
+
+            joints[0, 0, 0] = [0.2, 0.0, 1.0]
+            np.save(joints_path, joints)
+            stat = joints_path.stat()
+            os.utime(joints_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            second = runtime.project_mano_frame(episode_dir=episode_dir, mano_dir=mano_dir, cam_id="00", frame_idx=5)
+
+            self.assertIsNotNone(second)
+            points, _visible = second  # type: ignore[misc]
+            self.assertAlmostEqual(points[0][0][0], 340.0)
+
+    def test_mano_projection_issue_reports_missing_calibration_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            mano_dir.mkdir(parents=True)
+            joints = np.zeros((1, 2, 21, 3), dtype=np.float32)
+            joints[:, :, :, 2] = 1.0
+            np.save(mano_dir / "joints_3d.npy", joints)
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps({"schema_version": 1, "kind": "orbbec_mano_3d_episode", "frames": [5], "joints_3d_file": "joints_3d.npy"}),
+                encoding="utf-8",
+            )
+
+            message = describe_mano_projection_issue(episode_dir, mano_dir, "00", 5)
+
+            self.assertIn("camera_params.json", message)
+            self.assertIn("extrinsics.json", message)
+            self.assertIn(str(episode_dir), message)
+
     def test_grouped_label_tasks_by_task(self) -> None:
         groups = grouped_label_tasks(
             [
@@ -213,7 +284,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
-    def test_backend_payload_resolved_path_does_not_need_mount_mapping(self) -> None:
+    def test_backend_payload_resolved_path_can_supply_data_uri_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             payload = {
@@ -227,6 +298,40 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             }
             task = correction_task_from_backend_payload(payload)
             self.assertEqual(task.episode_dir(), Path(payload["resolved_data_path"]).resolve())
+
+    def test_backend_payload_nas_data_uri_requires_mount_or_resolved_path(self) -> None:
+        payload = {
+            "data_uri": "nas://ego/S001/pick_object/episode_001",
+            "subject_id": "S001",
+            "task_name": "pick_object",
+            "episode_id": "episode_001",
+            "cameras": ["00"],
+            "frames": [1],
+        }
+
+        with self.assertRaisesRegex(ValueError, "data_uri is not resolvable"):
+            correction_task_from_backend_payload(payload)
+
+    def test_backend_payload_prefers_mounted_data_uri_over_stale_resolved_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
+            (episode_dir / "00" / "RGB").mkdir(parents=True)
+            (episode_dir / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
+            payload = {
+                "data_uri": "nas://ego/S001/pick_object/episode_001",
+                "resolved_data_path": str(tmp_path / "collection_machine" / "stale_episode_001"),
+                "subject_id": "S001",
+                "task_name": "pick_object",
+                "episode_id": "episode_001",
+                "cameras": ["00"],
+                "frames": [1],
+            }
+
+            task = correction_task_from_backend_payload(payload, mounts={"nas://ego": str(nas_root)})
+
+            self.assertEqual(task.episode_dir(), episode_dir.resolve())
 
     def test_backend_payload_can_discover_missing_cameras_and_frames_from_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

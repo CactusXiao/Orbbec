@@ -10,11 +10,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from label.canvas_view import ImageAnnotatorCanvas
-    from label.mano_view import ManoViewRuntime
+    from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
     from label.theme import Theme, apply_theme
 except Exception:
     from ...label.canvas_view import ImageAnnotatorCanvas  # type: ignore
-    from ...label.mano_view import ManoViewRuntime  # type: ignore
+    from ...label.mano_view import ManoViewRuntime, describe_mano_projection_issue  # type: ignore
     from ...label.theme import Theme, apply_theme  # type: ignore
 
 from .backend import QcBackendClient, QcBackendError
@@ -819,6 +819,7 @@ class QcPage(ttk.Frame):
             canvas.set_image(path)
             canvas.set_read_only(True)
             canvas.set_annotation_visible(False)
+            issue = ""
             try:
                 projected = self.mano_runtime.project_mano_frame(
                     episode_dir=media.episode_dir,
@@ -828,11 +829,12 @@ class QcPage(ttk.Frame):
                 )
             except Exception as exc:
                 projected = None
-                self._labels[cam].configure(text=f"Camera {cam}    投影失败：{exc}")
+                issue = str(exc)
             if projected is None:
                 canvas.set_skeleton_overlay(None)
-                if "投影失败" not in str(self._labels[cam].cget("text")):
-                    self._labels[cam].configure(text=f"Camera {cam}    无 MANO 投影")
+                if not issue:
+                    issue = describe_mano_projection_issue(media.episode_dir, media.mano_dir, cam, frame)
+                self._labels[cam].configure(text=f"Camera {cam}    无 MANO 投影：{issue}")
             else:
                 points, visible = projected
                 canvas.set_skeleton_overlay(points, visible)

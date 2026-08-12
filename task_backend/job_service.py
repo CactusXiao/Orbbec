@@ -1124,20 +1124,18 @@ class JobService:
     def _camera_params_for_media(self, episode_path: Optional[Path], camera: str) -> Dict[str, Any]:
         if episode_path is None:
             return {}
-        for path in (episode_path / "camera_params.json", episode_path / camera / "camera_params.json"):
-            if not path.exists() or not path.is_file():
-                continue
-            try:
-                parsed = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            cam_obj = parsed.get(camera)
-            if isinstance(cam_obj, dict):
-                return cam_obj
-            if isinstance(parsed.get("RGB"), dict) or isinstance(parsed.get("Depth"), dict):
-                return parsed
+        path = episode_path / "camera_params.json"
+        if not path.exists() or not path.is_file():
+            return {}
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        cam_obj = parsed.get(camera)
+        if isinstance(cam_obj, dict):
+            return cam_obj
         return {}
 
     @staticmethod
@@ -1176,28 +1174,28 @@ class JobService:
         return uri_join(data_uri, camera, stream, storage_file)
 
     def resolve_data_path(self, data_uri: str, local_capture_path: str = "") -> str:
+        value = str(data_uri or "").strip()
+        if value:
+            parsed = urlparse(value)
+            if not parsed.scheme:
+                return str(Path(value).expanduser().resolve())
+            if parsed.scheme == "local":
+                return str(Path(path_from_local_uri(value)).expanduser().resolve())
+            best_prefix = ""
+            best_root = ""
+            for prefix, root in self.uri_mounts.items():
+                if value == prefix or value.startswith(prefix + "/"):
+                    if len(prefix) > len(best_prefix):
+                        best_prefix = prefix
+                        best_root = root
+            if best_prefix:
+                suffix = value[len(best_prefix):].lstrip("/")
+                return str((Path(best_root).expanduser() / unquote(suffix)).resolve())
+            return ""
         local_capture_path = str(local_capture_path or "").strip()
         if local_capture_path:
             return str(Path(local_capture_path).expanduser().resolve())
-        value = str(data_uri or "").strip()
-        if not value:
-            return ""
-        parsed = urlparse(value)
-        if not parsed.scheme:
-            return str(Path(value).expanduser().resolve())
-        if parsed.scheme == "local":
-            return str(Path(path_from_local_uri(value)).expanduser().resolve())
-        best_prefix = ""
-        best_root = ""
-        for prefix, root in self.uri_mounts.items():
-            if value == prefix or value.startswith(prefix + "/"):
-                if len(prefix) > len(best_prefix):
-                    best_prefix = prefix
-                    best_root = root
-        if not best_prefix:
-            return ""
-        suffix = value[len(best_prefix):].lstrip("/")
-        return str((Path(best_root).expanduser() / unquote(suffix)).resolve())
+        return ""
 
     def _resolved_episode_path(self, data_uri: str, local_capture_path: str = "") -> Optional[Path]:
         resolved = self.resolve_data_path(data_uri, local_capture_path)

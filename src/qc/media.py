@@ -7,9 +7,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 try:
+    from label.mano_view import require_episode_calibration, require_mano_episode_artifact
     from label.storage import CorrectionTask, correction_task_from_backend_payload, find_frame_path
     from label.video_frames import _decode_camera_frames, _load_frame_map, _locate_rgb_video
 except Exception:
+    from ...label.mano_view import require_episode_calibration, require_mano_episode_artifact  # type: ignore
     from ...label.storage import CorrectionTask, correction_task_from_backend_payload, find_frame_path  # type: ignore
     from ...label.video_frames import _decode_camera_frames, _load_frame_map, _locate_rgb_video  # type: ignore
 
@@ -39,6 +41,7 @@ class QcEpisodeMedia:
 
 def media_from_payload(payload: Mapping[str, Any], mounts: Mapping[str, str]) -> QcEpisodeMedia:
     task = correction_task_from_backend_payload(dict(payload), mounts=dict(mounts or {}))
+    _validate_qc_episode(task)
     episode_id = str(payload.get("episode_id") or task.episode or task.episode_dir().name)
     return QcEpisodeMedia(task=task, cache_dir=Path(episode_id))
 
@@ -51,6 +54,7 @@ def prepare_qc_media(
     on_progress: Optional[ProgressCallback] = None,
 ) -> QcEpisodeMedia:
     task = correction_task_from_backend_payload(dict(payload), mounts=dict(mounts or {}))
+    _validate_qc_episode(task)
     episode_id = str(payload.get("episode_id") or task.episode or task.episode_dir().name)
     cache_dir = Path(tmp_dir).expanduser().resolve() / episode_id
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +91,12 @@ def prepare_qc_media(
     return QcEpisodeMedia(task=task, cache_dir=cache_dir)
 
 
+def _validate_qc_episode(task: CorrectionTask) -> None:
+    episode_dir = task.episode_dir()
+    require_episode_calibration(episode_dir)
+    require_mano_episode_artifact(episode_dir / task.mano_episode_dir)
+
+
 def cleanup_qc_cache(cache_dir: Path) -> None:
     try:
         path = Path(cache_dir)
@@ -109,4 +119,3 @@ def _emit(callback: Optional[ProgressCallback], camera: str, **fields: Any) -> N
     payload = {"camera": camera}
     payload.update(fields)
     callback(camera, payload)
-

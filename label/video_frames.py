@@ -185,19 +185,17 @@ def _video_from_camera_params(episode_dir: Path, camera: str) -> Optional[Tuple[
 
 
 def _camera_params_for(episode_dir: Path, camera: str) -> Optional[Mapping[str, Any]]:
-    for path in (episode_dir / "camera_params.json", episode_dir / camera / "camera_params.json"):
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            obj = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if isinstance(obj, Mapping):
-            cam_obj = obj.get(camera)
-            if isinstance(cam_obj, Mapping):
-                return cam_obj
-            if isinstance(obj.get("RGB"), Mapping) or isinstance(obj.get("rgb"), Mapping):
-                return obj
+    path = episode_dir / "camera_params.json"
+    if not path.exists() or not path.is_file():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(obj, Mapping):
+        cam_obj = obj.get(camera)
+        if isinstance(cam_obj, Mapping):
+            return cam_obj
     return None
 
 

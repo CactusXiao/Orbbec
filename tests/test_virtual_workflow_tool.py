@@ -41,6 +41,7 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     virtual_hand_values,
     virtual_failed_segments,
     write_float32_npy,
+    write_mano_artifact_for_payload,
     write_placeholder_rgb_image,
 )
 
@@ -266,6 +267,20 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertTrue(np.all(np.isnan(joints)))
             self.assertEqual(manifest["metrics"]["valid_joint_count"], 0)
             self.assertEqual(manifest["metrics"]["missing_joint_count"], 42)
+
+    def test_mano_worker_requires_data_uri_to_match_configured_nas_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
+            payload = {
+                "data_uri": "nas://ego/S001/pick_object/episode_001",
+                "resolved_data_path": str(tmp_path / "stale_local_episode"),
+                "prediction_dir": "pred_2d",
+                "scope": "episode",
+            }
+
+            with self.assertRaisesRegex(BackendError, "mano_opt cannot resolve episode data_uri"):
+                write_mano_artifact_for_payload(nas, payload, None, ["00", "01"], [0])
 
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
         if shutil.which("ffmpeg") is None:

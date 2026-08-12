@@ -92,11 +92,7 @@ class ManoViewRuntime:
         meta_path = _mano_metadata_path(mano_dir)
         if meta_path is None:
             return None
-        try:
-            stat_key = str(meta_path.stat().st_mtime_ns)
-        except OSError:
-            stat_key = "missing"
-        cache_key = (str(meta_path.resolve()), stat_key, int(frame_idx))
+        cache_key = (str(meta_path.resolve()), _mano_input_signature(mano_dir, meta_path), int(frame_idx))
         if cache_key in self._joints_cache:
             cached = self._joints_cache[cache_key]
             return None if cached is None else cached.copy()
@@ -335,6 +331,85 @@ def _mano_metadata_path(mano_dir: Path) -> Optional[Path]:
     return None
 
 
+def _file_signature(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return f"{path.resolve()}:missing"
+    return f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _mano_input_signature(mano_dir: Path, meta_path: Path) -> str:
+    parts = [_file_signature(meta_path)]
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as exc:
+        parts.append(f"metadata_error:{type(exc).__name__}")
+        return "|".join(parts)
+    if isinstance(meta, Mapping):
+        raw_file = str(meta.get("joints_3d_file") or meta.get("joints_file") or "").strip()
+        if raw_file:
+            npy_path = Path(raw_file)
+            if not npy_path.is_absolute():
+                npy_path = mano_dir / npy_path
+            parts.append(_file_signature(npy_path))
+    return "|".join(parts)
+
+
+def describe_mano_projection_issue(episode_dir: Path, mano_dir: Path, cam_id: str, frame_idx: int) -> str:
+    meta_path = _mano_metadata_path(mano_dir)
+    if meta_path is None:
+        return f"MANO 3D metadata not found at {mano_dir}"
+    try:
+        joints = load_mano_frame_joints(mano_dir, int(frame_idx), meta_path=meta_path)
+    except Exception as exc:
+        return f"Failed to load MANO 3D from {mano_dir}: {exc}"
+    if joints is None:
+        return f"No MANO 3D joints for frame {int(frame_idx)} in {mano_dir}"
+    try:
+        load_episode_cameras(episode_dir, [str(cam_id)])
+    except Exception as exc:
+        return str(exc)
+    return "No finite MANO projection for this camera/frame."
+
+
+def episode_calibration_paths(episode_dir: Path) -> Tuple[Path, Path]:
+    root = Path(episode_dir).expanduser().resolve()
+    return root / "camera_params.json", root / "extrinsics.json"
+
+
+def require_episode_calibration(episode_dir: Path) -> Tuple[Path, Path]:
+    cam_path, ext_path = episode_calibration_paths(episode_dir)
+    if not cam_path.is_file() or not ext_path.is_file():
+        raise FileNotFoundError(
+            "Collection calibration missing at episode root "
+            f"{Path(episode_dir).expanduser().resolve()}: expected {cam_path} and {ext_path}"
+        )
+    return cam_path, ext_path
+
+
+def require_mano_3d_artifact(mano_dir: Path) -> Path:
+    root = Path(mano_dir).expanduser().resolve()
+    meta_path = _mano_metadata_path(root)
+    if meta_path is None:
+        raise FileNotFoundError(
+            f"MANO 3D output missing at {root}: expected mano_episode.json, mano_patch.json, or joints_3d.json"
+        )
+    return meta_path
+
+
+def require_mano_episode_artifact(mano_dir: Path) -> Path:
+    root = Path(mano_dir).expanduser().resolve()
+    meta_path = root / "mano_episode.json"
+    joints_path = root / "joints_3d.npy"
+    if not meta_path.is_file() or not joints_path.is_file():
+        raise FileNotFoundError(
+            f"MANO episode output missing at {root}: expected {meta_path} and {joints_path}"
+        )
+    return meta_path
+
+
 def load_mano_frame_joints(mano_dir: Path, frame_idx: int, *, meta_path: Optional[Path] = None) -> Optional[np.ndarray]:
     meta_path = meta_path or _mano_metadata_path(mano_dir)
     if meta_path is None:
@@ -420,14 +495,7 @@ def _frames_from_mano_meta(meta: Mapping[str, Any]) -> List[int]:
 
 
 def load_episode_cameras(episode_dir: Path, camera_ids: List[str]) -> Dict[str, CameraParams]:
-    cam_path = episode_dir / "camera_params.json"
-    ext_path = episode_dir / "extrinsics.json"
-    if not cam_path.exists() and Path("camera_params.json").exists():
-        cam_path = Path("camera_params.json")
-    if not ext_path.exists() and Path("extrinsics.json").exists():
-        ext_path = Path("extrinsics.json")
-    if not cam_path.exists() or not ext_path.exists():
-        raise FileNotFoundError("Missing camera_params.json or extrinsics.json.")
+    cam_path, ext_path = require_episode_calibration(episode_dir)
 
     with cam_path.open("r", encoding="utf-8") as f:
         cam_obj = json.load(f)

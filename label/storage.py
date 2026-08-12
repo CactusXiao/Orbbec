@@ -249,20 +249,32 @@ def correction_task_from_backend_payload(
 ) -> CorrectionTask:
     if not isinstance(payload, dict):
         raise ValueError("Backend label job payload must be an object.")
+    resolver = UriResolver(mounts or {})
+    data_uri = str(payload.get("data_uri") or payload.get("episode_base_uri") or "").strip()
+    resolved_path = str(payload.get("resolved_data_path") or "").strip()
+    if data_uri:
+        episode_dir: Optional[Path] = None
+        if mounts:
+            try:
+                episode_dir = resolver.resolve(data_uri).expanduser().resolve()
+            except Exception as exc:
+                raise ValueError(f"Backend label job data_uri is not resolvable: {data_uri}") from exc
+        elif resolved_path:
+            episode_dir = Path(resolved_path).expanduser().resolve()
+        else:
+            raise ValueError(f"Backend label job data_uri is not resolvable: {data_uri}")
+    else:
+        episode_dir = None
     resolved_path = str(
-        payload.get("resolved_data_path")
+        resolved_path
         or payload.get("local_episode_path")
         or payload.get("local_capture_path")
         or ""
     ).strip()
-    if resolved_path:
+    if episode_dir is None and resolved_path:
         episode_dir = Path(resolved_path).expanduser().resolve()
-    else:
-        resolver = UriResolver(mounts or {})
-        data_uri = str(payload.get("data_uri") or "").strip()
-        if not data_uri:
-            raise ValueError("Backend label job payload must include `resolved_data_path` or `data_uri`.")
-        episode_dir = resolver.resolve(data_uri)
+    if episode_dir is None:
+        raise ValueError("Backend label job payload must include a resolvable `data_uri` or `resolved_data_path`.")
     cameras = _label_camera_ids(_optional_str_list(payload, "cameras")) or _discover_cameras(episode_dir)
     frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
     if not cameras:

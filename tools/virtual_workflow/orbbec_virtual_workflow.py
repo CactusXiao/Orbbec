@@ -683,20 +683,18 @@ def _rgb_video_from_camera_params(episode_dir: Path, cam: str) -> Optional[Tuple
 
 
 def _worker_camera_params(episode_dir: Path, cam: str) -> Json:
-    for path in (episode_dir / "camera_params.json", episode_dir / str(cam) / "camera_params.json"):
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            obj = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(obj, dict):
-            continue
-        cam_obj = obj.get(str(cam))
-        if isinstance(cam_obj, dict):
-            return cam_obj
-        if isinstance(obj.get("RGB"), dict) or isinstance(obj.get("rgb"), dict):
-            return obj
+    path = episode_dir / "camera_params.json"
+    if not path.exists() or not path.is_file():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    cam_obj = obj.get(str(cam))
+    if isinstance(cam_obj, dict):
+        return cam_obj
     return {}
 
 
@@ -843,7 +841,10 @@ def _load_camera_model(episode_dir: Path, cameras: Sequence[str]) -> Dict[str, J
     cam_path = episode_dir / "camera_params.json"
     ext_path = episode_dir / "extrinsics.json"
     if not cam_path.exists() or not cam_path.is_file() or not ext_path.exists() or not ext_path.is_file():
-        raise FileNotFoundError(f"MANO 3D optimization requires camera_params.json and extrinsics.json in {episode_dir}")
+        raise FileNotFoundError(
+            f"MANO 3D optimization requires collection calibration at episode root {episode_dir}: "
+            f"expected {cam_path} and {ext_path}"
+        )
     cam_obj = json.loads(cam_path.read_text(encoding="utf-8"))
     ext_obj = json.loads(ext_path.read_text(encoding="utf-8"))
     out: Dict[str, Json] = {}
@@ -1450,6 +1451,13 @@ def source_path_from_payload(
     nas: Optional[NasSimulator] = None,
 ) -> Optional[Path]:
     episode = episode or {}
+    data_uri = str(payload.get("data_uri") or episode.get("data_uri") or "")
+    if data_uri:
+        if data_uri.startswith("local://"):
+            return path_from_local_uri(data_uri)
+        if nas is not None and data_uri.startswith(nas.uri_prefix):
+            return nas.local_path_for_uri(data_uri)
+        return None
     raw = str(
         payload.get("resolved_data_path")
         or episode.get("resolved_data_path")
@@ -1462,11 +1470,6 @@ def source_path_from_payload(
     )
     if raw:
         return Path(raw).expanduser().resolve()
-    data_uri = str(payload.get("data_uri") or episode.get("data_uri") or "")
-    if data_uri.startswith("local://"):
-        return path_from_local_uri(data_uri)
-    if nas is not None and data_uri.startswith(nas.uri_prefix):
-        return nas.local_path_for_uri(data_uri)
     return None
 
 
@@ -1503,19 +1506,19 @@ def write_prediction_artifact_for_payload(
     if data_uri.startswith(nas.uri_prefix):
         return nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template, detector)
     episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-                if detector is None:
-                    write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
-                else:
-                    values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
-                    if values is None:
-                        values = invisible_hand_values()
-                    write_float32_npy(out, values)
-        return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
-    return uri_join(data_uri, prediction_dir)
+    if episode_path is None:
+        raise BackendError(f"auto_label cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
+    for cam in cameras or ["00"]:
+        for frame in frames or [0]:
+            out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+            if detector is None:
+                write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
+            else:
+                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
+                if values is None:
+                    values = invisible_hand_values()
+                write_float32_npy(out, values)
+    return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
 
 
 def write_corrected_artifact_for_payload(
@@ -1532,13 +1535,13 @@ def write_corrected_artifact_for_payload(
         episode_path = nas.local_path_for_uri(data_uri)
     else:
         episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        for cam in cameras or ["00"]:
-            for frame in frames or [0]:
-                out = episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy"
-                write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="manual")
-        return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
-    return uri_join(data_uri, correction_dir)
+    if episode_path is None:
+        raise BackendError(f"manual correction cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
+    for cam in cameras or ["00"]:
+        for frame in frames or [0]:
+            out = episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy"
+            write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="manual")
+    return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
 
 
 def write_mano_artifact_for_payload(
@@ -1560,20 +1563,18 @@ def write_mano_artifact_for_payload(
             return "mano_segment_patch", nas.write_mano_segment_patch(data_uri, segment_id, cameras, frames, manual_2d_dir, manual_2d_uri, rgb_path_template)
         return "mano_episode", nas.write_mano_episode_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template)
     episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        if scope == "segment":
-            out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
-            source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
-            require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
-            write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path, segment_id=segment_id)
-            return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
-        out = episode_path / "mano" / "episode"
-        source_dir = episode_path / prediction_dir
-        require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
-        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path)
-        return "mano_episode", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode")
+    if episode_path is None:
+        raise BackendError(f"mano_opt cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
     if scope == "segment":
-        return "mano_segment_patch", uri_join(data_uri, "mano", "segments", segment_id)
+        out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
+        source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
+        require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
+        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path, segment_id=segment_id)
+        return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
+    out = episode_path / "mano" / "episode"
+    source_dir = episode_path / prediction_dir
+    require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
+    write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path)
     return "mano_episode", uri_join(data_uri, "mano", "episode")
 
 
@@ -1651,12 +1652,12 @@ def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optio
         out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return uri_join(data_uri, "qc", "qc_report.json")
     episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        out = episode_path / "qc" / "qc_report.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return uri_join(data_uri or local_uri_from_path(episode_path), "qc", "qc_report.json")
-    return uri_join(data_uri, "qc", "qc_report.json")
+    if episode_path is None:
+        raise BackendError(f"qc cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
+    out = episode_path / "qc" / "qc_report.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return uri_join(data_uri or local_uri_from_path(episode_path), "qc", "qc_report.json")
 
 
 def payload_from_task(task: LabelTask, data_uri: str, job_id: str, reason: str) -> Json:

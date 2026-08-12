@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
+    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, parse_mounts_json, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from .storage import (
         CorrectionProgress,
@@ -30,11 +30,11 @@ try:
         view_state_from_bundle,
     )
     from .theme import Theme, apply_theme
-    from .mano_view import ManoMeshResult, ManoViewRuntime
+    from .mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
 except Exception:
-    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
+    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, parse_mounts_json, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from storage import (
         CorrectionProgress,
@@ -53,7 +53,7 @@ except Exception:
         view_state_from_bundle,
     )
     from theme import Theme, apply_theme
-    from mano_view import ManoMeshResult, ManoViewRuntime
+    from mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
 
@@ -70,6 +70,14 @@ SOURCE_LABELS = {
 }
 STATUS_DONE_COLOR = "#46d36b"
 STATUS_TODO_COLOR = "#ff5c5c"
+
+
+def _label_uri_mounts_from_env() -> Dict[str, str]:
+    for key in ("ORBBEC_LABEL_URI_MOUNTS_JSON", "ORBBEC_URI_MOUNTS_JSON", "QC_URI_MOUNTS_JSON"):
+        raw = os.environ.get(key, "").strip()
+        if raw:
+            return parse_mounts_json(raw)
+    return {}
 
 
 class LabelToolApp(tk.Tk):
@@ -401,6 +409,7 @@ class HomePage(ttk.Frame):
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
+                mounts=_label_uri_mounts_from_env(),
                 lease_seconds=600,
                 task_name=task_name,
                 episode_id=episode_id,
@@ -451,6 +460,7 @@ class LabelPage(ttk.Frame):
         self._skeleton_joints_3d = None
         self._show_skeleton: bool = False
         self._tracking_notice_keys = set()
+        self._mano_projection_errors: Dict[Tuple[str, int, str], str] = {}
         self._source_btn: Optional[ttk.Button] = None
         self._skeleton_btn: Optional[ttk.Button] = None
         self._mano_btn: Optional[ttk.Button] = None
@@ -557,6 +567,7 @@ class LabelPage(ttk.Frame):
         self._source_state_cache = {}
         self._reset_visualizations()
         self._tracking_notice_keys = set()
+        self._mano_projection_errors = {}
         if self._frame_status is not None:
             self._frame_status.configure(text="")
 
@@ -695,6 +706,7 @@ class LabelPage(ttk.Frame):
         self._source_state_cache = {}
         self._reset_visualizations()
         self._tracking_notice_keys = set()
+        self._mano_projection_errors = {}
         self._update_source_button()
 
         for item in self._tree.get_children():
@@ -839,6 +851,7 @@ class LabelPage(ttk.Frame):
         self._view_states = {}
         self._source_state_cache = {}
         self._reset_visualizations()
+        self._mano_projection_errors = {}
         self._frame_pos = self._next_unconfirmed_position(task, 0)
         if self._frame_pos < 0:
             self._frame_pos = 0
@@ -945,15 +958,26 @@ class LabelPage(ttk.Frame):
         task = self._active_task
         if task is None:
             return None
+        err_key = (task.key, int(frame_idx), str(cam_id))
+        self._mano_projection_errors.pop(err_key, None)
         try:
-            return self._mano_runtime_instance().project_mano_frame(
+            state = self._mano_runtime_instance().project_mano_frame(
                 episode_dir=task.episode_dir(),
                 mano_dir=task.episode_dir() / task.mano_episode_dir,
                 cam_id=cam_id,
                 frame_idx=frame_idx,
             )
-        except Exception:
+        except Exception as exc:
+            self._mano_projection_errors[err_key] = str(exc)
             return None
+        if state is None:
+            self._mano_projection_errors[err_key] = describe_mano_projection_issue(
+                task.episode_dir(),
+                task.episode_dir() / task.mano_episode_dir,
+                cam_id,
+                frame_idx,
+            )
+        return state
 
     @staticmethod
     def _is_hidden_point(point: Tuple[float, float]) -> bool:
@@ -1075,6 +1099,8 @@ class LabelPage(ttk.Frame):
         return self._bundles.get("pred") or self._active_bundle
 
     def _cache_current_source_state(self) -> None:
+        if self._mode == "mano":
+            return
         cam_id = self._active_cam_id()
         if cam_id is None:
             return
@@ -1104,11 +1130,30 @@ class LabelPage(ttk.Frame):
     def _view_source_status(self, source: str, frame_idx: int, cam_id: str, visible: HandVisible) -> str:
         source = self._normalize_source(source)
         label = self._source_label(source)
-        if source in {"mano", "tracking"}:
+        if source == "mano":
+            if self._has_any_visible(visible):
+                return label
+            return f"{label} (missing: {self._mano_projection_error(frame_idx, cam_id)})"
+        if source == "tracking":
             return label if self._has_any_visible(visible) else f"{label} (missing)"
         if self._is_source_missing(source, frame_idx, cam_id):
             return f"{label} (missing)"
         return label
+
+    def _mano_projection_error(self, frame_idx: int, cam_id: str) -> str:
+        task = self._active_task
+        if task is None:
+            return "no active task"
+        key = (task.key, int(frame_idx), str(cam_id))
+        message = self._mano_projection_errors.get(key)
+        if message:
+            return message
+        return describe_mano_projection_issue(
+            task.episode_dir(),
+            task.episode_dir() / task.mano_episode_dir,
+            cam_id,
+            frame_idx,
+        )
 
     @staticmethod
     def _has_any_visible(visible: HandVisible) -> bool:

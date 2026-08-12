@@ -24,8 +24,10 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             (source / "ego" / "RGB" / "00001.png").write_bytes(b"pico")
             (source / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
 
+            nas_root = tmp_path / "nas"
+            nas_prefix = "nas://ego-test"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
             service.record_collection_confirm(
                 {
                     "reservation_id": "reservation_001",
@@ -42,8 +44,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             uploader = NasUploader(
                 service,
                 NasUploadConfig(
-                    root=tmp_path / "nas",
-                    uri_prefix="nas://ego-test",
+                    root=nas_root,
+                    uri_prefix=nas_prefix,
                     worker_id="smoke_uploader",
                 ),
             )
@@ -262,6 +264,21 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(leased["job"]["episode_id"], "episode_b")
             self.assertEqual(leased["job"]["job_id"], target_job["job_id"])
             self.assertEqual(store.jobs_for_episode("episode_a", "qc")[0]["status"], "queued")
+
+    def test_backend_resolved_data_path_prefers_nas_data_uri_over_collection_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            old_local = tmp_path / "collection_machine" / "S001" / "pick_object" / "episode_001"
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, uri_mounts={"nas://ego": str(nas_root)})
+
+            resolved = service.resolve_data_path(
+                "nas://ego/S001/pick_object/episode_001",
+                str(old_local),
+            )
+
+            self.assertEqual(Path(resolved), (nas_root / "S001" / "pick_object" / "episode_001").resolve())
 
     def test_manual_segment_lease_orders_by_task_episode_and_start_frame(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
