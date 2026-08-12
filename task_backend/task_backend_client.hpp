@@ -33,7 +33,7 @@ struct TaskUploadStatus {
     uint64_t    totalBytes = 0;
     int         filesDone = 0;
     int         filesTotal = 0;
-    std::string localPath;
+    std::string collectionPath;
     std::string nasUri;
     std::string error;
     std::string updatedAt;
@@ -59,7 +59,7 @@ public:
                         const std::string &subjectId,
                         const std::string &taskName,
                         int episodeNumber,
-                        const std::string &localPath,
+                        const std::string &collectionPath,
                         double durationSeconds,
                         int frameCount,
                         const std::string &idempotencyKey,

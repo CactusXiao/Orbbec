@@ -72,12 +72,9 @@ STATUS_DONE_COLOR = "#46d36b"
 STATUS_TODO_COLOR = "#ff5c5c"
 
 
-def _label_uri_mounts_from_env() -> Dict[str, str]:
-    for key in ("ORBBEC_LABEL_URI_MOUNTS_JSON", "ORBBEC_URI_MOUNTS_JSON", "QC_URI_MOUNTS_JSON"):
-        raw = os.environ.get(key, "").strip()
-        if raw:
-            return parse_mounts_json(raw)
-    return {}
+def _label_nas_mounts_from_env() -> Dict[str, str]:
+    raw = os.environ.get("ORBBEC_LABEL_NAS_MOUNTS_JSON", "").strip()
+    return parse_mounts_json(raw) if raw else {}
 
 
 class LabelToolApp(tk.Tk):
@@ -409,7 +406,7 @@ class HomePage(ttk.Frame):
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
-                mounts=_label_uri_mounts_from_env(),
+                mounts=_label_nas_mounts_from_env(),
                 lease_seconds=600,
                 task_name=task_name,
                 episode_id=episode_id,
@@ -1553,32 +1550,24 @@ class LabelPage(ttk.Frame):
         session = self._backend_session
         if session is None or self._backend_completed:
             return True
-        data_uri = str(session.payload.get("data_uri") or "").rstrip("/")
-        artifact_uri = str(session.payload.get("manual_2d_output_uri") or session.payload.get("manual_2d_uri") or "").strip()
-        if not artifact_uri:
-            correction_dir = str(session.payload.get("correction_dir") or task.correction_dir or "manual_2d").strip("/")
-            artifact_uri = f"{data_uri}/{correction_dir}" if data_uri and correction_dir else data_uri
-        artifacts = []
-        if artifact_uri:
-            artifacts.append(
-                {
-                    "kind": "manual_2d",
-                    "uri": artifact_uri,
-                    "metadata": {
-                        "segment_id": session.segment_id or session.job_id,
-                        "cameras": list(task.cameras),
-                        "frames": list(task.frames),
-                        "operator_id": session.operator_id,
-                    },
-                }
-            )
+        segment_id = str(session.segment_id or session.job_id or "").strip()
+        artifacts = [
+            {
+                "kind": "manual_2d",
+                "metadata": {
+                    "segment_id": segment_id,
+                    "cameras": list(task.cameras),
+                    "frames": list(task.frames),
+                    "operator_id": session.operator_id,
+                },
+            }
+        ]
         try:
             session.client.complete_label_job(
                 session.job_id,
                 result={
                     "operator_id": session.operator_id,
                     "frames_completed": list(task.frames),
-                    "local_progress_cache": self._jsonl_path or "",
                 },
                 artifacts=artifacts,
             )
@@ -1597,7 +1586,7 @@ class LabelPage(ttk.Frame):
             session.client.fail_label_job(
                 session.job_id,
                 error=error,
-                result={"operator_id": session.operator_id, "local_progress_cache": self._jsonl_path or ""},
+                result={"operator_id": session.operator_id},
             )
             self._backend_completed = True
             self._cancel_backend_heartbeat()

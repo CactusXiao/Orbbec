@@ -8291,7 +8291,7 @@ struct EpisodeReservationUi {
     std::string reservationId;
     std::string taskName;
     int         episodeNumber = 0;
-    fs::path    localPath;
+    fs::path    collectionPath;
     std::string idempotencyKey;
     double      durationSeconds = 0.0;
     int         frameCount = 0;
@@ -8303,7 +8303,7 @@ struct EpisodeReservationUi {
         reservationId.clear();
         taskName.clear();
         episodeNumber = 0;
-        localPath.clear();
+        collectionPath.clear();
         idempotencyKey.clear();
         durationSeconds = 0.0;
         frameCount = 0;
@@ -8950,7 +8950,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                                          subject,
                                          currentReservation.taskName,
                                          currentReservation.episodeNumber,
-                                         currentReservation.localPath.string(),
+                                         currentReservation.collectionPath.string(),
                                          currentReservation.durationSeconds,
                                          currentReservation.frameCount,
                                          currentReservation.idempotencyKey,
@@ -10191,8 +10191,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     currentReservation.reservationId = reservation.reservationId;
                     currentReservation.taskName = reservation.taskName;
                     currentReservation.episodeNumber = reservation.episodeNumber;
-                    currentReservation.localPath = root / subject / reservation.taskName
-                                                   / ("episode_" + std::to_string(reservation.episodeNumber));
+                    currentReservation.collectionPath = root / subject / reservation.taskName
+                                                        / ("episode_" + std::to_string(reservation.episodeNumber));
                     currentReservation.idempotencyKey = makeIdempotencyKey(collectionClientId,
                                                                            reservation.reservationId,
                                                                            reservation.episodeNumber);

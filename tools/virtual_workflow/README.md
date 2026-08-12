@@ -48,7 +48,7 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state_fullflow
 ORBBEC_NAS_ENABLED=1
 ORBBEC_NAS_ROOT=/mnt/nas
 ORBBEC_NAS_URI_PREFIX=nas://ego
-ORBBEC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
+ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
 
 ORBBEC_VIRTUAL_WORKFLOW_WORKERS=all
@@ -72,7 +72,6 @@ creates queued manual segments through `/api/v1/dev/label/jobs`.
 ```bash
 python3 tools/virtual_workflow/orbbec_virtual_workflow.py seed-label \
   --jsonl label/task.jsonl \
-  --use-nas \
   --frames-per-segment 32 \
   --max-jobs 3 \
   --limit 1

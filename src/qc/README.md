@@ -23,7 +23,7 @@ QC_TMP_DIR=./tmp
 QC_STATE_DIR=./qc_state
 QC_WORKER_MACHINE_ID=qc_machine_01
 QC_RANGE_MERGE_GAP_FRAMES=5
-QC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
+QC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 ```
 
 ## 行为

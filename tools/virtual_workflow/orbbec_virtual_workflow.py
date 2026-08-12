@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote
 from urllib.request import Request, urlopen
 
 try:
@@ -44,8 +44,6 @@ except ModuleNotFoundError:  # pragma: no cover - optional local demo dependency
 
 Json = Dict[str, Any]
 _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
-_RGB_VIDEO_CANDIDATES = ("rgb.h265", "rgb.hevc", "rgb.mp4", "rgb.mkv", "rgb.mov")
-_VIDEO_SUFFIXES = {".h265", ".hevc", ".mp4", ".mkv", ".mov"}
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
 _FALLBACK_IMAGE_SIZE = (640, 480)
@@ -192,21 +190,9 @@ def clean_id(value: str, fallback: str = "item") -> str:
     return text or fallback
 
 
-def local_uri_from_path(path: Path) -> str:
-    return "local://" + str(path.expanduser().resolve())
-
-
-def path_from_local_uri(uri: str) -> Path:
-    parsed = urlparse(uri)
-    if parsed.scheme != "local":
-        raise ValueError(f"not a local URI: {uri}")
-    if parsed.netloc and parsed.path:
-        raw = "/" + parsed.netloc + parsed.path
-    elif parsed.netloc:
-        raw = parsed.netloc
-    else:
-        raw = parsed.path
-    return Path(unquote(raw)).expanduser().resolve()
+def clean_path_segment(value: str, fallback: str = "item") -> str:
+    text = re.sub(r"[\\/]+", "_", str(value or "").strip()).strip(" .")
+    return text or fallback
 
 
 def uri_join(base_uri: str, *parts: str) -> str:
@@ -330,8 +316,6 @@ class LabelTask:
     cameras: List[str]
     frames: List[int]
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png"
-    prediction_dir: str = "pred_2d"
-    correction_dir: str = "corrected_2d"
 
     @property
     def episode_dir(self) -> Path:
@@ -365,8 +349,6 @@ def load_label_tasks(path: Path, limit: int = 0) -> List[LabelTask]:
                     cameras=cameras,
                     frames=frames,
                     rgb_path_template=str(obj.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-                    prediction_dir=str(obj.get("prediction_dir") or "pred_2d"),
-                    correction_dir=str(obj.get("correction_dir") or "corrected_2d"),
                 )
             )
             if limit and len(tasks) >= limit:
@@ -383,8 +365,6 @@ def task_with_frames(task: LabelTask, frames: Sequence[int]) -> LabelTask:
         cameras=list(task.cameras),
         frames=[int(frame) for frame in frames],
         rgb_path_template=task.rgb_path_template,
-        prediction_dir=task.prediction_dir,
-        correction_dir=task.correction_dir,
     )
 
 
@@ -549,11 +529,13 @@ def ensure_rgb_frames_from_video_for_payload(
     episode: Optional[Json],
     cameras: Sequence[str],
     frames: Sequence[int],
+    *,
+    rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> str:
     episode_dir = source_path_from_payload(payload, episode, nas)
     if episode_dir is None:
-        return str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
-    current_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
+        return rgb_path_template
+    current_template = rgb_path_template or "{camera}/RGB/{frame:05d}.png"
     needed = [
         str(cam) for cam in cameras
         if any(find_rgb_frame_path(episode_dir, str(cam), int(frame), current_template) is None for frame in frames)
@@ -594,74 +576,16 @@ def _worker_frame_cache_key(episode_dir: Path, payload: Json) -> str:
         str(episode_dir.expanduser().resolve()),
         str(payload.get("episode_id") or ""),
         str(payload.get("job_id") or payload.get("segment_id") or ""),
-        str(payload.get("data_uri") or payload.get("episode_base_uri") or ""),
+        str(payload.get("episode_uri") or ""),
     ]
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:20]
 
 
 def _locate_rgb_video_for_worker(episode_dir: Path, cam: str, payload: Json) -> Tuple[Path, Optional[Path]]:
-    media_match = _rgb_video_from_episode_media(episode_dir, cam, payload)
-    if media_match is not None:
-        return media_match
     params_match = _rgb_video_from_camera_params(episode_dir, cam)
-    if params_match is not None:
-        return params_match
-    rgb_dir = episode_dir / str(cam) / "RGB"
-    for name in _RGB_VIDEO_CANDIDATES:
-        candidate = rgb_dir / name
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve(), _worker_timestamp_sidecar(candidate)
-    if rgb_dir.exists() and rgb_dir.is_dir():
-        videos = sorted(path for path in rgb_dir.iterdir() if path.is_file() and path.suffix.lower() in _VIDEO_SUFFIXES)
-        if videos:
-            return videos[0].resolve(), _worker_timestamp_sidecar(videos[0])
-    raise FileNotFoundError(f"RGB H265 video not found under {rgb_dir}")
-
-
-def _rgb_video_from_episode_media(episode_dir: Path, cam: str, payload: Json) -> Optional[Tuple[Path, Optional[Path]]]:
-    media = payload.get("episode_media")
-    if not isinstance(media, dict):
-        return None
-    cameras = media.get("cameras")
-    if not isinstance(cameras, dict):
-        return None
-    cam_obj = cameras.get(str(cam))
-    if not isinstance(cam_obj, dict):
-        return None
-    rgb_obj = cam_obj.get("rgb") or cam_obj.get("RGB")
-    if not isinstance(rgb_obj, dict):
-        return None
-    video_path = _path_from_worker_media_obj(episode_dir, rgb_obj, ("path", "local_path", "resolved_path"))
-    if video_path is None:
-        storage_file = str(rgb_obj.get("storage_file") or rgb_obj.get("storageFile") or "").strip()
-        if storage_file:
-            video_path = _worker_storage_path(episode_dir, cam, "RGB", storage_file)
-    if video_path is None or not video_path.exists():
-        return None
-    timestamp_path = _path_from_worker_media_obj(
-        episode_dir,
-        rgb_obj,
-        ("timestamp_path", "timestamp_local_path", "timestamp_resolved_path"),
-    )
-    if timestamp_path is None:
-        timestamp_file = str(rgb_obj.get("timestamp_file") or rgb_obj.get("timestampFile") or "").strip()
-        if timestamp_file:
-            timestamp_path = _worker_storage_path(episode_dir, cam, "RGB", timestamp_file)
-    if timestamp_path is None:
-        timestamp_path = _worker_timestamp_sidecar(video_path)
-    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
-
-
-def _path_from_worker_media_obj(episode_dir: Path, obj: Json, keys: Sequence[str]) -> Optional[Path]:
-    for key in keys:
-        raw = str(obj.get(key) or "").strip()
-        if raw:
-            return Path(raw).expanduser().resolve()
-    uri = str(obj.get("uri") or "").strip()
-    base_uri = str(obj.get("episode_uri") or obj.get("episode_base_uri") or "").strip().rstrip("/")
-    if uri and base_uri and (uri == base_uri or uri.startswith(base_uri + "/")):
-        return (episode_dir / unquote(uri[len(base_uri):].lstrip("/"))).resolve()
-    return None
+    if params_match is None:
+        raise FileNotFoundError(f"RGB storageFile missing from {episode_dir / 'camera_params.json'} for camera {cam}")
+    return params_match
 
 
 def _rgb_video_from_camera_params(episode_dir: Path, cam: str) -> Optional[Tuple[Path, Optional[Path]]]:
@@ -671,15 +595,19 @@ def _rgb_video_from_camera_params(episode_dir: Path, cam: str) -> Optional[Tuple
     rgb_obj = cam_obj.get("RGB") or cam_obj.get("rgb")
     if not isinstance(rgb_obj, dict):
         return None
-    storage_file = str(rgb_obj.get("storageFile") or rgb_obj.get("storage_file") or "").strip()
+    storage_file = str(rgb_obj.get("storageFile") or "").strip()
     if not storage_file:
         return None
     video_path = _worker_storage_path(episode_dir, cam, "RGB", storage_file)
     if not video_path.exists():
-        return None
-    timestamp_file = str(rgb_obj.get("timestampFile") or rgb_obj.get("timestamp_file") or "").strip()
-    timestamp_path = _worker_storage_path(episode_dir, cam, "RGB", timestamp_file) if timestamp_file else _worker_timestamp_sidecar(video_path)
-    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
+        raise FileNotFoundError(f"RGB storageFile from camera_params.json not found: {video_path}")
+    timestamp_file = str(rgb_obj.get("timestampFile") or "").strip()
+    if not timestamp_file:
+        raise FileNotFoundError(f"RGB timestampFile missing from camera_params.json for camera {cam}")
+    timestamp_path = _worker_storage_path(episode_dir, cam, "RGB", timestamp_file)
+    if not timestamp_path.exists():
+        raise FileNotFoundError(f"RGB timestampFile from camera_params.json not found: {timestamp_path}")
+    return video_path.resolve(), timestamp_path.resolve()
 
 
 def _worker_camera_params(episode_dir: Path, cam: str) -> Json:
@@ -700,23 +628,12 @@ def _worker_camera_params(episode_dir: Path, cam: str) -> Json:
 
 def _worker_storage_path(episode_dir: Path, cam: str, stream: str, storage_file: str) -> Path:
     raw = unquote(str(storage_file or "").strip())
+    if not raw:
+        raise ValueError("storageFile must be a non-empty file name")
     p = Path(raw)
     if p.is_absolute():
-        return p.expanduser().resolve()
-    candidates = [
-        episode_dir / str(cam) / stream / p,
-        episode_dir / str(cam) / p,
-        episode_dir / p,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve()
-
-
-def _worker_timestamp_sidecar(video_path: Path) -> Optional[Path]:
-    candidate = Path(str(video_path) + ".timestamps.csv")
-    return candidate if candidate.exists() else candidate
+        raise ValueError(f"storageFile must be relative to the NAS episode root: {storage_file}")
+    return (episode_dir / str(cam) / stream / p).resolve()
 
 
 def _load_worker_video_frame_map(timestamp_path: Optional[Path]) -> Dict[int, int]:
@@ -1214,7 +1131,7 @@ class NasSimulator:
         self.uri_prefix = uri_prefix.rstrip("/")
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def local_path_for_uri(self, uri: str) -> Path:
+    def nas_path_for_uri(self, uri: str) -> Path:
         uri = str(uri or "").rstrip("/")
         if not uri.startswith(self.uri_prefix):
             raise ValueError(f"URI does not belong to this NAS root: {uri}")
@@ -1222,7 +1139,7 @@ class NasSimulator:
         return (self.root / unquote(suffix)).resolve()
 
     def task_uri(self, subject: str, task: str, episode: str) -> str:
-        return uri_join(self.uri_prefix, clean_id(subject), clean_id(task), clean_id(episode))
+        return uri_join(self.uri_prefix, clean_path_segment(subject, "subject"), clean_path_segment(task, "task"), clean_path_segment(episode, "episode"))
 
     def materialize_task(
         self,
@@ -1233,7 +1150,7 @@ class NasSimulator:
         materialize_predictions: bool = True,
     ) -> str:
         uri = self.task_uri(task.subject, task.task, task.episode)
-        dst = self.local_path_for_uri(uri)
+        dst = self.nas_path_for_uri(uri)
         self._materialize_episode_dir(
             dst,
             subject=task.subject,
@@ -1242,7 +1159,6 @@ class NasSimulator:
             cameras=task.cameras,
             frames=task.frames,
             rgb_path_template=task.rgb_path_template,
-            prediction_dir=task.prediction_dir,
             source=task.episode_dir if copy_source else None,
             max_frames=max_frames,
             materialize_predictions=materialize_predictions,
@@ -1257,6 +1173,8 @@ class NasSimulator:
         copy_source: bool = False,
         max_frames: int = 0,
         materialize_predictions: bool = True,
+        rgb_path_template: str = "{camera}/RGB/{frame:05d}.ppm",
+        source_override: Optional[Path] = None,
     ) -> str:
         episode = episode or {}
         episode_id = str(payload.get("episode_id") or episode.get("episode_id") or f"episode_{uuid.uuid4().hex[:8]}")
@@ -1265,9 +1183,9 @@ class NasSimulator:
         episode_name = str(payload.get("episode") or episode.get("episode_name") or episode_id)
         cameras = cameras_from_payload(payload, episode, self)
         frames = frames_from_payload(payload, episode, self, cameras)
-        source = source_path_from_payload(payload, episode, self) if copy_source else None
+        source = source_override if copy_source else None
         uri = self.task_uri(subject, task_name, episode_name)
-        dst = self.local_path_for_uri(uri)
+        dst = self.nas_path_for_uri(uri)
         self._materialize_episode_dir(
             dst,
             subject=subject,
@@ -1275,8 +1193,7 @@ class NasSimulator:
             episode=episode_name,
             cameras=cameras,
             frames=frames,
-            rgb_path_template=str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.ppm"),
-            prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
+            rgb_path_template=rgb_path_template,
             source=source,
             max_frames=max_frames,
             materialize_predictions=materialize_predictions,
@@ -1293,7 +1210,6 @@ class NasSimulator:
         cameras: Sequence[str],
         frames: Sequence[int],
         rgb_path_template: str,
-        prediction_dir: str,
         source: Optional[Path],
         max_frames: int,
         materialize_predictions: bool,
@@ -1318,7 +1234,7 @@ class NasSimulator:
                 if not rgb_path.exists():
                     write_placeholder_rgb_image(rgb_path)
                 if materialize_predictions:
-                    pred_path = dst / prediction_dir / cam / f"{int(frame):05d}.npy"
+                    pred_path = dst / "pred_2d" / cam / f"{int(frame):05d}.npy"
                     if not pred_path.exists():
                         write_frame_hand_npy(pred_path, dst, cam, int(frame), rgb_path_template=rgb_path_template, variant="pred")
         metadata = {
@@ -1335,68 +1251,55 @@ class NasSimulator:
 
     def write_prediction_artifact(
         self,
-        data_uri: str,
+        episode_uri: str,
         cameras: Sequence[str],
         frames: Sequence[int],
-        prediction_dir: str = "pred_2d",
         rgb_path_template: str = "",
         detector: Optional[InteractionHandGtDetector] = None,
     ) -> str:
-        base = self.local_path_for_uri(data_uri)
+        base = self.nas_path_for_uri(episode_uri)
         for cam in cameras or ["00"]:
             for frame in frames or [0]:
-                out = base / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
+                out = base / "pred_2d" / str(cam) / f"{int(frame):05d}.npy"
                 if detector is None:
                     raise BackendError("auto_label requires interaction handGT detector")
                 values = detector.detect_values(base, str(cam), int(frame), rgb_path_template=rgb_path_template)
                 if values is None:
                     values = invisible_hand_values()
                 write_float32_npy(out, values)
-        return uri_join(data_uri, prediction_dir)
+        return uri_join(episode_uri, "pred_2d")
 
     def write_mano_episode_artifact(
         self,
-        data_uri: str,
+        episode_uri: str,
         cameras: Sequence[str],
         frames: Sequence[int],
-        prediction_dir: str = "pred_2d",
         rgb_path_template: str = "",
     ) -> str:
-        base = self.local_path_for_uri(data_uri)
-        source_dir = base / prediction_dir
+        base = self.nas_path_for_uri(episode_uri)
+        source_dir = base / "pred_2d"
         require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
         out = base / "mano" / "episode"
         write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base)
-        return uri_join(data_uri, "mano", "episode")
+        return uri_join(episode_uri, "mano", "episode")
 
     def write_mano_segment_patch(
         self,
-        data_uri: str,
+        episode_uri: str,
         segment_id: str,
         cameras: Sequence[str],
         frames: Sequence[int],
-        manual_2d_dir: str = "",
-        manual_2d_uri: str = "",
         rgb_path_template: str = "",
     ) -> str:
-        base = self.local_path_for_uri(data_uri)
-        source_dir = self.manual_2d_source_path(data_uri, segment_id, manual_2d_dir, manual_2d_uri)
+        base = self.nas_path_for_uri(episode_uri)
+        source_dir = self.manual_2d_source_path(episode_uri, segment_id)
         require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
         out = base / "mano" / "segments" / clean_id(segment_id, "segment")
         write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base, segment_id=segment_id)
-        return uri_join(data_uri, "mano", "segments", segment_id)
+        return uri_join(episode_uri, "mano", "segments", segment_id)
 
-    def manual_2d_source_path(self, data_uri: str, segment_id: str, manual_2d_dir: str = "", manual_2d_uri: str = "") -> Path:
-        data_uri = str(data_uri or "").rstrip("/")
-        manual_2d_uri = str(manual_2d_uri or "").rstrip("/")
-        if manual_2d_uri:
-            if data_uri and manual_2d_uri.startswith(data_uri + "/"):
-                return self.local_path_for_uri(data_uri) / manual_2d_uri[len(data_uri):].lstrip("/")
-            if manual_2d_uri.startswith(self.uri_prefix):
-                return self.local_path_for_uri(manual_2d_uri)
-            if manual_2d_uri.startswith("local://"):
-                return path_from_local_uri(manual_2d_uri)
-        return self.local_path_for_uri(data_uri) / (manual_2d_dir or f"manual_2d/segments/{segment_id}")
+    def manual_2d_source_path(self, episode_uri: str, segment_id: str) -> Path:
+        return self.nas_path_for_uri(str(episode_uri or "").rstrip("/")) / "manual_2d" / "segments" / clean_id(segment_id, "segment")
 
 
 def as_string_list(value: Any) -> List[str]:
@@ -1451,26 +1354,16 @@ def source_path_from_payload(
     nas: Optional[NasSimulator] = None,
 ) -> Optional[Path]:
     episode = episode or {}
-    data_uri = str(payload.get("data_uri") or episode.get("data_uri") or "")
-    if data_uri:
-        if data_uri.startswith("local://"):
-            return path_from_local_uri(data_uri)
-        if nas is not None and data_uri.startswith(nas.uri_prefix):
-            return nas.local_path_for_uri(data_uri)
+    episode_uri = str(payload.get("episode_uri") or episode.get("episode_uri") or "")
+    if not episode_uri or nas is None or not episode_uri.startswith(nas.uri_prefix):
         return None
-    raw = str(
-        payload.get("resolved_data_path")
-        or episode.get("resolved_data_path")
-        or payload.get("local_episode_path")
-        or episode.get("local_episode_path")
-        or payload.get("local_capture_path")
-        or episode.get("local_capture_path")
-        or payload.get("local_path")
-        or ""
-    )
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return None
+    return nas.nas_path_for_uri(episode_uri)
+
+
+def collection_path_from_upload_payload(payload: Json, episode: Optional[Json] = None) -> Optional[Path]:
+    episode = episode or {}
+    raw = str(payload.get("collection_path") or episode.get("collection_path") or "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
 
 
 def cameras_from_payload(payload: Json, episode: Optional[Json], nas: NasSimulator) -> List[str]:
@@ -1498,27 +1391,14 @@ def write_prediction_artifact_for_payload(
     episode: Optional[Json],
     cameras: Sequence[str],
     frames: Sequence[int],
-    prediction_dir: str,
     detector: Optional[InteractionHandGtDetector] = None,
+    *,
+    rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> str:
-    data_uri = str(payload.get("data_uri") or "")
-    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
-    if data_uri.startswith(nas.uri_prefix):
-        return nas.write_prediction_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template, detector)
-    episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is None:
-        raise BackendError(f"auto_label cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
-    for cam in cameras or ["00"]:
-        for frame in frames or [0]:
-            out = episode_path / prediction_dir / str(cam) / f"{int(frame):05d}.npy"
-            if detector is None:
-                write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="pred")
-            else:
-                values = detector.detect_values(episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template)
-                if values is None:
-                    values = invisible_hand_values()
-                write_float32_npy(out, values)
-    return uri_join(data_uri or local_uri_from_path(episode_path), prediction_dir)
+    episode_uri = str(payload.get("episode_uri") or "")
+    if not episode_uri.startswith(nas.uri_prefix):
+        raise BackendError(f"auto_label requires episode_uri under configured NAS prefix: {episode_uri}")
+    return nas.write_prediction_artifact(episode_uri, cameras, frames, rgb_path_template, detector)
 
 
 def write_corrected_artifact_for_payload(
@@ -1527,21 +1407,20 @@ def write_corrected_artifact_for_payload(
     episode: Optional[Json],
     cameras: Sequence[str],
     frames: Sequence[int],
-    correction_dir: str,
+    *,
+    rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> str:
-    data_uri = str(payload.get("data_uri") or "")
-    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
-    if data_uri.startswith(nas.uri_prefix):
-        episode_path = nas.local_path_for_uri(data_uri)
-    else:
-        episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is None:
-        raise BackendError(f"manual correction cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
+    episode_uri = str(payload.get("episode_uri") or "")
+    if not episode_uri.startswith(nas.uri_prefix):
+        raise BackendError(f"manual correction requires episode_uri under configured NAS prefix: {episode_uri}")
+    episode_dir = nas.nas_path_for_uri(episode_uri)
+    segment_id = clean_id(str(payload.get("segment_id") or payload.get("job_id") or "segment"), "segment")
+    correction_dir = f"manual_2d/segments/{segment_id}"
     for cam in cameras or ["00"]:
         for frame in frames or [0]:
-            out = episode_path / correction_dir / str(cam) / f"{int(frame):05d}.npy"
-            write_frame_hand_npy(out, episode_path, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="manual")
-    return uri_join(data_uri or local_uri_from_path(episode_path), correction_dir)
+            out = episode_dir / correction_dir / str(cam) / f"{int(frame):05d}.npy"
+            write_frame_hand_npy(out, episode_dir, str(cam), int(frame), rgb_path_template=rgb_path_template, variant="manual")
+    return uri_join(episode_uri, correction_dir)
 
 
 def write_mano_artifact_for_payload(
@@ -1550,68 +1429,24 @@ def write_mano_artifact_for_payload(
     episode: Optional[Json],
     cameras: Sequence[str],
     frames: Sequence[int],
+    *,
+    rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> Tuple[str, str]:
-    data_uri = str(payload.get("data_uri") or "")
+    episode_uri = str(payload.get("episode_uri") or "")
+    if not episode_uri.startswith(nas.uri_prefix):
+        raise BackendError(f"mano_opt requires episode_uri under configured NAS prefix: {episode_uri}")
     scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
     segment_id = str(payload.get("segment_id") or "")
-    prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
-    manual_2d_dir = str(payload.get("manual_2d_dir") or f"manual_2d/segments/{segment_id}")
-    manual_2d_uri = str(payload.get("manual_2d_uri") or payload.get("input_2d_uri") or "")
-    rgb_path_template = str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png")
-    if data_uri.startswith(nas.uri_prefix):
-        if scope == "segment":
-            return "mano_segment_patch", nas.write_mano_segment_patch(data_uri, segment_id, cameras, frames, manual_2d_dir, manual_2d_uri, rgb_path_template)
-        return "mano_episode", nas.write_mano_episode_artifact(data_uri, cameras, frames, prediction_dir, rgb_path_template)
-    episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is None:
-        raise BackendError(f"mano_opt cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
     if scope == "segment":
-        out = episode_path / "mano" / "segments" / clean_id(segment_id, "segment")
-        source_dir = manual_2d_source_path_for_payload(nas, data_uri, episode_path, segment_id, manual_2d_dir, manual_2d_uri)
-        require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
-        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path, segment_id=segment_id)
-        return "mano_segment_patch", uri_join(data_uri or local_uri_from_path(episode_path), "mano", "segments", segment_id)
-    out = episode_path / "mano" / "episode"
-    source_dir = episode_path / prediction_dir
-    require_2d_inputs_available(source_dir, cameras, frames, label="pred_2d")
-    write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=episode_path)
-    return "mano_episode", uri_join(data_uri, "mano", "episode")
-
-
-def manual_2d_source_path_for_payload(
-    nas: NasSimulator,
-    data_uri: str,
-    episode_path: Path,
-    segment_id: str,
-    manual_2d_dir: str,
-    manual_2d_uri: str,
-) -> Path:
-    data_uri = str(data_uri or "").rstrip("/")
-    manual_2d_uri = str(manual_2d_uri or "").rstrip("/")
-    if manual_2d_uri:
-        if data_uri and manual_2d_uri.startswith(data_uri + "/"):
-            return episode_path / manual_2d_uri[len(data_uri):].lstrip("/")
-        if manual_2d_uri.startswith(nas.uri_prefix):
-            return nas.local_path_for_uri(manual_2d_uri)
-        if manual_2d_uri.startswith("local://"):
-            return path_from_local_uri(manual_2d_uri)
-    return episode_path / (manual_2d_dir or f"manual_2d/segments/{segment_id}")
+        return "mano_segment_patch", nas.write_mano_segment_patch(episode_uri, segment_id, cameras, frames, rgb_path_template)
+    return "mano_episode", nas.write_mano_episode_artifact(episode_uri, cameras, frames, rgb_path_template)
 
 
 def mano_3d_path_for_payload(nas: NasSimulator, payload: Json, episode: Optional[Json]) -> Tuple[str, Optional[Path]]:
-    data_uri = str(payload.get("data_uri") or (episode or {}).get("data_uri") or "").rstrip("/")
-    mano_uri = str(payload.get("mano_episode_uri") or "").rstrip("/")
-    if not mano_uri and data_uri:
-        mano_uri = uri_join(data_uri, "mano", "episode")
+    episode_uri = str(payload.get("episode_uri") or (episode or {}).get("episode_uri") or "").rstrip("/")
+    mano_uri = uri_join(episode_uri, "mano", "episode")
     if mano_uri.startswith(nas.uri_prefix):
-        return mano_uri, nas.local_path_for_uri(mano_uri)
-    if mano_uri.startswith("local://"):
-        return mano_uri, path_from_local_uri(mano_uri)
-    episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is not None:
-        if data_uri and mano_uri.startswith(data_uri + "/"):
-            return mano_uri, episode_path / mano_uri[len(data_uri):].lstrip("/")
-        return mano_uri or uri_join(data_uri or local_uri_from_path(episode_path), "mano", "episode"), episode_path / "mano" / "episode"
+        return mano_uri, nas.nas_path_for_uri(mano_uri)
     return mano_uri, None
 
 
@@ -1632,7 +1467,9 @@ def mano_3d_artifact_ready(path: Optional[Path], frames: Sequence[int]) -> bool:
 
 
 def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optional[Json], result: Json) -> str:
-    data_uri = str(payload.get("data_uri") or (episode or {}).get("data_uri") or "")
+    episode_uri = str(payload.get("episode_uri") or (episode or {}).get("episode_uri") or "")
+    if not episode_uri.startswith(nas.uri_prefix):
+        raise BackendError(f"qc requires episode_uri under configured NAS prefix: {episode_uri}")
     report = {
         "mock": True,
         "generated_at_ms": now_ms(),
@@ -1646,32 +1483,21 @@ def write_qc_report_for_payload(nas: NasSimulator, payload: Json, episode: Optio
         "mano_3d_uri": str(result.get("mano_3d_uri") or ""),
         "mano_3d_checked": bool(result.get("mano_3d_checked")),
     }
-    if data_uri.startswith(nas.uri_prefix):
-        out = nas.local_path_for_uri(data_uri) / "qc" / "qc_report.json"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        return uri_join(data_uri, "qc", "qc_report.json")
-    episode_path = source_path_from_payload(payload, episode, nas)
-    if episode_path is None:
-        raise BackendError(f"qc cannot resolve episode data_uri/path: {data_uri or payload.get('resolved_data_path') or ''}")
-    out = episode_path / "qc" / "qc_report.json"
+    out = nas.nas_path_for_uri(episode_uri) / "qc" / "qc_report.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return uri_join(data_uri or local_uri_from_path(episode_path), "qc", "qc_report.json")
+    return uri_join(episode_uri, "qc", "qc_report.json")
 
 
-def payload_from_task(task: LabelTask, data_uri: str, job_id: str, reason: str) -> Json:
+def payload_from_task(task: LabelTask, episode_uri: str, job_id: str, reason: str) -> Json:
     return {
         "job_id": job_id,
         "episode_id": task.episode_id,
         "subject_id": task.subject,
         "task_name": task.task,
-        "data_uri": data_uri,
+        "episode_uri": episode_uri,
         "cameras": task.cameras,
         "frames": task.frames,
-        "rgb_path_template": task.rgb_path_template,
-        "prediction_dir": task.prediction_dir,
-        "correction_dir": task.correction_dir,
         "reason": reason,
         "metadata": {"source": "virtual_workflow", "label_jsonl_episode": task.episode},
     }
@@ -1688,22 +1514,15 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
             if args.max_jobs and count >= args.max_jobs:
                 stop = True
                 break
-            if args.use_nas:
-                data_uri = nas.materialize_task(segment_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
-                local_path = ""
-            else:
-                data_uri = local_uri_from_path(task.episode_dir)
-                local_path = str(task.episode_dir)
+            episode_uri = nas.materialize_task(segment_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
             suffix = f"_s{segment_index:04d}" if len(segments) > 1 else ""
             job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}{suffix}"
-            body = payload_from_task(segment_task, data_uri, job_id, "seeded_from_label_jsonl")
+            body = payload_from_task(segment_task, episode_uri, job_id, "seeded_from_label_jsonl")
             body["payload"] = {
                 "segment_index": segment_index,
                 "segment_count": len(segments),
                 "frames_per_segment": int(args.frames_per_segment or 0),
             }
-            if local_path:
-                body["local_path"] = local_path
             result = client.create_manual_label_job(body)
             segment = result.get("segment", {})
             count += 1
@@ -1711,7 +1530,7 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
                 "manual_segment_seeded",
                 segment_id=segment.get("segment_id", job_id),
                 episode_id=task.episode_id,
-                data_uri=data_uri,
+                episode_uri=episode_uri,
                 frames=len(segment_task.frames),
                 segment_index=segment_index,
                 segment_count=len(segments),
@@ -1733,8 +1552,8 @@ def seed_captured_upload_jobs(args: argparse.Namespace) -> int:
             "task_name": task.task,
             "episode_index": None,
             "status": "captured",
-            "data_uri": local_uri_from_path(task.episode_dir),
-            "local_capture_path": str(task.episode_dir),
+            "episode_uri": "",
+            "collection_path": str(task.episode_dir),
             "frame_count": len(task.frames),
             "cameras": task.cameras,
             "metadata": {"source": "virtual_seed_captured", "label_jsonl_episode": task.episode},
@@ -1745,13 +1564,9 @@ def seed_captured_upload_jobs(args: argparse.Namespace) -> int:
             "episode_id": task.episode_id,
             "subject_id": task.subject,
             "task_name": task.task,
-            "data_uri": episode["data_uri"],
-            "local_capture_path": str(task.episode_dir),
+            "collection_path": str(task.episode_dir),
             "cameras": task.cameras,
             "frames": task.frames,
-            "rgb_path_template": task.rgb_path_template,
-            "prediction_dir": task.prediction_dir,
-            "correction_dir": task.correction_dir,
             "reason": "virtual_captured_seed",
         }
         result = client.create_dev_job("upload", task.episode_id, payload, episode=episode)
@@ -1775,21 +1590,12 @@ def enriched_payload(response: Json) -> Json:
     for key in (
         "subject_id",
         "task_name",
-        "data_uri",
-        "episode_base_uri",
-        "local_capture_path",
-        "resolved_data_path",
+        "episode_uri",
         "cameras",
         "frames",
         "start_frame",
         "end_frame",
         "frame_count",
-        "rgb_path_template",
-        "prediction_dir",
-        "correction_dir",
-        "manual_2d_output_uri",
-        "manual_2d_uri",
-        "mano_episode_uri",
     ):
         if payload.get(key) in (None, "", []):
             payload[key] = episode.get(key)
@@ -1806,12 +1612,14 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
+    collection_path = collection_path_from_upload_payload(payload, episode)
     nas_uri = nas.materialize_payload(
         payload,
         episode,
         copy_source=args.copy_source,
         max_frames=args.max_materialized_frames,
         materialize_predictions=False,
+        source_override=collection_path,
     )
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
@@ -1821,7 +1629,7 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
             "ok": True,
             "nas_uri": nas_uri,
             "virtual_worker": owner,
-            "copied_from": str(source_path_from_payload(payload, episode, nas) or ""),
+            "copied_from": str(collection_path or ""),
         },
         artifacts=[{"kind": "nas_episode", "uri": nas_uri, "metadata": {"worker_id": owner}}],
     )
@@ -1847,19 +1655,25 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
-    data_uri = str(payload.get("data_uri") or "")
+    episode_uri = str(payload.get("episode_uri") or "")
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
-    payload = dict(payload)
-    payload["rgb_path_template"] = ensure_rgb_frames_from_video_for_payload(nas, payload, episode, cameras, frames)
-    prediction_dir = str(payload.get("prediction_dir") or "pred_2d")
-    pred_uri = write_prediction_artifact_for_payload(nas, payload, episode, cameras, frames, prediction_dir, hand_gt_detector_for_args(args))
+    rgb_path_template = ensure_rgb_frames_from_video_for_payload(nas, payload, episode, cameras, frames)
+    pred_uri = write_prediction_artifact_for_payload(
+        nas,
+        payload,
+        episode,
+        cameras,
+        frames,
+        hand_gt_detector_for_args(args),
+        rgb_path_template=rgb_path_template,
+    )
     client.complete_job(
         str(job["job_id"]),
         {"ok": True, "model": "virtual_hand2d", "frames_predicted": frames, "virtual_worker": owner},
-        artifacts=[{"kind": "pred_2d", "uri": pred_uri, "metadata": {"worker_id": owner, "mock": True}}],
+        artifacts=[{"kind": "pred_2d", "metadata": {"worker_id": owner, "mock": True}}],
     )
     print_event("auto_label_completed", job_id=job["job_id"], episode_id=payload.get("episode_id"), pred_uri=pred_uri, next_job="queued_by_backend")
     return True
@@ -1889,9 +1703,8 @@ def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argpars
             "segment_id": payload.get("segment_id") or "",
             "frames_optimized": frames,
             "virtual_worker": owner,
-            "output_uri": uri,
         },
-        artifacts=[{"kind": kind, "uri": uri, "metadata": {"worker_id": owner, "mock": False, "scope": scope}}],
+        artifacts=[{"kind": kind, "metadata": {"worker_id": owner, "mock": False, "scope": scope, "segment_id": payload.get("segment_id") or ""}}],
     )
     print_event(
         "mano_opt_completed",
@@ -1936,7 +1749,7 @@ def handle_qc_once(client: BackendClient, nas: NasSimulator, args: argparse.Name
     client.complete_job(
         str(job["job_id"]),
         result,
-        artifacts=[{"kind": "qc_report", "uri": qc_report_uri, "metadata": {"passed": passed, "worker_id": owner}}],
+        artifacts=[{"kind": "qc_report", "metadata": {"passed": passed, "worker_id": owner}}],
     )
     if passed:
         print_event("qc_passed", job_id=job["job_id"], episode_id=payload.get("episode_id"))
@@ -2085,7 +1898,6 @@ def build_parser() -> argparse.ArgumentParser:
     seed_label.add_argument("--max-jobs", type=int, default=0, help="Stop after seeding this many manual label jobs.")
     seed_label.add_argument("--frames-per-segment", type=int, default=0, help="Split each JSONL task into manual-label segments of N frames. 0 keeps one segment per task.")
     seed_label.add_argument("--job-prefix", default="seeded_manual")
-    seed_label.add_argument("--use-nas", action="store_true", help="Materialize tasks under the configured NAS root and use nas:// URIs.")
     seed_label.add_argument("--copy-source", action="store_true", help="Copy real source episode folders when they exist.")
     seed_label.add_argument("--max-materialized-frames", type=int, default=0, help="0 means materialize all frames.")
     seed_label.set_defaults(func=seed_manual_label_jobs)

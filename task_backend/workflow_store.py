@@ -95,8 +95,8 @@ class WorkflowStore:
                     task_name TEXT NOT NULL,
                     episode_index INTEGER,
                     status TEXT NOT NULL,
-                    data_uri TEXT,
-                    local_capture_path TEXT,
+                    episode_uri TEXT,
+                    collection_path TEXT,
                     frame_count INTEGER,
                     cameras_json TEXT NOT NULL DEFAULT '[]',
                     metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -175,6 +175,7 @@ class WorkflowStore:
                 PRAGMA user_version = 2;
                 """
             )
+            self._ensure_episode_storage_columns(conn)
             timestamp = now_iso()
             for job_type in sorted(CONTROLLED_STAGE_JOB_TYPES):
                 conn.execute(
@@ -189,6 +190,19 @@ class WorkflowStore:
         finally:
             conn.close()
 
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return [str(row[1]) for row in rows]
+
+    def _ensure_episode_storage_columns(self, conn: sqlite3.Connection) -> None:
+        columns = set(self._table_columns(conn, "episodes"))
+        if "episode_uri" not in columns:
+            conn.execute("ALTER TABLE episodes ADD COLUMN episode_uri TEXT")
+            columns.add("episode_uri")
+        if "collection_path" not in columns:
+            conn.execute("ALTER TABLE episodes ADD COLUMN collection_path TEXT")
+
     def create_or_update_episode(
         self,
         *,
@@ -197,8 +211,8 @@ class WorkflowStore:
         task_name: str,
         episode_index: Optional[int] = None,
         status: str = "planned",
-        data_uri: str = "",
-        local_capture_path: str = "",
+        episode_uri: str = "",
+        collection_path: str = "",
         frame_count: Optional[int] = None,
         cameras: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
@@ -219,8 +233,8 @@ class WorkflowStore:
                 "task_name": task_name,
                 "episode_index": episode_index,
                 "status": status,
-                "data_uri": data_uri,
-                "local_capture_path": local_capture_path,
+                "episode_uri": episode_uri,
+                "collection_path": collection_path,
                 "frame_count": frame_count,
                 "cameras": cameras or [],
                 "metadata": metadata or {},
@@ -234,8 +248,8 @@ class WorkflowStore:
                         "task_name": task_name or existing["task_name"],
                         "episode_index": episode_index if episode_index is not None else existing.get("episode_index"),
                         "status": status or existing["status"],
-                        "data_uri": data_uri or existing.get("data_uri", ""),
-                        "local_capture_path": local_capture_path or existing.get("local_capture_path", ""),
+                        "episode_uri": episode_uri or existing.get("episode_uri", ""),
+                        "collection_path": collection_path or existing.get("collection_path", ""),
                         "frame_count": frame_count if frame_count is not None else existing.get("frame_count"),
                         "cameras": cameras if cameras is not None else existing.get("cameras", []),
                         "metadata": {**existing.get("metadata", {}), **(metadata or {})},
@@ -247,7 +261,7 @@ class WorkflowStore:
                 """
                 INSERT OR REPLACE INTO episodes (
                     episode_id, subject_id, task_name, episode_index, status,
-                    data_uri, local_capture_path, frame_count, cameras_json,
+                    episode_uri, collection_path, frame_count, cameras_json,
                     metadata_json, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -257,8 +271,8 @@ class WorkflowStore:
                     values["task_name"],
                     values["episode_index"],
                     values["status"],
-                    values["data_uri"],
-                    values["local_capture_path"],
+                    values["episode_uri"],
+                    values["collection_path"],
                     values["frame_count"],
                     _json_dumps(values["cameras"]),
                     _json_dumps(values["metadata"]),
@@ -321,8 +335,8 @@ class WorkflowStore:
         self,
         episode_id: str,
         *,
-        data_uri: str = "",
-        local_capture_path: str = "",
+        episode_uri: str = "",
+        collection_path: str = "",
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         episode_id = str(episode_id or "").strip()
@@ -338,12 +352,12 @@ class WorkflowStore:
             conn.execute(
                 """
                 UPDATE episodes
-                SET data_uri = ?, local_capture_path = ?, metadata_json = ?, updated_at = ?
+                SET episode_uri = ?, collection_path = ?, metadata_json = ?, updated_at = ?
                 WHERE episode_id = ?
                 """,
                 (
-                    str(data_uri or episode.get("data_uri") or ""),
-                    str(local_capture_path or episode.get("local_capture_path") or ""),
+                    str(episode_uri or episode.get("episode_uri") or ""),
+                    str(collection_path or episode.get("collection_path") or ""),
                     _json_dumps(merged_metadata),
                     now_iso(),
                     episode_id,
@@ -1113,8 +1127,8 @@ class WorkflowStore:
             "task_name": row["task_name"],
             "episode_index": row["episode_index"],
             "status": row["status"],
-            "data_uri": row["data_uri"] or "",
-            "local_capture_path": row["local_capture_path"] or "",
+            "episode_uri": row["episode_uri"] or "",
+            "collection_path": row["collection_path"] or "",
             "frame_count": row["frame_count"],
             "cameras": _json_loads(row["cameras_json"], []),
             "metadata": _json_loads(row["metadata_json"], {}),

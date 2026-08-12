@@ -13,10 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     from .job_service import JobService
-    from .storage_resolver import path_from_local_uri, uri_join
+    from .storage_resolver import uri_join
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
-    from storage_resolver import path_from_local_uri, uri_join  # type: ignore
+    from storage_resolver import uri_join  # type: ignore
 
 
 def now_iso() -> str:
@@ -151,23 +151,23 @@ class NasUploader:
             raise RuntimeError("leased upload job is missing episode_id")
         source = self._source_path(payload, episode)
         if source is None or not source.exists():
-            raise FileNotFoundError(f"local capture path not found: {source or ''}")
+            raise FileNotFoundError(f"collection path not found: {source or ''}")
         source = source.resolve()
         if not (source.is_dir() or source.is_file()):
-            raise RuntimeError(f"local capture path is not a file or directory: {source}")
+            raise RuntimeError(f"collection path is not a file or directory: {source}")
 
         subject = clean_path_part(payload.get("subject_id") or episode.get("subject_id"), "subject")
         task = clean_path_part(payload.get("task_name") or episode.get("task_name"), "task")
         episode_part = clean_path_part(episode_id, "episode")
         nas_uri = uri_join(self.config.uri_prefix, subject, task, episode_part)
-        dest = self._local_path_for_uri(nas_uri)
+        dest = self._nas_path_for_uri(nas_uri)
         tmp = self.config.root / ".upload_tmp" / f"{clean_path_part(job_id, 'upload')}.{uuid.uuid4().hex}"
 
         files_total, total_bytes = path_totals(source)
         progress: Dict[str, Any] = {
             "ok": False,
             "phase": "scanning",
-            "local_path": str(source),
+            "collection_path": str(source),
             "nas_uri": nas_uri,
             "copied_bytes": 0,
             "total_bytes": total_bytes,
@@ -273,9 +273,9 @@ class NasUploader:
             **progress,
             "ok": True,
             "phase": "complete",
-            "local_path": str(source),
+            "collection_path": str(source),
             "nas_uri": nas_uri,
-            "nas_local_path": str(dest),
+            "nas_path": str(dest),
             "copied_bytes": total_bytes,
             "total_bytes": total_bytes,
             "files_done": files_total,
@@ -293,8 +293,8 @@ class NasUploader:
                         "uri": nas_uri,
                         "metadata": {
                             "worker_id": self.worker_id,
-                            "local_path": str(source),
-                            "nas_local_path": str(dest),
+                            "collection_path": str(source),
+                            "nas_path": str(dest),
                             "files_total": files_total,
                             "total_bytes": total_bytes,
                         },
@@ -315,20 +315,12 @@ class NasUploader:
         self.service.store.update_job_progress(job_id=job_id, progress=progress, status="running")
 
     def _source_path(self, payload: Dict[str, Any], episode: Dict[str, Any]) -> Optional[Path]:
-        local_path = str(
-            payload.get("local_capture_path")
-            or episode.get("local_capture_path")
-            or payload.get("local_path")
-            or ""
-        ).strip()
-        if local_path:
-            return Path(local_path).expanduser()
-        data_uri = str(payload.get("data_uri") or episode.get("data_uri") or "")
-        if data_uri.startswith("local://"):
-            return Path(path_from_local_uri(data_uri)).expanduser()
+        collection_path = str(payload.get("collection_path") or episode.get("collection_path") or "").strip()
+        if collection_path:
+            return Path(collection_path).expanduser()
         return None
 
-    def _local_path_for_uri(self, uri: str) -> Path:
+    def _nas_path_for_uri(self, uri: str) -> Path:
         if not uri.startswith(self.config.uri_prefix):
             raise ValueError(f"URI does not belong to NAS: {uri}")
         suffix = uri[len(self.config.uri_prefix):].strip("/")

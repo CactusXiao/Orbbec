@@ -401,7 +401,7 @@ static bool parseUploadStatusPayload(const std::string &body,
     parsed.totalBytes = jsonUint64(upload, "total_bytes", 0);
     parsed.filesDone = jsonInt(upload, "files_done", 0);
     parsed.filesTotal = jsonInt(upload, "files_total", 0);
-    parsed.localPath = jsonString(upload, "local_path");
+    parsed.collectionPath = jsonString(upload, "collection_path");
     parsed.nasUri = jsonString(upload, "nas_uri");
     parsed.error = jsonString(upload, "error");
     parsed.updatedAt = jsonString(upload, "updated_at");
@@ -476,7 +476,7 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
                                        const std::string &subjectId,
                                        const std::string &taskName,
                                        int episodeNumber,
-                                       const std::string &localPath,
+                                       const std::string &collectionPath,
                                        double durationSeconds,
                                        int frameCount,
                                        const std::string &idempotencyKey,
@@ -487,7 +487,7 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
     cJSON_AddStringToObject(root, "subject_id", subjectId.c_str());
     cJSON_AddStringToObject(root, "task_name", taskName.c_str());
     cJSON_AddNumberToObject(root, "episode_number", episodeNumber);
-    cJSON_AddStringToObject(root, "local_path", localPath.c_str());
+    cJSON_AddStringToObject(root, "collection_path", collectionPath.c_str());
     if(durationSeconds > 0.0) {
         cJSON_AddNumberToObject(root, "duration_seconds", durationSeconds);
     }

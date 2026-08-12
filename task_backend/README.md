@@ -20,13 +20,12 @@ NAS storage is represented by a real mounted NAS directory. Collection still
 saves the episode locally first. After the frontend confirms the local save, the
 backend creates an `upload` job and a background worker copies that local
 episode directory into the configured NAS root. The server records upload
-progress, verifies copied file and byte counts, then switches the episode
-`data_uri` from `local://...` to `nas://...` only after the copy succeeds.
+progress, verifies copied file and byte counts, then records the episode's
+single NAS root as `episode_uri`.
 
 Automatic labeling and automatic QC remain decoupled worker stages. The server
-stores abstract URIs such as `local:///data/episode_001` or
-`nas://ego/S001/...`, job status, and artifact registrations, but it
-does not import model code or run QC/model inference itself.
+stores the NAS episode root, job status, and artifact registrations, but it does
+not import model code or run QC/model inference itself.
 
 ## Start The Backend
 
@@ -53,7 +52,7 @@ ORBBEC_TASK_BACKEND_DATA_ROOT=./task_backend_state
 ORBBEC_NAS_ENABLED=1
 ORBBEC_NAS_ROOT=/mnt/nas
 ORBBEC_NAS_URI_PREFIX=nas://ego
-ORBBEC_URI_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
+ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 
 # Upload success waits for an explicit push before queuing auto_label jobs.
 # Set this to 1 only for legacy fully automatic local tests:
@@ -194,7 +193,7 @@ Array form is also accepted:
 
 This `nas` block is frontend-visible deployment information for the collection
 app. Backend startup remains owned by `.env` (`ORBBEC_NAS_ROOT`,
-`ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_URI_MOUNTS_JSON`).
+`ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_NAS_MOUNTS_JSON`).
 
 Environment overrides:
 
@@ -362,25 +361,23 @@ endpoint:
 POST /api/v1/dev/label/jobs
 ```
 
-Example with local data:
+Example with NAS data:
 
 ```bash
 curl -s http://127.0.0.1:8765/api/v1/dev/label/jobs \
   -H 'Content-Type: application/json' \
   -d '{
-    "local_path": "/Users/cactusxiao/data/S001/pick_object/episode_000456",
+    "episode_uri": "nas://ego/S001/pick_object/episode_000456",
     "subject_id": "S001",
     "task_name": "pick_object",
     "episode_id": "episode_000456",
     "cameras": ["camera_01", "camera_02"],
-    "frames": [120, 121, 122, 123],
-    "rgb_path_template": "{camera}/RGB/{frame:05d}.png",
-    "prediction_dir": "pred_2d"
+    "frames": [120, 121, 122, 123]
   }'
 ```
 
-The endpoint converts `local_path` to a `local://` data URI and creates a
-`pending_manual` segment for local smoke tests.
+The endpoint creates a `pending_manual` segment. It requires a NAS `episode_uri`;
+the expected files live at fixed paths under that episode root.
 
 There is also a development-only generic helper for stubbing `upload`,
 `auto_label`, `qc`, or `review` jobs:
@@ -419,23 +416,9 @@ The collection frontend also exposes a `Manual Label` button on the Collection
 Config page and the Task Select page. It launches the same `python3 -m
 label.main` GUI as a separate window and pre-fills the backend URL from the
 collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
-`subject_id` as the operator hint. NAS/local path mapping is owned by the
-backend: it resolves `data_uri` into `resolved_data_path` in the leased segment
-payload. Configure the backend with `ORBBEC_NAS_ROOT`,
-`ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_URI_MOUNTS_JSON`. For uploaded episodes,
-segment label payloads resolve
-the uploaded `data_uri` mount rather than the original collection
-`local_capture_path`, so human `manual_2d` outputs are written under the NAS
-episode directory.
-
-For local smoke tests, a payload with
-`"data_uri":"local:///Users/cactusxiao/data/S001/pick_object/episode_000456"`
-requires no mount mapping. A NAS-style URI such as
-`nas://orbbec-dataset/S001/pick_object/episode_000456` resolves through the
-backend-configured mount prefix.
-
-Label confirmation writes corrected 2D arrays to the `correction_dir` returned
-by the backend payload. For segment work the default is:
+`subject_id` as the operator hint. The backend leases each label segment with a
+single `episode_uri`; the label frontend resolves that NAS root through
+`ORBBEC_LABEL_NAS_MOUNTS_JSON` and writes corrected 2D arrays to:
 
 ```text
 manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from label.backend_client import LabelBackendClient, UriResolver, grouped_label_tasks
+from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
 from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
@@ -220,7 +220,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             (episode_dir / "camera_01" / "RGB").mkdir(parents=True)
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://orbbec-test": str(tmp_path / "nas")})
             registry = TaskInstanceRegistry(tmp_path / "backend_state", seed_task_files=[])
             runtime = BackendRuntime(registry, service)
             server = TaskHTTPServer(("127.0.0.1", 0), RequestHandler, runtime)
@@ -229,13 +229,15 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             try:
                 host, port = server.server_address
                 base_url = f"http://{host}:{port}"
+                nas_episode_dir = tmp_path / "nas" / "S001" / "pick_object" / "episode_000456"
+                (nas_episode_dir / "camera_01" / "RGB").mkdir(parents=True)
                 service.store.create_or_update_episode(
                     episode_id="episode_000456",
                     subject_id="S001",
                     task_name="pick_object",
                     episode_index=1,
                     status="manual_correction_pending",
-                    data_uri="local://" + str(episode_dir),
+                    episode_uri="nas://orbbec-test/S001/pick_object/episode_000456",
                     cameras=["camera_01"],
                     frame_count=2,
                 )
@@ -264,15 +266,15 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 leased = client.lease_label_segment("labeler_01", lease_seconds=60, task_name="pick_object", episode_id="episode_000456")
                 job_id = leased["payload"]["segment_id"]
                 self.assertEqual(leased["segment"]["status"], "manual_labeling")
-                self.assertEqual(UriResolver().resolve(leased["payload"]["data_uri"]), episode_dir.resolve())
+                self.assertEqual(NasEpisodeResolver({"nas://orbbec-test": str(tmp_path / "nas")}).resolve(leased["payload"]["episode_uri"]), nas_episode_dir.resolve())
                 self.assertEqual(leased["payload"]["frames"], [120, 121])
-                self.assertTrue(leased["payload"]["episode_media"]["requires_rgb_video_decode"])
-                self.assertIn("camera_01", leased["payload"]["episode_media"]["cameras"])
+                self.assertNotIn("episode_media", leased["payload"])
+                self.assertNotIn("rgb_path_template", leased["payload"])
 
                 completed = client.complete_label_job(
                     job_id,
                     result={"ok": True, "operator_id": "labeler_01"},
-                    artifacts=[{"kind": "manual_2d", "uri": "local://" + str(episode_dir / "manual_2d" / "segments" / job_id)}],
+                    artifacts=[{"kind": "manual_2d", "metadata": {"segment_id": job_id}}],
                 )
                 self.assertEqual(completed["segment"]["status"], "mano_queued")
 
@@ -284,24 +286,27 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=5)
 
-    def test_backend_payload_resolved_path_can_supply_data_uri_mapping(self) -> None:
+    def test_backend_payload_resolves_nas_episode_uri_from_mount(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
+            (episode_dir / "camera_01" / "RGB").mkdir(parents=True)
+            (episode_dir / "camera_01" / "RGB" / "00001.png").write_bytes(b"rgb")
             payload = {
-                "data_uri": "nas://orbbec-test/S001/pick_object/episode_001",
-                "resolved_data_path": str(tmp_path / "nas" / "S001" / "pick_object" / "episode_001"),
+                "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "subject_id": "S001",
                 "task_name": "pick_object",
                 "episode_id": "episode_001",
-                "cameras": ["camera_01"],
-                "frames": [1],
             }
-            task = correction_task_from_backend_payload(payload)
-            self.assertEqual(task.episode_dir(), Path(payload["resolved_data_path"]).resolve())
+            task = correction_task_from_backend_payload(payload, mounts={"nas://ego": str(nas_root)})
+            self.assertEqual(task.episode_dir(), episode_dir.resolve())
+            self.assertEqual(task.cameras, ["camera_01"])
+            self.assertEqual(task.frames, [1])
 
-    def test_backend_payload_nas_data_uri_requires_mount_or_resolved_path(self) -> None:
+    def test_backend_payload_nas_episode_uri_requires_mount(self) -> None:
         payload = {
-            "data_uri": "nas://ego/S001/pick_object/episode_001",
+            "episode_uri": "nas://ego/S001/pick_object/episode_001",
             "subject_id": "S001",
             "task_name": "pick_object",
             "episode_id": "episode_001",
@@ -309,10 +314,10 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             "frames": [1],
         }
 
-        with self.assertRaisesRegex(ValueError, "data_uri is not resolvable"):
+        with self.assertRaisesRegex(ValueError, "episode_uri is not resolvable"):
             correction_task_from_backend_payload(payload)
 
-    def test_backend_payload_prefers_mounted_data_uri_over_stale_resolved_path(self) -> None:
+    def test_backend_payload_ignores_non_contract_path_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             nas_root = tmp_path / "nas"
@@ -320,8 +325,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             (episode_dir / "00" / "RGB").mkdir(parents=True)
             (episode_dir / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
             payload = {
-                "data_uri": "nas://ego/S001/pick_object/episode_001",
-                "resolved_data_path": str(tmp_path / "collection_machine" / "stale_episode_001"),
+                "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "subject_id": "S001",
                 "task_name": "pick_object",
                 "episode_id": "episode_001",
@@ -333,10 +337,11 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
 
             self.assertEqual(task.episode_dir(), episode_dir.resolve())
 
-    def test_backend_payload_can_discover_missing_cameras_and_frames_from_path(self) -> None:
+    def test_backend_payload_can_discover_missing_cameras_and_frames_from_nas_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            episode_dir = tmp_path / "S001" / "pick_object" / "episode_001"
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
             for camera in ("00", "01", "ego", "pico_ego"):
                 rgb = episode_dir / camera / "RGB"
                 rgb.mkdir(parents=True)
@@ -344,11 +349,12 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 (rgb / "00002.png").write_bytes(b"rgb")
             task = correction_task_from_backend_payload(
                 {
-                    "resolved_data_path": str(episode_dir),
+                    "episode_uri": "nas://ego/S001/pick_object/episode_001",
                     "subject_id": "S001",
                     "task_name": "pick_object",
                     "episode_id": "episode_001",
-                }
+                },
+                mounts={"nas://ego": str(nas_root)},
             )
             self.assertEqual(task.cameras, ["00", "01"])
             self.assertEqual(task.frames, [1, 2])
@@ -357,7 +363,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
             payload = {
-                "resolved_data_path": str(episode_dir),
+                "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "subject_id": "S001",
                 "task_name": "pick_object",
                 "episode_id": "episode_001",
@@ -365,7 +371,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 "frames": [1],
             }
 
-            task = correction_task_from_backend_payload(payload)
+            task = correction_task_from_backend_payload(payload, mounts={"nas://ego": str(Path(tmp))})
 
             self.assertEqual(task.cameras, ["00", "camera_01"])
 
@@ -374,7 +380,8 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.skipTest("ffmpeg is not installed")
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            episode_dir = tmp_path / "S001" / "pick_object" / "episode_001"
+            nas_root = tmp_path / "nas"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode_001"
             rgb_dir = episode_dir / "camera_01" / "RGB"
             rgb_dir.mkdir(parents=True)
             video_path = rgb_dir / "rgb.h265"
@@ -410,9 +417,24 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 "2,122,3000\n",
                 encoding="utf-8",
             )
+            (episode_dir / "camera_params.json").write_text(
+                json.dumps(
+                    {
+                        "camera_01": {
+                            "RGB": {
+                                "storageEncoding": "h265",
+                                "storageFile": "rgb.h265",
+                                "timestampFile": "rgb.h265.timestamps.csv",
+                                "intrinsic": {"fx": 100.0, "fy": 100.0, "cx": 16.0, "cy": 12.0},
+                                "distortion": {},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
             payload = {
-                "resolved_data_path": str(episode_dir),
-                "data_uri": "local://" + str(episode_dir),
+                "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "subject_id": "S001",
                 "task_name": "pick_object",
                 "episode_id": "episode_001",
@@ -420,7 +442,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 "cameras": ["camera_01"],
                 "frames": [120, 122],
             }
-            task = correction_task_from_backend_payload(payload)
+            task = correction_task_from_backend_payload(payload, mounts={"nas://ego": str(nas_root)})
             decoded = ensure_decoded_rgb_frames(task, payload, cache_root=tmp_path / "cache")
             first = find_frame_path(decoded.episode_dir(), "camera_01", 120, decoded.rgb_path_template)
             last = find_frame_path(decoded.episode_dir(), "camera_01", 122, decoded.rgb_path_template)
@@ -432,11 +454,10 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
     def test_backend_payload_missing_context_uses_backend_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             payload = {
-                "data_uri": "local://" + str(Path(tmp) / "empty_episode"),
-                "resolved_data_path": str(Path(tmp) / "empty_episode"),
+                "episode_uri": "nas://ego/empty_episode",
             }
             with self.assertRaises(ValueError) as exc:
-                correction_task_from_backend_payload(payload)
+                correction_task_from_backend_payload(payload, mounts={"nas://ego": str(Path(tmp))})
             self.assertIn("Backend label job payload", str(exc.exception))
             self.assertNotIn("Line 1", str(exc.exception))
 

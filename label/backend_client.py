@@ -24,20 +24,18 @@ class LabelJobSession:
     segment_id: str = ""
 
 
-class UriResolver:
+class NasEpisodeResolver:
     def __init__(self, mounts: Optional[Mapping[str, str]] = None):
         self.mounts = {str(k).rstrip("/"): str(v) for k, v in (mounts or {}).items() if str(k).strip()}
 
-    def resolve(self, uri_or_path: str) -> Path:
-        value = str(uri_or_path or "").strip()
+    def resolve(self, episode_uri: str) -> Path:
+        value = str(episode_uri or "").strip()
         if not value:
-            raise ValueError("Task data URI/path is empty.")
+            raise ValueError("Episode URI is empty.")
 
         parsed = urlparse(value)
-        if not parsed.scheme:
-            return Path(value).expanduser().resolve()
-        if parsed.scheme == "local":
-            return self._resolve_local(parsed)
+        if parsed.scheme != "nas":
+            raise ValueError(f"Episode URI must be a nas:// URI: {value}")
 
         base = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
         best_prefix = ""
@@ -54,17 +52,7 @@ class UriResolver:
         if best_prefix:
             suffix = value[len(best_prefix):].lstrip("/")
             return (Path(best_root).expanduser() / unquote(suffix)).resolve()
-        raise ValueError(f"No local mount mapping is configured for URI: {value}")
-
-    @staticmethod
-    def _resolve_local(parsed) -> Path:
-        if parsed.netloc and parsed.path:
-            raw_path = "/" + parsed.netloc + parsed.path
-        elif parsed.netloc:
-            raw_path = parsed.netloc
-        else:
-            raw_path = parsed.path
-        return Path(unquote(raw_path)).expanduser().resolve()
+        raise ValueError(f"No NAS mount mapping is configured for URI: {value}")
 
 
 class LabelBackendClient:

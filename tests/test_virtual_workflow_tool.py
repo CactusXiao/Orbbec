@@ -125,15 +125,15 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 frames=[0],
             )
 
-            data_uri = nas.materialize_task(task, copy_source=True, materialize_predictions=False)
-            episode_dir = nas.local_path_for_uri(data_uri)
+            episode_uri = nas.materialize_task(task, copy_source=True, materialize_predictions=False)
+            episode_dir = nas.nas_path_for_uri(episode_uri)
 
             self.assertTrue((episode_dir / "00" / "RGB" / "00000.png").exists())
             self.assertFalse((episode_dir / "pred_2d").exists())
 
-            pred_uri = nas.write_prediction_artifact(data_uri, ["00"], [0], detector=FakeHandGtDetector())
+            pred_uri = nas.write_prediction_artifact(episode_uri, ["00"], [0], detector=FakeHandGtDetector())
             pred = np.load(episode_dir / "pred_2d" / "00" / "00000.npy")
-            self.assertEqual(pred_uri, data_uri + "/pred_2d")
+            self.assertEqual(pred_uri, episode_uri + "/pred_2d")
             self.assertEqual(pred.shape, (2, 21, 2))
             self.assertTrue(np.any(pred >= 0))
 
@@ -149,10 +149,10 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 cameras=["00"],
                 frames=[0],
             )
-            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
 
             with self.assertRaisesRegex(BackendError, "requires interaction handGT detector"):
-                nas.write_prediction_artifact(data_uri, ["00"], [0])
+                nas.write_prediction_artifact(episode_uri, ["00"], [0])
 
     def test_auto_label_no_hand_writes_invisible_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,10 +166,10 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 cameras=["00"],
                 frames=[0],
             )
-            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
-            episode_dir = nas.local_path_for_uri(data_uri)
+            episode_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.nas_path_for_uri(episode_uri)
 
-            nas.write_prediction_artifact(data_uri, ["00"], [0], detector=NoHandDetector())
+            nas.write_prediction_artifact(episode_uri, ["00"], [0], detector=NoHandDetector())
 
             pred = np.load(episode_dir / "pred_2d" / "00" / "00000.npy")
             visible = load_frame_visibility(episode_dir / "pred_2d", "00", 0)
@@ -189,8 +189,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 cameras=["00", "01"],
                 frames=[0],
             )
-            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
-            episode_dir = nas.local_path_for_uri(data_uri)
+            episode_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.nas_path_for_uri(episode_uri)
             self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
             target = self._synthetic_3d_hands(0)
             for cam in task.cameras:
@@ -200,9 +200,9 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                         pred[hand, joint] = self._project_test_point(target[hand, joint], cam)
                 write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
 
-            uri = nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+            uri = nas.write_mano_episode_artifact(episode_uri, task.cameras, task.frames)
 
-            self.assertEqual(uri, data_uri + "/mano/episode")
+            self.assertEqual(uri, episode_uri + "/mano/episode")
             joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
             manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
             self.assertEqual(joints.shape, (1, 2, 21, 3))
@@ -222,8 +222,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 cameras=["00", "01"],
                 frames=[0],
             )
-            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
-            episode_dir = nas.local_path_for_uri(data_uri)
+            episode_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.nas_path_for_uri(episode_uri)
             self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
             target = self._synthetic_3d_hands(0)
             for cam in task.cameras:
@@ -232,7 +232,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                     pred[0, joint] = self._project_test_point(target[0, joint], cam)
                 write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
 
-            nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+            nas.write_mano_episode_artifact(episode_uri, task.cameras, task.frames)
 
             joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
             manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
@@ -253,14 +253,14 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 cameras=["00", "01"],
                 frames=[0],
             )
-            data_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
-            episode_dir = nas.local_path_for_uri(data_uri)
+            episode_uri = nas.materialize_task(task, copy_source=False, materialize_predictions=False)
+            episode_dir = nas.nas_path_for_uri(episode_uri)
             self._write_camera_calibration(episode_dir, ["00", "01"], width=640, height=480)
             pred = np.full((2, 21, 2), -1.0, dtype=np.float32)
             for cam in task.cameras:
                 write_float32_npy(episode_dir / "pred_2d" / cam / "00000.npy", pred.reshape(-1).tolist())
 
-            nas.write_mano_episode_artifact(data_uri, task.cameras, task.frames)
+            nas.write_mano_episode_artifact(episode_uri, task.cameras, task.frames)
 
             joints = np.load(episode_dir / "mano" / "episode" / "joints_3d.npy")
             manifest = json.loads((episode_dir / "mano" / "episode" / "mano_episode.json").read_text(encoding="utf-8"))
@@ -268,18 +268,16 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self.assertEqual(manifest["metrics"]["valid_joint_count"], 0)
             self.assertEqual(manifest["metrics"]["missing_joint_count"], 42)
 
-    def test_mano_worker_requires_data_uri_to_match_configured_nas_prefix(self) -> None:
+    def test_mano_worker_requires_episode_uri_to_match_configured_nas_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             nas = NasSimulator(tmp_path / "nas", "nas://orbbec-test")
             payload = {
-                "data_uri": "nas://ego/S001/pick_object/episode_001",
-                "resolved_data_path": str(tmp_path / "stale_local_episode"),
-                "prediction_dir": "pred_2d",
+                "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "scope": "episode",
             }
 
-            with self.assertRaisesRegex(BackendError, "mano_opt cannot resolve episode data_uri"):
+            with self.assertRaisesRegex(BackendError, "mano_opt requires episode_uri under configured NAS prefix"):
                 write_mano_artifact_for_payload(nas, payload, None, ["00", "01"], [0])
 
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
@@ -294,7 +292,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 self.skipTest("ffmpeg cannot create h265 fixture")
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
+            service = JobService(store, nas_mounts={nas_prefix: str(nas_root)})
             registry = TaskInstanceRegistry(tmp_path / "backend_state", seed_task_files=[])
             runtime = BackendRuntime(registry, service)
             server = TaskHTTPServer(("127.0.0.1", 0), RequestHandler, runtime)
@@ -310,7 +308,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                     task_name="pick_object",
                     episode_index=1,
                     status="uploaded",
-                    data_uri=f"{nas_prefix}/S001/pick_object/episode_video",
+                    episode_uri=f"{nas_prefix}/S001/pick_object/episode_video",
                     frame_count=3,
                     cameras=["00"],
                     metadata={"nas_uri": f"{nas_prefix}/S001/pick_object/episode_video"},
@@ -355,7 +353,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             self._write_capture_episode(capture_dir, frames=60, cameras=["00", "01"])
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
+            service = JobService(store, nas_mounts={nas_prefix: str(nas_root)})
             registry = TaskInstanceRegistry(tmp_path / "backend_state", seed_task_files=[])
             runtime = BackendRuntime(registry, service)
             server = TaskHTTPServer(("127.0.0.1", 0), RequestHandler, runtime)
@@ -384,15 +382,15 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                         "episode_number": 1,
                         "client_id": "collection_smoke",
                         "idempotency_key": "collection_smoke:episode_full",
-                        "local_path": str(capture_dir),
+                        "collection_path": str(capture_dir),
                         "frame_count": 60,
                     }
                 )
                 self.assertTrue(handle_upload_once(client, nas, args))
                 episode = store.get_episode("episode_full")
                 self.assertIsNotNone(episode)
-                data_uri = str((episode or {}).get("data_uri") or "")
-                episode_dir = nas.local_path_for_uri(data_uri)
+                episode_uri = str((episode or {}).get("episode_uri") or "")
+                episode_dir = nas.nas_path_for_uri(episode_uri)
                 self.assertEqual((episode or {}).get("status"), "uploaded")
                 self.assertFalse((episode_dir / "pred_2d").exists())
 
@@ -437,7 +435,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                         if "no pending manual segment" in str(exc):
                             break
                         raise
-                    self._complete_segment_with_real_label_storage(label_client, leased)
+                    self._complete_segment_with_real_label_storage(label_client, leased, {nas_prefix: str(nas_root)})
                     completed_segments += 1
                     self.assertTrue(handle_mano_opt_once(client, nas, args))
 
@@ -555,13 +553,36 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
         for idx in range(frames):
             rows.append(f"{idx},{idx},{int(frame_offset + idx)}")
         (rgb_dir / "rgb.h265.timestamps.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        episode_dir = rgb_dir.parent.parent
+        camera = rgb_dir.parent.name
+        params_path = episode_dir / "camera_params.json"
+        try:
+            params = json.loads(params_path.read_text(encoding="utf-8")) if params_path.exists() else {}
+        except Exception:
+            params = {}
+        if not isinstance(params, dict):
+            params = {}
+        cam_obj = params.get(camera) if isinstance(params.get(camera), dict) else {}
+        rgb_obj = cam_obj.get("RGB") if isinstance(cam_obj.get("RGB"), dict) else {}
+        rgb_obj.update(
+            {
+                "storageEncoding": "h265",
+                "storageFile": "rgb.h265",
+                "timestampFile": "rgb.h265.timestamps.csv",
+                "intrinsic": rgb_obj.get("intrinsic") or {"fx": 32.0, "fy": 32.0, "cx": 16.0, "cy": 12.0},
+                "distortion": rgb_obj.get("distortion") or {},
+            }
+        )
+        cam_obj["RGB"] = rgb_obj
+        params[camera] = cam_obj
+        params_path.write_text(json.dumps(params), encoding="utf-8")
         return True
 
     @staticmethod
-    def _complete_segment_with_real_label_storage(label_client: LabelBackendClient, leased: dict) -> None:
+    def _complete_segment_with_real_label_storage(label_client: LabelBackendClient, leased: dict, mounts: dict[str, str]) -> None:
         payload = dict(leased.get("payload") or {})
         segment = dict(leased.get("segment") or {})
-        task = correction_task_from_backend_payload(payload)
+        task = correction_task_from_backend_payload(payload, mounts=mounts)
         bundle = load_prediction_bundle(task, mode="pred")
         for frame in task.frames:
             for cam in task.cameras:
@@ -569,24 +590,18 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 apply_view_state_to_corrected(bundle, int(frame), cam, points, visible)
         save_corrected_array(bundle)
 
-        artifact_uri = str(payload.get("manual_2d_output_uri") or payload.get("manual_2d_uri") or "").strip()
-        if not artifact_uri:
-            data_uri = str(payload.get("data_uri") or "").rstrip("/")
-            correction_dir = str(payload.get("correction_dir") or task.correction_dir or "manual_2d").strip("/")
-            artifact_uri = f"{data_uri}/{correction_dir}" if data_uri and correction_dir else data_uri
+        segment_id = str(segment.get("segment_id") or payload.get("segment_id") or "").strip()
         label_client.complete_label_job(
             str(segment.get("segment_id") or payload.get("segment_id") or ""),
             result={
                 "operator_id": "real_label_storage_smoke",
                 "frames_completed": list(task.frames),
-                "local_progress_cache": "",
             },
             artifacts=[
                 {
                     "kind": "manual_2d",
-                    "uri": artifact_uri,
                     "metadata": {
-                        "segment_id": segment.get("segment_id") or payload.get("segment_id") or "",
+                        "segment_id": segment_id,
                         "cameras": list(task.cameras),
                         "frames": list(task.frames),
                         "operator_id": "real_label_storage_smoke",

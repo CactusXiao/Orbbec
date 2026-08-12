@@ -27,7 +27,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             nas_root = tmp_path / "nas"
             nas_prefix = "nas://ego-test"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, uri_mounts={nas_prefix: str(nas_root)})
+            service = JobService(store, nas_mounts={nas_prefix: str(nas_root)})
             service.record_collection_confirm(
                 {
                     "reservation_id": "reservation_001",
@@ -36,7 +36,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "episode_number": 1,
                     "client_id": "smoke",
                     "idempotency_key": "smoke:reservation_001",
-                    "local_path": str(source),
+                    "collection_path": str(source),
                     "frame_count": 2,
                 }
             )
@@ -72,7 +72,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_pass"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
             self._create_uploaded_episode(store, tmp_path, "episode_pass", frames=2)
 
             service.push_auto_label({"episode_id": "episode_pass", "pushed_by": "smoke"})
@@ -81,7 +81,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 auto_job["job_id"],
                 {
                     "result": {"ok": True},
-                    "artifacts": [{"kind": "pred_2d", "uri": f"local://{episode_dir / 'pred_2d'}", "metadata": {"mock": True}}],
+                    "artifacts": [{"kind": "pred_2d", "metadata": {"mock": True}}],
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "auto_labeled")  # type: ignore[index]
@@ -94,7 +94,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 mano_jobs[0]["job_id"],
                 {
                     "result": {"ok": True},
-                    "artifacts": [{"kind": "mano_episode", "uri": f"local://{episode_dir / 'mano' / 'episode'}", "metadata": {"mock": True}}],
+                    "artifacts": [{"kind": "mano_episode", "metadata": {"mock": True}}],
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "mano_optimized")  # type: ignore[index]
@@ -105,7 +105,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 qc_jobs[0]["job_id"],
                 {
                     "result": {"passed": True, "score": 0.99},
-                    "artifacts": [{"kind": "qc_report", "uri": f"local://{episode_dir / 'qc' / 'qc_report.json'}", "metadata": {"passed": True}}],
+                    "artifacts": [{"kind": "qc_report", "metadata": {"passed": True}}],
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "finalized")  # type: ignore[index]
@@ -123,7 +123,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_fail"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
             self._create_uploaded_episode(store, tmp_path, "episode_fail", frames=30, cameras=["00", "01"])
             self._advance_to_qc_job(service, store, "episode_fail")
 
@@ -154,14 +154,16 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(leased["segment"]["start_frame"], 10)
             self.assertEqual(leased["payload"]["frames"], [10, 11, 12])
             self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
-            self.assertEqual(leased["payload"]["correction_dir"], f"manual_2d/segments/{leased['segment']['segment_id']}")
+            self.assertNotIn("correction_dir", leased["payload"])
+            self.assertNotIn("episode_media", leased["payload"])
+            self.assertNotIn("rgb_path_template", leased["payload"])
 
             first_segment_id = leased["segment"]["segment_id"]
             completed = service.complete_label_segment(
                 first_segment_id,
                 {
                     "result": {"operator_id": "labeler", "frames_completed": [10, 11, 12]},
-                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / first_segment_id}", "metadata": {"segment_id": first_segment_id}}],
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": first_segment_id}}],
                 },
             )
             self.assertEqual(completed["segment"]["status"], "mano_queued")
@@ -171,12 +173,13 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             segment_mano = [job for job in store.jobs_for_episode("episode_fail", "mano_opt") if job["payload"].get("scope") == "segment"]
             self.assertEqual(len(segment_mano), 1)
             self.assertEqual(segment_mano[0]["payload"]["segment_id"], first_segment_id)
+            self.assertNotIn("rgb_path_template", segment_mano[0]["payload"])
 
             service.complete_job(
                 segment_mano[0]["job_id"],
                 {
-                    "result": {"ok": True, "output_uri": f"local://{episode_dir / 'mano' / 'segments' / first_segment_id}"},
-                    "artifacts": [{"kind": "mano_segment_patch", "uri": f"local://{episode_dir / 'mano' / 'segments' / first_segment_id}", "metadata": {"segment_id": first_segment_id}}],
+                    "result": {"ok": True},
+                    "artifacts": [{"kind": "mano_segment_patch", "metadata": {"segment_id": first_segment_id}}],
                 },
             )
             self.assertNotEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
@@ -192,7 +195,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 second_segment_id,
                 {
                     "result": {"operator_id": "labeler", "frames_completed": [20, 21]},
-                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / second_segment_id}", "metadata": {"segment_id": second_segment_id}}],
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": second_segment_id}}],
                 },
             )
             second_mano = [
@@ -203,8 +206,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             service.complete_job(
                 second_mano["job_id"],
                 {
-                    "result": {"ok": True, "output_uri": f"local://{episode_dir / 'mano' / 'segments' / second_segment_id}"},
-                    "artifacts": [{"kind": "mano_segment_patch", "uri": f"local://{episode_dir / 'mano' / 'segments' / second_segment_id}", "metadata": {"segment_id": second_segment_id}}],
+                    "result": {"ok": True},
+                    "artifacts": [{"kind": "mano_segment_patch", "metadata": {"segment_id": second_segment_id}}],
                 },
             )
             self.assertEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
@@ -217,7 +220,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
             self._create_uploaded_episode(store, tmp_path, "episode_bad", frames=30)
             self._advance_to_qc_job(service, store, "episode_bad")
 
@@ -243,7 +246,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
             self._create_uploaded_episode(store, tmp_path, "episode_a", frames=3, episode_index=1)
             self._create_uploaded_episode(store, tmp_path, "episode_b", frames=3, episode_index=2)
             self._advance_to_qc_job(service, store, "episode_a")
@@ -265,18 +268,14 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(leased["job"]["job_id"], target_job["job_id"])
             self.assertEqual(store.jobs_for_episode("episode_a", "qc")[0]["status"], "queued")
 
-    def test_backend_resolved_data_path_prefers_nas_data_uri_over_collection_local_path(self) -> None:
+    def test_backend_maps_nas_episode_uri_to_mount(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             nas_root = tmp_path / "nas"
-            old_local = tmp_path / "collection_machine" / "S001" / "pick_object" / "episode_001"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, uri_mounts={"nas://ego": str(nas_root)})
+            service = JobService(store, nas_mounts={"nas://ego": str(nas_root)})
 
-            resolved = service.resolve_data_path(
-                "nas://ego/S001/pick_object/episode_001",
-                str(old_local),
-            )
+            resolved = service.nas_root_dir_from_uri("nas://ego/S001/pick_object/episode_001")
 
             self.assertEqual(Path(resolved), (nas_root / "S001" / "pick_object" / "episode_001").resolve())
 
@@ -284,7 +283,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
             self._create_uploaded_episode(store, tmp_path, "episode_late", frames=10, episode_index=2)
             self._create_uploaded_episode(store, tmp_path, "episode_early", frames=10, episode_index=1)
             store.create_segment(segment_id="late_001", episode_id="episode_late", start_frame=1, end_frame=1)
@@ -314,16 +313,16 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             (attempt_dir / "partial.json").write_text("partial", encoding="utf-8")
 
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store)
-            self._create_uploaded_episode(store, tmp_path, "episode_retry", frames=1, data_uri=f"local://{episode_dir}")
-            store.register_artifact(episode_id="episode_retry", kind="pred_2d", uri=f"local://{episode_dir / 'pred_2d'}")
-            store.register_artifact(episode_id="episode_retry", kind="mano_episode", uri=f"local://{episode_dir / 'mano' / 'episode'}")
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
+            self._create_uploaded_episode(store, tmp_path, "episode_retry", frames=1)
+            store.register_artifact(episode_id="episode_retry", kind="pred_2d", uri="nas://ego/S001/pick_object/episode_retry/pred_2d")
+            store.register_artifact(episode_id="episode_retry", kind="mano_episode", uri="nas://ego/S001/pick_object/episode_retry/mano/episode")
             segment = store.create_segment(segment_id="retry_seg", episode_id="episode_retry", start_frame=0, end_frame=0)
             service.complete_label_segment(
                 segment["segment_id"],
                 {
                     "result": {"operator_id": "labeler"},
-                    "artifacts": [{"kind": "manual_2d", "uri": f"local://{episode_dir / 'manual_2d' / 'segments' / 'retry_seg'}"}],
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": "retry_seg"}}],
                 },
             )
             mano_job = [
@@ -360,7 +359,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         frames: int,
         cameras: list[str] | None = None,
         episode_index: int = 1,
-        data_uri: str = "",
+        episode_uri: str = "",
     ) -> None:
         store.create_or_update_episode(
             episode_id=episode_id,
@@ -368,10 +367,10 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             task_name="pick_object",
             episode_index=episode_index,
             status="uploaded",
-            data_uri=data_uri or f"local://{tmp_path / 'S001' / 'pick_object' / episode_id}",
+            episode_uri=episode_uri or f"nas://ego/S001/pick_object/{episode_id}",
             frame_count=frames,
             cameras=cameras or ["00"],
-            metadata={"nas_uri": data_uri or f"local://{tmp_path / 'S001' / 'pick_object' / episode_id}"},
+            metadata={"nas_uri": episode_uri or f"nas://ego/S001/pick_object/{episode_id}"},
         )
 
     def _advance_to_qc_job(self, service: JobService, store: WorkflowStore, episode_id: str) -> None:

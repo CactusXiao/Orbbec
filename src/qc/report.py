@@ -4,20 +4,12 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Tuple
 
 from .state_store import now_iso
 
 
 Range = Tuple[int, int]
-
-
-def qc_report_uri(payload: Mapping[str, Any]) -> str:
-    explicit = str(payload.get("qc_report_uri") or payload.get("report_uri") or "").strip()
-    if explicit:
-        return explicit
-    data_uri = str(payload.get("data_uri") or payload.get("episode_base_uri") or "").strip().rstrip("/")
-    return data_uri + "/qc/qc_report.json" if data_uri else ""
 
 
 def build_qc_result(
@@ -93,4 +85,3 @@ def write_qc_report(
         except OSError:
             pass
     return path
-

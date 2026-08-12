@@ -12,11 +12,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 try:
-    from .storage_resolver import local_uri_from_path, path_from_local_uri, uri_join
+    from .storage_resolver import uri_join
     from .workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
-    from storage_resolver import local_uri_from_path, path_from_local_uri, uri_join  # type: ignore
+    from storage_resolver import uri_join  # type: ignore
     from workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
@@ -127,7 +127,7 @@ def _as_int_list(value: Any) -> List[int]:
     return out
 
 
-def _normalize_uri_mounts(value: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+def _normalize_nas_mounts(value: Optional[Mapping[str, Any]]) -> Dict[str, str]:
     out: Dict[str, str] = {}
     for prefix, root in (value or {}).items():
         clean_prefix = str(prefix or "").strip().rstrip("/")
@@ -192,19 +192,6 @@ def _discover_frames(episode_dir: Optional[Path], cameras: List[str]) -> List[in
     return sorted(frames)
 
 
-def _local_episode_path(data_uri: str, local_path: str) -> Optional[Path]:
-    if local_path:
-        return Path(local_path).expanduser().resolve()
-    if data_uri.startswith("local://"):
-        return Path(path_from_local_uri(data_uri)).expanduser().resolve()
-    return None
-
-
-def _stream_storage_obj(camera_obj: Mapping[str, Any], stream_name: str) -> Dict[str, Any]:
-    value = camera_obj.get(stream_name) or camera_obj.get(stream_name.lower()) or {}
-    return dict(value) if isinstance(value, dict) else {}
-
-
 def _infer_subject_task_episode(path: Optional[Path]) -> Tuple[str, str, str]:
     if path is None:
         return "", "", ""
@@ -220,35 +207,28 @@ class JobService:
         store: WorkflowStore,
         *,
         auto_label_after_upload: bool = False,
-        uri_mounts: Optional[Mapping[str, Any]] = None,
+        nas_mounts: Optional[Mapping[str, Any]] = None,
     ):
         self.store = store
         self.auto_label_after_upload = bool(auto_label_after_upload)
-        self.uri_mounts = _normalize_uri_mounts(uri_mounts)
+        self.nas_mounts = _normalize_nas_mounts(nas_mounts)
 
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload_in = dict(body or {})
-        local_path = str(
-            payload_in.get("local_episode_path")
-            or payload_in.get("local_capture_path")
-            or payload_in.get("local_path")
-            or ""
-        ).strip()
-        data_uri = str(payload_in.get("data_uri") or "").strip()
-        if not data_uri and local_path:
-            data_uri = local_uri_from_path(local_path)
-        if not data_uri:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, "data_uri or local_path is required")
+        collection_path = str(payload_in.get("collection_path") or "").strip()
+        episode_uri = str(payload_in.get("episode_uri") or "").strip()
+        if not episode_uri:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_uri is required")
 
-        episode_path = _local_episode_path(data_uri, local_path)
-        inferred_subject, inferred_task, inferred_episode = _infer_subject_task_episode(episode_path)
+        nas_root_dir = self.nas_root_dir_from_uri(episode_uri)
+        inferred_subject, inferred_task, inferred_episode = _infer_subject_task_episode(nas_root_dir)
         subject_id = str(payload_in.get("subject_id") or inferred_subject or "dev_subject").strip()
         task_name = str(payload_in.get("task_name") or inferred_task or "manual_label").strip()
         episode_id = str(payload_in.get("episode_id") or inferred_episode or _new_id("episode")).strip()
         episode_index = _optional_int(payload_in.get("episode_index"))
 
-        cameras = _label_camera_ids(payload_in.get("cameras")) or _discover_cameras(episode_path)
-        frames = _as_int_list(payload_in.get("frames")) or _discover_frames(episode_path, cameras)
+        cameras = _label_camera_ids(payload_in.get("cameras")) or _discover_cameras(nas_root_dir)
+        frames = _as_int_list(payload_in.get("frames")) or _discover_frames(nas_root_dir, cameras)
         frame_count = _optional_int(payload_in.get("frame_count")) or len(frames) or None
         priority = _optional_int(payload_in.get("priority"))
         if priority is None:
@@ -262,8 +242,8 @@ class JobService:
             task_name=task_name,
             episode_index=episode_index,
             status="manual_correction_pending",
-            data_uri=data_uri,
-            local_capture_path=str(episode_path) if episode_path is not None else local_path,
+            episode_uri=episode_uri,
+            collection_path=collection_path,
             frame_count=frame_count,
             cameras=cameras,
             metadata=metadata,
@@ -283,8 +263,6 @@ class JobService:
             "created_by": "dev_label_segment",
             "reason": str(payload_in.get("reason") or "dev_created"),
             "priority": priority,
-            "rgb_path_template": str(payload_in.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-            "prediction_dir": str(payload_in.get("prediction_dir") or "pred_2d"),
         }
         extra_payload = json_object(payload_in.get("payload"), "payload")
         segment_metadata.update(extra_payload)
@@ -315,8 +293,8 @@ class JobService:
                 task_name=str(episode_obj.get("task_name") or payload_in.get("task_name") or "dev_task"),
                 episode_index=_optional_int(episode_obj.get("episode_index")),
                 status=str(episode_obj.get("status") or "planned"),
-                data_uri=str(episode_obj.get("data_uri") or payload_in.get("data_uri") or ""),
-                local_capture_path=str(episode_obj.get("local_capture_path") or ""),
+                episode_uri=str(episode_obj.get("episode_uri") or payload_in.get("episode_uri") or ""),
+                collection_path=str(episode_obj.get("collection_path") or ""),
                 frame_count=_optional_int(episode_obj.get("frame_count")),
                 cameras=_label_camera_ids(episode_obj.get("cameras")),
                 metadata=json_object(episode_obj.get("metadata"), "episode.metadata"),
@@ -392,8 +370,8 @@ class JobService:
         nas_uri = str(result.get("nas_uri") or "")
         if not nas_uri and upload_artifacts:
             nas_uri = str(upload_artifacts[-1].get("uri") or "")
-        if not nas_uri and str(episode.get("data_uri") or "").startswith("nas://"):
-            nas_uri = str(episode.get("data_uri") or "")
+        if not nas_uri and str(episode.get("episode_uri") or "").startswith("nas://"):
+            nas_uri = str(episode.get("episode_uri") or "")
         workflow_status = str(episode.get("status") or "planned")
         active_jobs = [
             job for job in all_jobs
@@ -426,7 +404,7 @@ class JobService:
                 "files_done": _optional_int(result.get("files_done")) or 0,
                 "files_total": _optional_int(result.get("files_total")) or 0,
                 "nas_uri": nas_uri,
-                "local_path": str(result.get("local_path") or episode.get("local_capture_path") or ""),
+                "collection_path": str(result.get("collection_path") or episode.get("collection_path") or ""),
                 "error": str(result.get("error") or ""),
                 "updated_at": str(upload_job.get("updated_at") or "") if upload_job else "",
                 "result": result,
@@ -646,7 +624,7 @@ class JobService:
                     "subject_id": str(episode.get("subject_id") or ""),
                     "episode_index": episode.get("episode_index"),
                     "episode_status": str(episode.get("status") or ""),
-                    "episode_base_uri": str(episode.get("data_uri") or ""),
+                    "episode_uri": str(episode.get("episode_uri") or ""),
                     "pending_segments": 0,
                     "leased_segments": 0,
                     "frames": 0,
@@ -822,8 +800,7 @@ class JobService:
 
     def record_collection_confirm(self, reservation: Dict[str, Any]) -> None:
         episode_id = str(reservation.get("reservation_id") or "")
-        local_path = str(reservation.get("local_path") or "")
-        data_uri = local_uri_from_path(local_path) if local_path else ""
+        collection_path = str(reservation.get("collection_path") or "")
         frame_count = _optional_int(reservation.get("frame_count"))
         self.store.create_or_update_episode(
             episode_id=episode_id,
@@ -831,8 +808,8 @@ class JobService:
             task_name=str(reservation.get("task_name") or ""),
             episode_index=_optional_int(reservation.get("episode_number")),
             status="captured",
-            data_uri=data_uri,
-            local_capture_path=local_path,
+            episode_uri="",
+            collection_path=collection_path,
             frame_count=frame_count,
             metadata={
                 "reservation_id": reservation.get("reservation_id"),
@@ -845,8 +822,7 @@ class JobService:
         payload = {
             "job_id": job_id,
             "episode_id": episode_id,
-            "data_uri": data_uri,
-            "local_capture_path": local_path,
+            "collection_path": collection_path,
             "reason": "collection_confirmed",
         }
         self._create_job_once(job_id=job_id, job_type="upload", episode_id=episode_id, payload=payload)
@@ -868,15 +844,9 @@ class JobService:
             payload.setdefault("episode_id", episode.get("episode_id"))
             payload.setdefault("subject_id", episode.get("subject_id"))
             payload.setdefault("task_name", episode.get("task_name"))
-            payload.setdefault("data_uri", episode.get("data_uri"))
+            payload.setdefault("episode_uri", episode.get("episode_uri"))
             payload.setdefault("cameras", _label_camera_ids(episode.get("cameras") or []))
-            payload.setdefault("local_capture_path", episode.get("local_capture_path") or "")
-        resolved_data_path = self.resolve_data_path(
-            str(payload.get("data_uri") or ""),
-            str(payload.get("local_capture_path") or (episode or {}).get("local_capture_path") or ""),
-        )
-        if resolved_data_path:
-            payload.setdefault("resolved_data_path", resolved_data_path)
+        self._strip_downstream_path_fields(payload)
         if episode is not None:
             episode_id = str(episode.get("episode_id") or job.get("episode_id") or "")
             cameras = _label_camera_ids(payload.get("cameras")) or self._cameras_for_episode_context(episode_id, episode, payload)
@@ -890,7 +860,6 @@ class JobService:
             )
             if frames:
                 payload["frames"] = frames
-            payload.setdefault("episode_media", self._episode_media_payload(episode, cameras))
         return {
             "job": job,
             "episode": episode,
@@ -903,12 +872,7 @@ class JobService:
         episode = self.store.get_episode(episode_id) if episode_id else None
         artifacts = self.store.artifacts_for_episode(episode_id) if episode_id else []
         payload = self._segment_label_payload(segment, episode or {}, artifacts)
-        resolved_data_path = self.resolve_data_path(
-            str(payload.get("episode_base_uri") or payload.get("data_uri") or ""),
-            "",
-        )
-        if resolved_data_path:
-            payload["resolved_data_path"] = resolved_data_path
+        self._strip_downstream_path_fields(payload)
         return {
             "segment": segment,
             "episode": episode,
@@ -923,20 +887,10 @@ class JobService:
         artifacts: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         episode_id = str(segment.get("episode_id") or episode.get("episode_id") or "")
-        data_uri = str(episode.get("data_uri") or "")
+        episode_uri = str(episode.get("episode_uri") or "")
         start_frame = _optional_int(segment.get("start_frame")) or 0
         end_frame = _optional_int(segment.get("end_frame")) or start_frame
         segment_id = str(segment.get("segment_id") or "")
-        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"}) or uri_join(data_uri, "pred_2d")
-        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
-        manual_output_uri = str(segment.get("manual_2d_uri") or "") or uri_join(data_uri, "manual_2d", "segments", segment_id)
-        segment_metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
-        prediction_dir = str(segment_metadata.get("prediction_dir") or "").strip() or self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d")
-        rgb_path_template = str(segment_metadata.get("rgb_path_template") or "").strip() or self._payload_field_for_episode_context(
-            episode_id,
-            "rgb_path_template",
-            "{camera}/RGB/{frame:05d}.png",
-        )
         cameras = self._cameras_for_episode_context(episode_id, episode, {})
         return {
             "segment_id": segment_id,
@@ -944,32 +898,13 @@ class JobService:
             "episode_id": episode_id,
             "task_name": str(episode.get("task_name") or ""),
             "subject_id": str(episode.get("subject_id") or ""),
-            "episode_base_uri": data_uri,
-            "data_uri": data_uri,
+            "episode_uri": episode_uri,
             "start_frame": start_frame,
             "end_frame": end_frame,
             "frames": list(range(start_frame, end_frame + 1)),
             "cameras": cameras,
-            "pred_2d_uri": pred_uri,
-            "pred_uri": pred_uri,
-            "mano_episode_uri": mano_episode_uri,
-            "mano_episode_dir": self._relative_data_uri_path(data_uri, mano_episode_uri) or "mano/episode",
-            "manual_2d_output_uri": manual_output_uri,
-            "manual_2d_uri": manual_output_uri,
-            "prediction_dir": prediction_dir,
-            "correction_dir": f"manual_2d/segments/{segment_id}",
-            "manual_2d_dir": f"manual_2d/segments/{segment_id}",
-            "rgb_path_template": rgb_path_template,
-            "episode_media": self._episode_media_payload(episode, cameras),
             "status": str(segment.get("status") or ""),
         }
-
-    @staticmethod
-    def _latest_artifact_uri(artifacts: List[Dict[str, Any]], kinds: set) -> str:
-        for artifact in reversed(artifacts):
-            if str(artifact.get("kind") or "") in kinds and str(artifact.get("uri") or ""):
-                return str(artifact.get("uri") or "")
-        return ""
 
     @staticmethod
     def _segment_frame_count(segment: Dict[str, Any]) -> int:
@@ -983,16 +918,10 @@ class JobService:
         result: Dict[str, Any],
         artifacts: List[Dict[str, Any]],
     ) -> str:
-        for artifact in artifacts:
-            if str(artifact.get("kind") or "") == "manual_2d" and str(artifact.get("uri") or ""):
-                return str(artifact.get("uri"))
-        uri = str(result.get("manual_2d_uri") or result.get("manual_2d_output_uri") or "").strip()
-        if uri:
-            return uri
         episode = self.store.get_episode(str(segment.get("episode_id") or "")) or {}
-        data_uri = str(episode.get("data_uri") or "")
+        episode_uri = str(episode.get("episode_uri") or "")
         segment_id = str(segment.get("segment_id") or "")
-        return uri_join(data_uri, "manual_2d", "segments", segment_id) if data_uri and segment_id else ""
+        return uri_join(episode_uri, "manual_2d", "segments", segment_id) if episode_uri and segment_id else ""
 
     def _create_mano_segment_job(self, segment: Dict[str, Any], result: Dict[str, Any]) -> None:
         segment_id = str(segment.get("segment_id") or "")
@@ -1007,201 +936,49 @@ class JobService:
         episode = self.store.get_episode(episode_id)
         if episode is None:
             return
-        artifacts = self.store.artifacts_for_episode(episode_id)
         start_frame = _optional_int(segment.get("start_frame")) or 0
         end_frame = _optional_int(segment.get("end_frame")) or start_frame
         base_id = _stable_id_part(segment_id, "segment")
         job_id = str(result.get("mano_job_id") or f"mano_opt_{base_id}")
-        data_uri = str(episode.get("data_uri") or "")
-        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"}) or uri_join(data_uri, "pred_2d")
-        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
+        episode_uri = str(episode.get("episode_uri") or "")
         payload = {
             "job_id": job_id,
             "episode_id": episode_id,
             "segment_id": segment_id,
             "subject_id": episode.get("subject_id"),
             "task_name": episode.get("task_name"),
-            "data_uri": data_uri,
+            "episode_uri": episode_uri,
             "cameras": self._cameras_for_episode_context(episode_id, episode, {}),
             "frames": list(range(start_frame, end_frame + 1)),
             "start_frame": start_frame,
             "end_frame": end_frame,
             "scope": "segment",
             "mano_scope": "segment",
-            "input_2d_uri": str(segment.get("manual_2d_uri") or ""),
-            "manual_2d_uri": str(segment.get("manual_2d_uri") or ""),
-            "pred_uri": pred_uri,
-            "mano_episode_uri": mano_episode_uri,
-            "output_uri": uri_join(data_uri, "mano", "segments", segment_id) if data_uri else "",
-            "mano_output_dir": f"mano/segments/{segment_id}",
-            "mano_episode_dir": self._relative_data_uri_path(data_uri, mano_episode_uri) or "mano/episode",
-            "rgb_path_template": self._payload_field_for_episode_context(
-                episode_id,
-                "rgb_path_template",
-                "{camera}/RGB/{frame:05d}.png",
-                result,
-            ),
-            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
-            "manual_2d_dir": f"manual_2d/segments/{segment_id}",
             "reason": "manual_segment_completed",
         }
         self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
         self.store.mark_segment_mano_queued(segment_id=segment_id, mano_job_id=job_id)
         self.store.update_episode_status(episode_id, "segment_mano_optimizing", {"active_job_id": job_id})
 
-    def _episode_media_payload(self, episode: Dict[str, Any], cameras: Sequence[str]) -> Dict[str, Any]:
-        data_uri = str(episode.get("data_uri") or "").strip().rstrip("/")
-        episode_path = self._resolved_episode_path(data_uri, "")
-        media_cameras: Dict[str, Any] = {}
-        for camera in cameras:
-            cam = str(camera or "").strip()
-            if not cam:
-                continue
-            cam_params = self._camera_params_for_media(episode_path, cam)
-            rgb_params = _stream_storage_obj(cam_params, "RGB")
-            depth_params = _stream_storage_obj(cam_params, "Depth")
-            media_cameras[cam] = {
-                "rgb": self._stream_media_payload(
-                    data_uri=data_uri,
-                    episode_path=episode_path,
-                    camera=cam,
-                    stream="RGB",
-                    default_file="rgb.h265",
-                    default_encoding="h265",
-                    params=rgb_params,
-                ),
-                "depth": self._stream_media_payload(
-                    data_uri=data_uri,
-                    episode_path=episode_path,
-                    camera=cam,
-                    stream="Depth",
-                    default_file="depth.mkv",
-                    default_encoding="ffv1_mkv",
-                    params=depth_params,
-                ),
-            }
-        return {
-            "schema_version": 1,
-            "kind": "orbbec_episode_media",
-            "episode_id": str(episode.get("episode_id") or ""),
-            "episode_uri": data_uri,
-            "requires_rgb_video_decode": True,
-            "rgb_frame_files_required": False,
-            "cameras": media_cameras,
-        }
-
-    def _stream_media_payload(
-        self,
-        *,
-        data_uri: str,
-        episode_path: Optional[Path],
-        camera: str,
-        stream: str,
-        default_file: str,
-        default_encoding: str,
-        params: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        storage_file = str(params.get("storageFile") or params.get("storage_file") or default_file).strip() or default_file
-        timestamp_file = str(params.get("timestampFile") or params.get("timestamp_file") or "").strip()
-        if not timestamp_file:
-            timestamp_file = storage_file + ".timestamps.csv"
-        storage_encoding = str(params.get("storageEncoding") or params.get("storage_encoding") or default_encoding).strip() or default_encoding
-        path = self._storage_file_path(episode_path, camera, stream, storage_file)
-        timestamp_path = self._storage_file_path(episode_path, camera, stream, timestamp_file)
-        return {
-            "encoding": storage_encoding,
-            "storage_file": storage_file,
-            "timestamp_file": timestamp_file,
-            "uri": self._storage_file_uri(data_uri, camera, stream, storage_file),
-            "timestamp_uri": self._storage_file_uri(data_uri, camera, stream, timestamp_file),
-            "path": str(path) if path is not None and path.exists() else "",
-            "timestamp_path": str(timestamp_path) if timestamp_path is not None and timestamp_path.exists() else "",
-            "width": _optional_int(params.get("width")),
-            "height": _optional_int(params.get("height")),
-            "fps": _optional_int(params.get("fps")),
-        }
-
-    def _camera_params_for_media(self, episode_path: Optional[Path], camera: str) -> Dict[str, Any]:
-        if episode_path is None:
-            return {}
-        path = episode_path / "camera_params.json"
-        if not path.exists() or not path.is_file():
-            return {}
-        try:
-            parsed = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        if not isinstance(parsed, dict):
-            return {}
-        cam_obj = parsed.get(camera)
-        if isinstance(cam_obj, dict):
-            return cam_obj
-        return {}
+    def nas_root_dir_from_uri(self, episode_uri: str) -> Optional[Path]:
+        value = str(episode_uri or "").strip()
+        if not value:
+            return None
+        best_prefix = ""
+        best_root = ""
+        for prefix, root in self.nas_mounts.items():
+            if value == prefix or value.startswith(prefix + "/"):
+                if len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+                    best_root = root
+        if not best_prefix:
+            return None
+        suffix = value[len(best_prefix):].lstrip("/")
+        return (Path(best_root).expanduser() / unquote(suffix)).resolve()
 
     @staticmethod
-    def _storage_file_path(
-        episode_path: Optional[Path],
-        camera: str,
-        stream: str,
-        storage_file: str,
-    ) -> Optional[Path]:
-        if episode_path is None:
-            return None
-        raw = unquote(str(storage_file or "").strip())
-        if not raw:
-            return None
-        p = Path(raw)
-        if p.is_absolute():
-            return p.expanduser().resolve()
-        candidates = [
-            episode_path / camera / stream / p,
-            episode_path / camera / p,
-            episode_path / p,
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate.resolve()
-        return candidates[0].resolve()
-
-    @staticmethod
-    def _storage_file_uri(data_uri: str, camera: str, stream: str, storage_file: str) -> str:
-        data_uri = str(data_uri or "").strip().rstrip("/")
-        storage_file = str(storage_file or "").strip().strip("/")
-        if not data_uri or not storage_file:
-            return ""
-        if "/" in storage_file:
-            return uri_join(data_uri, camera, storage_file)
-        return uri_join(data_uri, camera, stream, storage_file)
-
-    def resolve_data_path(self, data_uri: str, local_capture_path: str = "") -> str:
-        value = str(data_uri or "").strip()
-        if value:
-            parsed = urlparse(value)
-            if not parsed.scheme:
-                return str(Path(value).expanduser().resolve())
-            if parsed.scheme == "local":
-                return str(Path(path_from_local_uri(value)).expanduser().resolve())
-            best_prefix = ""
-            best_root = ""
-            for prefix, root in self.uri_mounts.items():
-                if value == prefix or value.startswith(prefix + "/"):
-                    if len(prefix) > len(best_prefix):
-                        best_prefix = prefix
-                        best_root = root
-            if best_prefix:
-                suffix = value[len(best_prefix):].lstrip("/")
-                return str((Path(best_root).expanduser() / unquote(suffix)).resolve())
-            return ""
-        local_capture_path = str(local_capture_path or "").strip()
-        if local_capture_path:
-            return str(Path(local_capture_path).expanduser().resolve())
-        return ""
-
-    def _resolved_episode_path(self, data_uri: str, local_capture_path: str = "") -> Optional[Path]:
-        resolved = self.resolve_data_path(data_uri, local_capture_path)
-        if not resolved:
-            return None
-        return Path(resolved).expanduser().resolve()
+    def _strip_downstream_path_fields(payload: Dict[str, Any]) -> None:
+        payload.pop("collection_path", None)
 
     def _cameras_for_episode_context(
         self,
@@ -1221,11 +998,8 @@ class JobService:
                 cameras = _label_camera_ids((job.get("payload") or {}).get("cameras"))
                 if cameras:
                     return cameras
-        episode_path = self._resolved_episode_path(
-            str(episode.get("data_uri") or ""),
-            str(episode.get("local_capture_path") or ""),
-        )
-        return _discover_cameras(episode_path)
+        nas_root_dir = self.nas_root_dir_from_uri(str(episode.get("episode_uri") or ""))
+        return _discover_cameras(nas_root_dir)
 
     def _frames_for_episode_context(
         self,
@@ -1243,35 +1017,14 @@ class JobService:
                 frames = _as_int_list((job.get("payload") or {}).get("frames"))
                 if frames:
                     return frames
-        episode_path = self._resolved_episode_path(
-            str(episode.get("data_uri") or ""),
-            str(episode.get("local_capture_path") or ""),
-        )
-        frames = _discover_frames(episode_path, cameras)
+        nas_root_dir = self.nas_root_dir_from_uri(str(episode.get("episode_uri") or ""))
+        frames = _discover_frames(nas_root_dir, cameras)
         if frames:
             return frames
         frame_count = _optional_int(episode.get("frame_count"))
         if frame_count:
             return list(range(frame_count))
         return []
-
-    def _payload_field_for_episode_context(
-        self,
-        episode_id: str,
-        key: str,
-        default: str,
-        *payloads: Dict[str, Any],
-    ) -> str:
-        for payload in payloads:
-            value = str((payload or {}).get(key) or "").strip()
-            if value:
-                return value
-        for job_type in ("manual_label", "mano_opt", "qc", "auto_label", "upload"):
-            for job in self.store.jobs_for_episode(episode_id, job_type):
-                value = str((job.get("payload") or {}).get(key) or "").strip()
-                if value:
-                    return value
-        return default
 
     def _stage_job_item(self, job: Dict[str, Any], now: str) -> Dict[str, Any]:
         episode_id = str(job.get("episode_id") or "")
@@ -1431,7 +1184,7 @@ class JobService:
             self._register_artifact_from_payload(episode_id, artifact)
 
         if job_type == "upload":
-            nas_uri = str(result.get("nas_uri") or result.get("data_uri") or "")
+            nas_uri = str(result.get("nas_uri") or result.get("episode_uri") or "")
             for artifact in artifacts:
                 if str(artifact.get("kind") or "") == "nas_episode" and str(artifact.get("uri") or ""):
                     nas_uri = str(artifact.get("uri"))
@@ -1440,8 +1193,8 @@ class JobService:
                 episode = self.store.get_episode(episode_id)
                 self.store.update_episode_storage(
                     episode_id,
-                    data_uri=nas_uri,
-                    local_capture_path=str((episode or {}).get("local_capture_path") or payload.get("local_capture_path") or ""),
+                    episode_uri=nas_uri,
+                    collection_path=str((episode or {}).get("collection_path") or payload.get("collection_path") or ""),
                     metadata={
                         "nas_uri": nas_uri,
                         "upload_job_id": job.get("job_id"),
@@ -1452,11 +1205,11 @@ class JobService:
             if self.auto_label_after_upload:
                 self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
-            if not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts) and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts) and payload.get("episode_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="pred_2d",
-                    uri=uri_join(str(payload.get("data_uri")), str(payload.get("prediction_dir") or "pred_2d")),
+                    uri=uri_join(str(payload.get("episode_uri")), "pred_2d"),
                     metadata={"source_job_id": job.get("job_id")},
                 )
             if self._all_episode_jobs_succeeded(episode_id, "auto_label"):
@@ -1509,11 +1262,11 @@ class JobService:
         elif job_type == "review":
             self.store.update_episode_status(episode_id, "review_passed")
         elif job_type == "manual_label":
-            if not any(str(artifact.get("kind") or "") in {"manual_2d", "corrected_2d"} for artifact in artifacts) and payload.get("data_uri"):
+            if not any(str(artifact.get("kind") or "") in {"manual_2d", "corrected_2d"} for artifact in artifacts) and payload.get("episode_uri"):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="manual_2d",
-                    uri=uri_join(str(payload.get("data_uri")), str(payload.get("correction_dir") or "manual_2d")),
+                    uri=uri_join(str(payload.get("episode_uri")), "manual_2d"),
                     metadata={"source_job_id": job.get("job_id")},
                 )
             self.store.update_episode_status(episode_id, "manual_labeled")
@@ -1603,11 +1356,9 @@ class JobService:
         parsed = urlparse(value)
         if not parsed.scheme:
             return Path(value).expanduser().resolve()
-        if parsed.scheme == "local":
-            return Path(path_from_local_uri(value)).expanduser().resolve()
-        resolved = self.resolve_data_path(value, "")
+        resolved = self.nas_root_dir_from_uri(value)
         if resolved:
-            return Path(resolved).expanduser().resolve()
+            return resolved
         return None
 
     def _create_auto_label_jobs_from_upload(
@@ -1622,13 +1373,7 @@ class JobService:
             return
         created = self._create_auto_label_jobs_for_episode(
             episode,
-            data_uri=str(nas_uri or upload_result.get("nas_uri") or episode.get("data_uri") or ""),
-            local_path=str(
-                upload_result.get("local_path")
-                or upload_payload.get("local_capture_path")
-                or episode.get("local_capture_path")
-                or ""
-            ),
+            episode_uri=str(nas_uri or upload_result.get("nas_uri") or episode.get("episode_uri") or ""),
             source_payload=upload_payload,
             reason="upload_succeeded",
         )
@@ -1646,21 +1391,21 @@ class JobService:
     def _push_auto_label_for_episode(self, episode: Dict[str, Any], *, pushed_by: str) -> Dict[str, Any]:
         episode_id = str(episode.get("episode_id") or "")
         status = str(episode.get("status") or "")
-        data_uri = self._auto_label_data_uri(episode)
+        episode_uri = self._auto_label_episode_uri(episode)
         base = {
             "episode_id": episode_id,
             "subject_id": str(episode.get("subject_id") or ""),
             "task_name": str(episode.get("task_name") or ""),
             "episode_index": episode.get("episode_index"),
             "status": status,
-            "data_uri": data_uri,
+            "episode_uri": episode_uri,
             "pushed": False,
             "jobs": [],
         }
         if status not in AUTO_LABEL_PUSHABLE_STATUSES:
             return {**base, "reason": f"episode status is not pushable: {status or 'unknown'}"}
-        if not data_uri:
-            return {**base, "reason": "episode has no nas_uri or data_uri"}
+        if not episode_uri:
+            return {**base, "reason": "episode has no nas_uri or episode_uri"}
         existing = self.store.jobs_for_episode(episode_id, "auto_label")
         if existing:
             return {
@@ -1671,8 +1416,7 @@ class JobService:
 
         jobs = self._create_auto_label_jobs_for_episode(
             episode,
-            data_uri=data_uri,
-            local_path=str(episode.get("local_capture_path") or ""),
+            episode_uri=episode_uri,
             source_payload={},
             reason="manual_push",
             pushed_by=pushed_by,
@@ -1696,33 +1440,32 @@ class JobService:
         }
 
     @staticmethod
-    def _auto_label_data_uri(episode: Dict[str, Any]) -> str:
+    def _auto_label_episode_uri(episode: Dict[str, Any]) -> str:
         metadata = episode.get("metadata") if isinstance(episode.get("metadata"), dict) else {}
         nas_uri = str(metadata.get("nas_uri") or "").strip()
-        return nas_uri or str(episode.get("data_uri") or "").strip()
+        return nas_uri or str(episode.get("episode_uri") or "").strip()
 
     def _create_auto_label_jobs_for_episode(
         self,
         episode: Dict[str, Any],
         *,
-        data_uri: str,
-        local_path: str,
+        episode_uri: str,
         source_payload: Dict[str, Any],
         reason: str,
         pushed_by: str = "",
     ) -> List[Dict[str, Any]]:
         episode_id = str(episode.get("episode_id") or "")
-        data_uri = str(data_uri or "").strip()
-        if not episode_id or not data_uri:
+        episode_uri = str(episode_uri or "").strip()
+        if not episode_id or not episode_uri:
             return []
         source_payload = dict(source_payload or {})
-        episode_path = self._resolved_episode_path(str(episode.get("data_uri") or data_uri), local_path)
+        nas_root_dir = self.nas_root_dir_from_uri(episode_uri)
         cameras = (
             _label_camera_ids(source_payload.get("cameras"))
             or _label_camera_ids(episode.get("cameras"))
-            or _discover_cameras(episode_path)
+            or _discover_cameras(nas_root_dir)
         )
-        frames = _as_int_list(source_payload.get("frames")) or _discover_frames(episode_path, cameras)
+        frames = _as_int_list(source_payload.get("frames")) or _discover_frames(nas_root_dir, cameras)
         if not frames:
             frame_count = _optional_int(episode.get("frame_count")) or _optional_int(source_payload.get("frame_count"))
             if frame_count:
@@ -1735,15 +1478,11 @@ class JobService:
             "episode_id": episode_id,
             "subject_id": episode.get("subject_id"),
             "task_name": episode.get("task_name"),
-            "data_uri": data_uri,
-            "local_capture_path": local_path,
+            "episode_uri": episode_uri,
             "cameras": cameras,
             "frames": frames,
             "scope": "episode",
             "label_scope": "episode",
-            "rgb_path_template": str(source_payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-            "prediction_dir": str(source_payload.get("prediction_dir") or "pred_2d"),
-            "correction_dir": str(source_payload.get("correction_dir") or "corrected_2d"),
             "reason": reason,
         }
         if pushed_by:
@@ -1780,33 +1519,19 @@ class JobService:
             cameras,
             result,
         )
-        pred_artifacts = self._prediction_artifacts_for_episode(episode_id)
-        pred_uri = str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else uri_join(str(episode.get("data_uri") or ""), "pred_2d")
         base_id = _stable_id_part(episode_id, "episode")
         job_id = str(result.get("mano_job_id") or result.get("mano_episode_job_id") or f"mano_opt_{base_id}_episode")
-        data_uri = str(episode.get("data_uri") or "")
+        episode_uri = str(episode.get("episode_uri") or "")
         payload = {
             "job_id": job_id,
             "episode_id": episode["episode_id"],
             "subject_id": episode["subject_id"],
             "task_name": episode["task_name"],
-            "data_uri": data_uri,
+            "episode_uri": episode_uri,
             "cameras": cameras,
             "frames": frames,
             "scope": "episode",
             "mano_scope": "episode",
-            "input_2d_uri": pred_uri,
-            "pred_uri": pred_uri,
-            "pred_artifacts": pred_artifacts,
-            "output_uri": uri_join(data_uri, "mano", "episode") if data_uri else "",
-            "mano_output_dir": "mano/episode",
-            "rgb_path_template": self._payload_field_for_episode_context(
-                episode_id,
-                "rgb_path_template",
-                "{camera}/RGB/{frame:05d}.png",
-                result,
-            ),
-            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
             "reason": "auto_label_succeeded",
         }
         self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
@@ -1824,8 +1549,6 @@ class JobService:
             cameras,
             result,
         )
-        pred_artifacts = self._prediction_artifacts_for_episode(episode_id)
-        mano_artifacts = [item for item in self.store.artifacts_for_episode(episode_id) if str(item.get("kind") or "") == "mano_episode"]
         base_id = _stable_id_part(episode_id, "episode")
         job_id = str(result.get("qc_job_id") or f"qc_{base_id}")
         payload = {
@@ -1833,44 +1556,18 @@ class JobService:
             "episode_id": episode["episode_id"],
             "subject_id": episode["subject_id"],
             "task_name": episode["task_name"],
-            "data_uri": episode["data_uri"],
+            "episode_uri": episode["episode_uri"],
             "cameras": cameras,
             "frames": frames,
-            "pred_artifacts": pred_artifacts,
-            "pred_uri": str(pred_artifacts[-1].get("uri") or "") if pred_artifacts else "",
-            "mano_episode_artifacts": mano_artifacts,
-            "mano_episode_uri": str(mano_artifacts[-1].get("uri") or "") if mano_artifacts else "",
-            "mano_episode_dir": self._relative_data_uri_path(
-                str(episode.get("data_uri") or ""),
-                str(mano_artifacts[-1].get("uri") or "") if mano_artifacts else "",
-            )
-            or "mano/episode",
-            "qc_report_uri": uri_join(str(episode.get("data_uri") or ""), "qc", "qc_report.json") if episode.get("data_uri") else "",
-            "rgb_path_template": self._payload_field_for_episode_context(
-                episode_id,
-                "rgb_path_template",
-                "{camera}/RGB/{frame:05d}.png",
-                result,
-            ),
-            "prediction_dir": self._payload_field_for_episode_context(episode_id, "prediction_dir", "pred_2d", result),
             "reason": "mano_episode_succeeded",
         }
         self._create_job_once(job_id=job_id, job_type="qc", episode_id=episode_id, payload=payload)
 
-    def _prediction_artifacts_for_episode(self, episode_id: str) -> List[Dict[str, Any]]:
-        return [
-            item
-            for item in self.store.artifacts_for_episode(episode_id)
-            if str(item.get("kind") or "") in {"pred_2d", "auto_2d"}
-        ]
-
     def _register_default_mano_episode(self, episode_id: str, job: Dict[str, Any], result: Dict[str, Any]) -> None:
         episode = self.store.get_episode(episode_id)
         payload = dict(job.get("payload") or {})
-        uri = str(result.get("mano_episode_uri") or result.get("output_uri") or payload.get("output_uri") or "").strip()
-        data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
-        if not uri and data_uri:
-            uri = uri_join(data_uri, "mano", "episode")
+        episode_uri = str((episode or {}).get("episode_uri") or payload.get("episode_uri") or "").strip()
+        uri = uri_join(episode_uri, "mano", "episode") if episode_uri else ""
         if not uri:
             return
         self.store.register_artifact(
@@ -1883,10 +1580,8 @@ class JobService:
     def _register_default_qc_report(self, episode_id: str, job: Dict[str, Any], result: Dict[str, Any]) -> None:
         episode = self.store.get_episode(episode_id)
         payload = dict(job.get("payload") or {})
-        report_uri = str(result.get("qc_report_uri") or result.get("report_uri") or "").strip()
-        data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
-        if not report_uri and data_uri:
-            report_uri = uri_join(data_uri, "qc", "qc_report.json")
+        episode_uri = str((episode or {}).get("episode_uri") or payload.get("episode_uri") or "").strip()
+        report_uri = uri_join(episode_uri, "qc", "qc_report.json") if episode_uri else ""
         if not report_uri:
             return
         self.store.register_artifact(
@@ -1986,17 +1681,9 @@ class JobService:
         segment_id = str(payload.get("segment_id") or result.get("segment_id") or "").strip()
         if not episode_id or not segment_id:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "segment mano_opt job requires episode_id and segment_id")
-        patch_uri = ""
-        for artifact in artifacts:
-            if str(artifact.get("kind") or "") == "mano_segment_patch" and str(artifact.get("uri") or ""):
-                patch_uri = str(artifact.get("uri") or "")
-                break
-        if not patch_uri:
-            patch_uri = str(result.get("mano_patch_uri") or result.get("mano_segment_patch_uri") or result.get("output_uri") or payload.get("output_uri") or "").strip()
-        if not patch_uri:
-            episode = self.store.get_episode(episode_id)
-            data_uri = str((episode or {}).get("data_uri") or payload.get("data_uri") or "").strip()
-            patch_uri = uri_join(data_uri, "mano", "segments", segment_id) if data_uri else ""
+        episode = self.store.get_episode(episode_id)
+        episode_uri = str((episode or {}).get("episode_uri") or payload.get("episode_uri") or "").strip()
+        patch_uri = uri_join(episode_uri, "mano", "segments", segment_id) if episode_uri else ""
         if not any(str(artifact.get("kind") or "") == "mano_segment_patch" for artifact in artifacts) and patch_uri:
             self.store.register_artifact(
                 episode_id=episode_id,
@@ -2025,19 +1712,18 @@ class JobService:
         episode = self.store.get_episode(episode_id)
         if episode is None:
             return
-        data_uri = str(episode.get("data_uri") or "").strip().rstrip("/")
-        if not data_uri:
+        episode_uri = str(episode.get("episode_uri") or "").strip().rstrip("/")
+        if not episode_uri:
             return
-        episode_path = self.resolve_data_path(data_uri, "")
-        if not episode_path:
+        nas_root_dir = self.nas_root_dir_from_uri(episode_uri)
+        if not nas_root_dir:
             return
 
-        artifacts = self.store.artifacts_for_episode(episode_id)
         segments = self.store.segments_for_episode(episode_id)
         metadata = episode.get("metadata") if isinstance(episode.get("metadata"), dict) else {}
-        mano_episode_uri = self._latest_artifact_uri(artifacts, {"mano_episode"}) or uri_join(data_uri, "mano", "episode")
-        qc_report_uri = self._latest_artifact_uri(artifacts, {"qc_report"})
-        pred_uri = self._latest_artifact_uri(artifacts, {"pred_2d", "auto_2d"})
+        mano_episode_uri = uri_join(episode_uri, "mano", "episode")
+        qc_report_uri = uri_join(episode_uri, "qc", "qc_report.json")
+        pred_uri = uri_join(episode_uri, "pred_2d")
 
         overrides = []
         for segment in segments:
@@ -2047,8 +1733,8 @@ class JobService:
             status = str(segment.get("status") or "")
             manual_2d_uri = str(segment.get("manual_2d_uri") or "")
             mano_patch_uri = str(segment.get("mano_patch_uri") or "")
-            expected_manual_2d_uri = uri_join(data_uri, "manual_2d", "segments", segment_id) if segment_id else ""
-            expected_mano_patch_uri = uri_join(data_uri, "mano", "segments", segment_id) if segment_id else ""
+            expected_manual_2d_uri = uri_join(episode_uri, "manual_2d", "segments", segment_id) if segment_id else ""
+            expected_mano_patch_uri = uri_join(episode_uri, "mano", "segments", segment_id) if segment_id else ""
             overrides.append(
                 {
                     "segment_id": segment_id,
@@ -2058,13 +1744,13 @@ class JobService:
                     "status": "ready" if status == "mano_succeeded" and mano_patch_uri else status,
                     "segment_status": status,
                     "manual_2d_uri": manual_2d_uri,
-                    "manual_2d_relative_path": self._relative_data_uri_path(data_uri, manual_2d_uri),
+                    "manual_2d_relative_path": self._relative_episode_uri_path(episode_uri, manual_2d_uri),
                     "expected_manual_2d_uri": expected_manual_2d_uri,
-                    "expected_manual_2d_relative_path": self._relative_data_uri_path(data_uri, expected_manual_2d_uri),
+                    "expected_manual_2d_relative_path": self._relative_episode_uri_path(episode_uri, expected_manual_2d_uri),
                     "mano_patch_uri": mano_patch_uri,
-                    "relative_path": self._relative_data_uri_path(data_uri, mano_patch_uri),
+                    "relative_path": self._relative_episode_uri_path(episode_uri, mano_patch_uri),
                     "expected_mano_patch_uri": expected_mano_patch_uri,
-                    "expected_mano_patch_relative_path": self._relative_data_uri_path(data_uri, expected_mano_patch_uri),
+                    "expected_mano_patch_relative_path": self._relative_episode_uri_path(episode_uri, expected_mano_patch_uri),
                 }
             )
 
@@ -2076,25 +1762,25 @@ class JobService:
             "task_name": str(episode.get("task_name") or ""),
             "episode_index": episode.get("episode_index"),
             "episode_status": str(episode.get("status") or ""),
-            "data_uri": data_uri,
-            "manifest_uri": uri_join(data_uri, FINAL_3D_SOURCES_REL_PATH),
+            "episode_uri": episode_uri,
+            "manifest_uri": uri_join(episode_uri, FINAL_3D_SOURCES_REL_PATH),
             "updated_at": now_iso(),
             "updated_reason": str(reason or ""),
             "base_2d": {
                 "source": "auto_label",
                 "uri": pred_uri,
-                "relative_path": self._relative_data_uri_path(data_uri, pred_uri),
+                "relative_path": self._relative_episode_uri_path(episode_uri, pred_uri),
             },
             "base_3d": {
                 "source": "auto_episode",
                 "uri": mano_episode_uri,
-                "relative_path": self._relative_data_uri_path(data_uri, mano_episode_uri),
+                "relative_path": self._relative_episode_uri_path(episode_uri, mano_episode_uri),
                 "status": "ready" if mano_episode_uri else "missing",
             },
             "qc": {
                 "status": str(metadata.get("qc_status") or ""),
                 "report_uri": qc_report_uri,
-                "relative_path": self._relative_data_uri_path(data_uri, qc_report_uri),
+                "relative_path": self._relative_episode_uri_path(episode_uri, qc_report_uri),
             },
             "overrides": overrides,
             "ready_override_count": sum(1 for item in overrides if item.get("status") == "ready"),
@@ -2104,7 +1790,7 @@ class JobService:
             },
         }
 
-        manifest_path = Path(episode_path).expanduser().resolve() / FINAL_3D_SOURCES_REL_PATH
+        manifest_path = Path(nas_root_dir).expanduser().resolve() / FINAL_3D_SOURCES_REL_PATH
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
         try:
@@ -2121,23 +1807,30 @@ class JobService:
                     pass
 
     @staticmethod
-    def _relative_data_uri_path(data_uri: str, uri: str) -> str:
-        data_uri = str(data_uri or "").strip().rstrip("/")
+    def _relative_episode_uri_path(episode_uri: str, uri: str) -> str:
+        episode_uri = str(episode_uri or "").strip().rstrip("/")
         uri = str(uri or "").strip().rstrip("/")
-        if not data_uri or not uri:
+        if not episode_uri or not uri:
             return ""
-        if uri == data_uri:
+        if uri == episode_uri:
             return "."
-        prefix = data_uri + "/"
+        prefix = episode_uri + "/"
         if uri.startswith(prefix):
             return uri[len(prefix):]
         return ""
 
     def _register_artifact_from_payload(self, episode_id: str, artifact: Dict[str, Any]) -> None:
         kind = str(artifact.get("kind") or "").strip()
-        uri = str(artifact.get("uri") or "").strip()
+        episode = self.store.get_episode(episode_id) or {}
+        episode_uri = str(episode.get("episode_uri") or "").strip()
+        if kind == "nas_episode":
+            uri = str(artifact.get("uri") or "").strip()
+            if not uri.startswith("nas://"):
+                uri = ""
+        else:
+            uri = self._fixed_artifact_uri(episode_uri, kind, dict(artifact.get("metadata") or {}))
         if not kind or not uri:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, "artifact kind and uri are required")
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "artifact kind and episode_uri are required")
         metadata = json_object(artifact.get("metadata"), "artifact.metadata")
         self.store.register_artifact(
             episode_id=episode_id,
@@ -2146,6 +1839,28 @@ class JobService:
             metadata=metadata,
             artifact_id=str(artifact.get("artifact_id") or "").strip() or None,
         )
+
+    @staticmethod
+    def _fixed_artifact_uri(episode_uri: str, kind: str, metadata: Dict[str, Any]) -> str:
+        episode_uri = str(episode_uri or "").strip().rstrip("/")
+        kind = str(kind or "").strip()
+        if kind == "nas_episode":
+            return episode_uri
+        if not episode_uri:
+            return ""
+        if kind in {"pred_2d", "auto_2d"}:
+            return uri_join(episode_uri, "pred_2d")
+        if kind == "mano_episode":
+            return uri_join(episode_uri, "mano", "episode")
+        if kind == "qc_report":
+            return uri_join(episode_uri, "qc", "qc_report.json")
+        if kind in {"manual_2d", "corrected_2d"}:
+            segment_id = str(metadata.get("segment_id") or "").strip()
+            return uri_join(episode_uri, "manual_2d", "segments", segment_id) if segment_id else ""
+        if kind == "mano_segment_patch":
+            segment_id = str(metadata.get("segment_id") or "").strip()
+            return uri_join(episode_uri, "mano", "segments", segment_id) if segment_id else ""
+        return ""
 
     @staticmethod
     def _artifacts_from_body(body: Dict[str, Any]) -> List[Dict[str, Any]]:

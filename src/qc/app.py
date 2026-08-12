@@ -20,7 +20,7 @@ except Exception:
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
 from .media import QcEpisodeMedia, cleanup_qc_cache, prepare_qc_media
-from .report import build_qc_result, qc_report_uri, write_qc_report
+from .report import build_qc_result, write_qc_report
 from .state_store import QcProgress, QcStateStore, first_sample_after, format_seconds, normalize_ranges
 
 
@@ -237,7 +237,7 @@ class QcWorkerApp(tk.Tk):
             try:
                 media = prepare_qc_media(
                     progress.payload,
-                    mounts=self.config.uri_mounts,
+                    mounts=self.config.nas_mounts,
                     tmp_dir=self.config.tmp_dir,
                     on_progress=progress_callback,
                 )
@@ -294,20 +294,16 @@ class QcWorkerApp(tk.Tk):
                     bad_ranges=report_ranges,
                     sample_interval=progress.sample_interval,
                 )
-                uri = qc_report_uri(progress.payload)
-                artifacts = []
-                if uri:
-                    artifacts.append(
-                        {
-                            "kind": "qc_report",
-                            "uri": uri,
-                            "metadata": {
-                                "passed": bool(result.get("passed")),
-                                "worker_id": self.config.worker_machine_id,
-                                "result_type": result.get("result_type"),
-                            },
-                        }
-                    )
+                artifacts = [
+                    {
+                        "kind": "qc_report",
+                        "metadata": {
+                            "passed": bool(result.get("passed")),
+                            "worker_id": self.config.worker_machine_id,
+                            "result_type": result.get("result_type"),
+                        },
+                    }
+                ]
                 self.client.complete_qc_job(progress.job_id, result=result, artifacts=artifacts)
                 self.state_store.delete(progress)
                 cleanup_qc_cache(media.cache_dir)

@@ -691,7 +691,7 @@ def format_bytes(size: Optional[int]) -> str:
     return f"{value:.2f} {unit}"
 
 
-def safe_local_path(value: Any) -> Optional[Path]:
+def safe_collection_path(value: Any) -> Optional[Path]:
     text = str(value or "").strip()
     if not text or text == "-":
         return None
@@ -780,17 +780,17 @@ def reservation_frame_count(item: Dict[str, Any]) -> Optional[int]:
 def episode_stats(item: Dict[str, Any]) -> Dict[str, Any]:
     duration_seconds = reservation_duration_seconds(item)
     frame_count = reservation_frame_count(item)
-    local_path = safe_local_path(item.get("local_path"))
+    collection_path = safe_collection_path(item.get("collection_path"))
     storage_bytes: Optional[int] = None
     path_exists = False
-    if local_path is not None:
+    if collection_path is not None:
         try:
-            path_exists = local_path.exists()
+            path_exists = collection_path.exists()
         except OSError:
             path_exists = False
         if path_exists:
-            storage_bytes = directory_size_bytes(local_path)
-            csv_stats = timestamp_csv_stats(local_path)
+            storage_bytes = directory_size_bytes(collection_path)
+            csv_stats = timestamp_csv_stats(collection_path)
             if frame_count is None:
                 frame_value = csv_stats.get("frame_count")
                 frame_count = int(frame_value) if frame_value is not None else None
@@ -803,7 +803,7 @@ def episode_stats(item: Dict[str, Any]) -> Dict[str, Any]:
         "frame_count_label": str(frame_count) if frame_count is not None else "-",
         "storage_bytes": storage_bytes,
         "storage_label": format_bytes(storage_bytes),
-        "local_path_exists": path_exists,
+        "collection_path_exists": path_exists,
     }
 
 
@@ -1196,7 +1196,7 @@ class TaskBackend:
         subject_id = str(payload.get("subject_id", "")).strip()
         task_name = str(payload.get("task_name", "")).strip()
         idempotency_key = str(payload.get("idempotency_key", "")).strip()
-        local_path = str(payload.get("local_path", "")).strip()
+        collection_path = str(payload.get("collection_path", "")).strip()
         try:
             episode_number = int(payload.get("episode_number"))
         except (TypeError, ValueError):
@@ -1237,7 +1237,7 @@ class TaskBackend:
             reservation["confirmed_at"] = now_iso()
             reservation["updated_at"] = now_iso()
             reservation["idempotency_key"] = idempotency_key
-            reservation["local_path"] = local_path
+            reservation["collection_path"] = collection_path
             duration_seconds = parse_nonnegative_float(payload.get("duration_seconds", payload.get("duration_sec")))
             if duration_seconds is not None:
                 reservation["duration_seconds"] = round(duration_seconds, 3)
@@ -1618,7 +1618,7 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         + render_metric("Episodes", model["reservation_count"], "all reservations")
         + render_metric("Confirmed", totals["confirmed"], "completed episodes")
         + render_metric("Total Duration", format_duration(model.get("duration_seconds")), "confirmed episodes")
-        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed local paths")
+        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed collection paths")
         + "</div>"
         "<section><h2>Task Summary</h2><div class=\"wide\"><table>"
         "<thead><tr>"
@@ -1664,7 +1664,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
             f"<td class=\"num\">{html_escape(stats.get('storage_label', '-'))}</td>"
             f"<td class=\"mono\">{html_escape(item.get('client_id', '-'))}</td>"
             f"<td class=\"muted mono\">{html_escape(item.get('updated_at') or item.get('created_at') or '-')}</td>"
-            f"<td class=\"mono\">{html_escape(item.get('local_path') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(item.get('collection_path') or '-')}</td>"
             "</tr>"
         )
     episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"11\" class=\"empty\">No episodes reserved yet.</td></tr>"
@@ -1685,7 +1685,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + render_metric("Reserved", counts.get("reserved", 0))
         + render_metric("Released", counts.get("released", 0))
         + render_metric("Total Duration", format_duration(model.get("duration_seconds")), "confirmed episodes")
-        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed local paths")
+        + render_metric("Storage", format_bytes(model.get("storage_bytes")), "confirmed collection paths")
         + "</div>"
         "<section><h2>Task Description</h2>"
         f"<div class=\"empty desc\">{html_escape(description or 'No description.')}</div></section>"
@@ -1941,7 +1941,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ("Total frames", stats.get("frame_count_label", "-")),
         ("Storage size", stats.get("storage_label", "-")),
         ("Client ID", item.get("client_id", "")),
-        ("Local capture path", item.get("local_path") or "-"),
+        ("Collection path", item.get("collection_path") or "-"),
         ("Idempotency key", item.get("idempotency_key") or "-"),
         ("Created at", item.get("created_at") or "-"),
         ("Updated at", item.get("updated_at") or "-"),
@@ -1983,7 +1983,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + field_html
         + "</div></section>"
         "<section><h2>Storage And Quality</h2><div class=\"kv\">"
-        f"<div>Storage status</div><div>{html_escape('Local path recorded' if item.get('local_path') else 'Waiting for confirm')}</div>"
+        f"<div>Storage status</div><div>{html_escape('Collection path recorded' if item.get('collection_path') else 'Waiting for confirm')}</div>"
         f"<div>Workflow status</div><div>{render_status_badge(workflow_status)}</div>"
         f"<div>Active job</div><div class=\"mono\">{html_escape(active_job)}"
         f"{html_escape(' / ' + active_job_id if active_job_id else '')}</div>"
@@ -2521,8 +2521,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         or "nas://ego"
     )
-    uri_mounts = env_json_object(env, "ORBBEC_URI_MOUNTS_JSON", "TASK_BACKEND_URI_MOUNTS_JSON")
-    uri_mounts.setdefault(nas_uri_prefix.rstrip("/"), str(nas_root))
+    nas_mounts = env_json_object(env, "ORBBEC_NAS_MOUNTS_JSON")
+    nas_mounts.setdefault(nas_uri_prefix.rstrip("/"), str(nas_root))
     auto_label_after_upload = env_bool(
         env,
         False,
@@ -2533,7 +2533,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     workflow_service = JobService(
         workflow_store,
         auto_label_after_upload=auto_label_after_upload,
-        uri_mounts=uri_mounts,
+        nas_mounts=nas_mounts,
     )
     nas_uploader = NasUploader(
         workflow_service,
@@ -2552,7 +2552,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
     print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} auto_label_scope=episode", file=sys.stderr)
     print(f"[task-backend] nas={'enabled' if nas_enabled else 'disabled'} root={nas_root} uri={nas_uri_prefix}", file=sys.stderr)
-    print(f"[task-backend] uri_mounts={uri_mounts}", file=sys.stderr)
+    print(f"[task-backend] nas_mounts={nas_mounts}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)

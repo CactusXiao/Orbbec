@@ -12,15 +12,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 try:
-    from .backend_client import UriResolver
+    from .backend_client import NasEpisodeResolver
 except Exception:
-    from backend_client import UriResolver
+    from backend_client import NasEpisodeResolver
 
 
 _FRAME_RE = re.compile(r"^(\d{5})\.[^.]+$")
 _NON_LABEL_CAMERA_TOKENS = ("ego", "pico", "fisheye")
 _HAND_COUNT = 2
 _JOINT_COUNT = 21
+PREDICTION_DIR = "pred_2d"
+MANUAL_SEGMENTS_DIR = "manual_2d/segments"
+MANO_EPISODE_DIR = "mano/episode"
 
 
 @dataclass(frozen=True)
@@ -33,10 +36,10 @@ class CorrectionTask:
     cameras: List[str]
     frames: List[int]
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png"
-    prediction_dir: str = "pred_2d"
+    prediction_dir: str = PREDICTION_DIR
     correction_dir: str = "corrected_2d"
-    mano_episode_dir: str = "mano/episode"
-    episode_path: Optional[str] = None
+    mano_episode_dir: str = MANO_EPISODE_DIR
+    nas_root_path: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -51,8 +54,8 @@ class CorrectionTask:
         return len(self.frames)
 
     def episode_dir(self) -> Path:
-        if self.episode_path:
-            return Path(self.episode_path).expanduser().resolve()
+        if self.nas_root_path:
+            return Path(self.nas_root_path).expanduser().resolve()
         return Path(self.root).expanduser().resolve() / self.subject / self.task / self.episode
 
 
@@ -249,43 +252,24 @@ def correction_task_from_backend_payload(
 ) -> CorrectionTask:
     if not isinstance(payload, dict):
         raise ValueError("Backend label job payload must be an object.")
-    resolver = UriResolver(mounts or {})
-    data_uri = str(payload.get("data_uri") or payload.get("episode_base_uri") or "").strip()
-    resolved_path = str(payload.get("resolved_data_path") or "").strip()
-    if data_uri:
-        episode_dir: Optional[Path] = None
-        if mounts:
-            try:
-                episode_dir = resolver.resolve(data_uri).expanduser().resolve()
-            except Exception as exc:
-                raise ValueError(f"Backend label job data_uri is not resolvable: {data_uri}") from exc
-        elif resolved_path:
-            episode_dir = Path(resolved_path).expanduser().resolve()
-        else:
-            raise ValueError(f"Backend label job data_uri is not resolvable: {data_uri}")
-    else:
-        episode_dir = None
-    resolved_path = str(
-        resolved_path
-        or payload.get("local_episode_path")
-        or payload.get("local_capture_path")
-        or ""
-    ).strip()
-    if episode_dir is None and resolved_path:
-        episode_dir = Path(resolved_path).expanduser().resolve()
-    if episode_dir is None:
-        raise ValueError("Backend label job payload must include a resolvable `data_uri` or `resolved_data_path`.")
+    episode_uri = str(payload.get("episode_uri") or "").strip()
+    if not episode_uri:
+        raise ValueError("Backend label job payload must include `episode_uri`.")
+    try:
+        episode_dir = NasEpisodeResolver(mounts or {}).resolve(episode_uri).expanduser().resolve()
+    except Exception as exc:
+        raise ValueError(f"Backend label job episode_uri is not resolvable: {episode_uri}") from exc
     cameras = _label_camera_ids(_optional_str_list(payload, "cameras")) or _discover_cameras(episode_dir)
     frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
     if not cameras:
         raise ValueError(
             "Backend label job payload must include non-empty `cameras`, "
-            "or `resolved_data_path` must point to an episode directory with camera/RGB folders."
+            "or the NAS episode root must contain camera/RGB folders."
         )
     if not frames:
         raise ValueError(
             "Backend label job payload must include non-empty `frames`, "
-            "or `resolved_data_path` must point to an episode directory with RGB frame files."
+            "or the NAS episode root must contain RGB frame files."
         )
     return CorrectionTask(
         line_no=line_no,
@@ -295,25 +279,12 @@ def correction_task_from_backend_payload(
         episode=str(payload.get("episode_id") or episode_dir.name),
         cameras=cameras,
         frames=frames,
-        rgb_path_template=str(payload.get("rgb_path_template") or "{camera}/RGB/{frame:05d}.png"),
-        prediction_dir=str(payload.get("prediction_dir") or "pred_2d"),
-        correction_dir=str(payload.get("correction_dir") or "corrected_2d"),
-        mano_episode_dir=_mano_episode_dir_from_payload(payload),
-        episode_path=str(episode_dir),
+        rgb_path_template="{camera}/RGB/{frame:05d}.png",
+        prediction_dir=PREDICTION_DIR,
+        correction_dir=f"{MANUAL_SEGMENTS_DIR}/{str(payload.get('segment_id') or payload.get('job_id') or '').strip()}".rstrip("/"),
+        mano_episode_dir=MANO_EPISODE_DIR,
+        nas_root_path=str(episode_dir),
     )
-
-
-def _mano_episode_dir_from_payload(payload: Dict[str, Any]) -> str:
-    explicit = str(payload.get("mano_episode_dir") or payload.get("mano_output_dir") or "").strip().strip("/")
-    if explicit:
-        return explicit
-    data_uri = str(payload.get("data_uri") or payload.get("episode_base_uri") or "").strip().rstrip("/")
-    mano_uri = str(payload.get("mano_episode_uri") or "").strip().rstrip("/")
-    if data_uri and mano_uri and (mano_uri == data_uri or mano_uri.startswith(data_uri + "/")):
-        rel = mano_uri[len(data_uri):].strip("/")
-        if rel:
-            return rel
-    return "mano/episode"
 
 
 def progress_csv_path(jsonl_path: str) -> Path:

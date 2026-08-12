@@ -9,17 +9,13 @@ import subprocess
 import tempfile
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 try:
     from .storage import CorrectionTask, find_frame_path
 except Exception:
     from storage import CorrectionTask, find_frame_path
-
-
-_RGB_VIDEO_CANDIDATES = ("rgb.h265", "rgb.hevc", "rgb.mp4", "rgb.mkv", "rgb.mov")
-_VIDEO_SUFFIXES = (".h265", ".hevc", ".mp4", ".mkv", ".mov")
 
 
 def ensure_decoded_rgb_frames(
@@ -83,7 +79,7 @@ def _episode_cache_key(episode_dir: Path, payload: Mapping[str, Any]) -> str:
         str(episode_dir.expanduser().resolve()),
         str(payload.get("episode_id") or ""),
         str(payload.get("segment_id") or payload.get("job_id") or ""),
-        str(payload.get("data_uri") or payload.get("episode_base_uri") or ""),
+        str(payload.get("episode_uri") or ""),
     ]
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:20]
 
@@ -93,78 +89,10 @@ def _locate_rgb_video(
     camera: str,
     payload: Mapping[str, Any],
 ) -> Tuple[Path, Optional[Path]]:
-    from_payload = _video_from_payload(episode_dir, camera, payload)
-    if from_payload is not None:
-        return from_payload
-
     from_params = _video_from_camera_params(episode_dir, camera)
-    if from_params is not None:
-        return from_params
-
-    rgb_dir = episode_dir / camera / "RGB"
-    for name in _RGB_VIDEO_CANDIDATES:
-        candidate = rgb_dir / name
-        if candidate.exists() and candidate.is_file():
-            return candidate.resolve(), _timestamp_sidecar(candidate)
-    if rgb_dir.exists() and rgb_dir.is_dir():
-        videos = sorted(p for p in rgb_dir.iterdir() if p.is_file() and p.suffix.lower() in _VIDEO_SUFFIXES)
-        if videos:
-            return videos[0].resolve(), _timestamp_sidecar(videos[0])
-    raise FileNotFoundError(f"RGB H265 video not found under {rgb_dir}")
-
-
-def _video_from_payload(
-    episode_dir: Path,
-    camera: str,
-    payload: Mapping[str, Any],
-) -> Optional[Tuple[Path, Optional[Path]]]:
-    media = payload.get("episode_media")
-    if not isinstance(media, Mapping):
-        return None
-    cameras = media.get("cameras")
-    if not isinstance(cameras, Mapping):
-        return None
-    cam_obj = cameras.get(camera)
-    if not isinstance(cam_obj, Mapping):
-        return None
-    rgb_obj = cam_obj.get("rgb") or cam_obj.get("RGB")
-    if not isinstance(rgb_obj, Mapping):
-        return None
-
-    video_path = _path_from_media_obj(episode_dir, rgb_obj, ("path", "local_path", "resolved_path"))
-    if video_path is None:
-        storage_file = str(rgb_obj.get("storage_file") or rgb_obj.get("storageFile") or "").strip()
-        if storage_file:
-            video_path = _resolve_storage_file(episode_dir, camera, "RGB", storage_file)
-    if video_path is None or not video_path.exists():
-        return None
-
-    timestamp_path = _path_from_media_obj(episode_dir, rgb_obj, ("timestamp_path", "timestamp_local_path", "timestamp_resolved_path"))
-    if timestamp_path is None:
-        timestamp_file = str(rgb_obj.get("timestamp_file") or rgb_obj.get("timestampFile") or "").strip()
-        if timestamp_file:
-            timestamp_path = _resolve_storage_file(episode_dir, camera, "RGB", timestamp_file)
-    if timestamp_path is None:
-        timestamp_path = _timestamp_sidecar(video_path)
-    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
-
-
-def _path_from_media_obj(
-    episode_dir: Path,
-    obj: Mapping[str, Any],
-    keys: Iterable[str],
-) -> Optional[Path]:
-    for key in keys:
-        raw = str(obj.get(key) or "").strip()
-        if raw:
-            return Path(raw).expanduser().resolve()
-    uri = str(obj.get("uri") or "").strip()
-    base_uri = str(obj.get("episode_uri") or obj.get("episode_base_uri") or "").strip().rstrip("/")
-    if uri and base_uri and (uri == base_uri or uri.startswith(base_uri + "/")):
-        rel = unquote(uri[len(base_uri):].lstrip("/"))
-        return (episode_dir / rel).resolve()
-    return None
-
+    if from_params is None:
+        raise FileNotFoundError(f"RGB storageFile missing from {episode_dir / 'camera_params.json'} for camera {camera}")
+    return from_params
 
 def _video_from_camera_params(episode_dir: Path, camera: str) -> Optional[Tuple[Path, Optional[Path]]]:
     cam_obj = _camera_params_for(episode_dir, camera)
@@ -173,15 +101,19 @@ def _video_from_camera_params(episode_dir: Path, camera: str) -> Optional[Tuple[
     rgb_obj = cam_obj.get("RGB") or cam_obj.get("rgb")
     if not isinstance(rgb_obj, Mapping):
         return None
-    storage_file = str(rgb_obj.get("storageFile") or rgb_obj.get("storage_file") or "").strip()
+    storage_file = str(rgb_obj.get("storageFile") or "").strip()
     if not storage_file:
         return None
     video_path = _resolve_storage_file(episode_dir, camera, "RGB", storage_file)
     if not video_path.exists():
-        return None
-    timestamp_file = str(rgb_obj.get("timestampFile") or rgb_obj.get("timestamp_file") or "").strip()
-    timestamp_path = _resolve_storage_file(episode_dir, camera, "RGB", timestamp_file) if timestamp_file else _timestamp_sidecar(video_path)
-    return video_path.resolve(), timestamp_path.resolve() if timestamp_path and timestamp_path.exists() else timestamp_path
+        raise FileNotFoundError(f"RGB storageFile from camera_params.json not found: {video_path}")
+    timestamp_file = str(rgb_obj.get("timestampFile") or "").strip()
+    if not timestamp_file:
+        raise FileNotFoundError(f"RGB timestampFile missing from camera_params.json for camera {camera}")
+    timestamp_path = _resolve_storage_file(episode_dir, camera, "RGB", timestamp_file)
+    if not timestamp_path.exists():
+        raise FileNotFoundError(f"RGB timestampFile from camera_params.json not found: {timestamp_path}")
+    return video_path.resolve(), timestamp_path.resolve()
 
 
 def _camera_params_for(episode_dir: Path, camera: str) -> Optional[Mapping[str, Any]]:
@@ -202,24 +134,11 @@ def _camera_params_for(episode_dir: Path, camera: str) -> Optional[Mapping[str, 
 def _resolve_storage_file(episode_dir: Path, camera: str, stream: str, storage_file: str) -> Path:
     raw = unquote(str(storage_file or "").strip())
     if not raw:
-        return episode_dir / camera / stream
+        raise ValueError("storageFile must be a non-empty file name")
     p = Path(raw)
     if p.is_absolute():
-        return p.expanduser().resolve()
-    candidates = [
-        episode_dir / camera / stream / p,
-        episode_dir / camera / p,
-        episode_dir / p,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate.resolve()
-    return candidates[0].resolve()
-
-
-def _timestamp_sidecar(video_path: Path) -> Optional[Path]:
-    candidate = Path(str(video_path) + ".timestamps.csv")
-    return candidate if candidate.exists() else candidate
+        raise ValueError(f"storageFile must be relative to the NAS episode root: {storage_file}")
+    return (episode_dir / camera / stream / p).resolve()
 
 
 def _load_frame_map(timestamp_path: Optional[Path]) -> Dict[int, int]:
