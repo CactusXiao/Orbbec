@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
+from label.env_config import label_nas_mounts_from_env
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
 from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
@@ -22,6 +23,27 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
+    def test_label_app_derives_mount_from_parent_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            child = tmp_path / "nested" / "label"
+            child.mkdir(parents=True)
+            nas_root = tmp_path / "nas"
+            (tmp_path / ".env").write_text(
+                f"ORBBEC_NAS_ROOT={nas_root}\nORBBEC_NAS_URI_PREFIX=nas://ego\n",
+                encoding="utf-8",
+            )
+
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(child)
+                with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                    mounts = label_nas_mounts_from_env()
+            finally:
+                os.chdir(old_cwd)
+
+            self.assertEqual(mounts, {"nas://ego": str(nas_root)})
+
     def test_mano_source_projects_episode_3d_result(self) -> None:
         try:
             import cv2  # noqa: F401

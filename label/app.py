@@ -33,6 +33,7 @@ try:
     from .mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
+    from .env_config import label_nas_mounts_from_env
 except Exception:
     from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, parse_mounts_json, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
@@ -56,6 +57,7 @@ except Exception:
     from mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
+    from env_config import label_nas_mounts_from_env
 
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
@@ -70,16 +72,6 @@ SOURCE_LABELS = {
 }
 STATUS_DONE_COLOR = "#46d36b"
 STATUS_TODO_COLOR = "#ff5c5c"
-
-
-def _label_nas_mounts_from_env() -> Dict[str, str]:
-    raw = os.environ.get("ORBBEC_NAS_MOUNTS_JSON", "").strip()
-    mounts = parse_mounts_json(raw) if raw else {}
-    prefix = os.environ.get("ORBBEC_NAS_URI_PREFIX", "").strip().rstrip("/")
-    root = os.environ.get("ORBBEC_NAS_ROOT", "").strip()
-    if prefix and root:
-        mounts.setdefault(prefix, root)
-    return mounts
 
 
 class LabelToolApp(tk.Tk):
@@ -411,7 +403,7 @@ class HomePage(ttk.Frame):
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
-                mounts=_label_nas_mounts_from_env(),
+                mounts=label_nas_mounts_from_env(),
                 lease_seconds=600,
                 task_name=task_name,
                 episode_id=episode_id,
