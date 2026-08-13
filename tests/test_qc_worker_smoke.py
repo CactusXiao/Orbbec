@@ -57,6 +57,32 @@ class QcWorkerSmokeTest(unittest.TestCase):
 
             self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
 
+    def test_qc_config_finds_parent_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            child = tmp_path / "nested" / "qc"
+            child.mkdir(parents=True)
+            (tmp_path / ".env").write_text('ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}\n', encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_qc_config(cwd=child)
+
+            self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
+
+    def test_qc_config_derives_mount_from_nas_root_and_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            nas_root = tmp_path / "nas"
+            (tmp_path / ".env").write_text(
+                f"ORBBEC_NAS_ROOT={nas_root}\nORBBEC_NAS_URI_PREFIX=nas://ego\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_qc_config(cwd=tmp_path)
+
+            self.assertEqual(config.nas_mounts, {"nas://ego": str(nas_root)})
+
     def test_prepare_qc_media_uses_nas_episode_root_for_calibration_and_mano(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

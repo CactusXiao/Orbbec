@@ -258,7 +258,12 @@ def correction_task_from_backend_payload(
     try:
         episode_dir = NasEpisodeResolver(mounts or {}).resolve(episode_uri).expanduser().resolve()
     except Exception as exc:
-        raise ValueError(f"Backend label job episode_uri is not resolvable: {episode_uri}") from exc
+        configured = ", ".join(sorted((mounts or {}).keys())) or "none"
+        raise ValueError(
+            "NAS episode_uri is not resolvable. "
+            f"episode_uri={episode_uri}; configured_mounts={configured}; "
+            "set ORBBEC_NAS_URI_PREFIX and ORBBEC_NAS_ROOT."
+        ) from exc
     cameras = _label_camera_ids(_optional_str_list(payload, "cameras")) or _discover_cameras(episode_dir)
     frames = _optional_int_list(payload, "frames") or _discover_frames(episode_dir, cameras)
     if not cameras:

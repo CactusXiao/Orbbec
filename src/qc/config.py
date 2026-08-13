@@ -123,6 +123,15 @@ def _json_object(env: Dict[str, str], keys: Iterable[str]) -> Dict[str, str]:
     return out
 
 
+def _nas_mounts(env: Dict[str, str]) -> Dict[str, str]:
+    mounts = _json_object(env, ("ORBBEC_NAS_MOUNTS_JSON",))
+    prefix = _first(env, ("ORBBEC_NAS_URI_PREFIX",), "").strip().rstrip("/")
+    root = _first(env, ("ORBBEC_NAS_ROOT",), "").strip()
+    if prefix and root:
+        mounts.setdefault(prefix, root)
+    return mounts
+
+
 def _default_worker_id() -> str:
     host = socket.gethostname() or "unknown-host"
     user = getpass.getuser() or "user"
@@ -134,8 +143,12 @@ def _default_env_path(cwd: Optional[Path]) -> Optional[Path]:
     if explicit:
         return Path(explicit).expanduser().resolve()
     base = (cwd or Path.cwd()).expanduser().resolve()
-    candidate = base / ".env"
-    return candidate if candidate.exists() else None
+    for parent in (base, *base.parents):
+        candidate = parent / ".env"
+        if candidate.exists():
+            return candidate
+    repo_candidate = Path(__file__).resolve().parents[2] / ".env"
+    return repo_candidate if repo_candidate.exists() else None
 
 
 @dataclass(frozen=True)
@@ -173,7 +186,7 @@ def load_qc_config(*, cwd: Optional[Path] = None) -> QcConfig:
         worker_machine_id=_first(file_env, ("QC_WORKER_MACHINE_ID",), _default_worker_id()),
         range_merge_gap_frames=max(0, _int(file_env, ("QC_RANGE_MERGE_GAP_FRAMES",), 5)),
         request_timeout_seconds=max(1.0, _float(file_env, ("QC_BACKEND_TIMEOUT_SECONDS",), 10.0)),
-        nas_mounts=_json_object(file_env, ("ORBBEC_NAS_MOUNTS_JSON",)),
+        nas_mounts=_nas_mounts(file_env),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

@@ -314,7 +314,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             "frames": [1],
         }
 
-        with self.assertRaisesRegex(ValueError, "episode_uri is not resolvable"):
+        with self.assertRaisesRegex(ValueError, "ORBBEC_NAS_URI_PREFIX"):
             correction_task_from_backend_payload(payload)
 
     def test_backend_payload_ignores_non_contract_path_fields(self) -> None:

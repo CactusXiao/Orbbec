@@ -74,7 +74,12 @@ STATUS_TODO_COLOR = "#ff5c5c"
 
 def _label_nas_mounts_from_env() -> Dict[str, str]:
     raw = os.environ.get("ORBBEC_NAS_MOUNTS_JSON", "").strip()
-    return parse_mounts_json(raw) if raw else {}
+    mounts = parse_mounts_json(raw) if raw else {}
+    prefix = os.environ.get("ORBBEC_NAS_URI_PREFIX", "").strip().rstrip("/")
+    root = os.environ.get("ORBBEC_NAS_ROOT", "").strip()
+    if prefix and root:
+        mounts.setdefault(prefix, root)
+    return mounts
 
 
 class LabelToolApp(tk.Tk):
