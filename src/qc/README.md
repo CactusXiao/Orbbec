@@ -12,9 +12,10 @@ python3 -m src.qc.main
 
 ## .env
 
-QC Worker 只读取 `QC_*` 配置，常用项：
+QC Worker 读取后台共享的 NAS mount 配置和自己的 `QC_*` 配置，常用项：
 
 ```bash
+ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 QC_BACKEND_URL=http://127.0.0.1:8765
 QC_SAMPLE_INTERVAL=10
 QC_DEFAULT_LEASE_MINUTES=10
@@ -23,7 +24,6 @@ QC_TMP_DIR=./tmp
 QC_STATE_DIR=./qc_state
 QC_WORKER_MACHINE_ID=qc_machine_01
 QC_RANGE_MERGE_GAP_FRAMES=5
-QC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 ```
 
 ## 行为

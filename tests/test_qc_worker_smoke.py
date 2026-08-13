@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import numpy as np
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from src.qc.config import load_qc_config
 from src.qc.media import prepare_qc_media
 from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, normalize_ranges
 
@@ -43,6 +46,16 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].episode_id, "episode_001")
             self.assertEqual(loaded[0].bad_frame_ranges, [(12, 15)])
+
+    def test_qc_config_uses_shared_orbbec_nas_mounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / ".env").write_text('ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}\n', encoding="utf-8")
+
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_qc_config(cwd=tmp_path)
+
+            self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
 
     def test_prepare_qc_media_uses_nas_episode_root_for_calibration_and_mano(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -173,7 +173,7 @@ def load_qc_config(*, cwd: Optional[Path] = None) -> QcConfig:
         worker_machine_id=_first(file_env, ("QC_WORKER_MACHINE_ID",), _default_worker_id()),
         range_merge_gap_frames=max(0, _int(file_env, ("QC_RANGE_MERGE_GAP_FRAMES",), 5)),
         request_timeout_seconds=max(1.0, _float(file_env, ("QC_BACKEND_TIMEOUT_SECONDS",), 10.0)),
-        nas_mounts=_json_object(file_env, ("QC_NAS_MOUNTS_JSON",)),
+        nas_mounts=_json_object(file_env, ("ORBBEC_NAS_MOUNTS_JSON",)),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)
