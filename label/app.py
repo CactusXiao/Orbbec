@@ -358,7 +358,7 @@ class HomePage(ttk.Frame):
             values = (
                 episode_id,
                 str(episode.get("subject_id") or ""),
-                str(episode.get("pending_segments") or 0),
+                str(episode.get("segments") or episode.get("pending_segments") or 0),
                 str(episode.get("frames") or 0),
                 str(episode.get("first_start_frame") if episode.get("first_start_frame") is not None else ""),
             )

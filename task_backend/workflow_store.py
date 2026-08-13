@@ -860,6 +860,44 @@ class WorkflowStore:
             rows = conn.execute(query, tuple(params)).fetchall()
             return [self._row_to_segment(row) for row in rows]
 
+    def list_leaseable_segments(
+        self,
+        *,
+        task_name: str = "",
+        subject_id: str = "",
+        episode_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        clauses = [
+            "segments.status IN ('pending_manual', 'manual_labeling')",
+            "(segments.status = 'pending_manual' OR segments.lease_until IS NULL OR segments.lease_until = '' OR segments.lease_until <= ?)",
+        ]
+        params: List[Any] = [now_iso()]
+        task_name = str(task_name or "").strip()
+        subject_id = str(subject_id or "").strip()
+        episode_id = str(episode_id or "").strip()
+        if task_name:
+            clauses.append("episodes.task_name = ?")
+            params.append(task_name)
+        if subject_id:
+            clauses.append("episodes.subject_id = ?")
+            params.append(subject_id)
+        if episode_id:
+            clauses.append("segments.episode_id = ?")
+            params.append(episode_id)
+        query = """
+            SELECT segments.* FROM segments
+            JOIN episodes ON episodes.episode_id = segments.episode_id
+            WHERE """ + " AND ".join(clauses)
+        query += """
+            ORDER BY episodes.task_name, episodes.subject_id,
+                     episodes.episode_index IS NULL, episodes.episode_index,
+                     episodes.created_at, episodes.episode_id,
+                     segments.start_frame, segments.end_frame, segments.segment_id
+        """
+        with self.connect() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+            return [self._row_to_segment(row) for row in rows]
+
     def lease_segment(
         self,
         *,

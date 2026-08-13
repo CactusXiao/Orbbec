@@ -563,7 +563,7 @@ class JobService:
         }
 
     def label_tasks(self) -> Dict[str, Any]:
-        segments = self.store.list_segments(statuses=["pending_manual", "manual_labeling"])
+        segments = self.store.list_leaseable_segments()
         groups: Dict[str, Dict[str, Any]] = {}
         subject_sets: Dict[str, set] = {}
         episode_sets: Dict[str, set] = {}
@@ -611,7 +611,7 @@ class JobService:
         task_name = str(task_name or "").strip()
         if not task_name:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "task_name is required")
-        segments = self.store.list_segments(task_name=task_name, statuses=["pending_manual", "manual_labeling"])
+        segments = self.store.list_leaseable_segments(task_name=task_name)
         groups: Dict[str, Dict[str, Any]] = {}
         for segment in segments:
             episode_id = str(segment.get("episode_id") or "")
@@ -625,6 +625,7 @@ class JobService:
                     "episode_index": episode.get("episode_index"),
                     "episode_status": str(episode.get("status") or ""),
                     "episode_uri": str(episode.get("episode_uri") or ""),
+                    "segments": 0,
                     "pending_segments": 0,
                     "leased_segments": 0,
                     "frames": 0,
@@ -632,6 +633,7 @@ class JobService:
                     "oldest_created_at": "",
                 },
             )
+            group["segments"] += 1
             if segment.get("status") == "pending_manual":
                 group["pending_segments"] += 1
             elif segment.get("status") == "manual_labeling":

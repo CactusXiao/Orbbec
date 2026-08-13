@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 from urllib.request import Request, urlopen
 
@@ -37,7 +38,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             old_cwd = Path.cwd()
             try:
                 os.chdir(child)
-                with unittest.mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch.dict(os.environ, {}, clear=True):
                     mounts = label_nas_mounts_from_env()
             finally:
                 os.chdir(old_cwd)

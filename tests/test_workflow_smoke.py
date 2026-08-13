@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from http import HTTPStatus
 from pathlib import Path
 
 from task_backend.job_service import FINAL_3D_SOURCES_REL_PATH, JobService
@@ -300,6 +301,44 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
 
             with self.assertRaises(WorkflowError):
                 service.lease_label_segment({"operator_id": "labeler", "task_name": "missing"})
+
+    def test_label_queue_lists_only_currently_leaseable_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
+            self._create_uploaded_episode(store, tmp_path, "episode_active", frames=10, episode_index=1)
+            self._create_uploaded_episode(store, tmp_path, "episode_pending", frames=10, episode_index=2)
+            self._create_uploaded_episode(store, tmp_path, "episode_expired", frames=10, episode_index=3)
+            store.create_segment(segment_id="active_seg", episode_id="episode_active", start_frame=1, end_frame=1)
+            store.create_segment(segment_id="pending_seg", episode_id="episode_pending", start_frame=2, end_frame=2)
+            store.create_segment(segment_id="expired_seg", episode_id="episode_expired", start_frame=3, end_frame=3, status="manual_labeling")
+            store.lease_segment(lease_owner="active_labeler", lease_seconds=3600, task_name="pick_object", episode_id="episode_active")
+            with store.connect() as conn:
+                conn.execute(
+                    "UPDATE segments SET lease_owner = ?, lease_until = ? WHERE segment_id = ?",
+                    ("stale_labeler", "2000-01-01T00:00:00Z", "expired_seg"),
+                )
+
+            tasks = service.label_tasks()["tasks"]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["segments"], 2)
+            self.assertEqual(tasks[0]["pending_segments"], 1)
+            self.assertEqual(tasks[0]["leased_segments"], 1)
+
+            episodes = {item["episode_id"]: item for item in service.label_task_episodes("pick_object")["episodes"]}
+            self.assertNotIn("episode_active", episodes)
+            self.assertEqual(episodes["episode_pending"]["segments"], 1)
+            self.assertEqual(episodes["episode_expired"]["segments"], 1)
+            self.assertEqual(episodes["episode_expired"]["leased_segments"], 1)
+
+            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
+            with self.assertRaises(WorkflowError) as cm:
+                service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_active"})
+            self.assertEqual(cm.exception.status, HTTPStatus.NOT_FOUND)
+
+            leased = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_expired"})
+            self.assertEqual(leased["segment"]["segment_id"], "expired_seg")
 
     def test_segment_mano_failure_requeues_only_segment_and_cleans_attempt_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
