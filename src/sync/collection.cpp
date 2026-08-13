@@ -2969,6 +2969,61 @@ public:
             oss << "depthAlign=" << queuedDepthAlignCount_.load() << "+" << depthAlignInFlight_.load();
             any = true;
         }
+        {
+            std::lock_guard<std::mutex> lock(h265Mtx_);
+            size_t queued = 0;
+            int inFlight = 0;
+            for(const auto &kv: h265Encoders_) {
+                if(kv.second) {
+                    queued += kv.second->queued();
+                    inFlight += kv.second->inFlight();
+                }
+            }
+            const size_t finalizing = h265StoppingEncoders_.load();
+            if(h265EncodingActive_.load() || queued > 0 || inFlight > 0 || finalizing > 0) {
+                if(any) {
+                    oss << " ";
+                }
+                oss << "h265=" << queued << "+" << inFlight;
+                if(finalizing > 0) {
+                    oss << "/finalize=" << finalizing;
+                }
+                any = true;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            size_t queued = 0;
+            int inFlight = 0;
+            for(const auto &kv: depthFfv1Encoders_) {
+                if(kv.second) {
+                    queued += kv.second->queued();
+                    inFlight += kv.second->inFlight();
+                }
+            }
+            const size_t finalizing = depthFfv1StoppingEncoders_.load();
+            if(depthFfv1EncodingActive_.load() || queued > 0 || inFlight > 0 || finalizing > 0) {
+                if(any) {
+                    oss << " ";
+                }
+                oss << "mkv=" << queued << "+" << inFlight;
+                if(finalizing > 0) {
+                    oss << "/finalize=" << finalizing;
+                }
+                any = true;
+            }
+        }
+        if(!any) {
+            std::lock_guard<std::mutex> lock(coordMtx_);
+            if(session_.active && !session_.coordinatorDone) {
+                oss << "finalizing";
+                any = true;
+            }
+            else if(depthAlignActive_.load()) {
+                oss << "depthAlign=stopping";
+                any = true;
+            }
+        }
         return any ? oss.str() : "";
     }
 
@@ -4643,11 +4698,19 @@ private:
         }
 
         void stop() {
+            requestStop();
+            join();
+        }
+
+        void requestStop() {
             {
                 std::lock_guard<std::mutex> lock(mtx_);
                 stop_ = true;
                 cv_.notify_all();
             }
+        }
+
+        void join() {
             if(worker_.joinable()) {
                 worker_.join();
             }
@@ -4655,6 +4718,14 @@ private:
 
         bool idle() const {
             return queued_.load() == 0 && inFlight_.load() == 0;
+        }
+
+        size_t queued() const {
+            return queued_.load();
+        }
+
+        int inFlight() const {
+            return inFlight_.load();
         }
 
     private:
@@ -4895,14 +4966,30 @@ private:
         }
 
         void stop() {
+            requestStop();
+            join();
+        }
+
+        void requestStop() {
             {
                 std::lock_guard<std::mutex> lock(mtx_);
                 stop_ = true;
                 cv_.notify_all();
             }
+        }
+
+        void join() {
             if(worker_.joinable()) {
                 worker_.join();
             }
+        }
+
+        size_t queued() const {
+            return queued_.load();
+        }
+
+        int inFlight() const {
+            return inFlight_.load();
         }
 
     private:
@@ -6320,15 +6407,32 @@ private:
     }
 
     void stopH265Encoders() {
-        std::unordered_map<std::string, std::unique_ptr<H265Encoder>> encoders;
+        std::vector<H265Encoder *> encoders;
         {
             std::lock_guard<std::mutex> lock(h265Mtx_);
-            encoders.swap(h265Encoders_);
-        }
-        for(auto &kv: encoders) {
-            if(kv.second) {
-                kv.second->stop();
+            encoders.reserve(h265Encoders_.size());
+            for(auto &kv: h265Encoders_) {
+                if(kv.second) {
+                    encoders.push_back(kv.second.get());
+                }
             }
+        }
+        for(auto *encoder: encoders) {
+            if(encoder) {
+                encoder->requestStop();
+            }
+        }
+        h265StoppingEncoders_.store(encoders.size());
+        for(auto *encoder: encoders) {
+            if(encoder) {
+                encoder->join();
+                h265StoppingEncoders_.fetch_sub(1);
+            }
+        }
+        h265StoppingEncoders_.store(0);
+        {
+            std::lock_guard<std::mutex> lock(h265Mtx_);
+            h265Encoders_.clear();
         }
         h265EncodingActive_.store(false);
     }
@@ -6435,17 +6539,106 @@ private:
     }
 
     void stopDepthFfv1Encoders() {
-        std::unordered_map<std::string, std::unique_ptr<DepthFfv1Encoder>> encoders;
+        std::vector<DepthFfv1Encoder *> encoders;
         {
             std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
-            encoders.swap(depthFfv1Encoders_);
-        }
-        for(auto &kv: encoders) {
-            if(kv.second) {
-                kv.second->stop();
+            encoders.reserve(depthFfv1Encoders_.size());
+            for(auto &kv: depthFfv1Encoders_) {
+                if(kv.second) {
+                    encoders.push_back(kv.second.get());
+                }
             }
         }
+        for(auto *encoder: encoders) {
+            if(encoder) {
+                encoder->requestStop();
+            }
+        }
+        depthFfv1StoppingEncoders_.store(encoders.size());
+        for(auto *encoder: encoders) {
+            if(encoder) {
+                encoder->join();
+                depthFfv1StoppingEncoders_.fetch_sub(1);
+            }
+        }
+        depthFfv1StoppingEncoders_.store(0);
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            depthFfv1Encoders_.clear();
+        }
         depthFfv1EncodingActive_.store(false);
+    }
+
+    void stopVideoEncoders() {
+        std::vector<H265Encoder *> h265Encoders;
+        std::vector<DepthFfv1Encoder *> depthFfv1Encoders;
+        {
+            std::lock_guard<std::mutex> lock(h265Mtx_);
+            h265Encoders.reserve(h265Encoders_.size());
+            for(auto &kv: h265Encoders_) {
+                if(kv.second) {
+                    h265Encoders.push_back(kv.second.get());
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            depthFfv1Encoders.reserve(depthFfv1Encoders_.size());
+            for(auto &kv: depthFfv1Encoders_) {
+                if(kv.second) {
+                    depthFfv1Encoders.push_back(kv.second.get());
+                }
+            }
+        }
+        const auto stopStart = std::chrono::steady_clock::now();
+        if(!h265Encoders.empty() || !depthFfv1Encoders.empty()) {
+            std::cerr << "[collection] stopping video encoders h265=" << h265Encoders.size()
+                      << " mkv=" << depthFfv1Encoders.size() << std::endl;
+        }
+
+        for(auto *encoder: h265Encoders) {
+            if(encoder) {
+                encoder->requestStop();
+            }
+        }
+        for(auto *encoder: depthFfv1Encoders) {
+            if(encoder) {
+                encoder->requestStop();
+            }
+        }
+
+        h265StoppingEncoders_.store(h265Encoders.size());
+        depthFfv1StoppingEncoders_.store(depthFfv1Encoders.size());
+        for(auto *encoder: h265Encoders) {
+            if(encoder) {
+                encoder->join();
+                h265StoppingEncoders_.fetch_sub(1);
+            }
+        }
+        for(auto *encoder: depthFfv1Encoders) {
+            if(encoder) {
+                encoder->join();
+                depthFfv1StoppingEncoders_.fetch_sub(1);
+            }
+        }
+        h265StoppingEncoders_.store(0);
+        depthFfv1StoppingEncoders_.store(0);
+        {
+            std::lock_guard<std::mutex> lock(h265Mtx_);
+            h265Encoders_.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(depthFfv1Mtx_);
+            depthFfv1Encoders_.clear();
+        }
+        h265EncodingActive_.store(false);
+        depthFfv1EncodingActive_.store(false);
+        if(!h265Encoders.empty() || !depthFfv1Encoders.empty()) {
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - stopStart).count();
+            std::cerr << "[collection] video encoders stopped in "
+                      << (static_cast<double>(elapsedMs) / 1000.0) << "s" << std::endl;
+        }
     }
 
     bool enqueueDepthFfv1Frame(const std::string &sn, const std::string &frameIndex, uint64_t tsUs, cv::Mat frame) {
@@ -6471,8 +6664,7 @@ private:
             coordinatorLoop();
             waitDepthAlignQueueIdle();
             stopDepthAlignWorkers();
-            stopH265Encoders();
-            stopDepthFfv1Encoders();
+            stopVideoEncoders();
         });
     }
 
@@ -8069,13 +8261,15 @@ private:
     std::atomic<size_t> queuedDepthAlignCount_{ 0 };
     std::atomic<int> depthAlignInFlight_{ 0 };
 
-    std::mutex h265Mtx_;
+    mutable std::mutex h265Mtx_;
     std::unordered_map<std::string, std::unique_ptr<H265Encoder>> h265Encoders_;
     std::atomic_bool h265EncodingActive_{ false };
+    std::atomic<size_t> h265StoppingEncoders_{ 0 };
 
-    std::mutex depthFfv1Mtx_;
+    mutable std::mutex depthFfv1Mtx_;
     std::unordered_map<std::string, std::unique_ptr<DepthFfv1Encoder>> depthFfv1Encoders_;
     std::atomic_bool depthFfv1EncodingActive_{ false };
+    std::atomic<size_t> depthFfv1StoppingEncoders_{ 0 };
 
     std::atomic_bool capturing_{ false };
     std::atomic_bool recording_{ false };
@@ -8695,6 +8889,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
     bool cameraReadyAnnounced = false;
     bool extrinsicReadyChecked = false;
     bool extrinsicReadyPassed = false;
+    std::chrono::steady_clock::time_point drainStartedAt{};
+    std::chrono::steady_clock::time_point nextDrainStatusLog{};
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
     if(cfg.colorExposureMs > 0.0f) {
@@ -8777,6 +8973,46 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         cameraReadyAnnounced = false;
         extrinsicReadyChecked = false;
         extrinsicReadyPassed = false;
+    };
+
+    auto beginDrainStatusTracking = [&]() {
+        drainStartedAt = std::chrono::steady_clock::now();
+        nextDrainStatusLog = drainStartedAt + std::chrono::seconds(3);
+    };
+
+    auto resetDrainStatusTracking = [&]() {
+        drainStartedAt = {};
+        nextDrainStatusLog = {};
+    };
+
+    auto updateDrainStatusTracking = [&]() {
+        if(captureState != CaptureState::DRAINING) {
+            return;
+        }
+        if(recorder.isDrainComplete()) {
+            resetDrainStatusTracking();
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if(drainStartedAt.time_since_epoch().count() == 0) {
+            beginDrainStatusTracking();
+        }
+        if(nextDrainStatusLog.time_since_epoch().count() != 0 && now >= nextDrainStatusLog) {
+            const std::string status = recorder.drainStatusLine();
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - drainStartedAt).count();
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed);
+            oss << "Background save still running after " << std::setprecision(1)
+                << (static_cast<double>(elapsedMs) / 1000.0) << "s";
+            if(!status.empty()) {
+                oss << ": " << status;
+            }
+            pushUiLog(oss.str());
+            std::cerr << "[collection] " << oss.str() << std::endl;
+            do {
+                nextDrainStatusLog += std::chrono::seconds(3);
+            } while(now >= nextDrainStatusLog + std::chrono::milliseconds(200));
+        }
     };
 
     auto selectedTaskName = [&]() -> std::string {
@@ -8984,6 +9220,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
     auto updateReadyState = [&]() {
         captureState = CaptureState::STOPPED_READY;
+        resetDrainStatusTracking();
         if(recorder.hasData()) {
             capUi.msg = "Data saved to disk. Confirm or reset this episode.";
             pushUiLog("Background save finished. Ready to confirm.");
@@ -9542,6 +9779,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     activeCameraFault = fault;
                     cameraFaultDrainCompleteLogged = false;
                     pendingResetAfterDrain = false;
+                    resetDrainStatusTracking();
                     resetCameraReadyAnnouncement();
                     capUi.msg = "Camera stream timeout. Choose an action.";
                     pushUiLog(fault->message);
@@ -9550,6 +9788,9 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                         stopRecordingTick();
                         recorder.stopRecording();
                         captureState = recorder.isDrainComplete() ? CaptureState::STOPPED_READY : CaptureState::DRAINING;
+                        if(captureState == CaptureState::DRAINING) {
+                            beginDrainStatusTracking();
+                        }
                         pushUiLog("Camera fault fuse tripped. Recording stopped.");
                     }
                 }
@@ -10174,6 +10415,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             if(doStart) {
                 collectionSetStage("ui_capture_start");
                 cfgUi.enforceRules();
+                resetDrainStatusTracking();
                 const fs::path root = fs::path(trimString(cfgUi.saveRoot));
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
@@ -10224,6 +10466,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 else {
                     captureState = CaptureState::RECORDING;
                     pendingResetAfterDrain = false;
+                    resetDrainStatusTracking();
                     capUi.msg.clear();
                     startRecordingTick();
                     announce("start", "start");
@@ -10253,6 +10496,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 }
                 else {
                     captureState = CaptureState::DRAINING;
+                    beginDrainStatusTracking();
                     capUi.msg = "Saving data to disk...";
                     pushUiLog("Stopped. Waiting for background save to finish.");
                 }
@@ -10271,6 +10515,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     }
                     else {
                         captureState = CaptureState::DRAINING;
+                        beginDrainStatusTracking();
                         capUi.msg = "Saving data to disk before reset...";
                         pushUiLog("Reset requested during recording. Waiting for background save to finish.");
                     }
@@ -10330,6 +10575,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                         recorder.clearStatus();
                         captureState = CaptureState::IDLE;
                         pendingResetAfterDrain = false;
+                        resetDrainStatusTracking();
                         resetCameraReadyAnnouncement();
                     }
                     else {
@@ -10347,6 +10593,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     const bool releaseOk = releaseCurrentReservation("reset");
                     captureState = CaptureState::IDLE;
                     pendingResetAfterDrain = false;
+                    resetDrainStatusTracking();
                     resetCameraReadyAnnouncement();
                     if(releaseOk) {
                         capUi.msg = "Capture discarded";
@@ -10367,6 +10614,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 collectionSetStage("ui_capture_delete_cancel");
                 captureState = CaptureState::STOPPED_READY;
                 pendingResetAfterDrain = false;
+                resetDrainStatusTracking();
                 capUi.msg = "Delete canceled";
                 pushUiLog("Delete canceled");
                 announce("reset_cancel", "reset canceled");
@@ -10381,12 +10629,14 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 }
                 else {
                     captureState = CaptureState::DRAINING;
+                    beginDrainStatusTracking();
                     capUi.msg = "Auto-stopped. Saving data to disk...";
                 }
                 pushUiLog("Auto stop by max duration");
             }
 
             updateRecordingTick();
+            updateDrainStatusTracking();
 
             // --- 消息显示 ---
             if(!capUi.msg.empty()) {
@@ -10402,9 +10652,12 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
             // --- Info 行 ---
             {
-                std::string info = recorder.lastInfoLine();
-                if(info.empty() && captureState == CaptureState::DRAINING) {
+                std::string info;
+                if(captureState == CaptureState::DRAINING) {
                     info = recorder.drainStatusLine();
+                }
+                if(info.empty()) {
+                    info = recorder.lastInfoLine();
                 }
                 if(!info.empty()) {
                     cv::putText(ui, info, cv::Point(4, winH - 20),
