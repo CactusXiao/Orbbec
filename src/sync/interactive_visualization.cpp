@@ -2249,34 +2249,10 @@ private:
                 continue;
             }
 
-            int droppedSamples = 0;
-            bool restartFailed = false;
-            EgoHevcSample newer;
-            while(recorder->popHevcSample(newer, std::chrono::milliseconds(0))) {
-                if(newer.payload.empty()) {
-                    continue;
-                }
-                if(newer.codecConfig) {
-                    if(!writeSample(newer) && !restartDecoder()) {
-                        restartFailed = true;
-                        break;
-                    }
-                    continue;
-                }
-                sample = std::move(newer);
-                droppedSamples++;
-            }
-            if(restartFailed) {
-                if(stopRequested_.load()) {
-                    break;
-                }
-                continue;
-            }
+            // Keep the compressed HEVC stream continuous; dropping here breaks
+            // reference frames and causes random live-preview corruption.
             if(stopRequested_.load()) {
                 break;
-            }
-            if(droppedSamples > 0 && latestFrameIndex() < 0) {
-                publishStatus("PICO RGB dropping delayed startup frames");
             }
             if(!writeSample(sample) && !restartDecoder()) {
                 break;
@@ -2349,6 +2325,8 @@ private:
                      "-i",
                      "pipe:0",
                      "-an",
+                     "-vf",
+                     "scale=w='min(960\\,iw)':h=-2",
                      "-pix_fmt",
                      "rgb24",
                      "-f",
