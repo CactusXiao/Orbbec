@@ -39,11 +39,28 @@ struct TaskUploadStatus {
     std::string updatedAt;
 };
 
+struct TaskBackendAuthResult {
+    std::string username;
+    std::string createdAt;
+    std::string lastLoginAt;
+};
+
 class TaskBackendClient {
 public:
     explicit TaskBackendClient(std::string baseUrl, int timeoutMs = 3000);
 
     const std::string &baseUrl() const { return baseUrl_; }
+
+    bool registerAccount(const std::string &username,
+                         const std::string &password,
+                         const std::string &passwordRepeat,
+                         TaskBackendAuthResult &resultOut,
+                         std::string *errorMessage = nullptr) const;
+
+    bool login(const std::string &username,
+               const std::string &password,
+               TaskBackendAuthResult &resultOut,
+               std::string *errorMessage = nullptr) const;
 
     bool getTasks(const std::string &subjectId,
                   std::vector<TaskBackendTask> &tasksOut,

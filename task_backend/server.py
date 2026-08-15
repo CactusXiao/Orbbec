@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import hmac
 import html
 import json
 import math
 import os
 import re
+import secrets
 import socket
 import sys
 import tempfile
@@ -482,6 +485,7 @@ class TaskInstanceRegistry:
 class BackendRuntime:
     def __init__(self, registry: TaskInstanceRegistry, workflow_service: JobService):
         self.registry = registry
+        self.accounts = AccountStore(registry.data_root)
         self.workflow_service = workflow_service
         self.lock = threading.RLock()
         self.backend: Optional[TaskBackend] = None
@@ -870,7 +874,7 @@ def status_class(status: str) -> str:
         "mano_running",
     }:
         return "warn"
-    if status in {"failed", "canceled", "qc_failed", "expired"}:
+    if status in {"failed", "canceled", "qc_failed", "qc_bad_episode", "expired"}:
         return "bad"
     if status in {"released", "planned", "missing", "not queued", "-"}:
         return "muted"
@@ -912,6 +916,145 @@ class BackendError(Exception):
         super().__init__(message)
         self.status = status
         self.message = message
+
+
+class AccountStore:
+    """Tiny file-backed account store for the local collection team."""
+
+    HASH_ITERATIONS = 120_000
+
+    def __init__(self, data_root: Path):
+        self.accounts_file = data_root / "accounts.json"
+        self.lock_file = self.accounts_file.with_suffix(self.accounts_file.suffix + ".lock")
+        data_root.mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def locked_accounts(self):
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.lock_file.open("a+", encoding="utf-8") as lock_f:
+            if fcntl is not None:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                accounts = self._read_unlocked()
+                yield accounts
+                self._write_unlocked(accounts)
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _read_unlocked(self) -> Dict[str, Any]:
+        if not self.accounts_file.exists():
+            return {"version": 1, "users": {}, "created_at": now_iso(), "updated_at": now_iso()}
+        with self.accounts_file.open("r", encoding="utf-8") as f:
+            try:
+                accounts = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise BackendError(HTTPStatus.INTERNAL_SERVER_ERROR, f"invalid accounts file: {exc}") from exc
+        if not isinstance(accounts, dict):
+            raise BackendError(HTTPStatus.INTERNAL_SERVER_ERROR, "accounts file root must be an object")
+        accounts.setdefault("version", 1)
+        accounts.setdefault("users", {})
+        accounts.setdefault("created_at", now_iso())
+        accounts.setdefault("updated_at", now_iso())
+        if not isinstance(accounts["users"], dict):
+            accounts["users"] = {}
+        return accounts
+
+    def _write_unlocked(self, accounts: Dict[str, Any]) -> None:
+        accounts["updated_at"] = now_iso()
+        self.accounts_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=self.accounts_file.name + ".",
+            suffix=".tmp",
+            dir=str(self.accounts_file.parent),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(accounts, f, ensure_ascii=False, indent=2, sort_keys=True)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.accounts_file)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _username(value: Any) -> str:
+        username = str(value or "").strip()
+        if not username:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "username is required")
+        return username
+
+    @staticmethod
+    def _password(value: Any) -> str:
+        password = str(value or "")
+        if password == "":
+            raise BackendError(HTTPStatus.BAD_REQUEST, "password is required")
+        return password
+
+    @classmethod
+    def _hash_password(cls, password: str, salt_hex: str) -> str:
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt_hex),
+            cls.HASH_ITERATIONS,
+        )
+        return digest.hex()
+
+    def register(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        username = self._username(payload.get("username"))
+        password = self._password(payload.get("password"))
+        password_repeat = self._password(payload.get("password_repeat", payload.get("repeat_password")))
+        if password != password_repeat:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "passwords do not match")
+
+        with self.locked_accounts() as accounts:
+            users = accounts.setdefault("users", {})
+            if username in users:
+                raise BackendError(HTTPStatus.CONFLICT, "username already exists")
+            salt = secrets.token_hex(16)
+            created_at = now_iso()
+            users[username] = {
+                "username": username,
+                "password_salt": salt,
+                "password_hash": self._hash_password(password, salt),
+                "hash": "pbkdf2_sha256",
+                "iterations": self.HASH_ITERATIONS,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }
+            return {"ok": True, "username": username, "created_at": created_at}
+
+    def login(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        username = self._username(payload.get("username"))
+        password = self._password(payload.get("password"))
+        with self.locked_accounts() as accounts:
+            users = accounts.setdefault("users", {})
+            user = users.get(username)
+            if not isinstance(user, dict):
+                raise BackendError(HTTPStatus.UNAUTHORIZED, "invalid username or password")
+            salt = str(user.get("password_salt") or "")
+            stored_hash = str(user.get("password_hash") or "")
+            if not salt or not stored_hash:
+                raise BackendError(HTTPStatus.UNAUTHORIZED, "invalid username or password")
+            actual_hash = self._hash_password(password, salt)
+            if not hmac.compare_digest(actual_hash, stored_hash):
+                raise BackendError(HTTPStatus.UNAUTHORIZED, "invalid username or password")
+            user["last_login_at"] = now_iso()
+            user["updated_at"] = user["last_login_at"]
+            return {
+                "ok": True,
+                "username": username,
+                "created_at": str(user.get("created_at") or ""),
+                "last_login_at": user["last_login_at"],
+            }
 
 
 class TaskBackend:
@@ -1840,6 +1983,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     status = str(item.get("status", "unknown"))
     stats = item.get("stats", {})
     workflow = model.get("workflow") or {}
+    workflow_episode = workflow.get("episode") if isinstance(workflow.get("episode"), dict) else {}
     upload = workflow.get("upload") if isinstance(workflow.get("upload"), dict) else {}
     upload_available = bool(upload.get("available")) if isinstance(upload, dict) else False
     upload_status = str(upload.get("status") or ("queued" if upload_available else "not queued")) if isinstance(upload, dict) else "not queued"
@@ -1855,6 +1999,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     upload_files_total = int(upload.get("files_total") or 0) if isinstance(upload, dict) else 0
     upload_nas_uri = str(upload.get("nas_uri") or "") if isinstance(upload, dict) else ""
     upload_error = str(upload.get("error") or workflow.get("error") or "") if isinstance(upload, dict) else str(workflow.get("error") or "")
+    collection_path = str(item.get("collection_path") or upload.get("collection_path") or "")
     workflow_info = workflow.get("workflow") if isinstance(workflow.get("workflow"), dict) else {}
     workflow_status = str(workflow_info.get("status") or "-")
     active_job_type = str(workflow_info.get("active_job_type") or "")
@@ -1863,6 +2008,83 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     active_job = (active_job_type + ":" + active_job_status).strip(":") if active_job_type or active_job_status else "-"
     workflow_job_count = int(workflow_info.get("job_count") or 0)
     jobs = workflow.get("jobs") if isinstance(workflow.get("jobs"), list) else []
+    workflow_artifacts = workflow.get("workflow_artifacts") if isinstance(workflow.get("workflow_artifacts"), list) else []
+    segments = workflow.get("segments") if isinstance(workflow.get("segments"), list) else []
+
+    def latest_artifact(kinds: set) -> Dict[str, Any]:
+        for artifact in reversed(workflow_artifacts):
+            if isinstance(artifact, dict) and str(artifact.get("kind") or "") in kinds:
+                return artifact
+        return {}
+
+    def jobs_of_type(job_type: str) -> List[Dict[str, Any]]:
+        return [job for job in jobs if isinstance(job, dict) and str(job.get("type") or "") == job_type]
+
+    def latest_job(job_type: str) -> Dict[str, Any]:
+        typed = jobs_of_type(job_type)
+        return typed[-1] if typed else {}
+
+    def compact_value(value: Any, fallback: str = "-") -> str:
+        text = str(value if value is not None else "").strip()
+        return text or fallback
+
+    def uri_cell(value: Any) -> str:
+        text = compact_value(value)
+        return f"<span class=\"mono\">{html_escape(text)}</span>"
+
+    def flow_row(step: str, stage_status: str, updated_at: Any, detail: Any, artifact: Any = "") -> str:
+        artifact_html = uri_cell(artifact) if compact_value(artifact) != "-" else "<span class=\"muted\">-</span>"
+        return (
+            "<tr>"
+            f"<td>{html_escape(step)}</td>"
+            f"<td>{render_status_badge(stage_status)}</td>"
+            f"<td class=\"mono\">{html_escape(compact_value(updated_at))}</td>"
+            f"<td>{html_escape(compact_value(detail))}</td>"
+            f"<td>{artifact_html}</td>"
+            "</tr>"
+        )
+
+    def flow_status_from_job(job_type: str, fallback: str = "not queued") -> str:
+        job = latest_job(job_type)
+        return str(job.get("status") or fallback) if job else fallback
+
+    auto_job = latest_job("auto_label")
+    mano_job = latest_job("mano_opt")
+    qc_job = latest_job("qc")
+    auto_artifact = latest_artifact({"pred_2d", "auto_2d"})
+    mano_episode_artifact = latest_artifact({"mano_episode"})
+    qc_report_artifact = latest_artifact({"qc_report"})
+    final_manifest_uri = upload_nas_uri.rstrip("/") + "/workflow/final_3d_sources.json" if upload_nas_uri else ""
+
+    segment_counts: Dict[str, int] = {}
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        segment_status = str(segment.get("status") or "unknown")
+        segment_counts[segment_status] = segment_counts.get(segment_status, 0) + 1
+    segment_total = sum(segment_counts.values())
+    segment_ready = segment_counts.get("mano_succeeded", 0)
+    segment_pending = segment_counts.get("pending_manual", 0) + segment_counts.get("manual_labeling", 0) + segment_counts.get("mano_queued", 0) + segment_counts.get("mano_running", 0)
+
+    if status == "released":
+        capture_status = "released"
+    elif status == "confirmed":
+        capture_status = "confirmed"
+    elif status == "reserved":
+        capture_status = "reserved"
+    else:
+        capture_status = status
+
+    if segment_total:
+        correction_detail = f"{segment_ready}/{segment_total} segments ready"
+        correction_status = "finalized" if segment_ready == segment_total and workflow_status == "finalized" else workflow_status
+    elif workflow_status in {"qc_failed", "manual_correction_pending", "manual_correction_running", "segment_mano_optimizing"}:
+        correction_detail = "waiting for failed segments"
+        correction_status = workflow_status
+    else:
+        correction_detail = "not needed"
+        correction_status = "not queued"
+
     job_rows = []
     failed_job_alerts = []
     for job in jobs:
@@ -1891,37 +2113,44 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             "</tr>"
         )
     workflow_jobs_html = "\n".join(job_rows) if job_rows else "<tr><td colspan=\"8\" class=\"empty\">No workflow jobs yet.</td></tr>"
-    workflow_artifacts = workflow.get("workflow_artifacts") if isinstance(workflow.get("workflow_artifacts"), list) else []
-    segments = workflow.get("segments") if isinstance(workflow.get("segments"), list) else []
+    artifact_rows = []
+    for artifact in workflow_artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        metadata = artifact.get("metadata") if isinstance(artifact.get("metadata"), dict) else {}
+        source = str(metadata.get("source_job_id") or metadata.get("source") or metadata.get("segment_id") or "")
+        artifact_rows.append(
+            "<tr>"
+            f"<td>{html_escape(artifact.get('kind') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(artifact.get('uri') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(source or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(artifact.get('created_at') or '-')}</td>"
+            "</tr>"
+        )
+    artifacts_html = "\n".join(artifact_rows) if artifact_rows else "<tr><td colspan=\"4\" class=\"empty\">No workflow artifacts yet.</td></tr>"
 
-    def latest_artifact(kinds: set) -> str:
-        for artifact in reversed(workflow_artifacts):
-            if isinstance(artifact, dict) and str(artifact.get("kind") or "") in kinds:
-                return str(artifact.get("uri") or "")
-        return ""
-
-    auto_2d_uri = latest_artifact({"pred_2d", "auto_2d"})
-    mano_episode_uri = latest_artifact({"mano_episode"})
-    qc_report_uri = latest_artifact({"qc_report"})
-    failed_segment_count = len(segments)
     segment_rows = []
     for segment in segments:
         if not isinstance(segment, dict):
             continue
         frame_range = f"{segment.get('start_frame', '-')}-{segment.get('end_frame', '-')}"
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        reason = str(metadata.get("reason") or metadata.get("label") or "")
         error = str(segment.get("error") or "")
         segment_rows.append(
             "<tr>"
             f"<td class=\"mono\">{html_escape(segment.get('segment_id') or '-')}</td>"
             f"<td class=\"num\">{html_escape(frame_range)}</td>"
             f"<td>{render_status_badge(str(segment.get('status') or '-'))}</td>"
+            f"<td>{html_escape(reason or '-')}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('lease_owner') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('manual_2d_uri') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('mano_patch_uri') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(error or '-')}</td>"
             "</tr>"
         )
-    segments_html = "\n".join(segment_rows) if segment_rows else "<tr><td colspan=\"7\" class=\"empty\">No failed QC segments.</td></tr>"
+    segments_html = "\n".join(segment_rows) if segment_rows else "<tr><td colspan=\"8\" class=\"empty\">QC passed or no failed segments have been created.</td></tr>"
+
     failed_alert_html = ""
     if failed_job_alerts:
         failed_alert_html = (
@@ -1930,80 +2159,154 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             + (" ..." if len(failed_job_alerts) > 5 else "")
             + "</div>"
         )
-    fields = [
-        ("Reservation ID", reservation_id),
-        ("Task", task_name),
-        ("Subject", item.get("subject_id", "")),
-        ("Episode number", item.get("episode_number", "")),
-        ("Status", status),
-        ("Workflow status", workflow_status),
-        ("Total duration", stats.get("duration_label", "-")),
-        ("Total frames", stats.get("frame_count_label", "-")),
-        ("Storage size", stats.get("storage_label", "-")),
-        ("Client ID", item.get("client_id", "")),
-        ("Collection path", item.get("collection_path") or "-"),
-        ("Idempotency key", item.get("idempotency_key") or "-"),
-        ("Created at", item.get("created_at") or "-"),
-        ("Updated at", item.get("updated_at") or "-"),
-        ("Confirmed at", item.get("confirmed_at") or "-"),
-        ("Released at", item.get("released_at") or "-"),
+
+    flow_rows = [
+        flow_row(
+            "1. 采集预约 / 确认",
+            capture_status,
+            item.get("confirmed_at") or item.get("updated_at") or item.get("created_at"),
+            f"{item.get('subject_id', '-')} / episode {item.get('episode_number', '-')}",
+            collection_path,
+        ),
+        flow_row(
+            "2. 上传到 NAS",
+            upload_status,
+            upload.get("updated_at") if isinstance(upload, dict) else "",
+            f"{upload_phase} {upload_percent_label} | {upload_files_done}/{upload_files_total} files",
+            upload_nas_uri,
+        ),
+        flow_row(
+            "3. 自动 2D 标注",
+            flow_status_from_job("auto_label"),
+            auto_job.get("updated_at") if auto_job else "",
+            auto_job.get("job_id") if auto_job else "waiting for push",
+            auto_artifact.get("uri") if auto_artifact else "",
+        ),
+        flow_row(
+            "4. Episode MANO 优化",
+            flow_status_from_job("mano_opt"),
+            mano_job.get("updated_at") if mano_job else "",
+            mano_job.get("job_id") if mano_job else "waiting for auto label",
+            mano_episode_artifact.get("uri") if mano_episode_artifact else "",
+        ),
+        flow_row(
+            "5. QC 质检",
+            flow_status_from_job("qc"),
+            qc_job.get("updated_at") if qc_job else "",
+            qc_job.get("job_id") if qc_job else "waiting for MANO",
+            qc_report_artifact.get("uri") if qc_report_artifact else "",
+        ),
+        flow_row(
+            "6. 人工纠偏 / 最终 3D",
+            correction_status,
+            workflow_info.get("updated_at") or workflow_episode.get("updated_at") or item.get("updated_at"),
+            correction_detail,
+            final_manifest_uri,
+        ),
     ]
-    field_html = "".join(
+
+    capture_fields = [
+        ("任务", task_name),
+        ("采集对象", item.get("subject_id", "")),
+        ("Episode 序号", item.get("episode_number", "")),
+        ("采集状态", status),
+        ("采集时长", stats.get("duration_label", "-")),
+        ("帧数", stats.get("frame_count_label", "-")),
+        ("本地大小", stats.get("storage_label", "-")),
+        ("本地路径", collection_path or "-"),
+        ("创建时间", item.get("created_at") or "-"),
+        ("确认时间", item.get("confirmed_at") or "-"),
+    ]
+    capture_html = "".join(
         f"<div>{html_escape(label)}</div><div class=\"mono\">{html_escape(value)}</div>"
-        for label, value in fields
+        for label, value in capture_fields
     )
+
+    storage_fields = [
+        ("上传状态", upload_status),
+        ("上传阶段", upload_phase),
+        ("上传进度", upload_percent_label),
+        ("上传文件", f"{upload_files_done} / {upload_files_total}"),
+        ("上传字节", f"{format_bytes(upload_copied)} / {format_bytes(upload_total)}"),
+        ("NAS Episode URI", upload_nas_uri or "-"),
+        ("Workflow Episode URI", workflow_episode.get("episode_uri") or "-"),
+        ("上传错误", upload_error or "-"),
+    ]
+    storage_html = "".join(
+        f"<div>{html_escape(label)}</div><div class=\"mono\">{html_escape(value)}</div>"
+        for label, value in storage_fields
+    )
+
+    workflow_fields = [
+        ("当前状态", workflow_status),
+        ("当前活跃任务", active_job),
+        ("活跃任务 ID", active_job_id or "-"),
+        ("Workflow Job 数", workflow_job_count),
+        ("失败分段数", segment_total),
+        ("已完成纠偏分段", segment_ready),
+        ("待处理纠偏分段", segment_pending),
+        ("更新时间", workflow_info.get("updated_at") or workflow_episode.get("updated_at") or "-"),
+    ]
+    workflow_html = "".join(
+        f"<div>{html_escape(label)}</div><div class=\"mono\">{html_escape(value)}</div>"
+        for label, value in workflow_fields
+    )
+
     meta_html = "".join(
         f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>"
         for key, value in model["metadata_pairs"]
     )
     if not meta_html:
         meta_html = "<div>Task metadata</div><div class=\"muted\">No extra task metadata.</div>"
-    storage_note = (
-        "Capture data is still stored on the capture host. NAS-backed file indexing "
-        "and quality results can be attached here later."
+
+    trace_fields = [
+        ("Reservation ID", reservation_id),
+        ("Workflow Episode ID", workflow_episode.get("episode_id") or "-"),
+        ("Client ID", item.get("client_id") or "-"),
+        ("Idempotency Key", item.get("idempotency_key") or "-"),
+        ("Reservation Updated", item.get("updated_at") or "-"),
+        ("Workflow Updated", workflow_episode.get("updated_at") or "-"),
+        ("Released At", item.get("released_at") or "-"),
+    ]
+    trace_html = "".join(
+        f"<div>{html_escape(label)}</div><div class=\"mono\">{html_escape(value)}</div>"
+        for label, value in trace_fields
     )
-    raw_item = dict(item)
-    raw_item.pop("stats", None)
+
     body = (
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / "
         f"<a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a> / "
         f"{html_escape(reservation_id[:8])}</div>"
-        "<section><h2>Workflow Action</h2><div class=\"actions top-actions\">"
-        + render_push_auto_label_form(f"/episodes/{url_part(reservation_id)}/push-auto-label", {"episode_id": reservation_id}, "推送标注")
-        + "</div></section>"
-        + "<div class=\"summary\">"
-        + render_metric("Status", status)
+        "<div class=\"summary\">"
+        + render_metric("Episode", item.get("episode_number", "-"), str(item.get("subject_id", "")))
+        + render_metric("采集状态", status)
         + render_metric("Duration", stats.get("duration_label", "-"))
         + render_metric("Frames", stats.get("frame_count_label", "-"))
-        + render_metric("Storage", stats.get("storage_label", "-"))
-        + render_metric("Workflow", workflow_status, active_job if active_job != "-" else "")
-        + render_metric("NAS Upload", upload_status, upload_percent_label if upload_available else "waiting for upload job")
+        + render_metric("NAS Upload", upload_status, upload_percent_label if upload_available else "waiting")
+        + render_metric("Workflow", workflow_status, active_job if active_job != "-" else "idle")
         + "</div>"
-        "<section><h2>Episode Details</h2><div class=\"kv\">"
-        + field_html
-        + "</div></section>"
-        "<section><h2>Storage And Quality</h2><div class=\"kv\">"
-        f"<div>Storage status</div><div>{html_escape('Collection path recorded' if item.get('collection_path') else 'Waiting for confirm')}</div>"
-        f"<div>Workflow status</div><div>{render_status_badge(workflow_status)}</div>"
-        f"<div>Active job</div><div class=\"mono\">{html_escape(active_job)}"
-        f"{html_escape(' / ' + active_job_id if active_job_id else '')}</div>"
-        f"<div>Workflow jobs</div><div class=\"mono\">{html_escape(workflow_job_count)}</div>"
-        f"<div>Upload job</div><div class=\"mono\">{html_escape(upload.get('job_id') or '-' if isinstance(upload, dict) else '-')}</div>"
-        f"<div>Upload status</div><div>{render_status_badge(upload_status)}"
-        f" <span class=\"muted mono\">{html_escape(upload_phase)} {html_escape(upload_percent_label)}</span></div>"
-        f"<div>Upload bytes</div><div class=\"mono\">{html_escape(format_bytes(upload_copied))} / {html_escape(format_bytes(upload_total))}</div>"
-        f"<div>Upload files</div><div class=\"mono\">{html_escape(upload_files_done)} / {html_escape(upload_files_total)}</div>"
-        f"<div>NAS URI</div><div class=\"mono\">{html_escape(upload_nas_uri or '-')}</div>"
-        f"<div>Auto 2D</div><div class=\"mono\">{html_escape(auto_2d_uri or '-')}</div>"
-        f"<div>Episode MANO</div><div class=\"mono\">{html_escape(mano_episode_uri or '-')}</div>"
-        f"<div>QC report</div><div class=\"mono\">{html_escape(qc_report_uri or '-')}</div>"
-        f"<div>Failed segments</div><div class=\"mono\">{html_escape(failed_segment_count)}</div>"
-        f"<div>Upload error</div><div class=\"mono\">{html_escape(upload_error or '-')}</div>"
-        f"<div>Backend file access</div><div class=\"muted\">{html_escape(storage_note)}</div>"
-        + "</div></section>"
         + failed_alert_html
-        + "<section><h2>QC Failed Segments</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>Lease Owner</th>"
+        + "<section><h2>当前流程</h2><div class=\"actions top-actions\">"
+        + render_push_auto_label_form(f"/episodes/{url_part(reservation_id)}/push-auto-label", {"episode_id": reservation_id}, "推送自动标注")
+        + "</div><div class=\"wide\"><table>"
+        "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>说明</th><th>关键路径 / 产物</th></tr></thead><tbody>"
+        + "\n".join(flow_rows)
+        + "</tbody></table></div></section>"
+        "<section><h2>采集信息</h2><div class=\"kv\">"
+        + capture_html
+        + "</div></section>"
+        "<section><h2>上传与存储</h2><div class=\"kv\">"
+        + storage_html
+        + "</div></section>"
+        "<section><h2>自动处理 / 质检</h2><div class=\"kv\">"
+        + workflow_html
+        + "</div></section>"
+        "<section><h2>流程产物</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>类型</th><th>URI</th><th>来源</th><th>创建时间</th></tr></thead><tbody>"
+        + artifacts_html
+        + "</tbody></table></div></section>"
+        "<section><h2>QC 失败分段 / 人工纠偏</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>原因</th><th>Lease Owner</th>"
         "<th>Manual 2D</th><th>MANO Patch</th><th>Error</th></tr></thead><tbody>"
         + segments_html
         + "</tbody></table></div></section>"
@@ -2012,17 +2315,17 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         "<th class=\"num\">Frames</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
         + workflow_jobs_html
         + "</tbody></table></div></section>"
-        "<section><h2>Task Metadata Snapshot</h2><div class=\"kv\">"
+        "<section><h2>任务定义快照</h2><div class=\"kv\">"
         + meta_html
         + "</div></section>"
-        "<section><h2>Backend Management</h2>"
-        "<div class=\"empty\">Delete removes this episode from backend progress only. Local capture files are not removed.</div>"
+        "<section><h2>后端记录</h2><div class=\"kv\">"
+        + trace_html
+        + "</div></section>"
+        "<section><h2>管理操作</h2>"
+        "<div class=\"empty\">删除只会移除后端进度记录，不会删除本地采集文件或 NAS 文件。</div>"
         f"<form method=\"post\" action=\"/episodes/{url_part(reservation_id)}/delete\" "
-        "onsubmit=\"return confirm('Delete this episode from backend only? Local files will not be removed.');\">"
+        "onsubmit=\"return confirm('Delete this episode from backend only? Local and NAS files will not be removed.');\">"
         "<div class=\"actions\"><button type=\"submit\" class=\"danger\">Delete Episode From Backend</button></div></form>"
-        "</section>"
-        "<section><h2>Raw Reservation JSON</h2>"
-        f"<div class=\"empty\"><pre class=\"mono\">{html_escape(json.dumps(raw_item, ensure_ascii=False, indent=2, sort_keys=True))}</pre></div>"
         "</section>"
     )
     return render_layout("Episode " + reservation_id[:8], body)
@@ -2256,6 +2559,14 @@ class RequestHandler(BaseHTTPRequestHandler):
             parsed.path.startswith("/workflow/") or parsed.path.startswith("/tasks/")
         )
         try:
+            if parsed.path == "/api/v1/auth/register":
+                self._json_response(HTTPStatus.OK, self.runtime.accounts.register(self._read_json()))
+                return
+
+            if parsed.path == "/api/v1/auth/login":
+                self._json_response(HTTPStatus.OK, self.runtime.accounts.login(self._read_json()))
+                return
+
             workflow_stage_api_prefix = "/api/v1/workflow/stages/"
             if parsed.path.startswith(workflow_stage_api_prefix):
                 rest = parsed.path[len(workflow_stage_api_prefix):].strip("/")

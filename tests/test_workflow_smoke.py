@@ -7,13 +7,87 @@ from http import HTTPStatus
 from pathlib import Path
 
 from task_backend.job_service import FINAL_3D_SOURCES_REL_PATH, JobService
-from task_backend.server import render_workflow_stage_page
+from task_backend.server import render_episode_detail, render_workflow_stage_page
 from task_backend.nas_uploader import NasUploadConfig, NasUploader
 from task_backend.workflow_models import WorkflowError
 from task_backend.workflow_store import WorkflowStore
 
 
 class WorkflowStoreSmokeTest(unittest.TestCase):
+    def test_episode_detail_page_is_grouped_by_current_workflow(self) -> None:
+        html = render_episode_detail(
+            {
+                "reservation": {
+                    "reservation_id": "episode_001",
+                    "task_name": "pick_object",
+                    "subject_id": "S001",
+                    "episode_number": 1,
+                    "status": "confirmed",
+                    "collection_path": "/captures/S001/pick_object/episode_1",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "confirmed_at": "2026-01-01T00:02:00Z",
+                    "updated_at": "2026-01-01T00:02:00Z",
+                    "stats": {
+                        "duration_label": "10.00 s",
+                        "frame_count_label": "300",
+                        "storage_label": "1.00 GB",
+                    },
+                },
+                "task": {"task_name": "pick_object", "total": 1, "raw": {}},
+                "metadata_pairs": [],
+                "workflow": {
+                    "episode": {
+                        "episode_id": "episode_001",
+                        "episode_uri": "nas://ego/S001/pick_object/episode_1",
+                        "updated_at": "2026-01-01T00:10:00Z",
+                    },
+                    "workflow": {
+                        "status": "manual_correction_pending",
+                        "active_job_type": "qc",
+                        "active_job_status": "succeeded",
+                        "job_count": 3,
+                        "updated_at": "2026-01-01T00:10:00Z",
+                    },
+                    "upload": {
+                        "available": True,
+                        "status": "succeeded",
+                        "phase": "complete",
+                        "percent": 100,
+                        "files_done": 10,
+                        "files_total": 10,
+                        "copied_bytes": 1024,
+                        "total_bytes": 1024,
+                        "nas_uri": "nas://ego/S001/pick_object/episode_1",
+                    },
+                    "workflow_artifacts": [
+                        {"kind": "pred_2d", "uri": "nas://ego/S001/pick_object/episode_1/pred_2d", "metadata": {}, "created_at": "t1"},
+                        {"kind": "mano_episode", "uri": "nas://ego/S001/pick_object/episode_1/mano/episode", "metadata": {}, "created_at": "t2"},
+                        {"kind": "qc_report", "uri": "nas://ego/S001/pick_object/episode_1/qc/qc_report.json", "metadata": {}, "created_at": "t3"},
+                    ],
+                    "segments": [
+                        {
+                            "segment_id": "seg_1",
+                            "start_frame": 10,
+                            "end_frame": 20,
+                            "status": "pending_manual",
+                            "metadata": {"reason": "qc_failed"},
+                        }
+                    ],
+                    "jobs": [
+                        {"job_id": "upload_episode_001", "type": "upload", "status": "succeeded", "updated_at": "t0"},
+                        {"job_id": "auto_label_episode_001", "type": "auto_label", "status": "succeeded", "updated_at": "t1"},
+                        {"job_id": "qc_episode_001", "type": "qc", "status": "succeeded", "updated_at": "t3"},
+                    ],
+                },
+            }
+        )
+        self.assertIn("当前流程", html)
+        self.assertIn("上传与存储", html)
+        self.assertIn("QC 失败分段 / 人工纠偏", html)
+        self.assertIn("1. 采集预约 / 确认", html)
+        self.assertIn("6. 人工纠偏 / 最终 3D", html)
+        self.assertNotIn("Raw Reservation JSON", html)
+
     def test_nas_uploader_keeps_auto_label_as_manual_push(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "shared_utils.hpp"
+#include "task_backend_client.hpp"
 
 #include "interactive_visualization.hpp"
 #include "viewer.hpp"
@@ -88,18 +89,34 @@ static bool uiCheckbox(cv::Mat &img, const cv::Rect &r, bool checked, const std:
     return false;
 }
 
-static bool uiTextField(cv::Mat &img, const cv::Rect &r, const std::string &label, std::string &value, bool active, FrameMouse &ms) {
+static std::string ellipsizeTextToWidth(const std::string &text, int maxWidthPx, int fontFace, double fontScale, int thickness);
+
+static bool uiTextFieldDisplay(cv::Mat &img,
+                               const cv::Rect &r,
+                               const std::string &label,
+                               const std::string &displayValue,
+                               bool active,
+                               FrameMouse &ms) {
     const bool hover = r.contains(cv::Point(ms.x, ms.y));
     cv::Scalar border = active ? cv::Scalar(80, 200, 80) : (hover ? cv::Scalar(180, 180, 180) : cv::Scalar(120, 120, 120));
     cv::rectangle(img, r, cv::Scalar(30, 30, 30), cv::FILLED);
     cv::rectangle(img, r, border, 1);
     cv::putText(img, label, cv::Point(r.x, r.y - 6), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-    cv::putText(img, value, cv::Point(r.x + 8, r.y + r.height - 10), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+    const std::string shown = ellipsizeTextToWidth(displayValue, r.width - 16, cv::FONT_HERSHEY_DUPLEX, 0.65, 1);
+    cv::putText(img, shown, cv::Point(r.x + 8, r.y + r.height - 10), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     if(ms.clicked && r.contains(cv::Point(ms.clickX, ms.clickY))) {
         ms.clicked = false;
         return true;
     }
     return false;
+}
+
+static bool uiTextField(cv::Mat &img, const cv::Rect &r, const std::string &label, std::string &value, bool active, FrameMouse &ms) {
+    return uiTextFieldDisplay(img, r, label, value, active, ms);
+}
+
+static bool uiPasswordField(cv::Mat &img, const cv::Rect &r, const std::string &label, const std::string &value, bool active, FrameMouse &ms) {
+    return uiTextFieldDisplay(img, r, label, std::string(value.size(), '*'), active, ms);
 }
 
 static std::string toStringInt(int v) {
@@ -170,6 +187,7 @@ static void applyPointCloudResolution(AppConfig &cfg, int w, int h, int fps) {
 }
 
 enum class AppPage {
+    Login,
     Menu,
     InteractionConfig,
     Placeholder
@@ -180,6 +198,50 @@ enum class PlaceholderMode {
     Collection,
     Calibration
 };
+
+struct AuthUi {
+    bool registerMode = false;
+    std::string username;
+    std::string password;
+    std::string passwordRepeat;
+    std::string activeField = "auth_user";
+    std::string notice;
+    std::string error;
+
+    void clearSecrets() {
+        password.clear();
+        passwordRepeat.clear();
+    }
+
+    void setLoginMode() {
+        registerMode = false;
+        passwordRepeat.clear();
+        activeField = username.empty() ? "auth_user" : "auth_pw";
+        error.clear();
+        notice.clear();
+    }
+
+    void setRegisterMode() {
+        registerMode = true;
+        activeField = username.empty() ? "auth_user" : "auth_pw";
+        error.clear();
+        notice.clear();
+    }
+};
+
+static void cycleAuthField(AuthUi &ui) {
+    std::vector<std::string> fields = { "auth_user", "auth_pw" };
+    if(ui.registerMode) {
+        fields.push_back("auth_repeat");
+    }
+    auto it = std::find(fields.begin(), fields.end(), ui.activeField);
+    if(it == fields.end() || (it + 1) == fields.end()) {
+        ui.activeField = fields.front();
+    }
+    else {
+        ui.activeField = *(it + 1);
+    }
+}
 
 struct InteractionConfigUi {
     AppConfig defaults;
@@ -449,11 +511,14 @@ int main(int argc, char **argv) {
         std::cerr << "Using config: " << configPathAbs.string() << std::endl;
         AppConfig baseCfg = loadConfig(configPathAbs);
         MenuPicoConnection menuPico(baseCfg.ego);
+        TaskBackendClient authClient(baseCfg.taskBackend.baseUrl, baseCfg.taskBackend.timeoutMs);
+        AuthUi authUi;
+        std::string loggedInUsername;
 
         InteractionConfigUi cfgUi;
         cfgUi.setDefaults(baseCfg);
 
-        AppPage page = AppPage::Menu;
+        AppPage page = AppPage::Login;
         PlaceholderMode placeholderMode = PlaceholderMode::Viewer;
 
         const std::string winName = "Sync";
@@ -476,6 +541,65 @@ int main(int argc, char **argv) {
             modeCancel.store(false);
         };
 
+        auto submitAuth = [&](bool registering) {
+            authUi.error.clear();
+            authUi.notice.clear();
+            if(!baseCfg.taskBackend.enabled) {
+                authUi.error = "Task backend is disabled in config.";
+                return;
+            }
+            const std::string username = trimString(authUi.username);
+            if(username.empty()) {
+                authUi.error = "Username is required.";
+                authUi.activeField = "auth_user";
+                return;
+            }
+            if(authUi.password.empty()) {
+                authUi.error = "Password is required.";
+                authUi.activeField = "auth_pw";
+                return;
+            }
+            if(registering && authUi.password != authUi.passwordRepeat) {
+                authUi.error = "Passwords do not match.";
+                authUi.activeField = "auth_repeat";
+                return;
+            }
+
+            TaskBackendAuthResult result;
+            std::string error;
+            const bool ok = registering
+                                ? authClient.registerAccount(username, authUi.password, authUi.passwordRepeat, result, &error)
+                                : authClient.login(username, authUi.password, result, &error);
+            if(!ok) {
+                authUi.error = error.empty() ? "Authentication failed." : error;
+                return;
+            }
+
+            loggedInUsername = result.username;
+            authUi.username = result.username;
+            authUi.clearSecrets();
+            authUi.error.clear();
+            authUi.notice.clear();
+            menuError.clear();
+            menuNotice = registering ? ("Registered and logged in as " + loggedInUsername)
+                                     : ("Logged in as " + loggedInUsername);
+            page = AppPage::Menu;
+        };
+
+        auto logout = [&]() {
+            stopPlaceholderMode();
+            authUi.username = loggedInUsername;
+            loggedInUsername.clear();
+            authUi.clearSecrets();
+            authUi.registerMode = false;
+            authUi.activeField = authUi.username.empty() ? "auth_user" : "auth_pw";
+            authUi.error.clear();
+            authUi.notice = "Logged out.";
+            menuNotice.clear();
+            menuError.clear();
+            page = AppPage::Login;
+        };
+
         bool running = true;
         while(running) {
             const int key = cv::waitKey(1);
@@ -488,14 +612,83 @@ int main(int argc, char **argv) {
 
             cv::Mat ui(640, 900, CV_8UC3, cv::Scalar(20, 20, 20));
 
-            if(page == AppPage::Menu) {
+            if(page == AppPage::Login) {
+                cv::putText(ui, "Orbbec Account", cv::Point(24, 54), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+                const std::string backendLine = "Backend: " + authClient.baseUrl();
+                cv::putText(ui, ellipsizeTextToWidth(backendLine, 820, cv::FONT_HERSHEY_DUPLEX, 0.56, 1), cv::Point(24, 84), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(190, 210, 220), 1, cv::LINE_AA);
+
+                cv::Rect tabLogin(230, 120, 205, 52);
+                cv::Rect tabRegister(465, 120, 205, 52);
+                if(uiButton(ui, tabLogin, authUi.registerMode ? "Login" : "[ Login ]", fm)) {
+                    authUi.setLoginMode();
+                }
+                if(uiButton(ui, tabRegister, authUi.registerMode ? "[ Register ]" : "Register", fm)) {
+                    authUi.setRegisterMode();
+                }
+
+                const int left = 250;
+                const int fieldW = 400;
+                if(uiTextField(ui, cv::Rect(left, 220, fieldW, 44), "username", authUi.username, authUi.activeField == "auth_user", fm)) {
+                    authUi.activeField = "auth_user";
+                }
+                if(uiPasswordField(ui, cv::Rect(left, 300, fieldW, 44), "password", authUi.password, authUi.activeField == "auth_pw", fm)) {
+                    authUi.activeField = "auth_pw";
+                }
+                if(authUi.registerMode) {
+                    if(uiPasswordField(ui, cv::Rect(left, 380, fieldW, 44), "repeat password", authUi.passwordRepeat, authUi.activeField == "auth_repeat", fm)) {
+                        authUi.activeField = "auth_repeat";
+                    }
+                }
+
+                if(key == 9) {
+                    cycleAuthField(authUi);
+                }
+                else if(key > 0 && key != 13 && key != 10) {
+                    if(authUi.activeField == "auth_user") {
+                        handleTextInput(authUi.username, key);
+                    }
+                    else if(authUi.activeField == "auth_pw") {
+                        handleTextInput(authUi.password, key);
+                    }
+                    else if(authUi.activeField == "auth_repeat") {
+                        handleTextInput(authUi.passwordRepeat, key);
+                    }
+                }
+
+                cv::Rect bSubmit(250, authUi.registerMode ? 465 : 390, 250, 58);
+                cv::Rect bExit(520, authUi.registerMode ? 465 : 390, 130, 58);
+                bool shouldSubmit = (key == 13 || key == 10);
+                if(uiButton(ui, bSubmit, authUi.registerMode ? "Register" : "Login", fm)) {
+                    shouldSubmit = true;
+                }
+                if(uiButton(ui, bExit, "Exit App", fm)) {
+                    stopPlaceholderMode();
+                    running = false;
+                }
+                if(shouldSubmit && running) {
+                    submitAuth(authUi.registerMode);
+                }
+
+                if(!authUi.error.empty()) {
+                    const std::string line = ellipsizeTextToWidth(authUi.error, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 2);
+                    cv::putText(ui, line, cv::Point(60, 585), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(70, 70, 255), 2, cv::LINE_AA);
+                }
+                else if(!authUi.notice.empty()) {
+                    const std::string line = ellipsizeTextToWidth(authUi.notice, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 1);
+                    cv::putText(ui, line, cv::Point(60, 585), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(90, 210, 90), 1, cv::LINE_AA);
+                }
+            }
+            else if(page == AppPage::Menu) {
                 cv::putText(ui, "Sync Menu", cv::Point(24, 48), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
                 cv::putText(ui, menuPico.statusLine(), cv::Point(24, 78), cv::FONT_HERSHEY_DUPLEX, 0.56, menuPico.statusColor(), 1, cv::LINE_AA);
-                cv::Rect b1(60, 105, 780, 76);
-                cv::Rect b2(60, 193, 780, 76);
-                cv::Rect b3(60, 281, 780, 76);
-                cv::Rect b4(60, 369, 780, 76);
-                cv::Rect b5(60, 457, 780, 76);
+                cv::putText(ui, "Logged in: " + loggedInUsername, cv::Point(24, 102), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+                cv::Rect b1(60, 118, 780, 54);
+                cv::Rect b2(60, 182, 780, 54);
+                cv::Rect b3(60, 246, 780, 54);
+                cv::Rect b4(60, 310, 780, 54);
+                cv::Rect b5(60, 374, 780, 54);
+                cv::Rect b6(60, 438, 780, 54);
+                cv::Rect b7(60, 502, 780, 54);
                 if(uiButton(ui, b1, "Interaction", fm)) {
                     menuNotice.clear();
                     menuError.clear();
@@ -545,7 +738,7 @@ int main(int argc, char **argv) {
                 if(uiButton(ui, b5, "Label", fm)) {
                     stopPlaceholderMode();
                     std::string detail;
-                    if(launchManualLabelFrontend(baseCfg.taskBackend.baseUrl, "", &detail)) {
+                    if(launchManualLabelFrontend(baseCfg.taskBackend.baseUrl, loggedInUsername, &detail)) {
                         menuError.clear();
                         menuNotice = "Label frontend opened. Log: " + detail;
                     }
@@ -554,13 +747,20 @@ int main(int argc, char **argv) {
                         menuError = "Label frontend failed: " + detail;
                     }
                 }
+                if(uiButton(ui, b6, "Logout", fm)) {
+                    logout();
+                }
+                if(uiButton(ui, b7, "Exit Application", fm)) {
+                    stopPlaceholderMode();
+                    running = false;
+                }
                 if(!menuError.empty()) {
                     const std::string line = ellipsizeTextToWidth(menuError, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 2);
-                    cv::putText(ui, line, cv::Point(60, 575), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(70, 70, 255), 2, cv::LINE_AA);
+                    cv::putText(ui, line, cv::Point(60, 595), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(70, 70, 255), 2, cv::LINE_AA);
                 }
                 else if(!menuNotice.empty()) {
                     const std::string line = ellipsizeTextToWidth(menuNotice, 780, cv::FONT_HERSHEY_DUPLEX, 0.62, 1);
-                    cv::putText(ui, line, cv::Point(60, 575), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(90, 210, 90), 1, cv::LINE_AA);
+                    cv::putText(ui, line, cv::Point(60, 595), cv::FONT_HERSHEY_DUPLEX, 0.62, cv::Scalar(90, 210, 90), 1, cv::LINE_AA);
                 }
             }
             else if(page == AppPage::InteractionConfig) {

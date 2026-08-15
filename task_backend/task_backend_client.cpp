@@ -410,6 +410,27 @@ static bool parseUploadStatusPayload(const std::string &body,
     return true;
 }
 
+static bool parseAuthPayload(const std::string &body,
+                             TaskBackendAuthResult &resultOut,
+                             std::string *errorMessage) {
+    cJSON *root = cJSON_Parse(body.c_str());
+    if(!root) {
+        setError(errorMessage, "Task backend auth response returned invalid JSON");
+        return false;
+    }
+    TaskBackendAuthResult parsed;
+    parsed.username = jsonString(root, "username");
+    parsed.createdAt = jsonString(root, "created_at");
+    parsed.lastLoginAt = jsonString(root, "last_login_at");
+    cJSON_Delete(root);
+    if(parsed.username.empty()) {
+        setError(errorMessage, "Task backend auth response is missing username");
+        return false;
+    }
+    resultOut = std::move(parsed);
+    return true;
+}
+
 }  // namespace
 
 TaskBackendClient::TaskBackendClient(std::string baseUrl, int timeoutMs)
@@ -418,6 +439,48 @@ TaskBackendClient::TaskBackendClient(std::string baseUrl, int timeoutMs)
     if(baseUrl_.empty()) {
         baseUrl_ = "http://127.0.0.1:8765";
     }
+}
+
+bool TaskBackendClient::registerAccount(const std::string &username,
+                                        const std::string &password,
+                                        const std::string &passwordRepeat,
+                                        TaskBackendAuthResult &resultOut,
+                                        std::string *errorMessage) const {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "username", username.c_str());
+    cJSON_AddStringToObject(root, "password", password.c_str());
+    cJSON_AddStringToObject(root, "password_repeat", passwordRepeat.c_str());
+    const std::string body = printJson(root);
+    cJSON_Delete(root);
+
+    HttpResponse response;
+    if(!httpRequest(baseUrl_, timeoutMs_, "POST", "/api/v1/auth/register", body, response, errorMessage)) {
+        return false;
+    }
+    if(!ensureSuccess(response, errorMessage)) {
+        return false;
+    }
+    return parseAuthPayload(response.body, resultOut, errorMessage);
+}
+
+bool TaskBackendClient::login(const std::string &username,
+                              const std::string &password,
+                              TaskBackendAuthResult &resultOut,
+                              std::string *errorMessage) const {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "username", username.c_str());
+    cJSON_AddStringToObject(root, "password", password.c_str());
+    const std::string body = printJson(root);
+    cJSON_Delete(root);
+
+    HttpResponse response;
+    if(!httpRequest(baseUrl_, timeoutMs_, "POST", "/api/v1/auth/login", body, response, errorMessage)) {
+        return false;
+    }
+    if(!ensureSuccess(response, errorMessage)) {
+        return false;
+    }
+    return parseAuthPayload(response.body, resultOut, errorMessage);
 }
 
 bool TaskBackendClient::getTasks(const std::string &subjectId,
