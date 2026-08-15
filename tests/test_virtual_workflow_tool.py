@@ -394,10 +394,6 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 self.assertEqual((episode or {}).get("status"), "uploaded")
                 self.assertFalse((episode_dir / "pred_2d").exists())
 
-                for stage in ("auto_label", "mano_opt", "qc", "manual_segment"):
-                    service.set_stage_leasing(stage, True, {"updated_by": "smoke"})
-                pushed = service.push_auto_label({"episode_id": "episode_full", "pushed_by": "smoke"})
-                self.assertEqual(pushed["created_jobs"], 1)
                 auto_jobs = store.jobs_for_episode("episode_full", "auto_label")
                 self.assertEqual(len(auto_jobs), 1)
                 self.assertEqual(auto_jobs[0]["payload"]["scope"], "episode")

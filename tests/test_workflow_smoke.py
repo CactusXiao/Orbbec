@@ -111,7 +111,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         self.assertIn("6. 人工纠偏 / 最终 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
 
-    def test_nas_uploader_keeps_auto_label_as_manual_push(self) -> None:
+    def test_nas_uploader_queues_auto_label_after_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
@@ -156,12 +156,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             status_after = service.upload_status("reservation_001")
             self.assertEqual(status_after["upload"]["status"], "succeeded")
             self.assertEqual(status_after["workflow"]["status"], "uploaded")
-            self.assertFalse(any(job["type"] == "auto_label" for job in status_after["jobs"]))
-            self.assertEqual(store.jobs_for_episode("reservation_001", "auto_label"), [])
-
-            pushed = service.push_auto_label({"episode_id": "reservation_001", "pushed_by": "smoke"})
-            self.assertEqual(pushed["pushed"], 1)
-            self.assertEqual(pushed["created_jobs"], 1)
+            self.assertTrue(any(job["type"] == "auto_label" for job in status_after["jobs"]))
             auto_jobs = store.jobs_for_episode("reservation_001", "auto_label")
             self.assertEqual(len(auto_jobs), 1)
             self.assertEqual(auto_jobs[0]["payload"]["scope"], "episode")

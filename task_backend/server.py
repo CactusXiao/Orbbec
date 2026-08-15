@@ -1624,30 +1624,11 @@ WORKFLOW_STAGE_LABELS = [
 ]
 
 
-def render_hidden_inputs(fields: Dict[str, Any]) -> str:
-    return "".join(
-        f"<input type=\"hidden\" name=\"{html_escape(key)}\" value=\"{html_escape(value)}\">"
-        for key, value in fields.items()
-        if value is not None
-    )
-
-
-def render_push_auto_label_form(action: str, fields: Dict[str, Any], label: str = "一键推送标注") -> str:
-    return (
-        f"<form method=\"post\" action=\"{html_escape(action)}\">"
-        + render_hidden_inputs(fields)
-        + f"<button type=\"submit\">{html_escape(label)}</button>"
-        + "</form>"
-    )
-
-
-def render_workflow_stage_shortcuts(include_push_all: bool = False) -> str:
+def render_workflow_stage_shortcuts() -> str:
     links = [
         f"<a class=\"button\" href=\"/workflow/stages/{url_part(job_type)}\">{html_escape(label)}：{html_escape(job_type)}</a>"
         for job_type, label in WORKFLOW_STAGE_LABELS
     ]
-    if include_push_all:
-        links.append(render_push_auto_label_form("/workflow/episodes/push-auto-label", {"scope": "all"}))
     return (
         "<section><h2>Workflow Stages</h2>"
         "<div class=\"actions top-actions\">"
@@ -1783,7 +1764,7 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         f"<div class=\"crumbs\">Task backend / Overview / {html_escape(instance_label)}</div>"
         "<div class=\"notice warn\">This backend process is locked to the selected task file and instance. "
         "Restart the process to choose another instance.</div>"
-        + render_workflow_stage_shortcuts(include_push_all=True)
+        + render_workflow_stage_shortcuts()
         + "<div class=\"summary\">"
         + render_metric("Tasks", len(model["tasks"]), "from task file")
         + render_metric("Subjects", len(model["subjects"]), subject_note)
@@ -1848,10 +1829,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
     description = task.get("description_cn") or task.get("description_en") or ""
     body = (
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / {html_escape(task_name)}</div>"
-        "<section><h2>Workflow Action</h2><div class=\"actions top-actions\">"
-        + render_push_auto_label_form(f"/tasks/{url_part(task_name)}/push-auto-label", {"task_name": task_name})
-        + "</div></section>"
-        + "<div class=\"summary\">"
+        "<div class=\"summary\">"
         + render_metric("Required / Subject", task.get("total", ""), "configured episodes")
         + render_metric("Confirmed", counts.get("confirmed", 0))
         + render_metric("Reserved", counts.get("reserved", 0))
@@ -2360,9 +2338,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + render_metric("Workflow", workflow_status, active_job if active_job != "-" else "idle")
         + "</div>"
         + failed_alert_html
-        + "<section><h2>当前流程</h2><div class=\"actions top-actions\">"
-        + render_push_auto_label_form(f"/episodes/{url_part(reservation_id)}/push-auto-label", {"episode_id": reservation_id}, "推送自动标注")
-        + "</div><div class=\"wide\"><table>"
+        + "<section><h2>当前流程</h2><div class=\"wide\"><table>"
         "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>操作员</th><th>说明</th><th>关键路径 / 产物</th></tr></thead><tbody>"
         + "\n".join(flow_rows)
         + "</tbody></table></div></section>"
@@ -2910,7 +2886,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     nas_mounts.setdefault(nas_uri_prefix.rstrip("/"), str(nas_root))
     auto_label_after_upload = env_bool(
         env,
-        False,
+        True,
         "ORBBEC_AUTO_LABEL_AFTER_UPLOAD",
         "TASK_BACKEND_AUTO_LABEL_AFTER_UPLOAD",
     )

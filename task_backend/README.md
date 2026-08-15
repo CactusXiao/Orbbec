@@ -54,8 +54,8 @@ ORBBEC_NAS_ROOT=/mnt/nas
 ORBBEC_NAS_URI_PREFIX=nas://ego
 ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 
-# Upload success waits for an explicit push before queuing auto_label jobs.
-# Set this to 1 only for legacy fully automatic local tests:
+# Upload success queues auto_label jobs by default.
+# Set this to 0 only when manually holding uploaded episodes before labeling:
 # ORBBEC_AUTO_LABEL_AFTER_UPLOAD=0
 # Optional seed file for the setup page:
 # ORBBEC_TASK_BACKEND_TASK_FILE=./tasks.json
@@ -228,10 +228,10 @@ have to match any path on the backend machine.
 8. Backend confirm creates an `upload` job. The NAS uploader copies the
    already-saved local episode asynchronously and records progress in the
    workflow database.
-9. Upload success marks the episode `uploaded`. It does not queue
-   `auto_label` by default.
-10. A dashboard, task-page, episode-page, or API push creates one episode-level
-    `auto_label` job. Repeating the push for the same episode is idempotent.
+9. Upload success marks the episode `uploaded` and immediately queues one
+   episode-level `auto_label` job by default.
+10. The dashboard only shows workflow status; the push API remains available
+    for repair/backfill and is idempotent when an `auto_label` job already exists.
 11. The collection UI returns to READY/IDLE after backend confirm succeeds. It
    keeps polling upload progress by reservation ID and displays the latest NAS
    status without blocking the next capture.
@@ -272,8 +272,9 @@ When collection confirms an episode, the workflow sidecar records an Episode
 with status `captured` and queues an `upload` job. The built-in NAS
 uploader leases this job, copies local data to the configured NAS root, updates progress,
 registers a `nas_episode` artifact, and marks the episode `uploaded` only after
-the verified copy completes. `auto_label` jobs are created only after an
-explicit push from the dashboard, task page, episode page, or workflow API.
+the verified copy completes. By default, upload success immediately creates the
+episode-level `auto_label` job; the push API remains available only for
+manual backfill or repair.
 The main workflow is `uploaded -> auto_label -> mano_opt -> qc -> finalized`.
 When QC fails, the backend creates failed-frame segments for manual correction;
 each corrected segment then gets only a segment-level `mano_opt` patch job.
@@ -337,15 +338,17 @@ POST /api/v1/workflow/stages/<job_type>/enable
 POST /api/v1/workflow/stages/<job_type>/disable
 ```
 
-Push uploaded episodes into automatic labeling:
+Backfill uploaded episodes into automatic labeling:
 
 ```text
 POST /api/v1/workflow/episodes/push-auto-label
 ```
 
-The push body may target one `episode_id`, one `task_name`, or all eligible
-episodes with `{"scope":"all"}`. An episode is eligible when it is `uploaded`,
-has a NAS/data URI, and has no existing `auto_label` job.
+This API is normally not needed after collection, because upload completion
+queues `auto_label` automatically. The body may still target one `episode_id`,
+one `task_name`, or all eligible episodes with `{"scope":"all"}` for repair
+or migration. An episode is eligible when it is `uploaded`, has a NAS/data URI,
+and has no existing `auto_label` job.
 
 `manual_segment` lease moves the Episode to `manual_correction_running`.
 Successful segment completion registers `manual_2d` and queues a segment-level

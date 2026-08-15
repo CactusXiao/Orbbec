@@ -223,7 +223,7 @@ class JobService:
         self,
         store: WorkflowStore,
         *,
-        auto_label_after_upload: bool = False,
+        auto_label_after_upload: bool = True,
         nas_mounts: Optional[Mapping[str, Any]] = None,
     ):
         self.store = store

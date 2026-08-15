@@ -1638,7 +1638,7 @@ def handle_upload_once(client: BackendClient, nas: NasSimulator, args: argparse.
         job_id=job["job_id"],
         episode_id=payload.get("episode_id") or episode.get("episode_id"),
         nas_uri=nas_uri,
-        auto_label="manual_push_required",
+        auto_label="queued_by_backend",
         cameras=len(cameras),
         frames=len(frames),
     )
