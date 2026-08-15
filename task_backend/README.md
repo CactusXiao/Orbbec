@@ -321,8 +321,8 @@ POST /api/v1/label/segments/{segment_id}/fail
 Lease semantics:
 
 - only queued jobs/segments, or work with an expired lease, can be leased;
-- `auto_label`, `mano_opt`, `qc`, and `manual_segment` leases are paused by default and return
-  `HTTP 409` with `leasing disabled for job type: <type>` until enabled;
+- `auto_label`, `mano_opt`, `qc`, and `manual_segment` leases are open by default;
+  manually disabled stages return `HTTP 409` with `leasing disabled for job type: <type>`;
 - lease writes `lease_owner`, `lease_until`, and `status=leased`;
 - heartbeat extends the lease and may mark the job `running`;
 - complete is idempotent;

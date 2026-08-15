@@ -62,6 +62,9 @@ def _new_id(prefix: str) -> str:
     return f"{clean}_{uuid.uuid4().hex[:12]}"
 
 
+DEFAULT_OPEN_STAGE_JOB_TYPES = set(CONTROLLED_STAGE_JOB_TYPES)
+
+
 class WorkflowStore:
     def __init__(self, db_path: Path):
         self.db_path = db_path.expanduser().resolve()
@@ -167,7 +170,7 @@ class WorkflowStore:
 
                 CREATE TABLE IF NOT EXISTS workflow_stage_controls (
                     job_type TEXT PRIMARY KEY,
-                    lease_enabled INTEGER NOT NULL DEFAULT 0,
+                    lease_enabled INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL,
                     updated_by TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
@@ -182,10 +185,29 @@ class WorkflowStore:
                     """
                     INSERT OR IGNORE INTO workflow_stage_controls (
                         job_type, lease_enabled, updated_at, updated_by, note
-                    ) VALUES (?, 0, ?, 'system', 'default paused')
+                    ) VALUES (?, ?, ?, 'system', ?)
                     """,
-                    (job_type, timestamp),
+                    (
+                        job_type,
+                        1 if job_type in DEFAULT_OPEN_STAGE_JOB_TYPES else 0,
+                        timestamp,
+                        "default open" if job_type in DEFAULT_OPEN_STAGE_JOB_TYPES else "default paused",
+                    ),
                 )
+            default_open_types = sorted(DEFAULT_OPEN_STAGE_JOB_TYPES)
+            conn.execute(
+                f"""
+                UPDATE workflow_stage_controls
+                SET lease_enabled = 1,
+                    updated_at = ?,
+                    note = 'default open'
+                WHERE job_type IN ({", ".join("?" for _ in default_open_types)})
+                  AND lease_enabled = 0
+                  AND updated_by = 'system'
+                  AND note = 'default paused'
+                """,
+                (timestamp, *default_open_types),
+            )
             conn.commit()
         finally:
             conn.close()
@@ -478,13 +500,14 @@ class WorkflowStore:
             ).fetchone()
             if row is None:
                 timestamp = now_iso()
+                default_open = job_type in DEFAULT_OPEN_STAGE_JOB_TYPES
                 conn.execute(
                     """
                     INSERT INTO workflow_stage_controls (
                         job_type, lease_enabled, updated_at, updated_by, note
-                    ) VALUES (?, 0, ?, 'system', 'default paused')
+                    ) VALUES (?, ?, ?, 'system', ?)
                     """,
-                    (job_type, timestamp),
+                    (job_type, 1 if default_open else 0, timestamp, "default open" if default_open else "default paused"),
                 )
                 row = conn.execute(
                     "SELECT * FROM workflow_stage_controls WHERE job_type = ?",

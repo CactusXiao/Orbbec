@@ -14,6 +14,20 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class WorkflowStoreSmokeTest(unittest.TestCase):
+    def test_workflow_stage_leases_are_open_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "workflow.sqlite3"
+            store = WorkflowStore(db_path)
+            for job_type in ("auto_label", "mano_opt", "qc", "manual_segment"):
+                self.assertTrue(store.get_stage_control(job_type)["lease_enabled"])
+
+            store.set_stage_control(job_type="auto_label", lease_enabled=False, updated_by="system", note="default paused")
+            store.set_stage_control(job_type="qc", lease_enabled=False, updated_by="api", note="manual pause")
+
+            reopened = WorkflowStore(db_path)
+            self.assertTrue(reopened.get_stage_control("auto_label")["lease_enabled"])
+            self.assertFalse(reopened.get_stage_control("qc")["lease_enabled"])
+
     def test_episode_detail_page_is_grouped_by_current_workflow(self) -> None:
         html = render_episode_detail(
             {
