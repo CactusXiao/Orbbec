@@ -8853,7 +8853,10 @@ static ExitConfirmModalActions drawExitConfirmModal(cv::Mat &ui,
 
 }  // namespace
 
-int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoRecorder *sharedEgoRecorder) {
+int run_collection(const AppConfig &cfg,
+                   const std::atomic_bool *cancel,
+                   EgoRecorder *sharedEgoRecorder,
+                   const std::string &operatorId) {
     (void)cancel;
 
     collectionInstallCrashHandlerOnce();
@@ -8869,6 +8872,11 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
     CollectionPage page = CollectionPage::Config;
     CollectionConfigUi cfgUi;
+    const std::string collectionOperatorId = trimString(operatorId);
+    const bool subjectBoundToLogin = !collectionOperatorId.empty();
+    if(subjectBoundToLogin) {
+        cfgUi.subjectId = collectionOperatorId;
+    }
     CollectionCaptureUi capUi;
     MultiDeviceStreamingRecorder recorder(cfg, sharedEgoRecorder);
     TaskBackendClient backendClient(cfg.taskBackend.baseUrl, cfg.taskBackend.timeoutMs);
@@ -9162,6 +9170,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         if(!backendClient.releaseEpisode(currentReservation.reservationId,
                                          subject,
                                          currentReservation.taskName,
+                                         collectionOperatorId,
                                          &error)) {
             capUi.msg = "Backend release failed: " + error;
             pushUiLog(capUi.msg);
@@ -9190,6 +9199,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                                          currentReservation.durationSeconds,
                                          currentReservation.frameCount,
                                          currentReservation.idempotencyKey,
+                                         collectionOperatorId,
                                          refreshedTasks,
                                          &error)) {
             capUi.msg = "Backend confirm failed: " + error;
@@ -9400,7 +9410,16 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
             if(uiTextField(ui, cv::Rect(left, fieldsTop, 520, 36), "save_path (required)", cfgUi.saveRoot, cfgUi.activeField == "save", fm)) {
                 cfgUi.activeField = "save";
             }
-            if(uiTextField(ui, cv::Rect(left + 560, fieldsTop, 260, 36), "subject_id (required)", cfgUi.subjectId, cfgUi.activeField == "sub", fm)) {
+            const cv::Rect subjectRect(left + 560, fieldsTop, 260, 36);
+            if(subjectBoundToLogin) {
+                cv::rectangle(ui, subjectRect, cv::Scalar(30, 30, 30), cv::FILLED);
+                cv::rectangle(ui, subjectRect, cv::Scalar(100, 140, 160), 1);
+                cv::putText(ui, "subject_id (login account)", cv::Point(subjectRect.x, subjectRect.y - 6),
+                            cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+                cv::putText(ui, cfgUi.subjectId, cv::Point(subjectRect.x + 8, subjectRect.y + subjectRect.height - 10),
+                            cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 245, 255), 1, cv::LINE_AA);
+            }
+            else if(uiTextField(ui, subjectRect, "subject_id (required)", cfgUi.subjectId, cfgUi.activeField == "sub", fm)) {
                 cfgUi.activeField = "sub";
             }
 
@@ -9435,7 +9454,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                     announce("enter_failed", "enter failed");
                 }
                 else if(!cfgUi.hasRequiredFields()) {
-                    cfgUi.error = "save_path and subject_id are required";
+                    cfgUi.error = "save_path and login account are required";
                     announce("enter_failed", "enter failed");
                 }
                 else {
@@ -9479,7 +9498,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 if(cfgUi.activeField == "save") {
                     handleTextInputShortcut(cfgUi.saveRoot, key, ctrlHeld);
                 }
-                else if(cfgUi.activeField == "sub") {
+                else if(!subjectBoundToLogin && cfgUi.activeField == "sub") {
                     handleTextInputShortcut(cfgUi.subjectId, key, ctrlHeld);
                 }
                 else if(cfgUi.activeField == "exp") {
@@ -10421,7 +10440,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 TaskEpisodeReservation reservation;
                 std::string backendError;
-                bool ok = backendClient.reserveEpisode(collectionClientId, subject, taskName, reservation, &backendError);
+                bool ok = backendClient.reserveEpisode(collectionClientId, subject, taskName, collectionOperatorId, reservation, &backendError);
                 if(!ok) {
                     capUi.msg = "Backend reserve failed: " + backendError;
                     pushUiLog(capUi.msg);

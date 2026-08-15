@@ -500,12 +500,16 @@ bool TaskBackendClient::getTasks(const std::string &subjectId,
 bool TaskBackendClient::reserveEpisode(const std::string &clientId,
                                        const std::string &subjectId,
                                        const std::string &taskName,
+                                       const std::string &operatorId,
                                        TaskEpisodeReservation &reservationOut,
                                        std::string *errorMessage) const {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "client_id", clientId.c_str());
     cJSON_AddStringToObject(root, "subject_id", subjectId.c_str());
     cJSON_AddStringToObject(root, "task_name", taskName.c_str());
+    if(!operatorId.empty()) {
+        cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    }
     const std::string body = printJson(root);
     cJSON_Delete(root);
 
@@ -543,6 +547,7 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
                                        double durationSeconds,
                                        int frameCount,
                                        const std::string &idempotencyKey,
+                                       const std::string &operatorId,
                                        std::vector<TaskBackendTask> &tasksOut,
                                        std::string *errorMessage) const {
     cJSON *root = cJSON_CreateObject();
@@ -558,6 +563,9 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
         cJSON_AddNumberToObject(root, "frame_count", frameCount);
     }
     cJSON_AddStringToObject(root, "idempotency_key", idempotencyKey.c_str());
+    if(!operatorId.empty()) {
+        cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    }
     const std::string body = printJson(root);
     cJSON_Delete(root);
 
@@ -574,11 +582,15 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
 bool TaskBackendClient::releaseEpisode(const std::string &reservationId,
                                        const std::string &subjectId,
                                        const std::string &taskName,
+                                       const std::string &operatorId,
                                        std::string *errorMessage) const {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "reservation_id", reservationId.c_str());
     cJSON_AddStringToObject(root, "subject_id", subjectId.c_str());
     cJSON_AddStringToObject(root, "task_name", taskName.c_str());
+    if(!operatorId.empty()) {
+        cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    }
     const std::string body = printJson(root);
     cJSON_Delete(root);
 

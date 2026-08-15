@@ -39,6 +39,11 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "episode": {
                         "episode_id": "episode_001",
                         "episode_uri": "nas://ego/S001/pick_object/episode_1",
+                        "metadata": {
+                            "collection_operator_id": "collector",
+                            "qc_operator_id": "qc_user",
+                            "manual_correction_operator_id": "labeler",
+                        },
                         "updated_at": "2026-01-01T00:10:00Z",
                     },
                     "workflow": {
@@ -70,13 +75,13 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                             "start_frame": 10,
                             "end_frame": 20,
                             "status": "pending_manual",
-                            "metadata": {"reason": "qc_failed"},
+                            "metadata": {"reason": "qc_failed", "operator_id": "labeler"},
                         }
                     ],
                     "jobs": [
                         {"job_id": "upload_episode_001", "type": "upload", "status": "succeeded", "updated_at": "t0"},
                         {"job_id": "auto_label_episode_001", "type": "auto_label", "status": "succeeded", "updated_at": "t1"},
-                        {"job_id": "qc_episode_001", "type": "qc", "status": "succeeded", "updated_at": "t3"},
+                        {"job_id": "qc_episode_001", "type": "qc", "status": "succeeded", "operator_id": "qc_user", "updated_at": "t3"},
                     ],
                 },
             }
@@ -84,6 +89,10 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         self.assertIn("当前流程", html)
         self.assertIn("上传与存储", html)
         self.assertIn("QC 失败分段 / 人工纠偏", html)
+        self.assertIn("操作员", html)
+        self.assertIn("collector", html)
+        self.assertIn("qc_user", html)
+        self.assertIn("labeler", html)
         self.assertIn("1. 采集预约 / 确认", html)
         self.assertIn("6. 人工纠偏 / 最终 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
@@ -113,8 +122,12 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "idempotency_key": "smoke:reservation_001",
                     "collection_path": str(source),
                     "frame_count": 2,
+                    "operator_id": "collector",
                 }
             )
+            episode = store.get_episode("reservation_001")
+            self.assertEqual(episode["subject_id"], "S001")  # type: ignore[index]
+            self.assertEqual(episode["metadata"]["collection_operator_id"], "collector")  # type: ignore[index]
 
             uploader = NasUploader(
                 service,
@@ -179,11 +192,12 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             service.complete_job(
                 qc_jobs[0]["job_id"],
                 {
-                    "result": {"passed": True, "score": 0.99},
-                    "artifacts": [{"kind": "qc_report", "metadata": {"passed": True}}],
+                    "result": {"passed": True, "score": 0.99, "operator_id": "qc_user"},
+                    "artifacts": [{"kind": "qc_report", "metadata": {"passed": True, "operator_id": "qc_user"}}],
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "finalized")  # type: ignore[index]
+            self.assertEqual(store.get_episode("episode_pass")["metadata"]["qc_operator_id"], "qc_user")  # type: ignore[index]
             kinds = [item["kind"] for item in store.artifacts_for_episode("episode_pass")]
             self.assertIn("pred_2d", kinds)
             self.assertIn("mano_episode", kinds)
@@ -209,6 +223,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "result": {
                         "passed": False,
                         "score": 0.2,
+                        "operator_id": "qc_user",
                         "segments": [
                             {"start_frame": 10, "end_frame": 12, "reason": "low_confidence"},
                             {"start_frame": 20, "end_frame": 21, "reason": "temporal_jump"},
@@ -217,6 +232,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 },
             )
             self.assertEqual(store.get_episode("episode_fail")["status"], "manual_correction_pending")  # type: ignore[index]
+            self.assertEqual(store.get_episode("episode_fail")["metadata"]["qc_operator_id"], "qc_user")  # type: ignore[index]
             segments = store.segments_for_episode("episode_fail")
             self.assertEqual([(s["start_frame"], s["end_frame"], s["status"]) for s in segments], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
@@ -242,6 +258,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 },
             )
             self.assertEqual(completed["segment"]["status"], "mano_queued")
+            self.assertEqual(store.get_episode("episode_fail")["metadata"]["manual_correction_operator_id"], "labeler")  # type: ignore[index]
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
             self.assertEqual(manifest["overrides"][0]["status"], "mano_queued")
             self.assertEqual(manifest["overrides"][0]["manual_2d_relative_path"], f"manual_2d/segments/{first_segment_id}")

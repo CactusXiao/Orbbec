@@ -160,6 +160,7 @@ class QcConfig:
     tmp_dir: Path
     state_dir: Path
     worker_machine_id: str
+    operator_id: str
     range_merge_gap_frames: int
     request_timeout_seconds: float
     nas_mounts: Dict[str, str]
@@ -184,6 +185,7 @@ def load_qc_config(*, cwd: Optional[Path] = None) -> QcConfig:
         tmp_dir=_path(file_env, ("QC_TMP_DIR",), "./tmp"),
         state_dir=_path(file_env, ("QC_STATE_DIR",), "./qc_state"),
         worker_machine_id=_first(file_env, ("QC_WORKER_MACHINE_ID",), _default_worker_id()),
+        operator_id=_first(file_env, ("ORBBEC_QC_OPERATOR_ID", "QC_OPERATOR_ID", "ORBBEC_LABEL_OPERATOR_ID"), getpass.getuser() or "qc_operator"),
         range_merge_gap_frames=max(0, _int(file_env, ("QC_RANGE_MERGE_GAP_FRAMES",), 5)),
         request_timeout_seconds=max(1.0, _float(file_env, ("QC_BACKEND_TIMEOUT_SECONDS",), 10.0)),
         nas_mounts=_nas_mounts(file_env),

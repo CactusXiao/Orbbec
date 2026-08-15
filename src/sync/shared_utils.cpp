@@ -143,7 +143,7 @@ static std::string shellQuote(const std::string &s) {
     return out;
 }
 
-static std::optional<fs::path> findManualLabelRepoRoot() {
+static std::optional<fs::path> findRepoRootContaining(const fs::path &requiredPath) {
     std::vector<fs::path> seeds;
     try {
         seeds.push_back(fs::current_path());
@@ -161,7 +161,7 @@ static std::optional<fs::path> findManualLabelRepoRoot() {
         catch(...) {
         }
         for(fs::path cur = seed; !cur.empty(); cur = cur.parent_path()) {
-            if(fs::exists(cur / "label" / "main.py")) {
+            if(fs::exists(cur / requiredPath)) {
                 return cur;
             }
             if(cur == cur.root_path()) {
@@ -170,6 +170,14 @@ static std::optional<fs::path> findManualLabelRepoRoot() {
         }
     }
     return std::nullopt;
+}
+
+static std::optional<fs::path> findManualLabelRepoRoot() {
+    return findRepoRootContaining(fs::path("label") / "main.py");
+}
+
+static std::optional<fs::path> findQcRepoRoot() {
+    return findRepoRootContaining(fs::path("src") / "qc" / "main.py");
 }
 
 bool launchManualLabelFrontend(const std::string &backendUrl,
@@ -214,6 +222,57 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
     if(rc != 0) {
         if(errorMessage) {
             *errorMessage = "failed to start manual label frontend; log: " + logPath.string();
+        }
+        return false;
+    }
+    if(errorMessage) {
+        *errorMessage = logPath.string();
+    }
+    return true;
+}
+
+bool launchQcFrontend(const std::string &backendUrl,
+                      const std::string &operatorHint,
+                      std::string *errorMessage) {
+    const auto repoRoot = findQcRepoRoot();
+    if(!repoRoot.has_value()) {
+        if(errorMessage) {
+            *errorMessage = "src/qc/main.py not found from current working directory";
+        }
+        return false;
+    }
+
+    const char *pythonEnv = std::getenv("ORBBEC_QC_PYTHON");
+    const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
+    const char *operatorEnv = std::getenv("ORBBEC_QC_OPERATOR_ID");
+    std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
+    if(operatorId.empty()) {
+        operatorId = trimString(operatorHint);
+    }
+    if(operatorId.empty()) {
+        operatorId = "qc_operator_01";
+    }
+
+    fs::path logPath;
+    try {
+        logPath = fs::temp_directory_path() / "orbbec_qc_frontend.log";
+    }
+    catch(...) {
+        logPath = "orbbec_qc_frontend.log";
+    }
+
+    std::ostringstream cmd;
+    cmd << "cd " << shellQuote(repoRoot->string())
+        << " && QC_BACKEND_URL=" << shellQuote(trimString(backendUrl))
+        << " ORBBEC_QC_OPERATOR_ID=" << shellQuote(operatorId)
+        << " nohup " << shellQuote(python)
+        << " -m src.qc.main >> " << shellQuote(logPath.string())
+        << " 2>&1 &";
+
+    const int rc = std::system(cmd.str().c_str());
+    if(rc != 0) {
+        if(errorMessage) {
+            *errorMessage = "failed to start QC frontend; log: " + logPath.string();
         }
         return false;
     }

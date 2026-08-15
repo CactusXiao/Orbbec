@@ -682,13 +682,14 @@ int main(int argc, char **argv) {
                 cv::putText(ui, "Sync Menu", cv::Point(24, 48), cv::FONT_HERSHEY_DUPLEX, 1.1, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
                 cv::putText(ui, menuPico.statusLine(), cv::Point(24, 78), cv::FONT_HERSHEY_DUPLEX, 0.56, menuPico.statusColor(), 1, cv::LINE_AA);
                 cv::putText(ui, "Logged in: " + loggedInUsername, cv::Point(24, 102), cv::FONT_HERSHEY_DUPLEX, 0.56, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-                cv::Rect b1(60, 118, 780, 54);
-                cv::Rect b2(60, 182, 780, 54);
-                cv::Rect b3(60, 246, 780, 54);
-                cv::Rect b4(60, 310, 780, 54);
-                cv::Rect b5(60, 374, 780, 54);
-                cv::Rect b6(60, 438, 780, 54);
-                cv::Rect b7(60, 502, 780, 54);
+                cv::Rect b1(60, 118, 780, 48);
+                cv::Rect b2(60, 174, 780, 48);
+                cv::Rect b3(60, 230, 780, 48);
+                cv::Rect b4(60, 286, 780, 48);
+                cv::Rect b5(60, 342, 780, 48);
+                cv::Rect b6(60, 398, 780, 48);
+                cv::Rect b7(60, 454, 780, 48);
+                cv::Rect b8(60, 510, 780, 48);
                 if(uiButton(ui, b1, "Interaction", fm)) {
                     menuNotice.clear();
                     menuError.clear();
@@ -714,7 +715,7 @@ int main(int argc, char **argv) {
                     AppConfig cfg = baseCfg;
                     cfg.mode      = "collection";
                     cv::destroyWindow(winName);
-                    run_collection(cfg, nullptr, menuPico.recorder());
+                    run_collection(cfg, nullptr, menuPico.recorder(), loggedInUsername);
                     page = AppPage::Menu;
                     cv::namedWindow(winName, cv::WINDOW_NORMAL);
                     cv::resizeWindow(winName, 900, 640);
@@ -747,10 +748,22 @@ int main(int argc, char **argv) {
                         menuError = "Label frontend failed: " + detail;
                     }
                 }
-                if(uiButton(ui, b6, "Logout", fm)) {
+                if(uiButton(ui, b6, "QC", fm)) {
+                    stopPlaceholderMode();
+                    std::string detail;
+                    if(launchQcFrontend(baseCfg.taskBackend.baseUrl, loggedInUsername, &detail)) {
+                        menuError.clear();
+                        menuNotice = "QC frontend opened. Log: " + detail;
+                    }
+                    else {
+                        menuNotice.clear();
+                        menuError = "QC frontend failed: " + detail;
+                    }
+                }
+                if(uiButton(ui, b7, "Logout", fm)) {
                     logout();
                 }
-                if(uiButton(ui, b7, "Exit Application", fm)) {
+                if(uiButton(ui, b8, "Exit Application", fm)) {
                     stopPlaceholderMode();
                     running = false;
                 }

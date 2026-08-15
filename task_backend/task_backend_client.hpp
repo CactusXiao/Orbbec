@@ -69,6 +69,7 @@ public:
     bool reserveEpisode(const std::string &clientId,
                         const std::string &subjectId,
                         const std::string &taskName,
+                        const std::string &operatorId,
                         TaskEpisodeReservation &reservationOut,
                         std::string *errorMessage = nullptr) const;
 
@@ -80,12 +81,14 @@ public:
                         double durationSeconds,
                         int frameCount,
                         const std::string &idempotencyKey,
+                        const std::string &operatorId,
                         std::vector<TaskBackendTask> &tasksOut,
                         std::string *errorMessage = nullptr) const;
 
     bool releaseEpisode(const std::string &reservationId,
                         const std::string &subjectId,
                         const std::string &taskName,
+                        const std::string &operatorId,
                         std::string *errorMessage = nullptr) const;
 
     bool getUploadStatus(const std::string &episodeId,

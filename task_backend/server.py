@@ -667,6 +667,17 @@ def parse_nonnegative_int(value: Any) -> Optional[int]:
     return parsed
 
 
+def operator_id_from_payload(payload: Dict[str, Any], fallback: str = "") -> str:
+    return str(
+        payload.get("operator_id")
+        or payload.get("operator")
+        or payload.get("username")
+        or payload.get("user")
+        or fallback
+        or ""
+    ).strip()
+
+
 def format_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "-"
@@ -1299,6 +1310,7 @@ class TaskBackend:
         client_id = str(payload.get("client_id", "")).strip()
         subject_id = str(payload.get("subject_id", "")).strip()
         task_name = str(payload.get("task_name", "")).strip()
+        operator_id = operator_id_from_payload(payload, subject_id)
         if not client_id or not subject_id or not task_name:
             raise BackendError(HTTPStatus.BAD_REQUEST, "client_id, subject_id, and task_name are required")
         task = self.tasks_by_name.get(task_name)
@@ -1320,6 +1332,8 @@ class TaskBackend:
                 "reservation_id": reservation_id,
                 "client_id": client_id,
                 "subject_id": subject_id,
+                "operator_id": operator_id,
+                "reserved_by": operator_id,
                 "task_name": task_name,
                 "episode_number": episode_number,
                 "status": "reserved",
@@ -1340,6 +1354,7 @@ class TaskBackend:
         task_name = str(payload.get("task_name", "")).strip()
         idempotency_key = str(payload.get("idempotency_key", "")).strip()
         collection_path = str(payload.get("collection_path", "")).strip()
+        operator_id = operator_id_from_payload(payload, subject_id)
         try:
             episode_number = int(payload.get("episode_number"))
         except (TypeError, ValueError):
@@ -1358,6 +1373,11 @@ class TaskBackend:
                 reservation = subject["reservations"].get(reservation_id)
                 if reservation is None:
                     raise BackendError(HTTPStatus.NOT_FOUND, "reservation not found for idempotency_key")
+                if operator_id and reservation.get("status") == "confirmed":
+                    reservation["operator_id"] = operator_id
+                    reservation["confirmed_by"] = operator_id
+                    reservation["updated_at"] = now_iso()
+                    self._workflow_hook("record_collection_confirm", reservation)
                 return progress_payload(subject_id, subject, self.tasks, state)
 
             reservation = subject["reservations"].get(reservation_id)
@@ -1374,11 +1394,18 @@ class TaskBackend:
                 if previous_key and previous_key != idempotency_key:
                     raise BackendError(HTTPStatus.CONFLICT, "reservation already confirmed with another idempotency_key")
                 subject["idempotency"][idempotency_key] = reservation_id
+                if operator_id:
+                    reservation["operator_id"] = operator_id
+                    reservation["confirmed_by"] = operator_id
+                    reservation["updated_at"] = now_iso()
+                    self._workflow_hook("record_collection_confirm", reservation)
                 return progress_payload(subject_id, subject, self.tasks, state)
 
             reservation["status"] = "confirmed"
             reservation["confirmed_at"] = now_iso()
             reservation["updated_at"] = now_iso()
+            reservation["operator_id"] = operator_id
+            reservation["confirmed_by"] = operator_id
             reservation["idempotency_key"] = idempotency_key
             reservation["collection_path"] = collection_path
             duration_seconds = parse_nonnegative_float(payload.get("duration_seconds", payload.get("duration_sec")))
@@ -1395,6 +1422,7 @@ class TaskBackend:
         reservation_id = str(payload.get("reservation_id", "")).strip()
         subject_id = str(payload.get("subject_id", "")).strip()
         task_name = str(payload.get("task_name", "")).strip()
+        operator_id = operator_id_from_payload(payload, subject_id)
         if not reservation_id or not subject_id:
             raise BackendError(HTTPStatus.BAD_REQUEST, "reservation_id and subject_id are required")
 
@@ -1409,6 +1437,7 @@ class TaskBackend:
                 reservation["status"] = "released"
                 reservation["released_at"] = now_iso()
                 reservation["updated_at"] = now_iso()
+                reservation["released_by"] = operator_id
                 released = True
                 self._workflow_hook("record_collection_release", reservation)
             else:
@@ -1984,6 +2013,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     stats = item.get("stats", {})
     workflow = model.get("workflow") or {}
     workflow_episode = workflow.get("episode") if isinstance(workflow.get("episode"), dict) else {}
+    workflow_metadata = workflow_episode.get("metadata") if isinstance(workflow_episode.get("metadata"), dict) else {}
     upload = workflow.get("upload") if isinstance(workflow.get("upload"), dict) else {}
     upload_available = bool(upload.get("available")) if isinstance(upload, dict) else False
     upload_status = str(upload.get("status") or ("queued" if upload_available else "not queued")) if isinstance(upload, dict) else "not queued"
@@ -2028,17 +2058,25 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         text = str(value if value is not None else "").strip()
         return text or fallback
 
+    def first_value(*values: Any, fallback: str = "-") -> str:
+        for value in values:
+            text = str(value if value is not None else "").strip()
+            if text:
+                return text
+        return fallback
+
     def uri_cell(value: Any) -> str:
         text = compact_value(value)
         return f"<span class=\"mono\">{html_escape(text)}</span>"
 
-    def flow_row(step: str, stage_status: str, updated_at: Any, detail: Any, artifact: Any = "") -> str:
+    def flow_row(step: str, stage_status: str, updated_at: Any, detail: Any, artifact: Any = "", operator: Any = "") -> str:
         artifact_html = uri_cell(artifact) if compact_value(artifact) != "-" else "<span class=\"muted\">-</span>"
         return (
             "<tr>"
             f"<td>{html_escape(step)}</td>"
             f"<td>{render_status_badge(stage_status)}</td>"
             f"<td class=\"mono\">{html_escape(compact_value(updated_at))}</td>"
+            f"<td>{html_escape(compact_value(operator))}</td>"
             f"<td>{html_escape(compact_value(detail))}</td>"
             f"<td>{artifact_html}</td>"
             "</tr>"
@@ -2065,6 +2103,31 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     segment_total = sum(segment_counts.values())
     segment_ready = segment_counts.get("mano_succeeded", 0)
     segment_pending = segment_counts.get("pending_manual", 0) + segment_counts.get("manual_labeling", 0) + segment_counts.get("mano_queued", 0) + segment_counts.get("mano_running", 0)
+
+    segment_operator_values = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        operator_text = first_value(metadata.get("operator_id"), segment.get("operator_id"), segment.get("lease_owner"), fallback="")
+        if operator_text:
+            segment_operator_values.append(operator_text)
+    last_segment_operator = segment_operator_values[-1] if segment_operator_values else ""
+    collection_operator = first_value(
+        workflow_metadata.get("collection_operator_id"),
+        workflow_metadata.get("collection_confirmed_by"),
+        item.get("confirmed_by"),
+        item.get("operator_id"),
+        item.get("subject_id"),
+        fallback="",
+    )
+    qc_operator = first_value(workflow_metadata.get("qc_operator_id"), qc_job.get("operator_id") if qc_job else "", fallback="")
+    manual_operator = first_value(
+        workflow_metadata.get("manual_correction_operator_id"),
+        workflow_metadata.get("manual_label_operator_id"),
+        last_segment_operator,
+        fallback="",
+    )
 
     if status == "released":
         capture_status = "released"
@@ -2107,12 +2170,13 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             f"<td>{render_status_badge(str(job.get('status') or '-'))}</td>"
             f"<td class=\"num\">{html_escape(scope_label)}</td>"
             f"<td class=\"num\">{html_escape(frames_label)}</td>"
+            f"<td class=\"mono\">{html_escape(job.get('operator_id') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(job.get('lease_owner') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(job.get('updated_at') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(error or '-')}</td>"
             "</tr>"
         )
-    workflow_jobs_html = "\n".join(job_rows) if job_rows else "<tr><td colspan=\"8\" class=\"empty\">No workflow jobs yet.</td></tr>"
+    workflow_jobs_html = "\n".join(job_rows) if job_rows else "<tr><td colspan=\"9\" class=\"empty\">No workflow jobs yet.</td></tr>"
     artifact_rows = []
     for artifact in workflow_artifacts:
         if not isinstance(artifact, dict):
@@ -2136,6 +2200,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         frame_range = f"{segment.get('start_frame', '-')}-{segment.get('end_frame', '-')}"
         metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
         reason = str(metadata.get("reason") or metadata.get("label") or "")
+        operator_id = first_value(metadata.get("operator_id"), segment.get("operator_id"), segment.get("lease_owner"), fallback="-")
         error = str(segment.get("error") or "")
         segment_rows.append(
             "<tr>"
@@ -2143,7 +2208,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             f"<td class=\"num\">{html_escape(frame_range)}</td>"
             f"<td>{render_status_badge(str(segment.get('status') or '-'))}</td>"
             f"<td>{html_escape(reason or '-')}</td>"
-            f"<td class=\"mono\">{html_escape(segment.get('lease_owner') or '-')}</td>"
+            f"<td class=\"mono\">{html_escape(operator_id)}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('manual_2d_uri') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('mano_patch_uri') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(error or '-')}</td>"
@@ -2167,6 +2232,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             item.get("confirmed_at") or item.get("updated_at") or item.get("created_at"),
             f"{item.get('subject_id', '-')} / episode {item.get('episode_number', '-')}",
             collection_path,
+            collection_operator,
         ),
         flow_row(
             "2. 上传到 NAS",
@@ -2174,6 +2240,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             upload.get("updated_at") if isinstance(upload, dict) else "",
             f"{upload_phase} {upload_percent_label} | {upload_files_done}/{upload_files_total} files",
             upload_nas_uri,
+            "",
         ),
         flow_row(
             "3. 自动 2D 标注",
@@ -2181,6 +2248,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             auto_job.get("updated_at") if auto_job else "",
             auto_job.get("job_id") if auto_job else "waiting for push",
             auto_artifact.get("uri") if auto_artifact else "",
+            "",
         ),
         flow_row(
             "4. Episode MANO 优化",
@@ -2188,6 +2256,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             mano_job.get("updated_at") if mano_job else "",
             mano_job.get("job_id") if mano_job else "waiting for auto label",
             mano_episode_artifact.get("uri") if mano_episode_artifact else "",
+            "",
         ),
         flow_row(
             "5. QC 质检",
@@ -2195,6 +2264,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             qc_job.get("updated_at") if qc_job else "",
             qc_job.get("job_id") if qc_job else "waiting for MANO",
             qc_report_artifact.get("uri") if qc_report_artifact else "",
+            qc_operator,
         ),
         flow_row(
             "6. 人工纠偏 / 最终 3D",
@@ -2202,6 +2272,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             workflow_info.get("updated_at") or workflow_episode.get("updated_at") or item.get("updated_at"),
             correction_detail,
             final_manifest_uri,
+            manual_operator,
         ),
     ]
 
@@ -2212,6 +2283,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ("采集状态", status),
         ("采集时长", stats.get("duration_label", "-")),
         ("帧数", stats.get("frame_count_label", "-")),
+        ("采集操作员", collection_operator or "-"),
         ("本地大小", stats.get("storage_label", "-")),
         ("本地路径", collection_path or "-"),
         ("创建时间", item.get("created_at") or "-"),
@@ -2245,6 +2317,8 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ("失败分段数", segment_total),
         ("已完成纠偏分段", segment_ready),
         ("待处理纠偏分段", segment_pending),
+        ("QC 操作员", qc_operator or "-"),
+        ("最后纠偏人", manual_operator or "-"),
         ("更新时间", workflow_info.get("updated_at") or workflow_episode.get("updated_at") or "-"),
     ]
     workflow_html = "".join(
@@ -2289,7 +2363,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + "<section><h2>当前流程</h2><div class=\"actions top-actions\">"
         + render_push_auto_label_form(f"/episodes/{url_part(reservation_id)}/push-auto-label", {"episode_id": reservation_id}, "推送自动标注")
         + "</div><div class=\"wide\"><table>"
-        "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>说明</th><th>关键路径 / 产物</th></tr></thead><tbody>"
+        "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>操作员</th><th>说明</th><th>关键路径 / 产物</th></tr></thead><tbody>"
         + "\n".join(flow_rows)
         + "</tbody></table></div></section>"
         "<section><h2>采集信息</h2><div class=\"kv\">"
@@ -2306,13 +2380,13 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + artifacts_html
         + "</tbody></table></div></section>"
         "<section><h2>QC 失败分段 / 人工纠偏</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>原因</th><th>Lease Owner</th>"
+        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>原因</th><th>操作员</th>"
         "<th>Manual 2D</th><th>MANO Patch</th><th>Error</th></tr></thead><tbody>"
         + segments_html
         + "</tbody></table></div></section>"
         "<section><h2>Workflow Jobs</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Job</th><th>Type</th><th>Status</th><th class=\"num\">Scope</th>"
-        "<th class=\"num\">Frames</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
+        "<th class=\"num\">Frames</th><th>操作员</th><th>Owner</th><th>Updated</th><th>Error</th></tr></thead><tbody>"
         + workflow_jobs_html
         + "</tbody></table></div></section>"
         "<section><h2>任务定义快照</h2><div class=\"kv\">"

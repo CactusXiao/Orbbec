@@ -80,6 +80,20 @@ def _short_summary(value: Any, limit: int = 220) -> str:
     return text[: max(0, limit - 3)] + "..."
 
 
+def _human_operator_id(*sources: Any) -> str:
+    for source in sources:
+        if isinstance(source, Mapping):
+            for key in ("operator_id", "operator", "completed_by", "confirmed_by", "username", "user"):
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
+        else:
+            value = str(source or "").strip()
+            if value:
+                return value
+    return ""
+
+
 def _new_id(prefix: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9_]+", "_", str(prefix or "item").strip().lower()).strip("_")
     return f"{clean or 'item'}_{uuid.uuid4().hex[:12]}"
@@ -149,6 +163,7 @@ def _optional_int(value: Any) -> Optional[int]:
 def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(job.get("payload") or {})
     result = dict(job.get("result") or {})
+    operator_id = _human_operator_id(result)
     out = {
         "job_id": str(job.get("job_id") or ""),
         "type": str(job.get("type") or ""),
@@ -161,6 +176,8 @@ def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "scope": str(payload.get("scope") or payload.get("label_scope") or payload.get("mano_scope") or ""),
         "frames": len(payload.get("frames") or []) if isinstance(payload.get("frames"), list) else None,
     }
+    if operator_id:
+        out["operator_id"] = operator_id
     if result.get("error"):
         out["error"] = str(result.get("error") or "")
     return out
@@ -723,6 +740,7 @@ class JobService:
             "operator_id": result.get("operator_id") or segment.get("lease_owner") or "",
             "frames_completed": result.get("frames_completed") or [],
         }
+        operator_id = _human_operator_id(metadata)
         updated = self.store.complete_segment_manual(
             segment_id=segment_id,
             manual_2d_uri=manual_uri,
@@ -730,6 +748,16 @@ class JobService:
             cleanup_manifest=cleanup_manifest,
             metadata=metadata,
         )
+        if operator_id:
+            self.store.update_episode_status(
+                episode_id,
+                "manual_correction_running",
+                {
+                    "manual_label_operator_id": operator_id,
+                    "manual_correction_operator_id": operator_id,
+                    "last_human_operator_id": operator_id,
+                },
+            )
         self._create_mano_segment_job(updated, result)
         self._refresh_final_3d_sources_manifest(episode_id, "manual_segment_completed")
         return self.enrich_segment(self.store.get_segment(segment_id) or updated)
@@ -762,6 +790,9 @@ class JobService:
         result = json_object(body.get("result"), "result")
         if not result:
             result = {k: v for k, v in body.items() if k not in {"artifacts", "artifact"}}
+        operator_id = _human_operator_id(body, result)
+        if operator_id:
+            result["operator_id"] = operator_id
         job, changed = self.store.complete_job(job_id=job_id, result=result)
         if changed:
             self._after_job_complete(job, result, self._artifacts_from_body(body))
@@ -787,6 +818,7 @@ class JobService:
         return enriched
 
     def record_collection_reservation(self, reservation: Dict[str, Any]) -> None:
+        operator_id = _human_operator_id(reservation, reservation.get("subject_id"))
         self.store.create_or_update_episode(
             episode_id=str(reservation.get("reservation_id") or ""),
             subject_id=str(reservation.get("subject_id") or ""),
@@ -796,6 +828,7 @@ class JobService:
             metadata={
                 "reservation_id": reservation.get("reservation_id"),
                 "client_id": reservation.get("client_id"),
+                "collection_reserved_by": operator_id,
                 "source": "collection_api",
             },
         )
@@ -804,6 +837,7 @@ class JobService:
         episode_id = str(reservation.get("reservation_id") or "")
         collection_path = str(reservation.get("collection_path") or "")
         frame_count = _optional_int(reservation.get("frame_count"))
+        operator_id = _human_operator_id(reservation, reservation.get("subject_id"))
         self.store.create_or_update_episode(
             episode_id=episode_id,
             subject_id=str(reservation.get("subject_id") or ""),
@@ -817,6 +851,9 @@ class JobService:
                 "reservation_id": reservation.get("reservation_id"),
                 "client_id": reservation.get("client_id"),
                 "idempotency_key": reservation.get("idempotency_key"),
+                "collection_operator_id": operator_id,
+                "collection_confirmed_by": operator_id,
+                "last_human_operator_id": operator_id,
                 "source": "collection_api",
             },
         )
@@ -1034,6 +1071,7 @@ class JobService:
         artifacts = self.store.artifacts_for_episode(episode_id) if episode_id else []
         payload = dict(job.get("payload") or {})
         result = dict(job.get("result") or {})
+        operator_id = _human_operator_id(result)
         job_type = str(job.get("type") or "")
         relevant_artifacts = self._relevant_artifacts_for_job(job_type, artifacts)
         frames = payload.get("frames")
@@ -1056,6 +1094,7 @@ class JobService:
             "episode_index": episode_index,
             "episode_status": str((episode or {}).get("status") or ""),
             "lease_owner": str(job.get("lease_owner") or ""),
+            "operator_id": operator_id,
             "lease_until": lease_until,
             "lease_expired": lease_expired,
             "created_at": str(job.get("created_at") or ""),
@@ -1078,6 +1117,8 @@ class JobService:
         episode = self.store.get_episode(episode_id) if episode_id else None
         lease_until = str(segment.get("lease_until") or "")
         status = str(segment.get("status") or "")
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        operator_id = _human_operator_id(metadata)
         lease_expired = bool(lease_until and lease_until <= now and status == "manual_labeling")
         start_frame = _optional_int(segment.get("start_frame")) or 0
         end_frame = _optional_int(segment.get("end_frame")) or start_frame
@@ -1108,6 +1149,7 @@ class JobService:
             "episode_index": (episode or {}).get("episode_index"),
             "episode_status": str((episode or {}).get("status") or ""),
             "lease_owner": str(segment.get("lease_owner") or ""),
+            "operator_id": operator_id,
             "lease_until": lease_until,
             "lease_expired": lease_expired,
             "created_at": str(segment.get("created_at") or ""),
@@ -1182,6 +1224,7 @@ class JobService:
             return
         job_type = str(job.get("type") or "")
         payload = dict(job.get("payload") or {})
+        operator_id = _human_operator_id(result)
         for artifact in artifacts:
             self._register_artifact_from_payload(episode_id, artifact)
 
@@ -1228,6 +1271,11 @@ class JobService:
                 self._refresh_final_3d_sources_manifest(episode_id, "mano_episode_completed")
                 self._create_qc_job_from_existing_episode(episode_id, result)
         elif job_type == "qc":
+            qc_operator_metadata = (
+                {"qc_operator_id": operator_id, "last_human_operator_id": operator_id}
+                if operator_id
+                else {}
+            )
             if not any(str(artifact.get("kind") or "") == "qc_report" for artifact in artifacts):
                 self._register_default_qc_report(episode_id, job, result)
             result_type = str(result.get("result_type") or result.get("qc_result_type") or "").strip().lower()
@@ -1245,20 +1293,21 @@ class JobService:
                         "qc_status": "bad_episode",
                         "bad_episode_job_id": job.get("job_id"),
                         "bad_episode_reason": str(result.get("reason") or result.get("abnormal_reason") or "bad_episode"),
+                        **qc_operator_metadata,
                     },
                 )
                 return
             passed = _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed"))
             if passed:
-                self.store.update_episode_status(episode_id, "finalized", {"qc_status": "passed"})
+                self.store.update_episode_status(episode_id, "finalized", {"qc_status": "passed", **qc_operator_metadata})
                 self._refresh_final_3d_sources_manifest(episode_id, "qc_passed")
             else:
-                self.store.update_episode_status(episode_id, "qc_failed", {"qc_status": "failed"})
+                self.store.update_episode_status(episode_id, "qc_failed", {"qc_status": "failed", **qc_operator_metadata})
                 created = self._create_segments_from_qc_failure(episode_id, job, result)
                 self.store.update_episode_status(
                     episode_id,
                     "manual_correction_pending",
-                    {"qc_status": "failed", "failed_segment_count": len(created)},
+                    {"qc_status": "failed", "failed_segment_count": len(created), **qc_operator_metadata},
                 )
                 self._refresh_final_3d_sources_manifest(episode_id, "qc_failed")
         elif job_type == "review":
@@ -1271,7 +1320,12 @@ class JobService:
                     uri=uri_join(str(payload.get("episode_uri")), "manual_2d"),
                     metadata={"source_job_id": job.get("job_id")},
                 )
-            self.store.update_episode_status(episode_id, "manual_labeled")
+            manual_metadata = (
+                {"manual_label_operator_id": operator_id, "last_human_operator_id": operator_id}
+                if operator_id
+                else {}
+            )
+            self.store.update_episode_status(episode_id, "manual_labeled", manual_metadata)
 
     def _after_job_fail(self, job: Dict[str, Any], error: str, result: Dict[str, Any]) -> None:
         episode_id = str(job.get("episode_id") or "")
@@ -1593,6 +1647,7 @@ class JobService:
             metadata={
                 "source_job_id": job.get("job_id"),
                 "passed": _truthy_bool(result.get("passed") if "passed" in result else result.get("qc_passed")),
+                "operator_id": _human_operator_id(result),
             },
         )
 

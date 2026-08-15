@@ -284,6 +284,7 @@ class QcWorkerApp(tk.Tk):
             bad_episode=bad_episode,
             sample_interval=progress.sample_interval,
         )
+        result["operator_id"] = self.config.operator_id
         self.qc_page.set_busy("正在提交 QC 结果...")
 
         def work() -> Tuple[bool, Optional[str]]:
@@ -300,11 +301,12 @@ class QcWorkerApp(tk.Tk):
                         "metadata": {
                             "passed": bool(result.get("passed")),
                             "worker_id": self.config.worker_machine_id,
+                            "operator_id": self.config.operator_id,
                             "result_type": result.get("result_type"),
                         },
                     }
                 ]
-                self.client.complete_qc_job(progress.job_id, result=result, artifacts=artifacts)
+                self.client.complete_qc_job(progress.job_id, result=result, artifacts=artifacts, operator_id=self.config.operator_id)
                 self.state_store.delete(progress)
                 cleanup_qc_cache(media.cache_dir)
                 return True, None

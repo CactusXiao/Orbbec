@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 from .state_store import now_iso
 
@@ -71,6 +71,7 @@ def write_qc_report(
         "segments": [{"start_frame": int(start), "end_frame": int(end)} for start, end in bad_ranges],
         "metrics": {},
         "worker_id": str(result.get("worker_id") or ""),
+        "operator_id": str(result.get("operator_id") or ""),
         "created_at": now_iso(),
     }
     fd, tmp_name = tempfile.mkstemp(prefix="qc_report_", suffix=".json", dir=str(qc_dir))

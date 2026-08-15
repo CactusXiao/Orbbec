@@ -79,8 +79,11 @@ class QcBackendClient:
         *,
         result: Dict[str, Any],
         artifacts: Optional[List[Dict[str, Any]]] = None,
+        operator_id: str = "",
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"result": dict(result or {})}
+        if operator_id:
+            payload["operator_id"] = str(operator_id)
         if artifacts:
             payload["artifacts"] = artifacts
         return self._post(f"/api/v1/jobs/{quote(str(job_id or ''), safe='')}/complete", payload)
@@ -157,4 +160,3 @@ def group_qc_items_by_task(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             group["oldest_created_at"] = created_at
         group["episodes"].append(item)
     return sorted(groups.values(), key=lambda item: (str(item.get("task_name") or ""), str(item.get("oldest_created_at") or "")))
-

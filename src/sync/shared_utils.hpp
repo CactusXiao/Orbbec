@@ -256,4 +256,8 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
                                const std::string &operatorHint,
                                std::string *errorMessage = nullptr);
 
+bool launchQcFrontend(const std::string &backendUrl,
+                      const std::string &operatorHint,
+                      std::string *errorMessage = nullptr);
+
 }  // namespace sync_app
