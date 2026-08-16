@@ -112,7 +112,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         self.assertIn("5. 人工纠偏 / Segment 3D / 最终 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
 
-    def test_nas_uploader_queues_auto_label_after_upload(self) -> None:
+    def test_nas_uploader_always_queues_auto_label_after_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             source = tmp_path / "captures" / "S001" / "pick_object" / "episode_1"
@@ -126,7 +126,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             nas_root = tmp_path / "nas"
             nas_prefix = "nas://ego-test"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
-            service = JobService(store, nas_mounts={nas_prefix: str(nas_root)})
+            service = JobService(store, auto_label_after_upload=False, nas_mounts={nas_prefix: str(nas_root)})
             service.record_collection_confirm(
                 {
                     "reservation_id": "reservation_001",

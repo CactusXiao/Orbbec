@@ -2875,16 +2875,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     nas_mounts = env_json_object(env, "ORBBEC_NAS_MOUNTS_JSON")
     nas_mounts.setdefault(nas_uri_prefix.rstrip("/"), str(nas_root))
-    auto_label_after_upload = env_bool(
-        env,
-        True,
-        "ORBBEC_AUTO_LABEL_AFTER_UPLOAD",
-        "TASK_BACKEND_AUTO_LABEL_AFTER_UPLOAD",
-    )
     workflow_store = WorkflowStore(workflow_db)
     workflow_service = JobService(
         workflow_store,
-        auto_label_after_upload=auto_label_after_upload,
         nas_mounts=nas_mounts,
     )
     nas_uploader = NasUploader(
@@ -2902,7 +2895,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
     print(f"[task-backend] setup_registry={registry.registry_file}", file=sys.stderr)
     print(f"[task-backend] workflow_db={workflow_db}", file=sys.stderr)
-    print(f"[task-backend] auto_label_after_upload={'enabled' if auto_label_after_upload else 'disabled'} auto_label_scope=episode", file=sys.stderr)
+    print("[task-backend] auto_label_after_upload=always auto_label_scope=episode", file=sys.stderr)
     print(f"[task-backend] nas={'enabled' if nas_enabled else 'disabled'} root={nas_root} uri={nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] nas_mounts={nas_mounts}", file=sys.stderr)
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)

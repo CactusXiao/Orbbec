@@ -227,7 +227,7 @@ class JobService:
         nas_mounts: Optional[Mapping[str, Any]] = None,
     ):
         self.store = store
-        self.auto_label_after_upload = bool(auto_label_after_upload)
+        self.auto_label_after_upload = True
         self.nas_mounts = _normalize_nas_mounts(nas_mounts)
 
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1255,8 +1255,7 @@ class JobService:
                     },
                 )
             self.store.update_episode_status(episode_id, "uploaded")
-            if self.auto_label_after_upload:
-                self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
+            self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
             if not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts) and payload.get("episode_uri"):
                 self.store.register_artifact(
