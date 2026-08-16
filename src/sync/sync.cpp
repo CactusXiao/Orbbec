@@ -739,7 +739,7 @@ int main(int argc, char **argv) {
                 if(uiButton(ui, b5, "Label", fm)) {
                     stopPlaceholderMode();
                     std::string detail;
-                    if(launchManualLabelFrontend(baseCfg.taskBackend.baseUrl, loggedInUsername, &detail)) {
+                    if(launchManualLabelFrontend(baseCfg, loggedInUsername, &detail)) {
                         menuError.clear();
                         menuNotice = "Label frontend opened. Log: " + detail;
                     }
@@ -751,7 +751,7 @@ int main(int argc, char **argv) {
                 if(uiButton(ui, b6, "QC", fm)) {
                     stopPlaceholderMode();
                     std::string detail;
-                    if(launchQcFrontend(baseCfg.taskBackend.baseUrl, loggedInUsername, &detail)) {
+                    if(launchQcFrontend(baseCfg, loggedInUsername, &detail)) {
                         menuError.clear();
                         menuNotice = "QC frontend opened. Log: " + detail;
                     }

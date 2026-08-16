@@ -180,7 +180,84 @@ static std::optional<fs::path> findQcRepoRoot() {
     return findRepoRootContaining(fs::path("src") / "qc" / "main.py");
 }
 
-bool launchManualLabelFrontend(const std::string &backendUrl,
+static fs::path defaultTempPath(const std::string &filename) {
+    try {
+        return fs::temp_directory_path() / filename;
+    }
+    catch(...) {
+        return fs::path(filename);
+    }
+}
+
+static bool ensureParentDirectory(const fs::path &path, std::string *errorMessage) {
+    const fs::path parent = path.parent_path();
+    if(parent.empty()) {
+        return true;
+    }
+    try {
+        fs::create_directories(parent);
+    }
+    catch(const std::exception &e) {
+        if(errorMessage) {
+            *errorMessage = "failed to create directory " + parent.string() + ": " + e.what();
+        }
+        return false;
+    }
+    return true;
+}
+
+static std::string normalizedNasPrefix(std::string value) {
+    value = trimString(std::move(value));
+    while(value.size() > 1 && value.back() == '/') {
+        value.pop_back();
+    }
+    return value;
+}
+
+static void addNasMountsConfig(cJSON *root, const NasConfig &nas) {
+    cJSON *mounts = cJSON_CreateObject();
+    if(nas.enabled) {
+        const std::string prefix = normalizedNasPrefix(nas.uriPrefix);
+        const std::string mountPath = trimString(nas.mountPath.string());
+        if(!prefix.empty() && !mountPath.empty()) {
+            cJSON_AddStringToObject(mounts, prefix.c_str(), mountPath.c_str());
+        }
+    }
+    cJSON_AddItemToObject(root, "nas_mounts", mounts);
+}
+
+static bool writeJsonConfigFile(cJSON *root, const fs::path &path, std::string *errorMessage) {
+    if(!ensureParentDirectory(path, errorMessage)) {
+        return false;
+    }
+    char *printed = cJSON_Print(root);
+    if(!printed) {
+        if(errorMessage) {
+            *errorMessage = "failed to serialize launch config";
+        }
+        return false;
+    }
+    std::ofstream out(path, std::ios::binary);
+    if(!out) {
+        if(errorMessage) {
+            *errorMessage = "failed to open launch config for writing: " + path.string();
+        }
+        cJSON_free(printed);
+        return false;
+    }
+    out << printed << "\n";
+    const bool ok = static_cast<bool>(out);
+    cJSON_free(printed);
+    if(!ok) {
+        if(errorMessage) {
+            *errorMessage = "failed to write launch config: " + path.string();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool launchManualLabelFrontend(const AppConfig &cfg,
                                const std::string &operatorHint,
                                std::string *errorMessage) {
     const auto repoRoot = findManualLabelRepoRoot();
@@ -191,10 +268,12 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
         return false;
     }
 
-    const char *pythonEnv = std::getenv("ORBBEC_LABEL_PYTHON");
-    const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
-    const char *operatorEnv = std::getenv("ORBBEC_LABEL_OPERATOR_ID");
-    std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
+    const auto &frontend = cfg.frontends.label;
+    std::string python = trimString(frontend.pythonExecutable);
+    if(python.empty()) {
+        python = "python3";
+    }
+    std::string operatorId = trimString(frontend.operatorId);
     if(operatorId.empty()) {
         operatorId = trimString(operatorHint);
     }
@@ -202,20 +281,37 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
         operatorId = "labeler_01";
     }
 
-    fs::path logPath;
-    try {
-        logPath = fs::temp_directory_path() / "orbbec_manual_label.log";
+    const fs::path logPath = frontend.logPath.empty() ? defaultTempPath("orbbec_manual_label.log") : frontend.logPath;
+    if(!ensureParentDirectory(logPath, errorMessage)) {
+        return false;
     }
-    catch(...) {
-        logPath = "orbbec_manual_label.log";
+
+    const fs::path launchConfigPath = defaultTempPath("orbbec_manual_label_config.json");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "backend_url", trimString(cfg.taskBackend.baseUrl).c_str());
+    cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    if(!frontend.frameCacheDir.empty()) {
+        cJSON_AddStringToObject(root, "frame_cache_dir", frontend.frameCacheDir.string().c_str());
+    }
+    std::string ffmpegExecutable = trimString(frontend.ffmpegExecutable);
+    if(ffmpegExecutable.empty()) {
+        ffmpegExecutable = "ffmpeg";
+    }
+    cJSON_AddStringToObject(root, "ffmpeg_executable", ffmpegExecutable.c_str());
+    cJSON_AddNumberToObject(root, "lease_seconds", std::max(1, frontend.leaseSeconds));
+    cJSON_AddNumberToObject(root, "request_timeout_seconds", std::max(1.0, frontend.requestTimeoutSeconds));
+    addNasMountsConfig(root, cfg.taskBackend.nas);
+    const bool wroteConfig = writeJsonConfigFile(root, launchConfigPath, errorMessage);
+    cJSON_Delete(root);
+    if(!wroteConfig) {
+        return false;
     }
 
     std::ostringstream cmd;
     cmd << "cd " << shellQuote(repoRoot->string())
-        << " && ORBBEC_TASK_BACKEND_URL=" << shellQuote(trimString(backendUrl))
-        << " ORBBEC_LABEL_OPERATOR_ID=" << shellQuote(operatorId)
-        << " nohup " << shellQuote(python)
-        << " -m label.main >> " << shellQuote(logPath.string())
+        << " && nohup " << shellQuote(python)
+        << " -m label.main --config " << shellQuote(launchConfigPath.string())
+        << " >> " << shellQuote(logPath.string())
         << " 2>&1 &";
 
     const int rc = std::system(cmd.str().c_str());
@@ -231,7 +327,7 @@ bool launchManualLabelFrontend(const std::string &backendUrl,
     return true;
 }
 
-bool launchQcFrontend(const std::string &backendUrl,
+bool launchQcFrontend(const AppConfig &cfg,
                       const std::string &operatorHint,
                       std::string *errorMessage) {
     const auto repoRoot = findQcRepoRoot();
@@ -242,10 +338,12 @@ bool launchQcFrontend(const std::string &backendUrl,
         return false;
     }
 
-    const char *pythonEnv = std::getenv("ORBBEC_QC_PYTHON");
-    const std::string python = trimString(pythonEnv ? pythonEnv : "python3");
-    const char *operatorEnv = std::getenv("ORBBEC_QC_OPERATOR_ID");
-    std::string operatorId = trimString(operatorEnv ? operatorEnv : "");
+    const auto &frontend = cfg.frontends.qc;
+    std::string python = trimString(frontend.pythonExecutable);
+    if(python.empty()) {
+        python = "python3";
+    }
+    std::string operatorId = trimString(frontend.operatorId);
     if(operatorId.empty()) {
         operatorId = trimString(operatorHint);
     }
@@ -253,20 +351,40 @@ bool launchQcFrontend(const std::string &backendUrl,
         operatorId = "qc_operator_01";
     }
 
-    fs::path logPath;
-    try {
-        logPath = fs::temp_directory_path() / "orbbec_qc_frontend.log";
+    const fs::path logPath = frontend.logPath.empty() ? defaultTempPath("orbbec_qc_frontend.log") : frontend.logPath;
+    if(!ensureParentDirectory(logPath, errorMessage)) {
+        return false;
     }
-    catch(...) {
-        logPath = "orbbec_qc_frontend.log";
+
+    std::string workerMachineId = trimString(frontend.workerMachineId);
+    if(workerMachineId.empty()) {
+        workerMachineId = "qc_" + operatorId;
+    }
+
+    const fs::path launchConfigPath = defaultTempPath("orbbec_qc_frontend_config.json");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "backend_url", trimString(cfg.taskBackend.baseUrl).c_str());
+    cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    cJSON_AddStringToObject(root, "worker_machine_id", workerMachineId.c_str());
+    cJSON_AddNumberToObject(root, "sample_interval", std::max(1, frontend.sampleInterval));
+    cJSON_AddNumberToObject(root, "default_lease_minutes", std::max(1, frontend.defaultLeaseMinutes));
+    cJSON_AddNumberToObject(root, "crash_lease_extension_minutes", std::max(1, frontend.crashLeaseExtensionMinutes));
+    cJSON_AddStringToObject(root, "tmp_dir", frontend.tmpDir.string().c_str());
+    cJSON_AddStringToObject(root, "state_dir", frontend.stateDir.string().c_str());
+    cJSON_AddNumberToObject(root, "range_merge_gap_frames", std::max(0, frontend.rangeMergeGapFrames));
+    cJSON_AddNumberToObject(root, "request_timeout_seconds", std::max(1.0, frontend.requestTimeoutSeconds));
+    addNasMountsConfig(root, cfg.taskBackend.nas);
+    const bool wroteConfig = writeJsonConfigFile(root, launchConfigPath, errorMessage);
+    cJSON_Delete(root);
+    if(!wroteConfig) {
+        return false;
     }
 
     std::ostringstream cmd;
     cmd << "cd " << shellQuote(repoRoot->string())
-        << " && QC_BACKEND_URL=" << shellQuote(trimString(backendUrl))
-        << " ORBBEC_QC_OPERATOR_ID=" << shellQuote(operatorId)
-        << " nohup " << shellQuote(python)
-        << " -m src.qc.main >> " << shellQuote(logPath.string())
+        << " && nohup " << shellQuote(python)
+        << " -m src.qc.main --config " << shellQuote(launchConfigPath.string())
+        << " >> " << shellQuote(logPath.string())
         << " 2>&1 &";
 
     const int rc = std::system(cmd.str().c_str());
@@ -694,6 +812,33 @@ AppConfig loadConfig(const fs::path &configPath) {
             if(auto v = getString(voiceObj, "command")) {
                 cfg.voiceFeedback.command = trimString(*v);
             }
+            if(auto v = getString(voiceObj, "voice")) {
+                cfg.voiceFeedback.voice = trimString(*v);
+            }
+            else if(auto v = getString(voiceObj, "ttsVoice")) {
+                cfg.voiceFeedback.voice = trimString(*v);
+            }
+            if(cfg.voiceFeedback.voice.empty()) {
+                cfg.voiceFeedback.voice = "zh-CN-XiaoxiaoNeural";
+            }
+            if(auto v = getString(voiceObj, "rate")) {
+                cfg.voiceFeedback.rate = trimString(*v);
+            }
+            else if(auto v = getString(voiceObj, "ttsRate")) {
+                cfg.voiceFeedback.rate = trimString(*v);
+            }
+            if(auto v = getString(voiceObj, "pitch")) {
+                cfg.voiceFeedback.pitch = trimString(*v);
+            }
+            else if(auto v = getString(voiceObj, "ttsPitch")) {
+                cfg.voiceFeedback.pitch = trimString(*v);
+            }
+            if(auto v = getBool(voiceObj, "naturalOnly")) {
+                cfg.voiceFeedback.naturalOnly = *v;
+            }
+            else if(auto v = getBool(voiceObj, "disableMechanicalFallback")) {
+                cfg.voiceFeedback.naturalOnly = *v;
+            }
             if(auto *messagesObj = cJSON_GetObjectItemCaseSensitive(voiceObj, "messages")) {
                 if(cJSON_IsObject(messagesObj)) {
                     cJSON *item = nullptr;
@@ -767,6 +912,90 @@ AppConfig loadConfig(const fs::path &configPath) {
     }
     if(cfg.taskBackend.baseUrl.empty()) {
         cfg.taskBackend.baseUrl = "http://127.0.0.1:8765";
+    }
+
+    if(auto *frontendsObj = cJSON_GetObjectItemCaseSensitive(root, "frontends")) {
+        if(cJSON_IsObject(frontendsObj)) {
+            if(auto *labelObj = cJSON_GetObjectItemCaseSensitive(frontendsObj, "label")) {
+                if(cJSON_IsObject(labelObj)) {
+                    if(auto v = getString(labelObj, "pythonExecutable")) {
+                        cfg.frontends.label.pythonExecutable = trimString(*v);
+                    }
+                    else if(auto v = getString(labelObj, "python")) {
+                        cfg.frontends.label.pythonExecutable = trimString(*v);
+                    }
+                    if(auto v = getString(labelObj, "operatorId")) {
+                        cfg.frontends.label.operatorId = trimString(*v);
+                    }
+                    if(auto v = getString(labelObj, "logPath")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.label.logPath = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getString(labelObj, "frameCacheDir")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.label.frameCacheDir = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getString(labelObj, "ffmpegExecutable")) {
+                        cfg.frontends.label.ffmpegExecutable = trimString(*v);
+                    }
+                    if(auto v = getInt(labelObj, "leaseSeconds")) {
+                        cfg.frontends.label.leaseSeconds = std::max(1, *v);
+                    }
+                    if(auto v = getDouble(labelObj, "requestTimeoutSeconds")) {
+                        cfg.frontends.label.requestTimeoutSeconds = std::max(1.0, *v);
+                    }
+                    else if(auto v = getInt(labelObj, "requestTimeoutMs")) {
+                        cfg.frontends.label.requestTimeoutSeconds = std::max(1.0, static_cast<double>(*v) / 1000.0);
+                    }
+                }
+            }
+            if(auto *qcObj = cJSON_GetObjectItemCaseSensitive(frontendsObj, "qc")) {
+                if(cJSON_IsObject(qcObj)) {
+                    if(auto v = getString(qcObj, "pythonExecutable")) {
+                        cfg.frontends.qc.pythonExecutable = trimString(*v);
+                    }
+                    else if(auto v = getString(qcObj, "python")) {
+                        cfg.frontends.qc.pythonExecutable = trimString(*v);
+                    }
+                    if(auto v = getString(qcObj, "operatorId")) {
+                        cfg.frontends.qc.operatorId = trimString(*v);
+                    }
+                    if(auto v = getString(qcObj, "logPath")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.qc.logPath = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getInt(qcObj, "sampleInterval")) {
+                        cfg.frontends.qc.sampleInterval = std::max(1, *v);
+                    }
+                    if(auto v = getInt(qcObj, "defaultLeaseMinutes")) {
+                        cfg.frontends.qc.defaultLeaseMinutes = std::max(1, *v);
+                    }
+                    if(auto v = getInt(qcObj, "crashLeaseExtensionMinutes")) {
+                        cfg.frontends.qc.crashLeaseExtensionMinutes = std::max(1, *v);
+                    }
+                    if(auto v = getString(qcObj, "tmpDir")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.qc.tmpDir = value.empty() ? fs::path("./tmp") : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getString(qcObj, "stateDir")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.qc.stateDir = value.empty() ? fs::path("./qc_state") : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getString(qcObj, "workerMachineId")) {
+                        cfg.frontends.qc.workerMachineId = trimString(*v);
+                    }
+                    if(auto v = getInt(qcObj, "rangeMergeGapFrames")) {
+                        cfg.frontends.qc.rangeMergeGapFrames = std::max(0, *v);
+                    }
+                    if(auto v = getDouble(qcObj, "requestTimeoutSeconds")) {
+                        cfg.frontends.qc.requestTimeoutSeconds = std::max(1.0, *v);
+                    }
+                    else if(auto v = getInt(qcObj, "requestTimeoutMs")) {
+                        cfg.frontends.qc.requestTimeoutSeconds = std::max(1.0, static_cast<double>(*v) / 1000.0);
+                    }
+                }
+            }
+        }
     }
 
     if(auto *saveObj = cJSON_GetObjectItemCaseSensitive(root, "save")) {

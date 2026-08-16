@@ -1433,9 +1433,10 @@ def write_mano_artifact_for_payload(
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> Tuple[str, str]:
     episode_uri = str(payload.get("episode_uri") or "")
+    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
     if not episode_uri.startswith(nas.uri_prefix):
-        raise BackendError(f"mano_opt requires episode_uri under configured NAS prefix: {episode_uri}")
-    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
+        label = "segment mano_opt" if scope == "segment" else "episode 3d"
+        raise BackendError(f"{label} requires episode_uri under configured NAS prefix: {episode_uri}")
     segment_id = str(payload.get("segment_id") or "")
     if scope == "segment":
         return "mano_segment_patch", nas.write_mano_segment_patch(episode_uri, segment_id, cameras, frames, rgb_path_template)
@@ -1670,12 +1671,37 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
         hand_gt_detector_for_args(args),
         rgb_path_template=rgb_path_template,
     )
+    mano_kind, mano_uri = write_mano_artifact_for_payload(
+        nas,
+        payload,
+        episode,
+        cameras,
+        frames,
+        rgb_path_template=rgb_path_template,
+    )
     client.complete_job(
         str(job["job_id"]),
-        {"ok": True, "model": "virtual_hand2d", "frames_predicted": frames, "virtual_worker": owner},
-        artifacts=[{"kind": "pred_2d", "metadata": {"worker_id": owner, "mock": True}}],
+        {
+            "ok": True,
+            "model": "virtual_hand2d_plus_episode_3d",
+            "frames_predicted": frames,
+            "frames_optimized": frames,
+            "mano_3d_uri": mano_uri,
+            "virtual_worker": owner,
+        },
+        artifacts=[
+            {"kind": "pred_2d", "metadata": {"worker_id": owner, "mock": True}},
+            {"kind": mano_kind, "metadata": {"worker_id": owner, "mock": False, "scope": "episode"}},
+        ],
     )
-    print_event("auto_label_completed", job_id=job["job_id"], episode_id=payload.get("episode_id"), pred_uri=pred_uri, next_job="queued_by_backend")
+    print_event(
+        "auto_label_episode_3d_completed",
+        job_id=job["job_id"],
+        episode_id=payload.get("episode_id"),
+        pred_uri=pred_uri,
+        mano_uri=mano_uri,
+        next_job="qc_queued_by_backend",
+    )
     return True
 
 
@@ -1689,12 +1715,14 @@ def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argpars
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
+    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
+    if scope != "segment":
+        raise BackendError(f"mano-opt worker only supports segment scope after workflow merge: {job.get('job_id')}")
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
         frames = frames[: args.max_materialized_frames]
     kind, uri = write_mano_artifact_for_payload(nas, payload, episode, cameras, frames)
-    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode")
     client.complete_job(
         str(job["job_id"]),
         {

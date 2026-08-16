@@ -24,6 +24,12 @@ def _ensure_utf8_env() -> None:
 
 def main() -> None:
     _ensure_utf8_env()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", help="Path to the QC launch config JSON.")
+    args = parser.parse_args()
+
     try:
         from .app import QcWorkerApp
         from .config import load_qc_config
@@ -31,10 +37,9 @@ def main() -> None:
         from app import QcWorkerApp  # type: ignore
         from config import load_qc_config  # type: ignore
 
-    app = QcWorkerApp(load_qc_config())
+    app = QcWorkerApp(load_qc_config(config_path=args.config))
     app.mainloop()
 
 
 if __name__ == "__main__":
     main()
-

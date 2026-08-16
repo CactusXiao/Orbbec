@@ -255,10 +255,11 @@ def session_from_lease(
     operator_id: str,
     mounts: Optional[Mapping[str, str]] = None,
     lease_seconds: int = 600,
+    timeout_seconds: float = 10.0,
     task_name: str = "",
     episode_id: str = "",
 ) -> LabelJobSession:
-    client = LabelBackendClient(backend_url)
+    client = LabelBackendClient(backend_url, timeout_seconds=timeout_seconds)
     response = client.lease_label_segment(
         operator_id,
         lease_seconds=lease_seconds,

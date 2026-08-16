@@ -108,7 +108,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         self.assertIn("qc_user", html)
         self.assertIn("labeler", html)
         self.assertIn("1. 采集预约 / 确认", html)
-        self.assertIn("6. 人工纠偏 / 最终 3D", html)
+        self.assertIn("3. 自动标注 + Episode 3D", html)
+        self.assertIn("5. 人工纠偏 / Segment 3D / 最终 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
 
     def test_nas_uploader_queues_auto_label_after_upload(self) -> None:
@@ -178,26 +179,18 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 auto_job["job_id"],
                 {
                     "result": {"ok": True},
-                    "artifacts": [{"kind": "pred_2d", "metadata": {"mock": True}}],
-                },
-            )
-            self.assertEqual(store.get_episode("episode_pass")["status"], "auto_labeled")  # type: ignore[index]
-            self.assertEqual(store.jobs_for_episode("episode_pass", "qc"), [])
-
-            mano_jobs = store.jobs_for_episode("episode_pass", "mano_opt")
-            self.assertEqual(len(mano_jobs), 1)
-            self.assertEqual(mano_jobs[0]["payload"]["scope"], "episode")
-            service.complete_job(
-                mano_jobs[0]["job_id"],
-                {
-                    "result": {"ok": True},
-                    "artifacts": [{"kind": "mano_episode", "metadata": {"mock": True}}],
+                    "artifacts": [
+                        {"kind": "pred_2d", "metadata": {"mock": True}},
+                        {"kind": "mano_episode", "metadata": {"mock": True}},
+                    ],
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "mano_optimized")  # type: ignore[index]
+            self.assertEqual(store.jobs_for_episode("episode_pass", "mano_opt"), [])
 
             qc_jobs = store.jobs_for_episode("episode_pass", "qc")
             self.assertEqual(len(qc_jobs), 1)
+            self.assertEqual(qc_jobs[0]["payload"]["reason"], "auto_label_episode_3d_succeeded")
             service.complete_job(
                 qc_jobs[0]["job_id"],
                 {
@@ -516,8 +509,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         service.push_auto_label({"episode_id": episode_id, "pushed_by": "smoke"})
         for auto_job in store.jobs_for_episode(episode_id, "auto_label"):
             service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
-        mano_job = store.jobs_for_episode(episode_id, "mano_opt")[0]
-        service.complete_job(mano_job["job_id"], {"result": {"ok": True}})
+        self.assertEqual(store.jobs_for_episode(episode_id, "mano_opt"), [])
 
 
 if __name__ == "__main__":

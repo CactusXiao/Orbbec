@@ -1,93 +1,97 @@
 from __future__ import annotations
 
-import os
-import re
+import getpass
+import json
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
-
-try:
-    from .backend_client import parse_mounts_json
-except Exception:
-    from backend_client import parse_mounts_json
+from typing import Any, Dict, Mapping, Optional
 
 
-def strip_env_comment(value: str) -> str:
-    in_single = False
-    in_double = False
-    escaped = False
-    for idx, ch in enumerate(value):
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\" and in_double:
-            escaped = True
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            continue
-        if ch == "#" and not in_single and not in_double and (idx == 0 or value[idx - 1].isspace()):
-            return value[:idx].rstrip()
-    return value.strip()
+@dataclass(frozen=True)
+class LabelConfig:
+    backend_url: str = "http://127.0.0.1:8765"
+    operator_id: str = "labeler_01"
+    frame_cache_dir: Optional[Path] = None
+    ffmpeg_executable: str = "ffmpeg"
+    lease_seconds: int = 600
+    request_timeout_seconds: float = 10.0
+    nas_mounts: Dict[str, str] = field(default_factory=dict)
 
 
-def unquote_env_value(value: str) -> str:
-    value = strip_env_comment(value.strip())
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        inner = value[1:-1]
-        if value[0] == '"':
-            inner = inner.replace(r"\\", "\\").replace(r"\"", '"')
-        return inner
-    return value
+def _string(value: Any, default: str = "") -> str:
+    text = str(value or "").strip()
+    return text if text else default
 
 
-def load_env_file(path: Path) -> Dict[str, str]:
-    if not path.exists() or not path.is_file():
+def _int(value: Any, default: int) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid integer config value: {value!r}") from exc
+
+
+def _float(value: Any, default: float) -> float:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid number config value: {value!r}") from exc
+
+
+def _mounts(value: Any) -> Dict[str, str]:
+    if value is None:
         return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("nas_mounts must be a JSON object")
     out: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, raw in enumerate(f, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            if "=" not in line:
-                raise ValueError(f"invalid .env line {line_no}: missing '='")
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-                raise ValueError(f"invalid .env line {line_no}: invalid key {key!r}")
-            out[key] = unquote_env_value(value)
+    for key, root in value.items():
+        prefix = str(key or "").strip().rstrip("/")
+        path = str(root or "").strip()
+        if prefix and path:
+            out[prefix] = path
     return out
 
 
-def default_label_env_path() -> Optional[Path]:
-    explicit = os.environ.get("ORBBEC_LABEL_ENV") or os.environ.get("ORBBEC_ENV_FILE")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    base = Path.cwd().expanduser().resolve()
-    for parent in (base, *base.parents):
-        candidate = parent / ".env"
-        if candidate.exists():
-            return candidate
-    repo_candidate = Path(__file__).resolve().parents[1] / ".env"
-    return repo_candidate if repo_candidate.exists() else None
+def _load_object(config_path: Optional[Path]) -> Dict[str, Any]:
+    if config_path is None:
+        return {}
+    path = Path(config_path).expanduser().resolve()
+    with path.open("r", encoding="utf-8") as f:
+        parsed = json.load(f)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Label config must be a JSON object: {path}")
+    return dict(parsed)
 
 
-def env_value(file_env: Dict[str, str], key: str) -> str:
-    return os.environ.get(key, "").strip() or str(file_env.get(key) or "").strip()
+def _config_base_dir(config_path: Optional[Path]) -> Path:
+    if config_path is None:
+        return Path.cwd().expanduser().resolve()
+    return Path(config_path).expanduser().resolve().parent
 
 
-def label_nas_mounts_from_env() -> Dict[str, str]:
-    env_path = default_label_env_path()
-    file_env = load_env_file(env_path) if env_path is not None else {}
-    raw = env_value(file_env, "ORBBEC_NAS_MOUNTS_JSON")
-    mounts = parse_mounts_json(raw) if raw else {}
-    prefix = env_value(file_env, "ORBBEC_NAS_URI_PREFIX").rstrip("/")
-    root = env_value(file_env, "ORBBEC_NAS_ROOT")
-    if prefix and root:
-        mounts.setdefault(prefix, root)
-    return mounts
+def _optional_path(value: Any, base_dir: Path) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def load_label_config(config_path: Optional[Path] = None) -> LabelConfig:
+    data = _load_object(config_path)
+    base_dir = _config_base_dir(config_path)
+    default_operator = getpass.getuser() or "labeler_01"
+    return LabelConfig(
+        backend_url=_string(data.get("backend_url"), "http://127.0.0.1:8765").rstrip("/"),
+        operator_id=_string(data.get("operator_id"), default_operator),
+        frame_cache_dir=_optional_path(data.get("frame_cache_dir"), base_dir),
+        ffmpeg_executable=_string(data.get("ffmpeg_executable"), "ffmpeg"),
+        lease_seconds=max(1, _int(data.get("lease_seconds"), 600)),
+        request_timeout_seconds=max(1.0, _float(data.get("request_timeout_seconds"), 10.0)),
+        nas_mounts=_mounts(data.get("nas_mounts")),
+    )

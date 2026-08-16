@@ -2,153 +2,10 @@ from __future__ import annotations
 
 import getpass
 import json
-import os
-import re
 import socket
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional
-
-
-def strip_env_comment(value: str) -> str:
-    in_single = False
-    in_double = False
-    escaped = False
-    for idx, ch in enumerate(value):
-        if escaped:
-            escaped = False
-            continue
-        if ch == "\\" and in_double:
-            escaped = True
-            continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            continue
-        if ch == "#" and not in_single and not in_double:
-            if idx == 0 or value[idx - 1].isspace():
-                return value[:idx].rstrip()
-    return value.strip()
-
-
-def unquote_env_value(value: str) -> str:
-    value = strip_env_comment(value.strip())
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
-        inner = value[1:-1]
-        if value[0] == '"':
-            inner = inner.replace(r"\\", "\\").replace(r"\"", '"')
-        return inner
-    return value
-
-
-def load_env_file(path: Path) -> Dict[str, str]:
-    if not path.exists() or not path.is_file():
-        return {}
-    out: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as f:
-        for line_no, raw in enumerate(f, 1):
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            if "=" not in line:
-                raise ValueError(f"invalid .env line {line_no}: missing '='")
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-                raise ValueError(f"invalid .env line {line_no}: invalid key {key!r}")
-            out[key] = unquote_env_value(value)
-    return out
-
-
-def _first(env: Dict[str, str], keys: Iterable[str], default: str = "") -> str:
-    for key in keys:
-        value = os.environ.get(key)
-        if value:
-            return value
-        value = env.get(key)
-        if value:
-            return value
-    return default
-
-
-def _int(env: Dict[str, str], keys: Iterable[str], default: int) -> int:
-    value = _first(env, keys, "")
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        joined = ", ".join(keys)
-        raise ValueError(f"invalid integer for {joined}: {value!r}") from exc
-
-
-def _float(env: Dict[str, str], keys: Iterable[str], default: float) -> float:
-    value = _first(env, keys, "")
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError as exc:
-        joined = ", ".join(keys)
-        raise ValueError(f"invalid number for {joined}: {value!r}") from exc
-
-
-def _path(env: Dict[str, str], keys: Iterable[str], default: str) -> Path:
-    raw = _first(env, keys, default)
-    return Path(raw).expanduser().resolve()
-
-
-def _json_object(env: Dict[str, str], keys: Iterable[str]) -> Dict[str, str]:
-    raw = _first(env, keys, "")
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        joined = ", ".join(keys)
-        raise ValueError(f"invalid JSON object for {joined}: {exc}") from exc
-    if not isinstance(parsed, dict):
-        joined = ", ".join(keys)
-        raise ValueError(f"{joined} must be a JSON object")
-    out: Dict[str, str] = {}
-    for key, value in parsed.items():
-        prefix = str(key or "").strip().rstrip("/")
-        root = str(value or "").strip()
-        if prefix and root:
-            out[prefix] = root
-    return out
-
-
-def _nas_mounts(env: Dict[str, str]) -> Dict[str, str]:
-    mounts = _json_object(env, ("ORBBEC_NAS_MOUNTS_JSON",))
-    prefix = _first(env, ("ORBBEC_NAS_URI_PREFIX",), "").strip().rstrip("/")
-    root = _first(env, ("ORBBEC_NAS_ROOT",), "").strip()
-    if prefix and root:
-        mounts.setdefault(prefix, root)
-    return mounts
-
-
-def _default_worker_id() -> str:
-    host = socket.gethostname() or "unknown-host"
-    user = getpass.getuser() or "user"
-    return f"qc_{host}_{user}"
-
-
-def _default_env_path(cwd: Optional[Path]) -> Optional[Path]:
-    explicit = os.environ.get("QC_ENV_FILE") or os.environ.get("ORBBEC_QC_ENV")
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    base = (cwd or Path.cwd()).expanduser().resolve()
-    for parent in (base, *base.parents):
-        candidate = parent / ".env"
-        if candidate.exists():
-            return candidate
-    repo_candidate = Path(__file__).resolve().parents[2] / ".env"
-    return repo_candidate if repo_candidate.exists() else None
+from typing import Any, Dict, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -174,21 +31,92 @@ class QcConfig:
         return max(1, int(self.crash_lease_extension_minutes) * 60)
 
 
-def load_qc_config(*, cwd: Optional[Path] = None) -> QcConfig:
-    env_path = _default_env_path(cwd)
-    file_env = load_env_file(env_path) if env_path is not None else {}
+def _default_worker_id() -> str:
+    host = socket.gethostname() or "unknown-host"
+    user = getpass.getuser() or "user"
+    return f"qc_{host}_{user}"
+
+
+def _read_config(config_path: Optional[Path]) -> Dict[str, Any]:
+    if config_path is None:
+        return {}
+    path = Path(config_path).expanduser().resolve()
+    with path.open("r", encoding="utf-8") as f:
+        parsed = json.load(f)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"QC config must be a JSON object: {path}")
+    return dict(parsed)
+
+
+def _base_dir(config_path: Optional[Path], cwd: Optional[Path]) -> Path:
+    if config_path is not None:
+        return Path(config_path).expanduser().resolve().parent
+    return (cwd or Path.cwd()).expanduser().resolve()
+
+
+def _string(data: Mapping[str, Any], key: str, default: str = "") -> str:
+    value = str(data.get(key) or "").strip()
+    return value if value else default
+
+
+def _int(data: Mapping[str, Any], key: str, default: int) -> int:
+    value = data.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid integer for {key}: {value!r}") from exc
+
+
+def _float(data: Mapping[str, Any], key: str, default: float) -> float:
+    value = data.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid number for {key}: {value!r}") from exc
+
+
+def _path(data: Mapping[str, Any], key: str, default: str, base_dir: Path) -> Path:
+    raw = str(data.get(key) or default).strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _mounts(data: Mapping[str, Any]) -> Dict[str, str]:
+    raw = data.get("nas_mounts")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("nas_mounts must be a JSON object")
+    out: Dict[str, str] = {}
+    for key, root in raw.items():
+        prefix = str(key or "").strip().rstrip("/")
+        path = str(root or "").strip()
+        if prefix and path:
+            out[prefix] = path
+    return out
+
+
+def load_qc_config(*, config_path: Optional[Path] = None, cwd: Optional[Path] = None) -> QcConfig:
+    data = _read_config(config_path)
+    base = _base_dir(config_path, cwd)
     config = QcConfig(
-        backend_url=_first(file_env, ("QC_BACKEND_URL", "ORBBEC_BACKEND_URL", "TASK_BACKEND_URL"), "http://127.0.0.1:8765").rstrip("/"),
-        sample_interval=max(1, _int(file_env, ("QC_SAMPLE_INTERVAL",), 10)),
-        default_lease_minutes=max(1, _int(file_env, ("QC_DEFAULT_LEASE_MINUTES",), 10)),
-        crash_lease_extension_minutes=max(1, _int(file_env, ("QC_CRASH_LEASE_EXTENSION_MINUTES",), 10)),
-        tmp_dir=_path(file_env, ("QC_TMP_DIR",), "./tmp"),
-        state_dir=_path(file_env, ("QC_STATE_DIR",), "./qc_state"),
-        worker_machine_id=_first(file_env, ("QC_WORKER_MACHINE_ID",), _default_worker_id()),
-        operator_id=_first(file_env, ("ORBBEC_QC_OPERATOR_ID", "QC_OPERATOR_ID", "ORBBEC_LABEL_OPERATOR_ID"), getpass.getuser() or "qc_operator"),
-        range_merge_gap_frames=max(0, _int(file_env, ("QC_RANGE_MERGE_GAP_FRAMES",), 5)),
-        request_timeout_seconds=max(1.0, _float(file_env, ("QC_BACKEND_TIMEOUT_SECONDS",), 10.0)),
-        nas_mounts=_nas_mounts(file_env),
+        backend_url=_string(data, "backend_url", "http://127.0.0.1:8765").rstrip("/"),
+        sample_interval=max(1, _int(data, "sample_interval", 10)),
+        default_lease_minutes=max(1, _int(data, "default_lease_minutes", 10)),
+        crash_lease_extension_minutes=max(1, _int(data, "crash_lease_extension_minutes", 10)),
+        tmp_dir=_path(data, "tmp_dir", "./tmp", base),
+        state_dir=_path(data, "state_dir", "./qc_state", base),
+        worker_machine_id=_string(data, "worker_machine_id", _default_worker_id()),
+        operator_id=_string(data, "operator_id", getpass.getuser() or "qc_operator"),
+        range_merge_gap_frames=max(0, _int(data, "range_merge_gap_frames", 5)),
+        request_timeout_seconds=max(1.0, _float(data, "request_timeout_seconds", 10.0)),
+        nas_mounts=_mounts(data),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

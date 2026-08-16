@@ -8,12 +8,11 @@ import subprocess
 import tempfile
 import threading
 import unittest
-from unittest import mock
 from pathlib import Path
 from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
-from label.env_config import label_nas_mounts_from_env
+from label.env_config import load_label_config
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
 from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
@@ -24,26 +23,35 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
-    def test_label_app_derives_mount_from_parent_env_file(self) -> None:
+    def test_label_app_loads_mount_from_launch_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            child = tmp_path / "nested" / "label"
-            child.mkdir(parents=True)
             nas_root = tmp_path / "nas"
-            (tmp_path / ".env").write_text(
-                f"ORBBEC_NAS_ROOT={nas_root}\nORBBEC_NAS_URI_PREFIX=nas://ego\n",
+            config_path = tmp_path / "label_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "backend_url": "http://127.0.0.1:9999",
+                        "operator_id": "labeler_a",
+                        "frame_cache_dir": "label_cache",
+                        "ffmpeg_executable": "/usr/local/bin/ffmpeg",
+                        "lease_seconds": 300,
+                        "request_timeout_seconds": 3.5,
+                        "nas_mounts": {"nas://ego": str(nas_root)},
+                    }
+                ),
                 encoding="utf-8",
             )
 
-            old_cwd = Path.cwd()
-            try:
-                os.chdir(child)
-                with mock.patch.dict(os.environ, {}, clear=True):
-                    mounts = label_nas_mounts_from_env()
-            finally:
-                os.chdir(old_cwd)
+            config = load_label_config(config_path)
 
-            self.assertEqual(mounts, {"nas://ego": str(nas_root)})
+            self.assertEqual(config.backend_url, "http://127.0.0.1:9999")
+            self.assertEqual(config.operator_id, "labeler_a")
+            self.assertEqual(config.frame_cache_dir, (tmp_path / "label_cache").resolve())
+            self.assertEqual(config.ffmpeg_executable, "/usr/local/bin/ffmpeg")
+            self.assertEqual(config.lease_seconds, 300)
+            self.assertEqual(config.request_timeout_seconds, 3.5)
+            self.assertEqual(config.nas_mounts, {"nas://ego": str(nas_root)})
 
     def test_mano_source_projects_episode_3d_result(self) -> None:
         try:

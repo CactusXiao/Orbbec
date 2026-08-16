@@ -277,7 +277,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 "scope": "episode",
             }
 
-            with self.assertRaisesRegex(BackendError, "mano_opt requires episode_uri under configured NAS prefix"):
+            with self.assertRaisesRegex(BackendError, "episode 3d requires episode_uri under configured NAS prefix"):
                 write_mano_artifact_for_payload(nas, payload, None, ["00", "01"], [0])
 
     def test_auto_label_worker_decodes_h265_only_episode(self) -> None:
@@ -288,6 +288,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
             nas_root = tmp_path / "nas"
             nas_prefix = "nas://orbbec-test"
             episode_dir = nas_root / "S001" / "pick_object" / "episode_video"
+            self._write_camera_calibration(episode_dir, ["00"], width=32, height=24)
             if not self._write_h265_rgb_video(episode_dir / "00" / "RGB", frames=3, frame_offset=10):
                 self.skipTest("ffmpeg cannot create h265 fixture")
 
@@ -327,6 +328,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 )
                 self.assertTrue(handle_auto_label_once(client, nas, args))
                 self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())
+                self.assertTrue((episode_dir / "mano" / "episode" / "joints_3d.npy").exists())
                 self.assertFalse((episode_dir / "00" / "RGB" / "00000.png").exists())
             finally:
                 server.shutdown()
@@ -401,9 +403,12 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
 
                 self.assertTrue(handle_auto_label_once(client, nas, args))
                 self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())
-                self.assertTrue(handle_mano_opt_once(client, nas, args))
                 self.assertTrue((episode_dir / "mano" / "episode" / "joints_3d.npy").exists())
                 self.assertFalse((episode_dir / "mano" / "episode" / "projected_2d").exists())
+                self.assertEqual(
+                    [job for job in store.jobs_for_episode("episode_full", "mano_opt") if job["payload"].get("scope") != "segment"],
+                    [],
+                )
 
                 random.seed(7)
                 self.assertTrue(handle_qc_once(client, nas, args))

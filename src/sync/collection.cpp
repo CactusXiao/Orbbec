@@ -1263,6 +1263,55 @@ private:
         });
     }
 
+    static std::string commandMessage(const std::string &message) {
+        return "printf '%s\\n' " + shellQuote("[collection][voice] " + message) + " >&2";
+    }
+
+    std::string buildMechanicalChineseFallback(const std::string &qText) const {
+        return "if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- " + qText + "; "
+               "elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin " + qText + "; "
+               "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 " + qText + "; "
+               "elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 " + qText + "; "
+               "else false; fi";
+    }
+
+    std::string buildNaturalChineseCommand(const std::string &qText) const {
+        const std::string voice = trimString(cfg_.voice).empty() ? "zh-CN-XiaoxiaoNeural" : trimString(cfg_.voice);
+        const std::string rate = trimString(cfg_.rate);
+        const std::string pitch = trimString(cfg_.pitch);
+
+        std::ostringstream cmd;
+        cmd << "(tmp=$(mktemp /tmp/orbbec-voice.XXXXXX.mp3); rm -f \"$tmp\"; "
+            << "cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; "
+            << "play_voice(){ "
+            << "if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet \"$1\"; "
+            << "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video \"$1\"; "
+            << "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q \"$1\"; "
+            << "else return 1; fi; "
+            << "}; "
+            << "run_edge_tts(){ "
+            << "if command -v edge-tts >/dev/null 2>&1; then edge-tts \"$@\"; "
+            << "elif command -v python3 >/dev/null 2>&1 && python3 -c 'import edge_tts' >/dev/null 2>&1; then python3 -m edge_tts \"$@\"; "
+            << "else return 127; fi; "
+            << "}; "
+            << "if run_edge_tts --voice " << shellQuote(voice);
+        if(!rate.empty()) {
+            cmd << " --rate " << shellQuote(rate);
+        }
+        if(!pitch.empty()) {
+            cmd << " --pitch " << shellQuote(pitch);
+        }
+        cmd << " --text " << qText << " --write-media \"$tmp\" >/dev/null 2>&1 && play_voice \"$tmp\"; then exit 0; fi; ";
+        if(cfg_.naturalOnly) {
+            cmd << commandMessage("natural Chinese TTS failed. Install edge-tts and ffmpeg: python3 -m pip install --user edge-tts; sudo apt install ffmpeg")
+                << "; exit 1)";
+        }
+        else {
+            cmd << "rm -f \"$tmp\"; " << buildMechanicalChineseFallback(qText) << ")";
+        }
+        return cmd.str();
+    }
+
     std::string buildBeepCommand() const {
 #if defined(__APPLE__)
         return "(if command -v osascript >/dev/null 2>&1; then osascript -e 'beep 1'; else printf '\\a'; fi)";
@@ -1304,24 +1353,8 @@ private:
         cmd << qText << "; fi";
         return cmd.str();
 #else
-        const std::string naturalChineseTts =
-            "(tmp=$(mktemp /tmp/orbbec-voice.XXXXXX.mp3); rm -f \"$tmp\"; "
-            "play_voice(){ "
-            "if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet \"$1\"; "
-            "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video \"$1\"; "
-            "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q \"$1\"; "
-            "else return 1; fi; "
-            "}; "
-            "if command -v edge-tts >/dev/null 2>&1 "
-            "&& edge-tts --voice zh-CN-XiaoxiaoNeural --text " + qText + " --write-media \"$tmp\" >/dev/null 2>&1 "
-            "&& play_voice \"$tmp\"; then rm -f \"$tmp\"; exit 0; fi; "
-            "rm -f \"$tmp\"; "
-            "if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- " + qText + "; "
-            "elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin " + qText + "; "
-            "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 " + qText + "; "
-            "elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 " + qText + "; fi)";
         if(containsNonAscii(text)) {
-            return naturalChineseTts;
+            return buildNaturalChineseCommand(qText);
         }
         return "(if command -v spd-say >/dev/null 2>&1 && spd-say -w -- " + qText + "; then :; "
                "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -s 155 " + qText + "; "

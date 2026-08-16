@@ -9,18 +9,19 @@
     "filters": {
         "_filter_comment": "preset: Default/Hand/High Accuracy/High Density/Medium Density/Custom",
         "preset": "Default",
-        "point_cloud_decimation_factor": 1,
+        "smooth_threshold": 0,
+        "point_cloud_decimation_factor": 2,
         "decimation_filter_scale": 0,
-        "noise_removal_filter_max_size": 0,
-        "noise_removal_filter_min_diff": 0,
+        "noise_removal_filter_max_size": 80,
+        "noise_removal_filter_min_diff": 256,
         "spatial_filter_alpha": 0,
-        "spatial_filter_disp_diff": 0,
+        "spatial_filter_disp_diff": 0.5,
         "spatial_filter_magnitude": 0,
         "spatial_filter_radius": 0,
         "temporal_filter_diff_scale": 0,
         "temporal_filter_weight": 0,
         "hole_filling_filter_mode": 0,
-        "desk_crop": true
+        "desk_crop": false
     },
     "calibration": {
         "samplesPerPair": 20,
@@ -32,7 +33,7 @@
     },
     "extrinsicHealthCheck": {
         "_comment": "Multi-camera AprilTag extrinsic consistency check after READY and before Start. Python needs opencv-contrib-python.",
-        "enabled": true,
+        "enabled": false,
         "pythonExecutable": "python3",
         "scriptPath": "extrinsic_health_check.py",
         "tagFamily": "tag36h11",
@@ -48,17 +49,17 @@
         "requireAllCameras": true,
         "minSharedCamerasPerTag": 2,
         "minTagInlierObservations": 2,
-        "minCheckedCameras": 3,
-        "minTagsPerCamera": 2,
-        "minPassingSnapshots": 3,
+        "minCheckedCameras": 2,
+        "minTagsPerCamera": 1,
+        "minPassingSnapshots": 1,
         "minFailingSnapshots": 2,
         "singleTagReprojLimitPx": 4.0,
-        "fusionTransThreshM": 0.08,
-        "fusionRotThreshDeg": 8.0,
-        "warnTransThreshM": 0.015,
+        "fusionTransThreshM": 0.01,
+        "fusionRotThreshDeg": 2.0,
+        "warnTransThreshM": 0.004,
         "warnRotThreshDeg": 1.0,
-        "warnReprojThreshPx": 5.0,
-        "failTransThreshM": 0.025,
+        "warnReprojThreshPx": 4.0,
+        "failTransThreshM": 0.008,
         "failRotThreshDeg": 2.0,
         "failReprojThreshPx": 8.0
     },
@@ -67,9 +68,8 @@
     "maxFrames": 1000,
     "collectFps": 30,
     "enableSync": true,
-    "colorExposureMs": 0.8,
     "colorBrightness": -1,
-    "colorCloudRgbFrameOffset": -1,
+    "colorCloudRgbFrameOffset": 0,
     "queueCapacity": 1024,
     "writerThreads": 0,
     "recordQueueCapacity": 1024,
@@ -91,6 +91,31 @@
             "sharePath": "//192.168.50.177/ego",
             "mountPath": "/mnt/nas",
             "uriPrefix": "nas://ego"
+        }
+    },
+    "frontends": {
+        "_comment": "Programs launched by the main UI. These settings are written to an explicit launch config and passed with --config; Label/QC do not read env for these values.",
+        "label": {
+            "pythonExecutable": "python3",
+            "operatorId": "",
+            "logPath": "../../logs/orbbec_manual_label.log",
+            "frameCacheDir": "../../tmp/label_rgb_frames",
+            "ffmpegExecutable": "ffmpeg",
+            "leaseSeconds": 600,
+            "requestTimeoutSeconds": 10.0
+        },
+        "qc": {
+            "pythonExecutable": "python3",
+            "operatorId": "",
+            "logPath": "../../logs/orbbec_qc_frontend.log",
+            "sampleInterval": 10,
+            "defaultLeaseMinutes": 10,
+            "crashLeaseExtensionMinutes": 10,
+            "tmpDir": "../../tmp/qc",
+            "stateDir": "../../qc_state",
+            "workerMachineId": "qc_machine_01",
+            "rangeMergeGapFrames": 5,
+            "requestTimeoutSeconds": 10.0
         }
     },
     "voiceFeedback": {
@@ -125,23 +150,23 @@
         }
     },
     "save": {
-        "rgbEncoding": "image",
-        "depthEncoding": "png",
+        "rgbEncoding": "h265",
+        "depthEncoding": "ffv1_mkv",
         "saveRaw": false,
         "colorExt": "jpg",
         "jpegQuality": 90,
         "pngCompression": 1,
         "h265Ext": "h265",
         "_h265_comment": "h265EncoderMode: software/hardware. h265Codec can be libx265, hevc_nvenc, nvenc_hevc, hevc_vaapi, hevc_qsv, or hevc_v4l2m2m. On this Ubuntu machine, hevc_nvenc is the recommended hardware encoder if NVIDIA driver is available.",
-        "h265EncoderMode": "software",
-        "h265Codec": "",
+        "h265EncoderMode": "hardware",
+        "h265Codec": "hevc_vaapi",
         "h265HwDevice": "/dev/dri/renderD128",
         "h265LogLevel": "info",
         "h265Preset": "medium",
         "h265Crf": 23,
         "h265Threads": 0,
-        "h265QueueCapacity": 90,
-        "depthFfv1QueueCapacity": 90,
+        "h265QueueCapacity": 90000,
+        "depthFfv1QueueCapacity": 90000,
         "h265ThreadsByCamera": {
             "00": 4,
             "01": 4,
@@ -163,7 +188,7 @@
         "cameraParamsPath": "../../camera_info/ego_camera_params.json"
     },
     "fisheye": {
-        "_comment": "Fish-eye cameras bind to a physical device by uniqueId. If the configured node cannot stream, startup will probe sibling video-index nodes on the same camera. camera1 -> left hand, camera2 -> right hand.",
+        "_comment": "Fish-eye cameras are resolved by exact uniqueId only. camera1 -> left hand, camera2 -> right hand.",
         "enabled": true,
         "targetFps": 60,
         "maxBufferedSets": 4096,
@@ -188,10 +213,204 @@
             }
         ]
     },
-    
     "devices": [
         {
-            "sn": "AY3794F0038",
+            "sn": "CPCBC53000MZ",
+            "index": "02",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPC7B530009K",
+            "index": "06",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPC7B53000G8",
+            "index": "05",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPC7B53000BV",
+            "index": "03",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPC7B53000CJ",
+            "index": "04",
+            "syncConfig": {
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
+                "depthDelayUs": 0,
+                "colorDelayUs": 0,
+                "trigger2ImageDelayUs": 0,
+                "triggerOutEnable": true,
+                "triggerOutDelayUs": 0,
+                "framesPerTrigger": 1
+            },
+            "streams": [
+                {
+                    "type": "RGB",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "RGB",
+                    "enable": false
+                },
+                {
+                    "type": "DEPTH",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "Y16",
+                    "enable": false
+                },
+                {
+                    "type": "POINT_CLOUD",
+                    "width": 1920,
+                    "height": 1080,
+                    "fps": 30,
+                    "format": "PLY",
+                    "enable": true
+                }
+            ]
+        },
+        {
+            "sn": "CPCBC5300065",
             "index": "00",
             "syncConfig": {
                 "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_PRIMARY",
@@ -208,7 +427,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "MJPG",
+                    "format": "RGB",
                     "enable": false
                 },
                 {
@@ -216,7 +435,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "Y14",
+                    "format": "Y16",
                     "enable": false
                 },
                 {
@@ -230,14 +449,14 @@
             ]
         },
         {
-            "sn": "AY3794F0039",
+            "sn": "CPCBC53000M1",
             "index": "01",
             "syncConfig": {
-                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED",
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
-                "triggerOutEnable": false,
+                "triggerOutEnable": true,
                 "triggerOutDelayUs": 0,
                 "framesPerTrigger": 1
             },
@@ -247,7 +466,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "MJPG",
+                    "format": "RGB",
                     "enable": false
                 },
                 {
@@ -255,7 +474,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "Y14",
+                    "format": "Y16",
                     "enable": false
                 },
                 {
@@ -269,14 +488,14 @@
             ]
         },
         {
-            "sn": "CPCBC5300065",
-            "index": "02",
+            "sn": "CPCBC5300098",
+            "index": "07",
             "syncConfig": {
-                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY_SYNCED",
+                "syncMode": "OB_MULTI_DEVICE_SYNC_MODE_SECONDARY",
                 "depthDelayUs": 0,
                 "colorDelayUs": 0,
                 "trigger2ImageDelayUs": 0,
-                "triggerOutEnable": false,
+                "triggerOutEnable": true,
                 "triggerOutDelayUs": 0,
                 "framesPerTrigger": 1
             },
@@ -286,7 +505,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "MJPG",
+                    "format": "RGB",
                     "enable": false
                 },
                 {
@@ -294,7 +513,7 @@
                     "width": 640,
                     "height": 400,
                     "fps": 30,
-                    "format": "Y14",
+                    "format": "Y16",
                     "enable": false
                 },
                 {

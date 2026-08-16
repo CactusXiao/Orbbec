@@ -23,12 +23,20 @@ def _ensure_utf8_env() -> None:
 
 def main() -> None:
     _ensure_utf8_env()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", help="Path to the Label launch config JSON.")
+    args = parser.parse_args()
+
     try:
         from .app import LabelToolApp
+        from .env_config import load_label_config
     except Exception:
         from app import LabelToolApp
+        from env_config import load_label_config
 
-    app = LabelToolApp()
+    app = LabelToolApp(load_label_config(args.config))
     app.mainloop()
 
 

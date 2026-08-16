@@ -417,11 +417,11 @@ task source.
 
 The collection frontend also exposes a `Manual Label` button on the Collection
 Config page and the Task Select page. It launches the same `python3 -m
-label.main` GUI as a separate window and pre-fills the backend URL from the
-collection config. Set `ORBBEC_LABEL_OPERATOR_ID` or use the current
-`subject_id` as the operator hint. The backend leases each label segment with a
-single `episode_uri`; the label frontend resolves that NAS root through
-`ORBBEC_NAS_MOUNTS_JSON` and writes corrected 2D arrays to:
+label.main --config <path>` GUI as a separate window. The main app writes that
+launch config from `src/sync/config.json`, including backend URL, operator
+default, lease settings, and NAS mounts. The backend leases each label segment
+with a single `episode_uri`; the label frontend resolves that NAS root through
+the launch config's `nas_mounts` and writes corrected 2D arrays to:
 
 ```text
 manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy

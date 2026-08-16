@@ -23,6 +23,7 @@ def ensure_decoded_rgb_frames(
     payload: Optional[Mapping[str, Any]] = None,
     *,
     cache_root: Optional[Path] = None,
+    ffmpeg_executable: str = "ffmpeg",
 ) -> CorrectionTask:
     """Decode the RGB H265 episode videos needed by a backend label segment."""
     payload = payload or {}
@@ -49,6 +50,7 @@ def ensure_decoded_rgb_frames(
                 camera=cam,
                 frames=task.frames,
                 out_dir=episode_cache / cam,
+                ffmpeg_executable=ffmpeg_executable,
             )
             decoded_any = True
         except Exception as exc:
@@ -68,8 +70,7 @@ def _cache_base_dir(cache_root: Optional[Path]) -> Path:
     if cache_root is not None:
         base = Path(cache_root).expanduser()
     else:
-        raw = os.environ.get("ORBBEC_LABEL_FRAME_CACHE_DIR", "").strip()
-        base = Path(raw).expanduser() if raw else Path.home() / ".cache" / "orbbec_label" / "rgb_frames"
+        base = Path.home() / ".cache" / "orbbec_label" / "rgb_frames"
     base.mkdir(parents=True, exist_ok=True)
     return base.resolve()
 
@@ -168,6 +169,7 @@ def _decode_camera_frames(
     camera: str,
     frames: Sequence[int],
     out_dir: Path,
+    ffmpeg_executable: str = "ffmpeg",
 ) -> None:
     requested = sorted({int(frame) for frame in frames if not isinstance(frame, bool)})
     if not requested:
@@ -192,7 +194,12 @@ def _decode_camera_frames(
     missing.sort(key=lambda item: item[1])
     with tempfile.TemporaryDirectory(prefix=f"decode_{camera}_", dir=str(out_dir)) as tmp_name:
         tmp = Path(tmp_name)
-        _run_ffmpeg_select(video_path, [video_idx for _, video_idx in missing], tmp / "%06d.png")
+        _run_ffmpeg_select(
+            video_path,
+            [video_idx for _, video_idx in missing],
+            tmp / "%06d.png",
+            ffmpeg_executable=ffmpeg_executable,
+        )
         outputs = sorted(tmp.glob("*.png"))
         if len(outputs) != len(missing):
             raise RuntimeError(
@@ -205,8 +212,14 @@ def _decode_camera_frames(
             os.replace(tmp_target, target)
 
 
-def _run_ffmpeg_select(video_path: Path, video_indices: Sequence[int], output_pattern: Path) -> None:
-    ffmpeg = os.environ.get("ORBBEC_LABEL_FFMPEG", "ffmpeg")
+def _run_ffmpeg_select(
+    video_path: Path,
+    video_indices: Sequence[int],
+    output_pattern: Path,
+    *,
+    ffmpeg_executable: str = "ffmpeg",
+) -> None:
+    ffmpeg = str(ffmpeg_executable or "ffmpeg").strip() or "ffmpeg"
     selects = "+".join(f"eq(n\\,{int(idx)})" for idx in video_indices)
     cmd = [
         ffmpeg,
@@ -225,7 +238,7 @@ def _run_ffmpeg_select(video_path: Path, video_indices: Sequence[int], output_pa
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError as exc:
-        raise RuntimeError("ffmpeg not found; set ORBBEC_LABEL_FFMPEG or install ffmpeg") from exc
+        raise RuntimeError(f"ffmpeg not found: {ffmpeg}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(f"ffmpeg failed for {video_path}: {detail}")

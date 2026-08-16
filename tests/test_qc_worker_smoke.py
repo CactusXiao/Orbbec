@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import numpy as np
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from src.qc.config import load_qc_config
 from src.qc.media import prepare_qc_media
@@ -47,41 +45,51 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(loaded[0].episode_id, "episode_001")
             self.assertEqual(loaded[0].bad_frame_ranges, [(12, 15)])
 
-    def test_qc_config_uses_shared_orbbec_nas_mounts(self) -> None:
+    def test_qc_config_loads_launch_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            (tmp_path / ".env").write_text('ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}\n', encoding="utf-8")
-
-            with patch.dict(os.environ, {}, clear=True):
-                config = load_qc_config(cwd=tmp_path)
-
-            self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
-
-    def test_qc_config_finds_parent_env_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            child = tmp_path / "nested" / "qc"
-            child.mkdir(parents=True)
-            (tmp_path / ".env").write_text('ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}\n', encoding="utf-8")
-
-            with patch.dict(os.environ, {}, clear=True):
-                config = load_qc_config(cwd=child)
-
-            self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
-
-    def test_qc_config_derives_mount_from_nas_root_and_prefix(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            nas_root = tmp_path / "nas"
-            (tmp_path / ".env").write_text(
-                f"ORBBEC_NAS_ROOT={nas_root}\nORBBEC_NAS_URI_PREFIX=nas://ego\n",
+            config_path = tmp_path / "qc_config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "backend_url": "http://127.0.0.1:9999",
+                        "sample_interval": 7,
+                        "default_lease_minutes": 11,
+                        "crash_lease_extension_minutes": 13,
+                        "tmp_dir": "tmp_cache",
+                        "state_dir": "state",
+                        "worker_machine_id": "qc_machine_a",
+                        "operator_id": "qc_operator_a",
+                        "range_merge_gap_frames": 2,
+                        "request_timeout_seconds": 4.5,
+                        "nas_mounts": {"nas://ego": "/mnt/nas"},
+                    }
+                ),
                 encoding="utf-8",
             )
 
-            with patch.dict(os.environ, {}, clear=True):
-                config = load_qc_config(cwd=tmp_path)
+            config = load_qc_config(config_path=config_path)
 
-            self.assertEqual(config.nas_mounts, {"nas://ego": str(nas_root)})
+            self.assertEqual(config.backend_url, "http://127.0.0.1:9999")
+            self.assertEqual(config.sample_interval, 7)
+            self.assertEqual(config.default_lease_minutes, 11)
+            self.assertEqual(config.crash_lease_extension_minutes, 13)
+            self.assertEqual(config.tmp_dir, (tmp_path / "tmp_cache").resolve())
+            self.assertEqual(config.state_dir, (tmp_path / "state").resolve())
+            self.assertEqual(config.worker_machine_id, "qc_machine_a")
+            self.assertEqual(config.operator_id, "qc_operator_a")
+            self.assertEqual(config.range_merge_gap_frames, 2)
+            self.assertEqual(config.request_timeout_seconds, 4.5)
+            self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
+
+    def test_qc_config_uses_cwd_for_default_local_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            config = load_qc_config(cwd=tmp_path)
+
+            self.assertEqual(config.tmp_dir, (tmp_path / "tmp").resolve())
+            self.assertEqual(config.state_dir, (tmp_path / "qc_state").resolve())
 
     def test_prepare_qc_media_uses_nas_episode_root_for_calibration_and_mano(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

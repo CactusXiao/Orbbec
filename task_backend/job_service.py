@@ -25,8 +25,8 @@ _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
 _NON_LABEL_CAMERA_TOKENS = ("ego", "pico", "fisheye")
 AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
 STAGE_ARTIFACT_KINDS = {
-    "auto_label": {"pred_2d", "auto_2d"},
-    "mano_opt": {"mano_episode", "mano_segment_patch"},
+    "auto_label": {"pred_2d", "auto_2d", "mano_episode"},
+    "mano_opt": {"mano_segment_patch"},
     "qc": {"qc_report"},
     "manual_label": {"manual_2d", "corrected_2d"},
     "manual_segment": {"manual_2d"},
@@ -298,6 +298,13 @@ class JobService:
         job_type = require_job_type(str(payload_in.get("type") or payload_in.get("job_type") or ""))
         if job_type == "manual_label":
             return self.create_manual_label_job(payload_in)
+        job_payload = json_object(payload_in.get("payload"), "payload")
+        if not job_payload:
+            job_payload = {k: v for k, v in payload_in.items() if k not in {"episode", "payload"}}
+        if job_type == "mano_opt":
+            mano_scope = str(job_payload.get("scope") or job_payload.get("mano_scope") or "").strip().lower()
+            if mano_scope != "segment":
+                raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode-level mano_opt is no longer supported; use auto_label")
 
         episode_obj = json_object(payload_in.get("episode"), "episode")
         episode_id = str(payload_in.get("episode_id") or episode_obj.get("episode_id") or "").strip()
@@ -317,9 +324,6 @@ class JobService:
                 metadata=json_object(episode_obj.get("metadata"), "episode.metadata"),
             )
         job_id = str(payload_in.get("job_id") or _new_id(job_type)).strip()
-        job_payload = json_object(payload_in.get("payload"), "payload")
-        if not job_payload:
-            job_payload = {k: v for k, v in payload_in.items() if k not in {"episode", "payload"}}
         job_payload.setdefault("job_id", job_id)
         job_payload.setdefault("episode_id", episode_id)
         job = self._create_job_once(job_id=job_id, job_type=job_type, episode_id=episode_id, payload=job_payload)
@@ -787,6 +791,11 @@ class JobService:
         before = self.store.get_job(job_id)
         if before is None:
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+        before_payload = dict(before.get("payload") or {})
+        if str(before.get("type") or "") == "mano_opt":
+            scope = str(before_payload.get("scope") or before_payload.get("mano_scope") or "").strip().lower()
+            if scope != "segment":
+                raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode-level mano_opt is no longer supported; use auto_label")
         result = json_object(body.get("result"), "result")
         if not result:
             result = {k: v for k, v in body.items() if k not in {"artifacts", "artifact"}}
@@ -1210,7 +1219,6 @@ class JobService:
             return
         status_by_type = {
             "auto_label": "auto_labeling",
-            "mano_opt": "mano_optimizing",
             "qc": "qc_running",
             "manual_label": "manual_labeling",
         }
@@ -1257,19 +1265,18 @@ class JobService:
                     uri=uri_join(str(payload.get("episode_uri")), "pred_2d"),
                     metadata={"source_job_id": job.get("job_id")},
                 )
+            if not any(str(artifact.get("kind") or "") == "mano_episode" for artifact in artifacts):
+                self._register_default_mano_episode(episode_id, job, result)
             if self._all_episode_jobs_succeeded(episode_id, "auto_label"):
-                self.store.update_episode_status(episode_id, "auto_labeled")
-                self._create_mano_episode_job_from_existing_episode(episode_id, result)
+                self.store.update_episode_status(episode_id, "mano_optimized")
+                self._refresh_final_3d_sources_manifest(episode_id, "auto_label_episode_3d_completed")
+                self._create_qc_job_from_existing_episode(episode_id, result, reason="auto_label_episode_3d_succeeded")
         elif job_type == "mano_opt":
             scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
             if scope == "segment":
                 self._complete_segment_mano_job(job, result, artifacts)
             else:
-                if not any(str(artifact.get("kind") or "") == "mano_episode" for artifact in artifacts):
-                    self._register_default_mano_episode(episode_id, job, result)
-                self.store.update_episode_status(episode_id, "mano_optimized")
-                self._refresh_final_3d_sources_manifest(episode_id, "mano_episode_completed")
-                self._create_qc_job_from_existing_episode(episode_id, result)
+                raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode-level mano_opt is no longer supported; use auto_label")
         elif job_type == "qc":
             qc_operator_metadata = (
                 {"qc_operator_id": operator_id, "last_human_operator_id": operator_id}
@@ -1441,6 +1448,7 @@ class JobService:
                     "auto_label_after_upload": True,
                     "auto_label_job_count": len(created),
                     "auto_label_scope": "episode",
+                    "episode_3d_merged_with_auto_label": True,
                 },
             )
 
@@ -1486,6 +1494,7 @@ class JobService:
                     "auto_label_pushed_by": pushed_by,
                     "auto_label_job_count": len(jobs),
                     "auto_label_scope": "episode",
+                    "episode_3d_merged_with_auto_label": True,
                 },
             )
         return {
@@ -1539,6 +1548,8 @@ class JobService:
             "frames": frames,
             "scope": "episode",
             "label_scope": "episode",
+            "mano_scope": "episode",
+            "produces": ["pred_2d", "mano_episode"],
             "reason": reason,
         }
         if pushed_by:
@@ -1560,39 +1571,7 @@ class JobService:
                 frames.append(frame)
         return frames
 
-    def _create_mano_episode_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
-        for job in self.store.jobs_for_episode(episode_id, "mano_opt"):
-            payload = dict(job.get("payload") or {})
-            if str(payload.get("scope") or payload.get("mano_scope") or "episode") == "episode":
-                return
-        episode = self.store.get_episode(episode_id)
-        if episode is None:
-            return
-        cameras = self._cameras_for_episode_context(episode_id, episode, result)
-        frames = _as_int_list(result.get("frames")) or self._frames_for_episode_context(
-            episode_id,
-            episode,
-            cameras,
-            result,
-        )
-        base_id = _stable_id_part(episode_id, "episode")
-        job_id = str(result.get("mano_job_id") or result.get("mano_episode_job_id") or f"mano_opt_{base_id}_episode")
-        episode_uri = str(episode.get("episode_uri") or "")
-        payload = {
-            "job_id": job_id,
-            "episode_id": episode["episode_id"],
-            "subject_id": episode["subject_id"],
-            "task_name": episode["task_name"],
-            "episode_uri": episode_uri,
-            "cameras": cameras,
-            "frames": frames,
-            "scope": "episode",
-            "mano_scope": "episode",
-            "reason": "auto_label_succeeded",
-        }
-        self._create_job_once(job_id=job_id, job_type="mano_opt", episode_id=episode_id, payload=payload)
-
-    def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any]) -> None:
+    def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any], *, reason: str = "mano_episode_succeeded") -> None:
         if self.store.jobs_for_episode(episode_id, "qc"):
             return
         episode = self.store.get_episode(episode_id)
@@ -1615,7 +1594,7 @@ class JobService:
             "episode_uri": episode["episode_uri"],
             "cameras": cameras,
             "frames": frames,
-            "reason": "mano_episode_succeeded",
+            "reason": reason,
         }
         self._create_job_once(job_id=job_id, job_type="qc", episode_id=episode_id, payload=payload)
 
@@ -1829,7 +1808,7 @@ class JobService:
                 "relative_path": self._relative_episode_uri_path(episode_uri, pred_uri),
             },
             "base_3d": {
-                "source": "auto_episode",
+                "source": "auto_label",
                 "uri": mano_episode_uri,
                 "relative_path": self._relative_episode_uri_path(episode_uri, mano_episode_uri),
                 "status": "ready" if mano_episode_uri else "missing",

@@ -7,23 +7,28 @@
 在 `Orbbec` 目录下执行：
 
 ```bash
-python3 -m src.qc.main
+python3 -m src.qc.main --config /tmp/orbbec_qc_frontend_config.json
 ```
 
-## .env
+## 配置
 
-QC Worker 读取后台共享的 NAS mount 配置和自己的 `QC_*` 配置，常用项：
+主程序点击 `QC` 时会根据 `src/sync/config.json` 里的 `frontends.qc` 和 NAS 配置生成启动配置，并通过
+`--config` 传给 QC Worker。直接本地调试时也可以手动提供同样结构的 JSON：
 
-```bash
-ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
-QC_BACKEND_URL=http://127.0.0.1:8765
-QC_SAMPLE_INTERVAL=10
-QC_DEFAULT_LEASE_MINUTES=10
-QC_CRASH_LEASE_EXTENSION_MINUTES=10
-QC_TMP_DIR=./tmp
-QC_STATE_DIR=./qc_state
-QC_WORKER_MACHINE_ID=qc_machine_01
-QC_RANGE_MERGE_GAP_FRAMES=5
+```json
+{
+  "backend_url": "http://127.0.0.1:8765",
+  "operator_id": "qc_operator_01",
+  "worker_machine_id": "qc_machine_01",
+  "sample_interval": 10,
+  "default_lease_minutes": 10,
+  "crash_lease_extension_minutes": 10,
+  "tmp_dir": "./tmp",
+  "state_dir": "./qc_state",
+  "range_merge_gap_frames": 5,
+  "request_timeout_seconds": 10.0,
+  "nas_mounts": {"nas://ego": "/mnt/nas"}
+}
 ```
 
 ## 行为
@@ -31,6 +36,6 @@ QC_RANGE_MERGE_GAP_FRAMES=5
 - Task / Episode 列表来自后端 `qc` stage 的可租 job。
 - 双击 Episode 后才会正式租借。
 - 本机保留的有效进度会合并显示，并显示剩余租期倒计时。
-- RGB H.265 会解码到 `QC_TMP_DIR/<episode_id>/<camera>/<frame>.png`。
+- RGB H.265 会解码到配置里的 `tmp_dir/<episode_id>/<camera>/<frame>.png`。
 - QC 提交会先写 `<episode>/qc/qc_report.json`，再调用后端 complete。
 - “Episode 异常”提交为 `result_type=bad_episode`，不会创建人工返修 segment。

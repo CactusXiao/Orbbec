@@ -151,6 +151,10 @@ struct VoiceFeedbackConfig {
     bool        enabled       = false;
     std::string speakerDevice = "default";
     std::string command;
+    std::string voice         = "zh-CN-XiaoxiaoNeural";
+    std::string rate          = "-8%";
+    std::string pitch         = "+0Hz";
+    bool        naturalOnly   = true;
     std::unordered_map<std::string, std::string> messages;
 };
 
@@ -163,11 +167,40 @@ struct NasConfig {
     std::string uriPrefix = "nas://ego";
 };
 
+struct ManualLabelFrontendConfig {
+    std::string pythonExecutable = "python3";
+    std::string operatorId;
+    fs::path    logPath;
+    fs::path    frameCacheDir;
+    std::string ffmpegExecutable = "ffmpeg";
+    int         leaseSeconds = 600;
+    double      requestTimeoutSeconds = 10.0;
+};
+
+struct QcFrontendConfig {
+    std::string pythonExecutable = "python3";
+    std::string operatorId;
+    fs::path    logPath;
+    int         sampleInterval = 10;
+    int         defaultLeaseMinutes = 10;
+    int         crashLeaseExtensionMinutes = 10;
+    fs::path    tmpDir = "./tmp";
+    fs::path    stateDir = "./qc_state";
+    std::string workerMachineId;
+    int         rangeMergeGapFrames = 5;
+    double      requestTimeoutSeconds = 10.0;
+};
+
 struct TaskBackendConfig {
     bool        enabled   = true;
     std::string baseUrl   = "http://127.0.0.1:8765";
     int         timeoutMs = 3000;
     NasConfig   nas;
+};
+
+struct FrontendLaunchConfig {
+    ManualLabelFrontendConfig label;
+    QcFrontendConfig          qc;
 };
 
 struct AppConfig {
@@ -198,6 +231,7 @@ struct AppConfig {
     SaveOptions               save;
     VoiceFeedbackConfig       voiceFeedback;
     TaskBackendConfig         taskBackend;
+    FrontendLaunchConfig      frontends;
     EgoModuleConfig           ego;
     FisheyeModuleConfig       fisheye;
     DepthPointCloudFiltersConfig filters;
@@ -252,11 +286,11 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr removeDominantPlaneRansac(const pcl::PointCl
 
 cv::Mat visualizeObFrame(const std::shared_ptr<const ob::Frame> &frame);
 
-bool launchManualLabelFrontend(const std::string &backendUrl,
+bool launchManualLabelFrontend(const AppConfig &cfg,
                                const std::string &operatorHint,
                                std::string *errorMessage = nullptr);
 
-bool launchQcFrontend(const std::string &backendUrl,
+bool launchQcFrontend(const AppConfig &cfg,
                       const std::string &operatorHint,
                       std::string *errorMessage = nullptr);
 

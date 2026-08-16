@@ -1617,8 +1617,8 @@ def render_status_badge(status: str) -> str:
 
 
 WORKFLOW_STAGE_LABELS = [
-    ("auto_label", "自动标注"),
-    ("mano_opt", "MANO 优化"),
+    ("auto_label", "自动标注 + Episode 3D"),
+    ("mano_opt", "Segment 3D 优化"),
     ("qc", "质检结果"),
     ("manual_segment", "人工纠偏"),
 ]
@@ -2065,7 +2065,6 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         return str(job.get("status") or fallback) if job else fallback
 
     auto_job = latest_job("auto_label")
-    mano_job = latest_job("mano_opt")
     qc_job = latest_job("qc")
     auto_artifact = latest_artifact({"pred_2d", "auto_2d"})
     mano_episode_artifact = latest_artifact({"mano_episode"})
@@ -2221,31 +2220,23 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             "",
         ),
         flow_row(
-            "3. 自动 2D 标注",
+            "3. 自动标注 + Episode 3D",
             flow_status_from_job("auto_label"),
             auto_job.get("updated_at") if auto_job else "",
-            auto_job.get("job_id") if auto_job else "waiting for push",
-            auto_artifact.get("uri") if auto_artifact else "",
+            (str(auto_job.get("job_id") or "") + " | pred_2d + mano/episode") if auto_job else "waiting for push",
+            mano_episode_artifact.get("uri") if mano_episode_artifact else auto_artifact.get("uri") if auto_artifact else "",
             "",
         ),
         flow_row(
-            "4. Episode MANO 优化",
-            flow_status_from_job("mano_opt"),
-            mano_job.get("updated_at") if mano_job else "",
-            mano_job.get("job_id") if mano_job else "waiting for auto label",
-            mano_episode_artifact.get("uri") if mano_episode_artifact else "",
-            "",
-        ),
-        flow_row(
-            "5. QC 质检",
+            "4. QC 质检",
             flow_status_from_job("qc"),
             qc_job.get("updated_at") if qc_job else "",
-            qc_job.get("job_id") if qc_job else "waiting for MANO",
+            qc_job.get("job_id") if qc_job else "waiting for auto label + episode 3D",
             qc_report_artifact.get("uri") if qc_report_artifact else "",
             qc_operator,
         ),
         flow_row(
-            "6. 人工纠偏 / 最终 3D",
+            "5. 人工纠偏 / Segment 3D / 最终 3D",
             correction_status,
             workflow_info.get("updated_at") or workflow_episode.get("updated_at") or item.get("updated_at"),
             correction_detail,

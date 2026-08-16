@@ -89,7 +89,15 @@ sudo apt install -y \
 | `ffmpeg` | H.265 编码、解码、回放、后处理 |
 | `fonts-noto-cjk` | 中文显示 |
 | `xclip`, `zenity`, `yad` | Viewer/Collection 中的剪贴板和目录选择辅助 |
-| `alsa-utils`, `espeak`, `speech-dispatcher` | 采集语音提示 |
+| `alsa-utils`, `espeak`, `speech-dispatcher` | 采集语音提示回退和声卡检查 |
+
+中文采集播报默认使用更自然的 neural TTS。安装系统包后再安装一次 Python 命令行工具：
+
+```bash
+python3 -m pip install --user edge-tts
+```
+
+如果终端找不到 `edge-tts`，确认 `~/.local/bin` 已在 `PATH` 中。默认中文音色在配置里是 `voiceFeedback.voice: "zh-CN-XiaoxiaoNeural"`，可换成 `zh-CN-XiaoyiNeural` 或 `zh-CN-YunxiNeural`；`voiceFeedback.rate` 可以调语速，例如 `-12%` 更慢。
 
 如果 CMake 版本仍然低于 3.22，可用 snap 安装新版：
 
@@ -1013,6 +1021,13 @@ aplay: main:831: 音乐打开错误： 没有那个文件或目录
 
 这是采集语音提示播放失败，通常不影响相机取流。没有扬声器、默认声卡不存在、root/sudo 环境没有音频权限时都会出现。
 
+中文播报如果听起来很机械，通常是没有装 `edge-tts` 或播放器不可用，程序退到了系统本地语音。当前默认配置会启用 `voiceFeedback.naturalOnly`，避免中文静默降级到机械音；缺依赖时会打印安装提示。修复方式：
+
+```bash
+sudo apt install ffmpeg
+python3 -m pip install --user edge-tts
+```
+
 如果不需要语音提示，直接在配置里关闭：
 
 ```json
@@ -1029,6 +1044,8 @@ speaker-test -t wav -c 2
 ```
 
 再把 `voiceFeedback.speakerDevice` 改成可用设备，例如 `default`、`plughw:0,0` 或 `hw:1,0`。
+
+如果确实希望在 neural TTS 失败时仍然用系统本地语音兜底，可把 `voiceFeedback.naturalOnly` 改成 `false`。
 
 ## 16. 批量部署建议
 

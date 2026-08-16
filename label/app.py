@@ -11,7 +11,7 @@ from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, parse_mounts_json, session_from_lease
+    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from .storage import (
         CorrectionProgress,
@@ -33,9 +33,9 @@ try:
     from .mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
-    from .env_config import label_nas_mounts_from_env
+    from .env_config import LabelConfig, load_label_config
 except Exception:
-    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, parse_mounts_json, session_from_lease
+    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from storage import (
         CorrectionProgress,
@@ -57,7 +57,7 @@ except Exception:
     from mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
-    from env_config import label_nas_mounts_from_env
+    from env_config import LabelConfig, load_label_config
 
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
@@ -75,9 +75,10 @@ STATUS_TODO_COLOR = "#ff5c5c"
 
 
 class LabelToolApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, config: Optional[LabelConfig] = None):
         self._ensure_utf8_env()
         super().__init__()
+        self.config = config or load_label_config()
 
         try:
             self.tk.call("encoding", "system", "utf-8")
@@ -104,8 +105,8 @@ class LabelToolApp(tk.Tk):
         self._page_host = ttk.Frame(self._root_container, style="TFrame")
         self._page_host.pack(fill="both", expand=True)
 
-        self._home = HomePage(self._page_host, on_exit=self._on_exit, on_enter=self._go_label)
-        self._label = LabelPage(self._page_host, on_back=self._go_home)
+        self._home = HomePage(self._page_host, config=self.config, on_exit=self._on_exit, on_enter=self._go_label)
+        self._label = LabelPage(self._page_host, config=self.config, on_back=self._go_home)
         self._home.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._label.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._go_home()
@@ -204,8 +205,9 @@ class LabelToolApp(tk.Tk):
 
 
 class HomePage(ttk.Frame):
-    def __init__(self, master, *, on_exit, on_enter):
+    def __init__(self, master, *, config: LabelConfig, on_exit, on_enter):
         super().__init__(master, style="TFrame")
+        self._config = config
         self._on_exit = on_exit
         self._on_enter = on_enter
         self._task_rows: Dict[str, Dict[str, Any]] = {}
@@ -223,8 +225,8 @@ class HomePage(ttk.Frame):
         form = ttk.Frame(center, style="Panel.TFrame")
         form.pack(padx=28, fill="x")
 
-        self._var_backend_url = tk.StringVar(value=os.environ.get("ORBBEC_TASK_BACKEND_URL", "http://127.0.0.1:8765"))
-        self._var_operator = tk.StringVar(value=os.environ.get("ORBBEC_LABEL_OPERATOR_ID", os.environ.get("USER", "labeler_01")))
+        self._var_backend_url = tk.StringVar(value=config.backend_url)
+        self._var_operator = tk.StringVar(value=config.operator_id)
         self._var_jsonl = tk.StringVar()
 
         ttk.Label(form, text="Backend URL", style="Muted.TLabel").pack(anchor="w")
@@ -299,7 +301,10 @@ class HomePage(ttk.Frame):
             messagebox.showwarning("Notice", "Please enter a backend URL.")
             return
         try:
-            groups = LabelBackendClient(backend_url).queued_label_tasks()
+            groups = LabelBackendClient(
+                backend_url,
+                timeout_seconds=self._config.request_timeout_seconds,
+            ).queued_label_tasks()
         except BackendClientError as exc:
             self._queue_notice.configure(text=str(exc))
             messagebox.showerror("Backend", str(exc))
@@ -348,7 +353,10 @@ class HomePage(ttk.Frame):
         if not task_name:
             return
         try:
-            episodes = LabelBackendClient(backend_url).label_task_episodes(task_name)
+            episodes = LabelBackendClient(
+                backend_url,
+                timeout_seconds=self._config.request_timeout_seconds,
+            ).label_task_episodes(task_name)
         except BackendClientError as exc:
             self._queue_notice.configure(text=str(exc))
             return
@@ -403,8 +411,9 @@ class HomePage(ttk.Frame):
             session = session_from_lease(
                 backend_url=backend_url,
                 operator_id=operator_id,
-                mounts=label_nas_mounts_from_env(),
-                lease_seconds=600,
+                mounts=self._config.nas_mounts,
+                lease_seconds=self._config.lease_seconds,
+                timeout_seconds=self._config.request_timeout_seconds,
                 task_name=task_name,
                 episode_id=episode_id,
             )
@@ -423,8 +432,9 @@ class HomePage(ttk.Frame):
 
 
 class LabelPage(ttk.Frame):
-    def __init__(self, master, *, on_back):
+    def __init__(self, master, *, config: LabelConfig, on_back):
         super().__init__(master, style="TFrame")
+        self._config = config
         self._on_back = on_back
 
         self._jsonl_path: Optional[str] = None
@@ -597,7 +607,12 @@ class LabelPage(ttk.Frame):
         self._decode_generation += 1
         generation = self._decode_generation
         self._cleanup_decode_cache()
-        cache_dir = Path(tempfile.mkdtemp(prefix=f"orbbec_label_{session.job_id}_"))
+        cache_parent = self._config.frame_cache_dir
+        if cache_parent is not None:
+            cache_parent.mkdir(parents=True, exist_ok=True)
+            cache_dir = Path(tempfile.mkdtemp(prefix=f"orbbec_label_{session.job_id}_", dir=str(cache_parent)))
+        else:
+            cache_dir = Path(tempfile.mkdtemp(prefix=f"orbbec_label_{session.job_id}_"))
         self._decode_cache_dir = cache_dir
         self._backend_session = session
         self._backend_completed = False
@@ -624,7 +639,12 @@ class LabelPage(ttk.Frame):
         cache_dir: Path,
     ) -> None:
         try:
-            decoded_task = ensure_decoded_rgb_frames(task, session.payload, cache_root=cache_dir)
+            decoded_task = ensure_decoded_rgb_frames(
+                task,
+                session.payload,
+                cache_root=cache_dir,
+                ffmpeg_executable=self._config.ffmpeg_executable,
+            )
             progress_ref = decoded_task.episode_dir() / f".{session.job_id}.jsonl"
             progress = load_correction_progress(str(progress_ref), [decoded_task])
             save_correction_progress(str(progress_ref), progress)
