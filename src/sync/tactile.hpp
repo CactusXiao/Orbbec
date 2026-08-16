@@ -16,6 +16,7 @@ namespace sync_app {
 constexpr size_t kTactileChannelCount = 48;
 constexpr size_t kTactileRegionCount = 6;
 constexpr size_t kTactileChannelsPerRegion = 8;
+constexpr size_t kJqShroomPressureChannelCount = 256;
 
 struct TactileCalibrationEntry {
     int    regionIndex = 0;
@@ -29,30 +30,51 @@ struct TactileCalibrationEntry {
 
 struct TactileSerialConfig {
     std::string portPath;
-    int         baudRate = 115200;
+    int         baudRate = 921600;
     int         timeoutMs = 1000;
-    std::string requestCommand = "A\r\n";
-    bool        clearInputBufferBeforeRequest = true;
 };
 
 struct TactileSaveOptions {
     int         csvFloatPrecision = 6;
     std::string sampleDirectoryName = "samples";
+    std::string directoryName = "touch";
+};
+
+struct TactileDeviceConfig {
+    std::string         streamId;
+    std::string         handSide;
+    int                 sensorType = 0;
+    TactileSerialConfig serial;
 };
 
 struct TactileModuleConfig {
     bool                  enabled = false;
+    bool                  required = true;
+    std::string           streamId;
+    std::string           handSide = "right";
+    int                   sensorType = 2;
     int                   targetFps = 60;
-    size_t                maxBufferedSamples = 4096;
-    bool                  applyCalibration = true;
-    std::filesystem::path calibrationPath;
+    size_t                maxBufferedSamples = 8192;
     TactileSerialConfig   serial;
     TactileSaveOptions    save;
+    std::vector<TactileDeviceConfig> devices;
 };
 
 struct TactileFrame {
     uint64_t              captureTimestampUs = 0;
     double                captureTimestampSec = 0.0;
+    std::string           side;
+    int                   sensorType = 0;
+    uint64_t              packet1TimestampUs = 0;
+    uint64_t              packet2TimestampUs = 0;
+    uint64_t              packetGapUs = 0;
+    std::vector<uint8_t>  imuRaw;
+    float                 imuW = 0.0f;
+    float                 imuX = 0.0f;
+    float                 imuY = 0.0f;
+    float                 imuZ = 0.0f;
+    bool                  imuValid = false;
+    std::string           qualityFlag = "ok";
     std::vector<uint16_t> rawAdc;
     std::vector<double>   calibratedValues;
     std::vector<double>   outputValues;
@@ -118,6 +140,7 @@ public:
     bool waitUntilReady(std::chrono::milliseconds timeout);
 
     std::optional<TactileSample> snapshotLatest(std::string *errorMessage = nullptr);
+    void resetCaptureCursorToLatest();
     std::optional<TactileSample> captureNext(std::string *errorMessage = nullptr);
     bool captureFor(std::chrono::milliseconds duration,
                     const std::atomic_bool *cancel = nullptr,
@@ -148,8 +171,7 @@ private:
     mutable std::mutex                    bufferMtx_;
     std::vector<TactileSample>            buffered_;
     uint64_t                              nextSequence_ = 0;
-    bool                                  nextCaptureTimeValid_ = false;
-    std::chrono::steady_clock::time_point nextCaptureTime_{};
+    uint64_t                              lastCaptureTimestampUs_ = 0;
 };
 
 }  // namespace sync_app

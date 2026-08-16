@@ -8,6 +8,7 @@
 
 #include "ego.hpp"
 #include "fisheyes.hpp"
+#include "tactile.hpp"
 #include "utils/cJSON.h"
 
 #include <pcl/filters/statistical_outlier_removal.h>
@@ -234,6 +235,7 @@ struct AppConfig {
     FrontendLaunchConfig      frontends;
     EgoModuleConfig           ego;
     FisheyeModuleConfig       fisheye;
+    TactileModuleConfig       touch;
     DepthPointCloudFiltersConfig filters;
     std::vector<DeviceConfig> devices;
 };

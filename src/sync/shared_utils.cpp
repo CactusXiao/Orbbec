@@ -1152,6 +1152,172 @@ AppConfig loadConfig(const fs::path &configPath) {
         }
     }
 
+    cJSON *touchObj = cJSON_GetObjectItemCaseSensitive(root, "touch");
+    if(!touchObj) {
+        touchObj = cJSON_GetObjectItemCaseSensitive(root, "tactile");
+    }
+    if(touchObj && cJSON_IsObject(touchObj)) {
+        if(auto v = getBool(touchObj, "enabled")) {
+            cfg.touch.enabled = *v;
+        }
+        if(auto v = getBool(touchObj, "required")) {
+            cfg.touch.required = *v;
+        }
+        if(auto v = getString(touchObj, "streamId")) {
+            cfg.touch.streamId = trimString(*v);
+        }
+        else if(auto v = getString(touchObj, "id")) {
+            cfg.touch.streamId = trimString(*v);
+        }
+        if(auto v = getString(touchObj, "handSide")) {
+            cfg.touch.handSide = trimString(*v);
+        }
+        else if(auto v = getString(touchObj, "side")) {
+            cfg.touch.handSide = trimString(*v);
+        }
+        if(cfg.touch.handSide.empty()) {
+            cfg.touch.handSide = "right";
+        }
+        if(auto v = getInt(touchObj, "sensorType")) {
+            cfg.touch.sensorType = std::max(0, *v);
+        }
+        else if(auto v = getInt(touchObj, "sensor_type")) {
+            cfg.touch.sensorType = std::max(0, *v);
+        }
+        if(auto v = getInt(touchObj, "targetFps")) {
+            cfg.touch.targetFps = std::max(1, *v);
+        }
+        if(auto v = getInt(touchObj, "maxBufferedSamples")) {
+            cfg.touch.maxBufferedSamples = static_cast<size_t>(std::max(1, *v));
+        }
+        if(auto v = getString(touchObj, "directoryName")) {
+            cfg.touch.save.directoryName = trimString(*v);
+        }
+        else if(auto v = getString(touchObj, "outputDirName")) {
+            cfg.touch.save.directoryName = trimString(*v);
+        }
+        if(cfg.touch.save.directoryName.empty()) {
+            cfg.touch.save.directoryName = "touch";
+        }
+        if(auto v = getInt(touchObj, "csvFloatPrecision")) {
+            cfg.touch.save.csvFloatPrecision = std::max(0, *v);
+        }
+
+        cJSON *serialObj = cJSON_GetObjectItemCaseSensitive(touchObj, "serial");
+        if(serialObj && cJSON_IsObject(serialObj)) {
+            if(auto v = getString(serialObj, "portPath")) {
+                cfg.touch.serial.portPath = trimString(*v);
+            }
+            else if(auto v = getString(serialObj, "port")) {
+                cfg.touch.serial.portPath = trimString(*v);
+            }
+            else if(auto v = getString(serialObj, "device")) {
+                cfg.touch.serial.portPath = trimString(*v);
+            }
+            if(auto v = getInt(serialObj, "baudRate")) {
+                cfg.touch.serial.baudRate = std::max(1, *v);
+            }
+            else if(auto v = getInt(serialObj, "baud")) {
+                cfg.touch.serial.baudRate = std::max(1, *v);
+            }
+            if(auto v = getInt(serialObj, "timeoutMs")) {
+                cfg.touch.serial.timeoutMs = std::max(1, *v);
+            }
+        }
+        if(auto v = getString(touchObj, "portPath")) {
+            cfg.touch.serial.portPath = trimString(*v);
+        }
+        else if(auto v = getString(touchObj, "port")) {
+            cfg.touch.serial.portPath = trimString(*v);
+        }
+        else if(auto v = getString(touchObj, "device")) {
+            cfg.touch.serial.portPath = trimString(*v);
+        }
+        if(auto v = getInt(touchObj, "baudRate")) {
+            cfg.touch.serial.baudRate = std::max(1, *v);
+        }
+        else if(auto v = getInt(touchObj, "baud")) {
+            cfg.touch.serial.baudRate = std::max(1, *v);
+        }
+        if(auto v = getInt(touchObj, "timeoutMs")) {
+            cfg.touch.serial.timeoutMs = std::max(1, *v);
+        }
+
+        cJSON *devicesObj = cJSON_GetObjectItemCaseSensitive(touchObj, "devices");
+        if(!devicesObj) {
+            devicesObj = cJSON_GetObjectItemCaseSensitive(touchObj, "hands");
+        }
+        if(devicesObj && cJSON_IsArray(devicesObj)) {
+            cfg.touch.devices.clear();
+            cJSON *deviceObj = nullptr;
+            cJSON_ArrayForEach(deviceObj, devicesObj) {
+                if(!deviceObj || !cJSON_IsObject(deviceObj)) {
+                    continue;
+                }
+                TactileDeviceConfig dev;
+                dev.serial = cfg.touch.serial;
+                if(auto v = getString(deviceObj, "streamId")) {
+                    dev.streamId = trimString(*v);
+                }
+                else if(auto v = getString(deviceObj, "id")) {
+                    dev.streamId = trimString(*v);
+                }
+                if(auto v = getString(deviceObj, "handSide")) {
+                    dev.handSide = trimString(*v);
+                }
+                else if(auto v = getString(deviceObj, "side")) {
+                    dev.handSide = trimString(*v);
+                }
+                if(auto v = getInt(deviceObj, "sensorType")) {
+                    dev.sensorType = std::max(0, *v);
+                }
+                else if(auto v = getInt(deviceObj, "sensor_type")) {
+                    dev.sensorType = std::max(0, *v);
+                }
+                cJSON *deviceSerialObj = cJSON_GetObjectItemCaseSensitive(deviceObj, "serial");
+                if(deviceSerialObj && cJSON_IsObject(deviceSerialObj)) {
+                    if(auto v = getString(deviceSerialObj, "portPath")) {
+                        dev.serial.portPath = trimString(*v);
+                    }
+                    else if(auto v = getString(deviceSerialObj, "port")) {
+                        dev.serial.portPath = trimString(*v);
+                    }
+                    else if(auto v = getString(deviceSerialObj, "device")) {
+                        dev.serial.portPath = trimString(*v);
+                    }
+                    if(auto v = getInt(deviceSerialObj, "baudRate")) {
+                        dev.serial.baudRate = std::max(1, *v);
+                    }
+                    else if(auto v = getInt(deviceSerialObj, "baud")) {
+                        dev.serial.baudRate = std::max(1, *v);
+                    }
+                    if(auto v = getInt(deviceSerialObj, "timeoutMs")) {
+                        dev.serial.timeoutMs = std::max(1, *v);
+                    }
+                }
+                if(auto v = getString(deviceObj, "portPath")) {
+                    dev.serial.portPath = trimString(*v);
+                }
+                else if(auto v = getString(deviceObj, "port")) {
+                    dev.serial.portPath = trimString(*v);
+                }
+                else if(auto v = getString(deviceObj, "device")) {
+                    dev.serial.portPath = trimString(*v);
+                }
+                if(auto v = getInt(deviceObj, "baudRate")) {
+                    dev.serial.baudRate = std::max(1, *v);
+                }
+                else if(auto v = getInt(deviceObj, "baud")) {
+                    dev.serial.baudRate = std::max(1, *v);
+                }
+                if(auto v = getInt(deviceObj, "timeoutMs")) {
+                    dev.serial.timeoutMs = std::max(1, *v);
+                }
+                cfg.touch.devices.push_back(std::move(dev));
+            }
+        }
+    }
+
     if(auto *fisheyeObj = cJSON_GetObjectItemCaseSensitive(root, "fisheye")) {
         if(cJSON_IsObject(fisheyeObj)) {
             if(auto v = getBool(fisheyeObj, "enabled")) {

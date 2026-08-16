@@ -1,6 +1,7 @@
 #include "collection.hpp"
 #include "ego.hpp"
 #include "fisheyes.hpp"
+#include "tactile.hpp"
 #include "task_backend_client.hpp"
 
 #include "utils/utils.hpp"
@@ -627,6 +628,94 @@ static std::string formatFrameIndex(size_t i) {
     return oss.str();
 }
 
+static std::string bytesToLowerHex(const std::vector<uint8_t> &bytes) {
+    std::ostringstream oss;
+    oss << std::hex << std::nouppercase << std::setfill('0');
+    for(uint8_t byte : bytes) {
+        oss << std::setw(2) << static_cast<int>(byte);
+    }
+    return oss.str();
+}
+
+static std::string sanitizeCsvIdentifier(std::string s) {
+    s = trimString(std::move(s));
+    if(s.empty()) {
+        return "touch";
+    }
+    for(char &ch : s) {
+        if(!std::isalnum(static_cast<unsigned char>(ch))) {
+            ch = '_';
+        }
+    }
+    while(s.find("__") != std::string::npos) {
+        s.replace(s.find("__"), 2, "_");
+    }
+    if(!s.empty() && s.front() == '_') {
+        s.erase(s.begin());
+    }
+    if(!s.empty() && s.back() == '_') {
+        s.pop_back();
+    }
+    return s.empty() ? std::string("touch") : s;
+}
+
+static std::string touchStreamIdForConfig(const TactileModuleConfig &cfg, size_t fallbackIndex) {
+    if(!cfg.streamId.empty()) {
+        return sanitizeCsvIdentifier(cfg.streamId);
+    }
+    if(!cfg.handSide.empty()) {
+        return sanitizeCsvIdentifier(cfg.handSide);
+    }
+    if(cfg.sensorType > 0) {
+        return "sensor" + std::to_string(cfg.sensorType);
+    }
+    return "touch" + std::to_string(fallbackIndex);
+}
+
+static std::string touchDisplayName(const std::string &streamId) {
+    return "touch " + streamId + " pressure";
+}
+
+static std::vector<TactileModuleConfig> expandTouchDeviceConfigs(const TactileModuleConfig &base) {
+    std::vector<TactileModuleConfig> out;
+    if(base.devices.empty()) {
+        TactileModuleConfig cfg = base;
+        cfg.devices.clear();
+        cfg.streamId = touchStreamIdForConfig(cfg, 0);
+        out.push_back(std::move(cfg));
+        return out;
+    }
+
+    out.reserve(base.devices.size());
+    for(size_t i = 0; i < base.devices.size(); ++i) {
+        const auto &dev = base.devices[i];
+        TactileModuleConfig cfg = base;
+        cfg.devices.clear();
+        if(!dev.streamId.empty()) {
+            cfg.streamId = dev.streamId;
+        }
+        if(!dev.handSide.empty()) {
+            cfg.handSide = dev.handSide;
+        }
+        if(dev.sensorType > 0) {
+            cfg.sensorType = dev.sensorType;
+        }
+        cfg.serial = dev.serial;
+        cfg.streamId = touchStreamIdForConfig(cfg, i);
+        out.push_back(std::move(cfg));
+    }
+
+    std::unordered_map<std::string, size_t> seen;
+    for(size_t i = 0; i < out.size(); ++i) {
+        auto &id = out[i].streamId;
+        const size_t count = seen[id]++;
+        if(count > 0) {
+            id += "_" + std::to_string(count + 1);
+        }
+    }
+    return out;
+}
+
 static std::string colorExtNormalized(std::string ext) {
     if(ext.empty()) {
         ext = "jpg";
@@ -745,6 +834,7 @@ struct CollectionConfigUi {
     bool enableMultiview = true;
     bool enableFisheyes  = false;
     bool enableEgo       = false;
+    bool enableTouch     = false;
     std::string saveRoot;
     std::string subjectId = "test";
     std::string exposureMs;
@@ -2864,6 +2954,18 @@ public:
         return false;
     }
 
+    void stopTouchRuntimes() {
+        for(auto &runtime: touchRuntimes_) {
+            if(runtime.recordThread.joinable()) {
+                runtime.recordThread.join();
+            }
+            if(runtime.recorder) {
+                runtime.recorder->stop();
+            }
+        }
+        touchRuntimes_.clear();
+    }
+
     void reset() {
         joinCoordinatorThreadIfPossible();
         {
@@ -2873,6 +2975,7 @@ public:
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
             coordEgoQueue_.clear();
+            coordTouchQueue_.clear();
             coordCv_.notify_all();
         }
         {
@@ -2904,6 +3007,8 @@ public:
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
         egoEnabled_ = false;
+        touchEnabled_ = false;
+        stopTouchRuntimes();
         resetStreamHealth();
     }
 
@@ -2980,11 +3085,14 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(coordMtx_);
-            if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty()) {
+            if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty() || !coordTouchQueue_.empty()) {
                 if(any) {
                     oss << " ";
                 }
-                oss << "align=" << coordRecordQueue_.size() << "+" << coordFisheyeQueue_.size() << "+" << coordEgoQueue_.size();
+                oss << "align=" << coordRecordQueue_.size()
+                    << "+" << coordFisheyeQueue_.size()
+                    << "+" << coordEgoQueue_.size()
+                    << "+" << coordTouchQueue_.size();
                 any = true;
             }
         }
@@ -3117,6 +3225,7 @@ public:
             return readiness;
         }
         const_cast<MultiDeviceStreamingRecorder *>(this)->refreshEgoReadyHealth();
+        const_cast<MultiDeviceStreamingRecorder *>(this)->refreshTouchReadyHealth();
 
         std::vector<std::string> missing;
         {
@@ -3524,12 +3633,15 @@ public:
         multiviewEnabled_ = ui.enableMultiview;
         fisheyeEnabled_   = ui.enableFisheyes;
         egoEnabled_       = ui.enableEgo;
+        touchEnabled_     = ui.enableTouch;
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
 
         if(!multiviewEnabled_ && !fisheyeEnabled_ && !egoEnabled_) {
             std::lock_guard<std::mutex> lock(mtx_);
-            captureInfoLine_ = "Select at least one capture type";
+            captureInfoLine_ = touchEnabled_
+                ? "Touch is an auxiliary modality; select multiview, fisheyes, or ego too"
+                : "Select at least one capture type";
             return false;
         }
 
@@ -3616,6 +3728,81 @@ public:
             }
         }
 
+        std::string touchStatusLine;
+        if(touchEnabled_) {
+            const auto touchCfgs = expandTouchDeviceConfigs(cfg_.touch);
+            if(touchCfgs.empty()) {
+                touchEnabled_ = false;
+                if(cfg_.touch.required) {
+                    fisheyeRecorder_.stop();
+                    if(!egoWasRunning && ownsEgoRecorder_) {
+                        egoRecorder_.stop();
+                    }
+                    std::lock_guard<std::mutex> lock(mtx_);
+                    captureInfoLine_ = "Touch start failed: no touch devices configured";
+                    return false;
+                }
+                touchStatusLine = "Touch unavailable, continuing without touch: no touch devices configured";
+            }
+            else {
+                for(const auto &baseTouchCfg: touchCfgs) {
+                    TactileModuleConfig touchCfg = baseTouchCfg;
+                    touchCfg.enabled = true;
+                    if(touchCfg.maxBufferedSamples == 0) {
+                        touchCfg.maxBufferedSamples = static_cast<size_t>(std::max(2048, ui.maxDurationInt() * std::max(1, touchCfg.targetFps) * 2));
+                    }
+
+                    TouchRuntime runtime;
+                    runtime.streamId = touchCfg.streamId;
+                    runtime.handSide = touchCfg.handSide;
+                    runtime.sensorType = touchCfg.sensorType;
+                    runtime.config = touchCfg;
+                    runtime.recorder = std::make_unique<TactileRecorder>();
+
+                    std::string touchError;
+                    if(!runtime.recorder->start(touchCfg, &touchError)) {
+                        if(cfg_.touch.required) {
+                            stopTouchRuntimes();
+                            touchEnabled_ = false;
+                            fisheyeRecorder_.stop();
+                            if(!egoWasRunning && ownsEgoRecorder_) {
+                                egoRecorder_.stop();
+                            }
+                            std::lock_guard<std::mutex> lock(mtx_);
+                            captureInfoLine_ = "Touch " + runtime.streamId + " start failed: " + touchError;
+                            return false;
+                        }
+                        std::cerr << "[collection] Touch " << runtime.streamId
+                                  << " unavailable, continuing without it: " << touchError << std::endl;
+                        continue;
+                    }
+                    const std::string port = touchCfg.serial.portPath.empty() ? "(auto)" : touchCfg.serial.portPath;
+                    if(!touchStatusLine.empty()) {
+                        touchStatusLine += "  ";
+                    }
+                    touchStatusLine += "Touch " + runtime.streamId + " listening on " + port
+                                     + " @" + std::to_string(touchCfg.serial.baudRate);
+                    touchRuntimes_.push_back(std::move(runtime));
+                }
+                if(touchRuntimes_.empty()) {
+                    touchEnabled_ = false;
+                    if(cfg_.touch.required) {
+                        fisheyeRecorder_.stop();
+                        if(!egoWasRunning && ownsEgoRecorder_) {
+                            egoRecorder_.stop();
+                        }
+                        std::lock_guard<std::mutex> lock(mtx_);
+                        captureInfoLine_ = "Touch start failed: no touch recorder is running";
+                        return false;
+                    }
+                    touchStatusLine = "Touch unavailable, continuing without touch";
+                }
+            }
+            if(!touchStatusLine.empty()) {
+                std::cerr << "[collection] " << touchStatusLine << std::endl;
+            }
+        }
+
         if(!multiviewEnabled_) {
             stopping_.store(false);
             capturing_.store(true);
@@ -3623,9 +3810,10 @@ public:
             initStreamHealthForActiveStreams();
             softwareTriggerDevices_.clear();
             useSoftwareTrigger_ = false;
-            if(!fisheyeStatusLine.empty() || !egoStatusLine.empty()) {
+            if(!fisheyeStatusLine.empty() || !egoStatusLine.empty() || !touchStatusLine.empty()) {
                 std::lock_guard<std::mutex> lock(mtx_);
-                captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine : egoStatusLine;
+                captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine
+                                   : (!egoStatusLine.empty() ? egoStatusLine : touchStatusLine);
             }
             return true;
         }
@@ -3634,6 +3822,7 @@ public:
         auto deviceList = ctx_.queryDeviceList();
         if(!deviceList || deviceList->deviceCount() == 0) {
             fisheyeRecorder_.stop();
+            stopTouchRuntimes();
             if(!egoWasRunning && ownsEgoRecorder_) {
                 egoRecorder_.stop();
             }
@@ -3647,6 +3836,7 @@ public:
         auto selected = selectDevicesWithPipeline(deviceList, cfg_);
         if(selected.empty()) {
             fisheyeRecorder_.stop();
+            stopTouchRuntimes();
             if(!egoWasRunning && ownsEgoRecorder_) {
                 egoRecorder_.stop();
             }
@@ -3804,9 +3994,10 @@ public:
         capturing_.store(true);
         recording_.store(false);
         initStreamHealthForActiveStreams();
-        if(!fisheyeStatusLine.empty() || !egoStatusLine.empty()) {
+        if(!fisheyeStatusLine.empty() || !egoStatusLine.empty() || !touchStatusLine.empty()) {
             std::lock_guard<std::mutex> lock(mtx_);
-            captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine : egoStatusLine;
+            captureInfoLine_ = !fisheyeStatusLine.empty() ? fisheyeStatusLine
+                               : (!egoStatusLine.empty() ? egoStatusLine : touchStatusLine);
         }
 
         softwareTriggerDevices_.clear();
@@ -3904,6 +4095,18 @@ public:
         local.fisheyeCameraCount = local.saveFisheye ? activeFisheyeCameraCount_ : 0;
         local.wroteFisheyeCameraParams.assign(local.fisheyeCameraCount, false);
         local.saveEgo = egoEnabled_;
+        local.saveTouch = touchEnabled_ && !touchRuntimes_.empty();
+        if(local.saveTouch) {
+            local.touchStreams.reserve(touchRuntimes_.size());
+            for(const auto &runtime: touchRuntimes_) {
+                TouchSessionStream stream;
+                stream.streamId = runtime.streamId;
+                stream.handSide = runtime.handSide;
+                stream.sensorType = runtime.sensorType;
+                local.touchSamples.emplace(stream.streamId, std::deque<TactileSample>{});
+                local.touchStreams.push_back(std::move(stream));
+            }
+        }
         local.egoSoftAlignEnabled = cfg_.ego.softAlignToOrbbecFirstFrame
                                      && local.saveEgo && multiviewEnabled_ && !local.refSn.empty();
         if(local.saveCloud || local.saveColorCloud) {
@@ -3960,6 +4163,11 @@ public:
             if(local.saveEgo) {
                 fs::create_directories(local.dest / "ego" / "RGB");
             }
+            if(local.saveTouch) {
+                const std::string touchDirName = cfg_.touch.save.directoryName.empty() ? std::string("touch") : cfg_.touch.save.directoryName;
+                fs::create_directories(local.dest / touchDirName);
+                writeTouchManifestJson(local.dest / touchDirName);
+            }
 
             if(multiviewEnabled_) {
                 writeParamsJson(local.dest, local.buffers, typesSaving_, cfg_.colorCloudRgbFrameOffset, cfg_.save);
@@ -3984,6 +4192,11 @@ public:
             if(local.egoAlignedTimestampsOfs.is_open()) {
                 local.egoAlignedTimestampsOfs.close();
             }
+            for(auto &stream: local.touchStreams) {
+                if(stream.rawOfs.is_open()) {
+                    stream.rawOfs.close();
+                }
+            }
             try {
                 fs::remove_all(local.dest);
             }
@@ -4002,12 +4215,22 @@ public:
                 if(local.egoAlignedTimestampsOfs.is_open()) {
                     local.egoAlignedTimestampsOfs.close();
                 }
+                for(auto &stream: local.touchStreams) {
+                    if(stream.rawOfs.is_open()) {
+                        stream.rawOfs.close();
+                    }
+                }
                 try {
                     if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
                         fs::remove(local.timestampsTmpPath);
                     }
                     if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
                         fs::remove(local.egoAlignedTimestampsTmpPath);
+                    }
+                    for(const auto &stream: local.touchStreams) {
+                        if(!stream.rawTmpPath.empty() && fs::exists(stream.rawTmpPath)) {
+                            fs::remove(stream.rawTmpPath);
+                        }
                     }
                     fs::remove_all(local.dest);
                 }
@@ -4026,6 +4249,11 @@ public:
             if(local.egoAlignedTimestampsOfs.is_open()) {
                 local.egoAlignedTimestampsOfs.close();
             }
+            for(auto &stream: local.touchStreams) {
+                if(stream.rawOfs.is_open()) {
+                    stream.rawOfs.close();
+                }
+            }
             try {
                 if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
                     fs::remove(local.timestampsTmpPath);
@@ -4033,12 +4261,54 @@ public:
                 if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
                     fs::remove(local.egoAlignedTimestampsTmpPath);
                 }
+                for(const auto &stream: local.touchStreams) {
+                    if(!stream.rawTmpPath.empty() && fs::exists(stream.rawTmpPath)) {
+                        fs::remove(stream.rawTmpPath);
+                    }
+                }
                 fs::remove_all(local.dest);
             }
             catch(...) {
             }
             std::lock_guard<std::mutex> lock(mtx_);
             captureInfoLine_ = "Fisheye recorder is not running";
+            return false;
+        }
+        auto failedTouchRuntime = std::find_if(touchRuntimes_.begin(), touchRuntimes_.end(), [](const TouchRuntime &runtime) {
+            return !runtime.recorder || !runtime.recorder->isRunning();
+        });
+        if(touchEnabled_ && (touchRuntimes_.empty() || failedTouchRuntime != touchRuntimes_.end())) {
+            if(local.timestampsOfs.is_open()) {
+                local.timestampsOfs.close();
+            }
+            if(local.egoAlignedTimestampsOfs.is_open()) {
+                local.egoAlignedTimestampsOfs.close();
+            }
+            for(auto &stream: local.touchStreams) {
+                if(stream.rawOfs.is_open()) {
+                    stream.rawOfs.close();
+                }
+            }
+            try {
+                if(!local.timestampsTmpPath.empty() && fs::exists(local.timestampsTmpPath)) {
+                    fs::remove(local.timestampsTmpPath);
+                }
+                if(!local.egoAlignedTimestampsTmpPath.empty() && fs::exists(local.egoAlignedTimestampsTmpPath)) {
+                    fs::remove(local.egoAlignedTimestampsTmpPath);
+                }
+                for(const auto &stream: local.touchStreams) {
+                    if(!stream.rawTmpPath.empty() && fs::exists(stream.rawTmpPath)) {
+                        fs::remove(stream.rawTmpPath);
+                    }
+                }
+                fs::remove_all(local.dest);
+            }
+            catch(...) {
+            }
+            std::lock_guard<std::mutex> lock(mtx_);
+            captureInfoLine_ = failedTouchRuntime == touchRuntimes_.end()
+                ? "Touch recorder is not running"
+                : ("Touch " + failedTouchRuntime->streamId + " recorder is not running");
             return false;
         }
 
@@ -4071,6 +4341,8 @@ public:
             session_ = std::move(local);
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
+            coordEgoQueue_.clear();
+            coordTouchQueue_.clear();
             if(!multiviewEnabled_) {
                 session_.multiviewEos = true;
             }
@@ -4079,6 +4351,9 @@ public:
             }
             if(!egoEnabled_) {
                 session_.egoEos = true;
+            }
+            if(!touchEnabled_) {
+                session_.touchEos = true;
             }
             coordCv_.notify_all();
         }
@@ -4111,6 +4386,7 @@ public:
                     coordRecordQueue_.clear();
                     coordFisheyeQueue_.clear();
                     coordEgoQueue_.clear();
+                    coordTouchQueue_.clear();
                     coordCv_.notify_all();
                 }
                 joinCoordinatorThreadIfPossible();
@@ -4146,6 +4422,19 @@ public:
             }
             egoRecordThread_ = std::thread([this]() { egoRecordLoop(); });
         }
+        if(touchEnabled_) {
+            for(auto &runtime: touchRuntimes_) {
+                if(runtime.recordThread.joinable()) {
+                    runtime.recordThread.join();
+                }
+                if(runtime.recorder) {
+                    runtime.recorder->resetCaptureCursorToLatest();
+                }
+                runtime.recordThread = std::thread([this, streamId = runtime.streamId]() {
+                    touchRecordLoop(streamId);
+                });
+            }
+        }
         std::cerr << "[collection] record begin" << std::endl;
         return true;
     }
@@ -4169,6 +4458,11 @@ public:
         if(egoRecordThread_.joinable()) {
             egoRecordThread_.join();
         }
+        for(auto &runtime: touchRuntimes_) {
+            if(runtime.recordThread.joinable()) {
+                runtime.recordThread.join();
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(mtx_);
             lastRecordedSeconds_ = static_cast<double>(durMs) / 1000.0;
@@ -4189,6 +4483,7 @@ public:
         }
         notifyFisheyeEos();
         notifyEgoEos();
+        notifyTouchEos();
         const std::string captureInfoSnapshot = buildCaptureInfoSnapshotLocked(durMs);
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -4200,6 +4495,7 @@ public:
     void stopIfRunning(bool closeEgoTcp = true) {
         if(!capturing_.load()) {
             fisheyeRecorder_.stop();
+            stopTouchRuntimes();
             if(closeEgoTcp) {
                 if(ownsEgoRecorder_) {
                     egoRecorder_.stop();
@@ -4208,6 +4504,7 @@ public:
             activeFisheyeCameraCount_ = 0;
             activeFisheyeCameraIds_.clear();
             egoEnabled_ = false;
+            touchEnabled_ = false;
             return;
         }
         stopping_.store(true);
@@ -4229,8 +4526,14 @@ public:
         if(egoRecordThread_.joinable()) {
             egoRecordThread_.join();
         }
+        for(auto &runtime: touchRuntimes_) {
+            if(runtime.recordThread.joinable()) {
+                runtime.recordThread.join();
+            }
+        }
         notifyFisheyeEos();
         notifyEgoEos();
+        notifyTouchEos();
         if(multiviewEnabled_) {
             waitRecordWorkerIdle();
             notifyMultiviewEos();
@@ -4254,6 +4557,7 @@ public:
             }
         }
         fisheyeRecorder_.stop();
+        stopTouchRuntimes();
         if(closeEgoTcp) {
             if(ownsEgoRecorder_) {
                 egoRecorder_.stop();
@@ -4266,6 +4570,7 @@ public:
         activeFisheyeCameraCount_ = 0;
         activeFisheyeCameraIds_.clear();
         egoEnabled_ = false;
+        touchEnabled_ = false;
         resetStreamHealth();
         {
             std::lock_guard<std::mutex> lock(mtx_);
@@ -4285,6 +4590,7 @@ public:
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
             coordEgoQueue_.clear();
+            coordTouchQueue_.clear();
             coordCv_.notify_all();
         }
         std::cerr << "[collection] pipelines stopped" << std::endl;
@@ -4305,6 +4611,7 @@ public:
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
             coordEgoQueue_.clear();
+            coordTouchQueue_.clear();
             coordCv_.notify_all();
         }
         hasData_.store(false);
@@ -4351,6 +4658,7 @@ public:
             coordRecordQueue_.clear();
             coordFisheyeQueue_.clear();
             coordEgoQueue_.clear();
+            coordTouchQueue_.clear();
             coordCv_.notify_all();
         }
         {
@@ -5147,6 +5455,38 @@ private:
         size_t encodedFrameCount_ = 0;
     };
 
+    struct TouchSessionStream {
+        std::string streamId;
+        std::string handSide;
+        int         sensorType = 0;
+        fs::path    rawPath;
+        fs::path    rawTmpPath;
+        std::ofstream rawOfs;
+        bool        rawOpen = false;
+        size_t      capturedSamples = 0;
+    };
+
+    struct TouchQueuedSample {
+        std::string streamId;
+        TactileSample sample;
+    };
+
+    struct TouchRuntime {
+        std::string streamId;
+        std::string handSide;
+        int         sensorType = 0;
+        TactileModuleConfig config;
+        std::unique_ptr<TactileRecorder> recorder;
+        std::thread recordThread;
+    };
+
+    struct PickedTouchSample {
+        std::string streamId;
+        size_t      sampleIndex = 0;
+        bool        hasSample = false;
+        uint64_t    absDiffUs = 0;
+    };
+
     struct SessionState {
         bool active = false;
         fs::path dest;
@@ -5168,6 +5508,7 @@ private:
         bool passthroughRgbMjpg = false;
         bool saveFisheye = false;
         bool saveEgo = false;
+        bool saveTouch = false;
         bool saveRgbTimesteps = false;
         bool saveDepthTimesteps = false;
         size_t fisheyeCameraCount = 0;
@@ -5176,9 +5517,12 @@ private:
         std::unordered_map<std::string, std::unordered_map<CollectDataType, StreamState>> streams;
         std::deque<FisheyeFrameSet> fisheyeSets;
         std::deque<EgoFrame> egoFrames;
+        std::vector<TouchSessionStream> touchStreams;
+        std::unordered_map<std::string, std::deque<TactileSample>> touchSamples;
         bool multiviewEos = false;
         bool fisheyeEos = false;
         bool egoEos = false;
+        bool touchEos = false;
         bool coordinatorDone = false;
         bool timestampsFinalized = false;
         bool imuWritten = false;
@@ -5378,6 +5722,78 @@ private:
         commitEgoFrameLocked(std::move(frame));
     }
 
+    TouchSessionStream *findTouchStreamLocked(const std::string &streamId) {
+        for(auto &stream: session_.touchStreams) {
+            if(stream.streamId == streamId) {
+                return &stream;
+            }
+        }
+        return nullptr;
+    }
+
+    const TouchSessionStream *findTouchStreamLocked(const std::string &streamId) const {
+        for(const auto &stream: session_.touchStreams) {
+            if(stream.streamId == streamId) {
+                return &stream;
+            }
+        }
+        return nullptr;
+    }
+
+    void writeTouchRawRowLocked(const std::string &streamId, const TactileSample &sample) {
+        auto *stream = findTouchStreamLocked(streamId);
+        if(!stream || !stream->rawOpen || !stream->rawOfs.is_open()) {
+            return;
+        }
+        const auto &frame = sample.frame;
+        std::vector<std::string> row;
+        row.reserve(15 + kJqShroomPressureChannelCount);
+        row.push_back(std::to_string(sample.sequence));
+        row.push_back(std::to_string(sample.representativeTimestampUs));
+        {
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed);
+            oss << std::setprecision(6) << sample.representativeTimestampSec;
+            row.push_back(oss.str());
+        }
+        row.push_back(frame.side);
+        row.push_back(std::to_string(frame.sensorType));
+        row.push_back(std::to_string(frame.packet1TimestampUs));
+        row.push_back(std::to_string(frame.packet2TimestampUs));
+        row.push_back(std::to_string(frame.packetGapUs));
+        row.push_back(bytesToLowerHex(frame.imuRaw));
+        row.push_back(std::to_string(frame.imuW));
+        row.push_back(std::to_string(frame.imuX));
+        row.push_back(std::to_string(frame.imuY));
+        row.push_back(std::to_string(frame.imuZ));
+        row.push_back(frame.imuValid ? "1" : "0");
+        row.push_back(frame.qualityFlag);
+        for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+            if(i < frame.rawAdc.size()) {
+                row.push_back(std::to_string(frame.rawAdc[i]));
+            }
+            else {
+                row.emplace_back();
+            }
+        }
+        writeCsvRow(stream->rawOfs, row);
+    }
+
+    void commitTouchSampleLocked(TouchQueuedSample &&queued) {
+        writeTouchRawRowLocked(queued.streamId, queued.sample);
+        auto &samples = session_.touchSamples[queued.streamId];
+        auto insertPos = std::upper_bound(samples.begin(),
+                                          samples.end(),
+                                          queued.sample.representativeTimestampUs,
+                                          [](uint64_t tsUs, const TactileSample &item) {
+                                              return tsUs < item.representativeTimestampUs;
+                                          });
+        samples.insert(insertPos, std::move(queued.sample));
+        if(auto *stream = findTouchStreamLocked(queued.streamId)) {
+            stream->capturedSamples++;
+        }
+    }
+
     bool flushEosSequenceGapsLocked() {
         bool advanced = false;
         for(auto &kv: session_.streams) {
@@ -5416,6 +5832,7 @@ private:
         }
         session_.fisheyeSets.clear();
         session_.egoFrames.clear();
+        session_.touchSamples.clear();
     }
 
     static size_t softWriterThreadCount(const AppConfig &cfg) {
@@ -5485,6 +5902,10 @@ private:
         return "ego RGB";
     }
 
+    static std::string touchStreamHealthKey(const std::string &streamId) {
+        return "touch:" + streamId + ":pressure";
+    }
+
     static std::string streamHealthDisplayName(const StreamHealthState &state) {
         if(!state.displayName.empty()) {
             return state.displayName;
@@ -5550,6 +5971,21 @@ private:
             state.requireTimestampAdvance = true;
             state.everReceived = egoRecorder_.isConnected();
             states.push_back(std::move(state));
+        }
+        if(touchEnabled_) {
+            for(const auto &runtime: touchRuntimes_) {
+                StreamHealthState state;
+                state.healthKey = touchStreamHealthKey(runtime.streamId);
+                state.sn = "touch_" + runtime.streamId;
+                state.camKey = runtime.streamId;
+                state.displayName = touchDisplayName(runtime.streamId);
+                state.type = CollectDataType::RGB;
+                state.startedSteady = now;
+                state.lastFrameSteady = now;
+                state.requireTimestampAdvance = true;
+                state.everReceived = false;
+                states.push_back(std::move(state));
+            }
         }
 
         std::lock_guard<std::mutex> lock(streamHealthMtx_);
@@ -5618,6 +6054,25 @@ private:
         state.everReceived = true;
     }
 
+    void noteTouchSample(const std::string &streamId, const TactileSample &sample) {
+        if(sample.representativeTimestampUs == 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(streamHealthMtx_);
+        auto it = streamHealth_.find(touchStreamHealthKey(streamId));
+        if(it == streamHealth_.end()) {
+            return;
+        }
+        auto &state = it->second;
+        if(state.requireTimestampAdvance && sample.representativeTimestampUs <= state.lastFrameTimestampUs) {
+            return;
+        }
+        state.lastFrameTimestampUs = sample.representativeTimestampUs;
+        state.lastFrameSteady = now;
+        state.everReceived = true;
+    }
+
     void refreshEgoReadyHealth() {
         if(!egoEnabled_ || recording_.load()) {
             return;
@@ -5633,6 +6088,22 @@ private:
         it->second.everReceived = connected;
         if(!connected) {
             it->second.lastFrameTimestampUs = 0;
+        }
+    }
+
+    void refreshTouchReadyHealth() {
+        if(!touchEnabled_ || recording_.load()) {
+            return;
+        }
+        for(auto &runtime: touchRuntimes_) {
+            if(!runtime.recorder || !runtime.recorder->isRunning()) {
+                continue;
+            }
+            std::string err;
+            auto sample = runtime.recorder->snapshotLatest(&err);
+            if(sample) {
+                noteTouchSample(runtime.streamId, *sample);
+            }
         }
     }
 
@@ -5720,6 +6191,13 @@ private:
             header.push_back("ego_frame_index");
             header.push_back("ego_timestamp_us");
         }
+        if(session.saveTouch) {
+            for(const auto &stream: session.touchStreams) {
+                header.push_back("touch_" + stream.streamId + "_frame_index");
+                header.push_back("touch_" + stream.streamId + "_timestamp_us");
+                header.push_back("touch_" + stream.streamId + "_abs_diff_us");
+            }
+        }
         header.push_back("rgbd_max_diff_ms");
         header.push_back("all_modalities_max_diff_ms");
         writeCsvRow(session.timestampsOfs, header);
@@ -5750,6 +6228,27 @@ private:
             session.egoAllTimestampsTmpPath = session.egoAllTimestampsPath;
             session.egoAllTimestampsTmpPath += ".tmp";
         }
+        if(session.saveTouch) {
+            const std::string touchDirName = cfg_.touch.save.directoryName.empty() ? std::string("touch") : cfg_.touch.save.directoryName;
+            for(auto &stream: session.touchStreams) {
+                const std::string rawName = stream.streamId + "_raw.csv";
+                stream.rawPath = session.dest / touchDirName / rawName;
+                stream.rawTmpPath = stream.rawPath;
+                stream.rawTmpPath += ".tmp";
+                stream.rawOfs.open(stream.rawTmpPath, std::ios::out | std::ios::trunc);
+                if(!stream.rawOfs.is_open()) {
+                    return false;
+                }
+                stream.rawOpen = true;
+                stream.rawOfs << "sample_index,touch_timestamp_us,touch_timestamp_s,side,sensor_type,"
+                              << "packet1_ts_us,packet2_ts_us,packet_gap_us,"
+                              << "imu_raw_hex,imu_w,imu_x,imu_y,imu_z,imu_valid,quality_flag";
+                for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+                    stream.rawOfs << ",pressure_" << std::setw(3) << std::setfill('0') << i;
+                }
+                stream.rawOfs << std::setfill(' ') << "\n";
+            }
+        }
         return static_cast<bool>(session.timestampsOfs);
     }
 
@@ -5774,6 +6273,13 @@ private:
             session_.egoAlignedTimestampsOfs.close();
         }
         session_.egoAlignedTimestampsOpen = false;
+        for(auto &stream: session_.touchStreams) {
+            if(stream.rawOfs.is_open()) {
+                stream.rawOfs.flush();
+                stream.rawOfs.close();
+            }
+            stream.rawOpen = false;
+        }
     }
 
     void writeEgoAllTimestampsLocked() {
@@ -5845,7 +6351,45 @@ private:
             catch(...) {
             }
         }
+        for(const auto &stream: session_.touchStreams) {
+            if(!stream.rawTmpPath.empty()) {
+                try {
+                    fs::rename(stream.rawTmpPath, stream.rawPath);
+                }
+                catch(...) {
+                }
+            }
+        }
         session_.timestampsFinalized = true;
+    }
+
+    void writeTouchManifestJson(const fs::path &touchDir) const {
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddStringToObject(root, "schema", "orbbec.touch.jq_shroom.v1");
+        cJSON_AddStringToObject(root, "protocol", "jq_shroom_record_tactile_py");
+        cJSON_AddNumberToObject(root, "pressure_channels", static_cast<double>(kJqShroomPressureChannelCount));
+        cJSON_AddNumberToObject(root, "target_fps", cfg_.touch.targetFps);
+        cJSON_AddStringToObject(root, "timestamp_domain", "collection_ref_timestamp_us");
+        cJSON *devices = cJSON_CreateArray();
+        for(const auto &runtime: touchRuntimes_) {
+            const auto &touchCfg = runtime.config;
+            cJSON *dev = cJSON_CreateObject();
+            cJSON_AddStringToObject(dev, "id", runtime.streamId.c_str());
+            cJSON_AddStringToObject(dev, "side", touchCfg.handSide.c_str());
+            cJSON_AddNumberToObject(dev, "sensor_type", touchCfg.sensorType);
+            cJSON_AddNumberToObject(dev, "baud_rate", touchCfg.serial.baudRate);
+            cJSON_AddStringToObject(dev, "port_path", touchCfg.serial.portPath.c_str());
+            cJSON_AddStringToObject(dev, "raw_csv", (runtime.streamId + "_raw.csv").c_str());
+            cJSON_AddItemToArray(devices, dev);
+        }
+        cJSON_AddItemToObject(root, "devices", devices);
+        char *printed = cJSON_Print(root);
+        cJSON_Delete(root);
+        if(!printed) {
+            return;
+        }
+        writeTextFile(touchDir / "touch_manifest.json", printed);
+        cJSON_free(printed);
     }
 
     static std::string buildCaptureInfoFromSession(const SessionState &session, double seconds) {
@@ -5861,6 +6405,13 @@ private:
         }
         if(session.fisheyeCapturedSets > 0) {
             oss << "  FisheyeFrames=" << session.fisheyeCapturedSets;
+        }
+        size_t touchCapturedSamples = 0;
+        for(const auto &stream: session.touchStreams) {
+            touchCapturedSamples += stream.capturedSamples;
+        }
+        if(touchCapturedSamples > 0) {
+            oss << "  TouchSamples=" << touchCapturedSamples;
         }
         return oss.str();
     }
@@ -6708,7 +7259,7 @@ private:
     }
 
     size_t coordQueuedCountLocked() const {
-        return coordRecordQueue_.size() + coordFisheyeQueue_.size() + coordEgoQueue_.size();
+        return coordRecordQueue_.size() + coordFisheyeQueue_.size() + coordEgoQueue_.size() + coordTouchQueue_.size();
     }
 
     void enqueueProcessedRecord(ProcessedRecord &&item) {
@@ -6753,6 +7304,23 @@ private:
         coordCv_.notify_one();
     }
 
+    void enqueueTouchSample(const std::string &streamId, TactileSample &&sample) {
+        {
+            std::unique_lock<std::mutex> lock(coordMtx_);
+            coordCv_.wait(lock, [&]() {
+                return !session_.active || stopping_.load() || coordQueuedCountLocked() < coordQueueMax_;
+            });
+            if(!session_.active || stopping_.load()) {
+                return;
+            }
+            TouchQueuedSample queued;
+            queued.streamId = streamId;
+            queued.sample = std::move(sample);
+            coordTouchQueue_.push_back(std::move(queued));
+        }
+        coordCv_.notify_one();
+    }
+
     void notifyMultiviewEos() {
         if(multiviewEosNotified_.exchange(true)) {
             return;
@@ -6785,6 +7353,15 @@ private:
             return;
         }
         session_.egoEos = true;
+        coordCv_.notify_one();
+    }
+
+    void notifyTouchEos() {
+        std::lock_guard<std::mutex> lock(coordMtx_);
+        if(!session_.active) {
+            return;
+        }
+        session_.touchEos = true;
         coordCv_.notify_one();
     }
 
@@ -6841,6 +7418,21 @@ private:
                 return false;
             }
         }
+        if(session_.saveTouch) {
+            const uint64_t requiredTouchTailUs = saturatingAddUs(centerUs, session_.maxAbsDiffUs);
+            for(const auto &stream: session_.touchStreams) {
+                auto itSamples = session_.touchSamples.find(stream.streamId);
+                if(itSamples == session_.touchSamples.end() || itSamples->second.empty()) {
+                    if(!session_.touchEos) {
+                        return false;
+                    }
+                    continue;
+                }
+                if(!session_.touchEos && itSamples->second.back().representativeTimestampUs < requiredTouchTailUs) {
+                    return false;
+                }
+            }
+        }
         return true;
     }
 
@@ -6853,6 +7445,64 @@ private:
 
     size_t pickNearestEgoIndexLocked(uint64_t centerUs) const {
         return findNearestEgoFrameIndex(session_.egoFrames, centerUs);
+    }
+
+    size_t pickNearestTouchIndexLocked(const std::string &streamId, uint64_t centerUs) const {
+        auto itSamples = session_.touchSamples.find(streamId);
+        if(itSamples == session_.touchSamples.end() || itSamples->second.empty()) {
+            return 0;
+        }
+        const auto &samples = itSamples->second;
+        auto absDiff = [](uint64_t a, uint64_t b) {
+            return a > b ? (a - b) : (b - a);
+        };
+        auto it = std::lower_bound(samples.begin(),
+                                   samples.end(),
+                                   centerUs,
+                                   [](const TactileSample &sample, uint64_t ts) {
+                                       return sample.representativeTimestampUs < ts;
+                                   });
+        size_t cand0 = (it == samples.end())
+            ? (samples.size() - 1)
+            : static_cast<size_t>(std::distance(samples.begin(), it));
+        size_t cand1 = cand0 > 0 ? cand0 - 1 : cand0;
+        const uint64_t d0 = absDiff(samples[cand0].representativeTimestampUs, centerUs);
+        const uint64_t d1 = absDiff(samples[cand1].representativeTimestampUs, centerUs);
+        return d1 <= d0 ? cand1 : cand0;
+    }
+
+    bool pickNearestTouchSampleLocked(const std::string &streamId, uint64_t centerUs, size_t &picked, uint64_t &absDiffUs) const {
+        picked = 0;
+        absDiffUs = 0;
+        auto itSamples = session_.touchSamples.find(streamId);
+        if(itSamples == session_.touchSamples.end() || itSamples->second.empty()) {
+            return false;
+        }
+        const auto &samples = itSamples->second;
+        picked = pickNearestTouchIndexLocked(streamId, centerUs);
+        const uint64_t ts = samples[picked].representativeTimestampUs;
+        absDiffUs = ts > centerUs ? (ts - centerUs) : (centerUs - ts);
+        return absDiffUs <= session_.maxAbsDiffUs;
+    }
+
+    bool touchTailReadyLocked(uint64_t targetUs) const {
+        if(!session_.saveTouch) {
+            return true;
+        }
+        const uint64_t requiredTailUs = saturatingAddUs(targetUs, session_.maxAbsDiffUs);
+        for(const auto &stream: session_.touchStreams) {
+            auto itSamples = session_.touchSamples.find(stream.streamId);
+            if(itSamples == session_.touchSamples.end() || itSamples->second.empty()) {
+                if(!session_.touchEos) {
+                    return false;
+                }
+                continue;
+            }
+            if(!session_.touchEos && itSamples->second.back().representativeTimestampUs < requiredTailUs) {
+                return false;
+            }
+        }
+        return true;
     }
 
     bool pickNearestMappedEgoFrameLocked(uint64_t centerUs,
@@ -6903,6 +7553,12 @@ private:
         }
         while(session_.egoFrames.size() > 1 && session_.egoFrames[1].refTimestampUs <= centerUs) {
             session_.egoFrames.pop_front();
+        }
+        for(auto &kv: session_.touchSamples) {
+            auto &samples = kv.second;
+            while(samples.size() > 1 && samples[1].representativeTimestampUs <= centerUs) {
+                samples.pop_front();
+            }
         }
     }
 
@@ -7144,6 +7800,24 @@ private:
                 fullThis = false;
             }
         }
+        std::vector<PickedTouchSample> pickedTouches;
+        if(session_.saveTouch) {
+            pickedTouches.reserve(session_.touchStreams.size());
+            for(const auto &stream: session_.touchStreams) {
+                PickedTouchSample pickedTouch;
+                pickedTouch.streamId = stream.streamId;
+                if(pickNearestTouchSampleLocked(stream.streamId, centerUs, pickedTouch.sampleIndex, pickedTouch.absDiffUs)) {
+                    const auto &touchSample = session_.touchSamples.at(stream.streamId)[pickedTouch.sampleIndex];
+                    pickedTouch.hasSample = true;
+                    tsMin = std::min(tsMin, touchSample.representativeTimestampUs);
+                    tsMax = std::max(tsMax, touchSample.representativeTimestampUs);
+                }
+                else {
+                    fullThis = false;
+                }
+                pickedTouches.push_back(std::move(pickedTouch));
+            }
+        }
 
         const size_t refIndex = session_.alignedRef;
         session_.alignedRef++;
@@ -7183,7 +7857,8 @@ private:
         hasData_.store(true);
 
         std::vector<std::string> row;
-        row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount + (session_.saveEgo ? 2 : 0) + 2);
+        row.reserve(2 + session_.deviceSns.size() * 2 + session_.fisheyeCameraCount
+                    + (session_.saveEgo ? 2 : 0) + (session_.saveTouch ? session_.touchStreams.size() * 3 : 0) + 2);
         row.push_back(frameIndex);
         row.push_back(std::to_string(centerUs));
         std::unordered_map<CollectDataType, uint64_t> rgbdTsMinByType;
@@ -7351,6 +8026,27 @@ private:
             }
         }
 
+        if(session_.saveTouch) {
+            for(const auto &pickedTouch: pickedTouches) {
+                auto itSamples = session_.touchSamples.find(pickedTouch.streamId);
+                if(pickedTouch.hasSample && itSamples != session_.touchSamples.end()
+                   && pickedTouch.sampleIndex < itSamples->second.size()) {
+                    const auto &touchSample = itSamples->second[pickedTouch.sampleIndex];
+                    row.push_back(std::to_string(touchSample.sequence));
+                    row.push_back(std::to_string(touchSample.representativeTimestampUs));
+                    row.push_back(std::to_string(pickedTouch.absDiffUs));
+                    allTsMin = std::min(allTsMin, touchSample.representativeTimestampUs);
+                    allTsMax = std::max(allTsMax, touchSample.representativeTimestampUs);
+                    allTsCount++;
+                }
+                else {
+                    row.emplace_back();
+                    row.emplace_back();
+                    row.emplace_back();
+                }
+            }
+        }
+
         {
             double rgbdMaxDiffMs = 0.0;
             for(const auto &kv: rgbdTsCountByType) {
@@ -7427,6 +8123,9 @@ private:
                 return false;
             }
         }
+        if(!touchTailReadyLocked(targetUs)) {
+            return false;
+        }
 
         const size_t egoIdx = pickNearestEgoIndexLocked(targetUs);
         if(egoIdx >= session_.egoFrames.size()) {
@@ -7454,6 +8153,19 @@ private:
             }
             return advanceEgoOnlyTarget();
         }
+        std::vector<PickedTouchSample> pickedTouches;
+        if(session_.saveTouch) {
+            pickedTouches.reserve(session_.touchStreams.size());
+            for(const auto &stream: session_.touchStreams) {
+                PickedTouchSample pickedTouch;
+                pickedTouch.streamId = stream.streamId;
+                if(!pickNearestTouchSampleLocked(stream.streamId, targetUs, pickedTouch.sampleIndex, pickedTouch.absDiffUs)) {
+                    return advanceEgoOnlyTarget();
+                }
+                pickedTouch.hasSample = true;
+                pickedTouches.push_back(std::move(pickedTouch));
+            }
+        }
 
         const size_t outIdx = session_.nextFrameIndex;
         const std::string frameIndex = formatFrameIndex(outIdx);
@@ -7465,7 +8177,7 @@ private:
         }
         session_.lastRefTs = egoFrame.refTimestampUs;
         std::vector<std::string> row;
-        row.reserve(2 + session_.fisheyeCameraCount + 4);
+        row.reserve(2 + session_.fisheyeCameraCount + 4 + (session_.saveTouch ? session_.touchStreams.size() * 3 : 0));
         row.push_back(frameIndex);
         row.push_back(std::to_string(egoFrame.refTimestampUs));
 
@@ -7506,6 +8218,26 @@ private:
 
         row.push_back(std::to_string(egoVideoFrameIndex));
         row.push_back(std::to_string(egoFrame.refTimestampUs));
+        if(session_.saveTouch) {
+            for(const auto &pickedTouch: pickedTouches) {
+                auto itSamples = session_.touchSamples.find(pickedTouch.streamId);
+                if(pickedTouch.hasSample && itSamples != session_.touchSamples.end()
+                   && pickedTouch.sampleIndex < itSamples->second.size()) {
+                    const auto &touchSample = itSamples->second[pickedTouch.sampleIndex];
+                    row.push_back(std::to_string(touchSample.sequence));
+                    row.push_back(std::to_string(touchSample.representativeTimestampUs));
+                    row.push_back(std::to_string(pickedTouch.absDiffUs));
+                    rowTsMin = std::min(rowTsMin, touchSample.representativeTimestampUs);
+                    rowTsMax = std::max(rowTsMax, touchSample.representativeTimestampUs);
+                    rowTsCount++;
+                }
+                else {
+                    row.emplace_back();
+                    row.emplace_back();
+                    row.emplace_back();
+                }
+            }
+        }
         row.push_back("");
         double allModalMaxDiffMs = 0.0;
         if(rowTsCount > 1 && rowTsMax >= rowTsMin) {
@@ -7530,6 +8262,12 @@ private:
                 session_.fisheyeSets.pop_front();
             }
         }
+        for(auto &kv: session_.touchSamples) {
+            auto &samples = kv.second;
+            while(samples.size() > 1 && samples[1].representativeTimestampUs <= targetUs) {
+                samples.pop_front();
+            }
+        }
         return true;
     }
 
@@ -7545,13 +8283,43 @@ private:
         if(!session_.fisheyeEos && session_.fisheyeSets.back().representativeTimestampUs < targetUs) {
             return false;
         }
+        if(!touchTailReadyLocked(targetUs)) {
+            return false;
+        }
 
         const size_t idx = pickNearestFisheyeIndexLocked(targetUs);
         const auto &sample = session_.fisheyeSets[idx];
+        auto advanceFisheyeOnlyTarget = [&]() {
+            session_.fisheyeOnlyNextTargetUs += session_.stepUs;
+            while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= targetUs) {
+                session_.fisheyeSets.pop_front();
+            }
+            for(auto &kv: session_.touchSamples) {
+                auto &samples = kv.second;
+                while(samples.size() > 1 && samples[1].representativeTimestampUs <= targetUs) {
+                    samples.pop_front();
+                }
+            }
+            return true;
+        };
+        std::vector<PickedTouchSample> pickedTouches;
+        if(session_.saveTouch) {
+            pickedTouches.reserve(session_.touchStreams.size());
+            for(const auto &stream: session_.touchStreams) {
+                PickedTouchSample pickedTouch;
+                pickedTouch.streamId = stream.streamId;
+                if(!pickNearestTouchSampleLocked(stream.streamId, targetUs, pickedTouch.sampleIndex, pickedTouch.absDiffUs)) {
+                    return advanceFisheyeOnlyTarget();
+                }
+                pickedTouch.hasSample = true;
+                pickedTouches.push_back(std::move(pickedTouch));
+            }
+        }
         if(!session_.hasLastEmittedFisheyeTs || session_.lastEmittedFisheyeTs != sample.representativeTimestampUs) {
             const size_t outIdx = session_.nextFrameIndex++;
             const std::string frameIndex = formatFrameIndex(outIdx);
             std::vector<std::string> row;
+            row.reserve(2 + session_.fisheyeCameraCount + (session_.saveTouch ? session_.touchStreams.size() * 3 : 0) + 2);
             row.push_back(frameIndex);
             row.push_back(std::to_string(sample.representativeTimestampUs));
             uint64_t rowTsMin = std::numeric_limits<uint64_t>::max();
@@ -7576,6 +8344,26 @@ private:
                     row.emplace_back();
                 }
             }
+            if(session_.saveTouch) {
+                for(const auto &pickedTouch: pickedTouches) {
+                    auto itSamples = session_.touchSamples.find(pickedTouch.streamId);
+                    if(pickedTouch.hasSample && itSamples != session_.touchSamples.end()
+                       && pickedTouch.sampleIndex < itSamples->second.size()) {
+                        const auto &touchSample = itSamples->second[pickedTouch.sampleIndex];
+                        row.push_back(std::to_string(touchSample.sequence));
+                        row.push_back(std::to_string(touchSample.representativeTimestampUs));
+                        row.push_back(std::to_string(pickedTouch.absDiffUs));
+                        rowTsMin = std::min(rowTsMin, touchSample.representativeTimestampUs);
+                        rowTsMax = std::max(rowTsMax, touchSample.representativeTimestampUs);
+                        rowTsCount++;
+                    }
+                    else {
+                        row.emplace_back();
+                        row.emplace_back();
+                        row.emplace_back();
+                    }
+                }
+            }
             row.push_back("");
             double allModalMaxDiffMs = 0.0;
             if(rowTsCount > 1 && rowTsMax >= rowTsMin) {
@@ -7591,11 +8379,7 @@ private:
             session_.lastEmittedFisheyeTs = sample.representativeTimestampUs;
         }
 
-        session_.fisheyeOnlyNextTargetUs += session_.stepUs;
-        while(session_.fisheyeSets.size() > 1 && session_.fisheyeSets[1].representativeTimestampUs <= targetUs) {
-            session_.fisheyeSets.pop_front();
-        }
-        return true;
+        return advanceFisheyeOnlyTarget();
     }
 
     void writeImuCsvForSessionLocked() {
@@ -7693,7 +8477,7 @@ private:
         if(session_.coordinatorDone || !session_.active) {
             return false;
         }
-        if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty()) {
+        if(!coordRecordQueue_.empty() || !coordFisheyeQueue_.empty() || !coordEgoQueue_.empty() || !coordTouchQueue_.empty()) {
             return false;
         }
         if(!session_.egoPendingSoftAlignFrames.empty()) {
@@ -7719,12 +8503,18 @@ private:
             if(session_.saveEgo && !session_.egoEos) {
                 return false;
             }
+            if(session_.saveTouch && !session_.touchEos) {
+                return false;
+            }
         }
         else {
             if(session_.saveFisheye && !session_.fisheyeEos) {
                 return false;
             }
             if(session_.saveEgo && !session_.egoEos) {
+                return false;
+            }
+            if(session_.saveTouch && !session_.touchEos) {
                 return false;
             }
             if(session_.fisheyeOnlyTargetInit && !session_.fisheyeSets.empty()
@@ -7773,11 +8563,14 @@ private:
             coordCv_.wait(lock, [&]() {
                 return !coordRecordQueue_.empty() || !coordFisheyeQueue_.empty()
                        || !coordEgoQueue_.empty()
+                       || !coordTouchQueue_.empty()
                        || (session_.active && (session_.multiviewEos || session_.fisheyeEos))
                        || (session_.active && session_.egoEos)
+                       || (session_.active && session_.touchEos)
                        || stopping_.load();
             });
-            if(!session_.active && coordRecordQueue_.empty() && coordFisheyeQueue_.empty() && coordEgoQueue_.empty()) {
+            if(!session_.active && coordRecordQueue_.empty() && coordFisheyeQueue_.empty()
+               && coordEgoQueue_.empty() && coordTouchQueue_.empty()) {
                 return;
             }
 
@@ -7796,6 +8589,11 @@ private:
             while(!coordEgoQueue_.empty()) {
                 acceptEgoFrameLocked(std::move(coordEgoQueue_.front()));
                 coordEgoQueue_.pop_front();
+                coordCv_.notify_all();
+            }
+            while(!coordTouchQueue_.empty()) {
+                commitTouchSampleLocked(std::move(coordTouchQueue_.front()));
+                coordTouchQueue_.pop_front();
                 coordCv_.notify_all();
             }
             flushPendingEgoSoftAlignLocked();
@@ -8108,6 +8906,43 @@ private:
         }
     }
 
+    TouchRuntime *findTouchRuntime(const std::string &streamId) {
+        for(auto &runtime: touchRuntimes_) {
+            if(runtime.streamId == streamId) {
+                return &runtime;
+            }
+        }
+        return nullptr;
+    }
+
+    void touchRecordLoop(const std::string &streamId) {
+        TouchRuntime *runtime = findTouchRuntime(streamId);
+        if(!runtime || !runtime->recorder) {
+            return;
+        }
+        uint64_t lastTouchTsUs = 0;
+        while(recording_.load() && !stopping_.load() && touchEnabled_) {
+            std::string err;
+            auto sample = runtime->recorder->captureNext(&err);
+            if(!sample) {
+                if(!recording_.load() || stopping_.load()) {
+                    break;
+                }
+                if(!err.empty()) {
+                    std::cerr << "[collection] touch " << streamId << " capture error: " << err << std::endl;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            if(sample->representativeTimestampUs == 0 || sample->representativeTimestampUs == lastTouchTsUs) {
+                continue;
+            }
+            lastTouchTsUs = sample->representativeTimestampUs;
+            noteTouchSample(streamId, *sample);
+            enqueueTouchSample(streamId, std::move(*sample));
+        }
+    }
+
     static void writeParamsJson(const fs::path &dest,
                                 const std::unordered_map<std::string, DeviceBuffer> &buffers,
                                 const std::vector<CollectDataType> &typesSaving,
@@ -8270,6 +9105,7 @@ private:
     std::deque<ProcessedRecord> coordRecordQueue_;
     std::deque<FisheyeFrameSet> coordFisheyeQueue_;
     std::deque<EgoFrame> coordEgoQueue_;
+    std::deque<TouchQueuedSample> coordTouchQueue_;
     size_t coordQueueMax_ = 512;
     SessionState session_{};
     std::thread coordinatorThread_;
@@ -8330,6 +9166,8 @@ private:
     EgoRecorder     ownedEgoRecorder_;
     EgoRecorder    &egoRecorder_;
     bool            ownsEgoRecorder_ = true;
+    bool            touchEnabled_ = false;
+    std::vector<TouchRuntime> touchRuntimes_;
 
     mutable std::mutex mtx_;
     std::unordered_map<std::string, DeviceBuffer> buffers_;
@@ -8934,6 +9772,7 @@ int run_collection(const AppConfig &cfg,
     std::chrono::steady_clock::time_point nextDrainStatusLog{};
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
     cfgUi.enableEgo = cfg.ego.enabled;
+    cfgUi.enableTouch = cfg.touch.enabled;
     if(cfg.colorExposureMs > 0.0f) {
         std::ostringstream oss;
         oss << std::setprecision(4) << cfg.colorExposureMs;
@@ -9423,9 +10262,10 @@ int run_collection(const AppConfig &cfg,
             const int rowH  = 64;
 
             cv::putText(ui, "Capture Types", cv::Point(left, top - 22), cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-            cv::Rect type1(left, top, 220, 36);
-            cv::Rect type2(left + 240, top, 220, 36);
-            cv::Rect type3(left + 480, top, 220, 36);
+            cv::Rect type1(left, top, 210, 36);
+            cv::Rect type2(left + 230, top, 210, 36);
+            cv::Rect type3(left + 460, top, 210, 36);
+            cv::Rect type4(left + 690, top, 210, 36);
             if(uiCheckbox(ui, type1, cfgUi.enableMultiview, "multiview", fm)) {
                 cfgUi.enableMultiview = !cfgUi.enableMultiview;
             }
@@ -9435,8 +10275,11 @@ int run_collection(const AppConfig &cfg,
             if(uiCheckbox(ui, type3, cfgUi.enableEgo, "ego", fm)) {
                 cfgUi.enableEgo = !cfgUi.enableEgo;
             }
+            if(uiCheckbox(ui, type4, cfgUi.enableTouch, "touch", fm)) {
+                cfgUi.enableTouch = !cfgUi.enableTouch;
+            }
             if(!cfgUi.hasSelectedCaptureType()) {
-                cv::putText(ui, "Select at least one capture type", cv::Point(left, top + rowH - 8), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(60, 60, 255), 1, cv::LINE_AA);
+                cv::putText(ui, "Select at least one visual capture type", cv::Point(left, top + rowH - 8), cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(60, 60, 255), 1, cv::LINE_AA);
             }
 
             const int fieldsTop = top + 2 * rowH;
@@ -10068,8 +10911,9 @@ int run_collection(const AppConfig &cfg,
             }
             if(cameraFaultActive && activeCameraFault.has_value()) {
                 sd = {"CAMERA ERROR", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
-                stateEmphasisLine = "cam" + activeCameraFault->camKey + " "
-                                    + dataTypeLabel(activeCameraFault->type) + " stalled";
+                stateEmphasisLine = activeCameraFault->displayName.empty()
+                    ? ("cam" + activeCameraFault->camKey + " " + dataTypeLabel(activeCameraFault->type) + " stalled")
+                    : (activeCameraFault->displayName + " stalled");
                 stateFootnoteLine = cameraFaultRestartBlocked ? "waiting for current episode to finish saving"
                                                               : "choose exit or delete + restart";
             }

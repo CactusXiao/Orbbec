@@ -3,9 +3,11 @@
 #include <array>
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -48,6 +50,16 @@ uint64_t parseTimestampSecToUs(const std::string &s) {
     catch(...) {
         return 0;
     }
+}
+
+std::string sideForSensorType(int sensorType) {
+    if(sensorType == 1) {
+        return "left";
+    }
+    if(sensorType == 2) {
+        return "right";
+    }
+    return "";
 }
 
 std::vector<std::string> splitCsvLineSimple(const std::string &line) {
@@ -187,6 +199,19 @@ private:
 
 struct SerialFrameResult {
     bool                  ok = false;
+    std::string           side;
+    int                   sensorType = 0;
+    uint64_t              timestampUs = 0;
+    uint64_t              packet1TimestampUs = 0;
+    uint64_t              packet2TimestampUs = 0;
+    uint64_t              packetGapUs = 0;
+    std::vector<uint8_t>  imuRaw;
+    float                 imuW = 0.0f;
+    float                 imuX = 0.0f;
+    float                 imuY = 0.0f;
+    float                 imuZ = 0.0f;
+    bool                  imuValid = false;
+    std::string           qualityFlag = "ok";
     std::vector<uint16_t> rawAdc;
     std::string           error;
 };
@@ -256,7 +281,6 @@ public:
         }
 
         ::tcflush(fd_, TCIOFLUSH);
-        timeoutMs_ = std::max(1, config.timeoutMs);
         return true;
     }
 
@@ -271,121 +295,52 @@ public:
         return fd_ >= 0;
     }
 
-    bool clearInputBuffer(std::string *errorMessage) {
+    ssize_t readSome(void *buffer, size_t capacity, int timeoutMs, std::string *errorMessage) {
         if(fd_ < 0) {
             if(errorMessage) {
                 *errorMessage = "Tactile serial port is not open";
             }
-            return false;
+            return -1;
         }
-        if(::tcflush(fd_, TCIFLUSH) != 0) {
-            if(errorMessage) {
-                *errorMessage = "Failed to flush tactile serial input buffer: " + std::string(std::strerror(errno));
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool writeAll(const std::string &data, std::string *errorMessage) {
-        return writeAll(data.data(), data.size(), errorMessage);
-    }
-
-    bool writeAll(const void *data, size_t size, std::string *errorMessage) {
-        if(fd_ < 0) {
-            if(errorMessage) {
-                *errorMessage = "Tactile serial port is not open";
-            }
-            return false;
+        if(capacity == 0) {
+            return 0;
         }
 
-        const auto *bytes = static_cast<const uint8_t *>(data);
-        size_t written = 0;
-        while(written < size) {
-            const ssize_t rc = ::write(fd_, bytes + written, size - written);
-            if(rc > 0) {
-                written += static_cast<size_t>(rc);
-                continue;
-            }
-            if(rc < 0 && errno == EINTR) {
-                continue;
-            }
-            if(errorMessage) {
-                *errorMessage = "Failed to write tactile serial request: " + std::string(std::strerror(errno));
-            }
-            return false;
-        }
+        timeval tv{};
+        const int boundedTimeoutMs = std::max(1, timeoutMs);
+        tv.tv_sec = static_cast<time_t>(boundedTimeoutMs / 1000);
+        tv.tv_usec = static_cast<suseconds_t>((boundedTimeoutMs % 1000) * 1000);
 
-        if(::tcdrain(fd_) != 0) {
-            if(errorMessage) {
-                *errorMessage = "tcdrain failed after tactile serial write: " + std::string(std::strerror(errno));
-            }
-            return false;
-        }
-        return true;
-    }
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(fd_, &readfds);
 
-    bool readExact(void *buffer, size_t size, std::string *errorMessage) {
-        if(fd_ < 0) {
-            if(errorMessage) {
-                *errorMessage = "Tactile serial port is not open";
-            }
-            return false;
-        }
-
-        auto *bytes = static_cast<uint8_t *>(buffer);
-        size_t totalRead = 0;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
-
-        while(totalRead < size) {
-            const auto now = std::chrono::steady_clock::now();
-            if(now >= deadline) {
-                if(errorMessage) {
-                    *errorMessage = "Timed out while reading tactile serial frame";
-                }
-                return false;
-            }
-
-            const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-            timeval tv{};
-            tv.tv_sec = static_cast<time_t>(remainingMs.count() / 1000);
-            tv.tv_usec = static_cast<suseconds_t>((remainingMs.count() % 1000) * 1000);
-
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(fd_, &readfds);
-
+        while(true) {
             const int ready = ::select(fd_ + 1, &readfds, nullptr, nullptr, &tv);
             if(ready > 0) {
-                const ssize_t rc = ::read(fd_, bytes + totalRead, size - totalRead);
-                if(rc > 0) {
-                    totalRead += static_cast<size_t>(rc);
-                    continue;
+                const ssize_t rc = ::read(fd_, buffer, capacity);
+                if(rc >= 0) {
+                    return rc;
                 }
-                if(rc < 0 && errno == EINTR) {
+                if(errno == EINTR) {
                     continue;
                 }
                 if(errorMessage) {
-                    *errorMessage = "Failed to read tactile serial frame: " + std::string(std::strerror(errno));
+                    *errorMessage = "Failed to read tactile serial stream: " + std::string(std::strerror(errno));
                 }
-                return false;
+                return -1;
             }
             if(ready == 0) {
-                if(errorMessage) {
-                    *errorMessage = "Timed out while reading tactile serial frame";
-                }
-                return false;
+                return 0;
             }
             if(errno == EINTR) {
                 continue;
             }
             if(errorMessage) {
-                *errorMessage = "select failed while reading tactile serial frame: " + std::string(std::strerror(errno));
+                *errorMessage = "select failed while reading tactile serial stream: " + std::string(std::strerror(errno));
             }
-            return false;
+            return -1;
         }
-
-        return true;
     }
 
 private:
@@ -405,47 +360,193 @@ private:
         case 230400:
             return B230400;
 #endif
+#ifdef B460800
+        case 460800:
+            return B460800;
+#endif
+#ifdef B500000
+        case 500000:
+            return B500000;
+#endif
+#ifdef B576000
+        case 576000:
+            return B576000;
+#endif
+#ifdef B921600
+        case 921600:
+            return B921600;
+#endif
+#ifdef B1000000
+        case 1000000:
+            return B1000000;
+#endif
         default:
             return static_cast<speed_t>(0);
         }
     }
 
     int fd_ = -1;
-    int timeoutMs_ = 1000;
 };
 #endif
 
-SerialFrameResult requestSerialFrame(
+struct JqPendingPacket {
+    std::vector<uint8_t> payload;
+    uint64_t             timestampUs = 0;
+};
+
+struct JqParserState {
+    std::vector<uint8_t> buffer;
+    std::map<int, JqPendingPacket> firstPacketBySensor;
+    size_t parseErrors = 0;
+    size_t droppedPacket1 = 0;
+    size_t droppedPacket2 = 0;
+};
+
+float readFloat32Le(const uint8_t *bytes) {
+    uint32_t raw = static_cast<uint32_t>(bytes[0])
+                 | (static_cast<uint32_t>(bytes[1]) << 8)
+                 | (static_cast<uint32_t>(bytes[2]) << 16)
+                 | (static_cast<uint32_t>(bytes[3]) << 24);
+    float out = 0.0f;
+    std::memcpy(&out, &raw, sizeof(float));
+    return out;
+}
+
+std::optional<SerialFrameResult> parseOneJqFrame(JqParserState &state, const TactileModuleConfig &config) {
+    static constexpr std::array<uint8_t, 4> kHeader = { 0xAA, 0x55, 0x03, 0x99 };
+
+    for(;;) {
+        if(state.buffer.size() < kHeader.size() + 2) {
+            return std::nullopt;
+        }
+
+        auto headerIt = std::search(state.buffer.begin(), state.buffer.end(), kHeader.begin(), kHeader.end());
+        if(headerIt == state.buffer.end()) {
+            if(state.buffer.size() > kHeader.size() - 1) {
+                state.buffer.erase(state.buffer.begin(), state.buffer.end() - static_cast<std::ptrdiff_t>(kHeader.size() - 1));
+            }
+            return std::nullopt;
+        }
+        if(headerIt != state.buffer.begin()) {
+            state.buffer.erase(state.buffer.begin(), headerIt);
+        }
+        if(state.buffer.size() < kHeader.size() + 2) {
+            return std::nullopt;
+        }
+
+        const uint8_t packetId = state.buffer[4];
+        const uint8_t sensorType = state.buffer[5];
+        size_t payloadLen = 0;
+        if(packetId == 0x01) {
+            payloadLen = 128;
+        }
+        else if(packetId == 0x02) {
+            payloadLen = 144;
+        }
+        else {
+            state.parseErrors++;
+            state.buffer.erase(state.buffer.begin());
+            continue;
+        }
+
+        const size_t packetLen = 6 + payloadLen;
+        if(state.buffer.size() < packetLen) {
+            return std::nullopt;
+        }
+
+        std::vector<uint8_t> payload(state.buffer.begin() + 6, state.buffer.begin() + static_cast<std::ptrdiff_t>(packetLen));
+        state.buffer.erase(state.buffer.begin(), state.buffer.begin() + static_cast<std::ptrdiff_t>(packetLen));
+        const uint64_t arrivalUs = systemClockNowUs();
+
+        if(config.sensorType > 0 && static_cast<int>(sensorType) != config.sensorType) {
+            continue;
+        }
+
+        if(packetId == 0x01) {
+            JqPendingPacket pending;
+            pending.payload = std::move(payload);
+            pending.timestampUs = arrivalUs;
+            state.firstPacketBySensor[static_cast<int>(sensorType)] = std::move(pending);
+            continue;
+        }
+
+        auto itFirst = state.firstPacketBySensor.find(static_cast<int>(sensorType));
+        if(itFirst == state.firstPacketBySensor.end()) {
+            state.droppedPacket1++;
+            continue;
+        }
+
+        JqPendingPacket first = std::move(itFirst->second);
+        state.firstPacketBySensor.erase(itFirst);
+        if(first.payload.size() != 128 || payload.size() < 144) {
+            state.parseErrors++;
+            continue;
+        }
+
+        SerialFrameResult result;
+        result.ok = true;
+        result.sensorType = static_cast<int>(sensorType);
+        result.side = !config.handSide.empty() ? config.handSide : sideForSensorType(result.sensorType);
+        result.packet1TimestampUs = first.timestampUs;
+        result.packet2TimestampUs = arrivalUs;
+        result.packetGapUs = arrivalUs >= first.timestampUs ? (arrivalUs - first.timestampUs) : 0;
+        result.timestampUs = std::max(result.packet1TimestampUs, result.packet2TimestampUs);
+        result.rawAdc.reserve(kJqShroomPressureChannelCount);
+        for(uint8_t value : first.payload) {
+            result.rawAdc.push_back(static_cast<uint16_t>(value));
+        }
+        for(size_t i = 0; i < 128; ++i) {
+            result.rawAdc.push_back(static_cast<uint16_t>(payload[i]));
+        }
+        result.imuRaw.assign(payload.begin() + 128, payload.begin() + 144);
+        if(result.imuRaw.size() == 16) {
+            result.imuW = readFloat32Le(result.imuRaw.data());
+            result.imuX = readFloat32Le(result.imuRaw.data() + 4);
+            result.imuY = readFloat32Le(result.imuRaw.data() + 8);
+            result.imuZ = readFloat32Le(result.imuRaw.data() + 12);
+            result.imuValid = true;
+        }
+        return result;
+    }
+}
+
+SerialFrameResult readJqShroomFrame(
 #if defined(__unix__) || defined(__APPLE__)
     PosixSerialPort &port,
 #endif
-    const TactileSerialConfig &config) {
+    JqParserState &parserState,
+    const TactileModuleConfig &config) {
     SerialFrameResult result;
-    result.rawAdc.resize(kTactileChannelCount, 0);
-
 #if defined(__unix__) || defined(__APPLE__)
-    std::string ioError;
-    if(config.clearInputBufferBeforeRequest && !port.clearInputBuffer(&ioError)) {
-        result.error = ioError;
-        return result;
-    }
-    if(!port.writeAll(config.requestCommand, &ioError)) {
-        result.error = ioError;
-        return result;
-    }
+    std::array<uint8_t, 4096> chunk{};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, config.serial.timeoutMs));
+    while(std::chrono::steady_clock::now() < deadline) {
+        if(auto parsed = parseOneJqFrame(parserState, config)) {
+            return *parsed;
+        }
 
-    std::array<uint8_t, kTactileChannelCount * 2> frameBytes{};
-    if(!port.readExact(frameBytes.data(), frameBytes.size(), &ioError)) {
-        result.error = ioError;
-        return result;
+        std::string ioError;
+        const int remainingMs = static_cast<int>(std::max<int64_t>(
+            1,
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count()));
+        const ssize_t n = port.readSome(chunk.data(), chunk.size(), remainingMs, &ioError);
+        if(n < 0) {
+            result.error = ioError;
+            return result;
+        }
+        if(n == 0) {
+            continue;
+        }
+        parserState.buffer.insert(parserState.buffer.end(), chunk.begin(), chunk.begin() + n);
+        if(parserState.buffer.size() > 8192) {
+            parserState.buffer.erase(parserState.buffer.begin(),
+                                     parserState.buffer.end() - static_cast<std::ptrdiff_t>(4096));
+            parserState.parseErrors++;
+        }
     }
-
-    for(size_t i = 0; i < kTactileChannelCount; ++i) {
-        const size_t offset = i * 2;
-        result.rawAdc[i] = static_cast<uint16_t>(frameBytes[offset] | (static_cast<uint16_t>(frameBytes[offset + 1]) << 8));
-    }
-    result.ok = true;
+    result.error = "Timed out while reading JQ/Shroom tactile frame";
 #else
+    (void)parserState;
     (void)config;
     result.error = "Tactile serial module currently requires a POSIX platform";
 #endif
@@ -508,7 +609,7 @@ public:
     }
 
     std::string pluginId() const override {
-        return "posix_serial";
+        return "jq_shroom_serial";
     }
 
     bool start(const TactileModuleConfig &config, std::string *errorMessage) override {
@@ -523,12 +624,6 @@ public:
 
         auto state = std::make_shared<State>();
         state->config = config;
-
-        if(config.applyCalibration && !config.calibrationPath.empty()) {
-            if(!state->calibration.load(config.calibrationPath, errorMessage)) {
-                return false;
-            }
-        }
 
 #if defined(__unix__) || defined(__APPLE__)
         if(!state->port.openDevice(config.serial, errorMessage)) {
@@ -607,7 +702,7 @@ public:
         }
 
         std::lock_guard<std::mutex> frameLock(state->sampleMtx);
-        if(!state->ready.load() || state->latest.frame.rawAdc.size() != kTactileChannelCount) {
+        if(!state->ready.load() || state->latest.frame.rawAdc.empty()) {
             if(errorMessage) {
                 *errorMessage = state->lastError.empty() ? "Tactile module has no ready frame yet" : state->lastError;
             }
@@ -622,7 +717,6 @@ public:
 private:
     struct State {
         TactileModuleConfig config;
-        CalibrationModel    calibration;
 #if defined(__unix__) || defined(__APPLE__)
         PosixSerialPort     port;
 #endif
@@ -632,24 +726,34 @@ private:
         std::mutex          sampleMtx;
         TactileSample       latest;
         std::string         lastError;
+        JqParserState       jqParser;
     };
 
     static TactileSample buildSample(const SerialFrameResult &frame,
-                                     const TactileModuleConfig &config,
-                                     const CalibrationModel &calibration) {
+                                     const TactileModuleConfig &config) {
         TactileSample sample;
-        sample.representativeTimestampUs = systemClockNowUs();
+        sample.representativeTimestampUs = frame.timestampUs != 0 ? frame.timestampUs : systemClockNowUs();
         sample.representativeTimestampSec = timestampUsToSec(sample.representativeTimestampUs);
         sample.frame.captureTimestampUs = sample.representativeTimestampUs;
         sample.frame.captureTimestampSec = sample.representativeTimestampSec;
+        sample.frame.side = frame.side.empty() ? config.handSide : frame.side;
+        sample.frame.sensorType = frame.sensorType;
+        sample.frame.packet1TimestampUs = frame.packet1TimestampUs;
+        sample.frame.packet2TimestampUs = frame.packet2TimestampUs;
+        sample.frame.packetGapUs = frame.packetGapUs;
+        sample.frame.imuRaw = frame.imuRaw;
+        sample.frame.imuW = frame.imuW;
+        sample.frame.imuX = frame.imuX;
+        sample.frame.imuY = frame.imuY;
+        sample.frame.imuZ = frame.imuZ;
+        sample.frame.imuValid = frame.imuValid;
+        sample.frame.qualityFlag = frame.qualityFlag.empty() ? "ok" : frame.qualityFlag;
         sample.frame.rawAdc = frame.rawAdc;
         sample.frame.calibratedValues.reserve(frame.rawAdc.size());
         sample.frame.outputValues.reserve(frame.rawAdc.size());
 
         for(size_t i = 0; i < frame.rawAdc.size(); ++i) {
-            const double calibrated = (!config.applyCalibration || calibration.empty())
-                                          ? static_cast<double>(frame.rawAdc[i])
-                                          : calibration.apply(i, frame.rawAdc[i]);
+            const double calibrated = static_cast<double>(frame.rawAdc[i]);
             sample.frame.calibratedValues.push_back(calibrated);
             sample.frame.outputValues.push_back(calibrated);
         }
@@ -658,11 +762,12 @@ private:
 
     void captureLoop(State &state) {
         while(!state.stopRequested.load()) {
-            const auto frame = requestSerialFrame(
+            const auto frame = readJqShroomFrame(
 #if defined(__unix__) || defined(__APPLE__)
                 state.port,
 #endif
-                state.config.serial);
+                state.jqParser,
+                state.config);
             if(!frame.ok) {
                 {
                     std::lock_guard<std::mutex> lock(state.sampleMtx);
@@ -672,7 +777,7 @@ private:
                 continue;
             }
 
-            TactileSample sample = buildSample(frame, state.config, state.calibration);
+            TactileSample sample = buildSample(frame, state.config);
             bool becameReady = false;
             {
                 std::lock_guard<std::mutex> lock(state.sampleMtx);
@@ -716,11 +821,14 @@ bool saveSingleSampleCsv(const TactileSample &sample,
     for(size_t i = 0; i < sample.frame.rawAdc.size(); ++i) {
         const size_t regionIndex = i / kTactileChannelsPerRegion;
         const size_t pointIndex = i % kTactileChannelsPerRegion;
+        const std::string regionName = regionIndex < names.size()
+            ? names[regionIndex]
+            : ("SensorBlock" + std::to_string(regionIndex + 1));
         const double calibrated = i < sample.frame.calibratedValues.size() ? sample.frame.calibratedValues[i] : 0.0;
         const double output = i < sample.frame.outputValues.size() ? sample.frame.outputValues[i] : calibrated;
         ofs << i
             << "," << (regionIndex + 1)
-            << "," << names[regionIndex]
+            << "," << regionName
             << "," << (pointIndex + 1)
             << "," << sample.frame.rawAdc[i]
             << "," << calibrated
@@ -809,14 +917,14 @@ bool TactileRecorder::start(const TactileModuleConfig &config, std::string *erro
     config_ = config;
     running_.store(true);
     nextSequence_ = 0;
-    nextCaptureTimeValid_ = false;
+    lastCaptureTimestampUs_ = 0;
     clearBuffered();
     return true;
 }
 
 void TactileRecorder::stop() {
     running_.store(false);
-    nextCaptureTimeValid_ = false;
+    lastCaptureTimestampUs_ = 0;
     if(module_) {
         module_->stop();
     }
@@ -840,6 +948,17 @@ std::optional<TactileSample> TactileRecorder::snapshotLatest(std::string *errorM
     return module_->snapshotLatest(errorMessage);
 }
 
+void TactileRecorder::resetCaptureCursorToLatest() {
+    lastCaptureTimestampUs_ = 0;
+    if(!isRunning()) {
+        return;
+    }
+    auto sample = module_->snapshotLatest(nullptr);
+    if(sample) {
+        lastCaptureTimestampUs_ = sample->representativeTimestampUs;
+    }
+}
+
 std::optional<TactileSample> TactileRecorder::captureNext(std::string *errorMessage) {
     if(!isRunning()) {
         if(errorMessage) {
@@ -848,37 +967,41 @@ std::optional<TactileSample> TactileRecorder::captureNext(std::string *errorMess
         return std::nullopt;
     }
 
-    const int targetFps = std::max(1, config_.targetFps);
-    const auto period = std::chrono::microseconds(static_cast<int64_t>(1000000.0 / static_cast<double>(targetFps)));
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::milliseconds(std::max(1, config_.serial.timeoutMs));
+    std::string lastError;
+    while(isRunning() && std::chrono::steady_clock::now() < deadline) {
+        std::string snapshotError;
+        auto sample = module_->snapshotLatest(&snapshotError);
+        if(sample && sample->representativeTimestampUs != lastCaptureTimestampUs_) {
+            lastCaptureTimestampUs_ = sample->representativeTimestampUs;
+            sample->sequence = nextSequence_++;
 
-    const auto now = std::chrono::steady_clock::now();
-    if(!nextCaptureTimeValid_) {
-        nextCaptureTime_ = now;
-        nextCaptureTimeValid_ = true;
-    }
-    if(now < nextCaptureTime_) {
-        std::this_thread::sleep_until(nextCaptureTime_);
+            {
+                std::lock_guard<std::mutex> lock(bufferMtx_);
+                buffered_.push_back(*sample);
+                if(config_.maxBufferedSamples > 0 && buffered_.size() > config_.maxBufferedSamples) {
+                    buffered_.erase(buffered_.begin());
+                }
+            }
+            return sample;
+        }
+
+        if(!snapshotError.empty()) {
+            lastError = std::move(snapshotError);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    auto sample = module_->snapshotLatest(errorMessage);
-    if(!sample) {
-        return std::nullopt;
-    }
-    sample->sequence = nextSequence_++;
-
-    {
-        std::lock_guard<std::mutex> lock(bufferMtx_);
-        buffered_.push_back(*sample);
-        if(config_.maxBufferedSamples > 0 && buffered_.size() > config_.maxBufferedSamples) {
-            buffered_.erase(buffered_.begin());
+    if(errorMessage) {
+        if(!isRunning()) {
+            *errorMessage = "Tactile recorder is not running";
+        }
+        else {
+            *errorMessage = lastError.empty() ? "Timed out waiting for next tactile frame" : lastError;
         }
     }
-
-    nextCaptureTime_ += period;
-    if(nextCaptureTime_ < std::chrono::steady_clock::now()) {
-        nextCaptureTime_ = std::chrono::steady_clock::now();
-    }
-    return sample;
+    return std::nullopt;
 }
 
 bool TactileRecorder::captureFor(std::chrono::milliseconds duration,

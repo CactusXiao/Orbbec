@@ -187,6 +187,33 @@
         "cameraId": "ego",
         "cameraParamsPath": "../../camera_info/ego_camera_params.json"
     },
+    "touch": {
+        "_comment": "Shroom/JQ tactile glove collection, matching tactile/record_tactile.py: continuous serial stream, header AA 55 03 99, packet 1 + packet 2 -> 256 uint8 pressure channels plus 16 raw IMU bytes. Both gloves are saved under each episode's touch/ directory and aligned in timestamps.csv.",
+        "enabled": false,
+        "required": true,
+        "targetFps": 60,
+        "maxBufferedSamples": 8192,
+        "directoryName": "touch",
+        "csvFloatPrecision": 6,
+        "serial": {
+            "baudRate": 921600,
+            "timeoutMs": 1000
+        },
+        "devices": [
+            {
+                "id": "left",
+                "handSide": "left",
+                "sensorType": 1,
+                "portPath": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5565053881-if00"
+            },
+            {
+                "id": "right",
+                "handSide": "right",
+                "sensorType": 2,
+                "portPath": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5565053747-if00"
+            }
+        ]
+    },
     "fisheye": {
         "_comment": "Fish-eye cameras are resolved by exact uniqueId only. camera1 -> left hand, camera2 -> right hand.",
         "enabled": true,
