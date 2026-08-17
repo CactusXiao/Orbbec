@@ -14,6 +14,8 @@
 #include <csignal>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <thread>
@@ -618,6 +620,19 @@ static std::string colorExtNormalized(std::string ext) {
         ext = "." + ext;
     }
     return ext;
+}
+
+static std::string localDateStampYmd() {
+    const std::time_t now = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &now);
+#else
+    localtime_r(&now, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%Y%m%d");
+    return oss.str();
 }
 
 static uint64_t frameTimestampUs(const std::shared_ptr<ob::Frame> &frame) {
@@ -8291,18 +8306,17 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
     std::atomic_bool stopRecordingActive{false};
     std::atomic_bool stopRecordingDone{false};
     cfgUi.enableEgo = cfg.ego.enabled;
+    auto demoDatedSaveRoot = [&]() {
+        fs::path root = cfg.demo.collection.savePath.empty() ? fs::path("/data/demo") : cfg.demo.collection.savePath;
+        return root / localDateStampYmd();
+    };
     if(cfg.demo.active) {
         cfgUi.enableMultiview = cfg.demo.collection.enableMultiview;
         cfgUi.enableFisheyes  = cfg.demo.collection.enableFisheyes;
         cfgUi.enableEgo       = cfg.demo.collection.enableEgo;
-        if(!cfg.demo.collection.savePath.empty()) {
-            cfgUi.saveRoot = cfg.demo.collection.savePath.string();
-        }
-        else if(!cfg.outputDir.empty()) {
-            cfgUi.saveRoot = cfg.outputDir.string();
-        }
+        cfgUi.saveRoot = demoDatedSaveRoot().string();
         cfgUi.taskPath = cfg.demo.collection.taskPath;
-        cfgUi.subjectId = cfg.demo.collection.subjectId.empty() ? "test" : cfg.demo.collection.subjectId;
+        cfgUi.subjectId = "demo";
     }
     const float effectiveExposureMs = (cfg.demo.active && cfg.demo.collection.exposureMs >= 0.0f)
                                     ? cfg.demo.collection.exposureMs
@@ -8382,14 +8396,8 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         if(!cfg.demo.active) {
             return;
         }
-        cfgUi.saveRoot = trimString(cfgUi.saveRoot);
-        cfgUi.subjectId = trimString(cfgUi.subjectId);
-        if(cfgUi.saveRoot.empty()) {
-            cfgUi.saveRoot = cfg.outputDir.empty() ? "./collection_000" : cfg.outputDir.string();
-        }
-        if(cfgUi.subjectId.empty()) {
-            cfgUi.subjectId = "test";
-        }
+        cfgUi.saveRoot = demoDatedSaveRoot().string();
+        cfgUi.subjectId = "demo";
         if(cfg.demo.active && !cfgUi.hasSelectedCaptureType()) {
             cfgUi.enableMultiview = true;
         }
@@ -8404,6 +8412,7 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
         if(!cfgUi.taskPath.empty()) {
             candidates.push_back(cfgUi.taskPath);
         }
+        candidates.push_back(saveRoot / "tasks.json");
         candidates.push_back(saveRoot / "task.json");
         candidates.push_back(fs::current_path() / "tasks.json");
         candidates.push_back(fs::current_path() / "task.json");
@@ -8424,7 +8433,82 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
                 return absP;
             }
         }
-        return cfgUi.taskPath.empty() ? (saveRoot / "task.json") : cfgUi.taskPath;
+        return cfgUi.taskPath.empty() ? (saveRoot / "tasks.json") : cfgUi.taskPath;
+    };
+
+    auto absoluteLexicalPath = [](fs::path p) {
+        if(p.is_relative()) {
+            p = fs::current_path() / p;
+        }
+        return p.lexically_normal();
+    };
+
+    auto findDemoTaskTemplatePath = [&](const fs::path &saveRoot) {
+        const fs::path target = absoluteLexicalPath(saveRoot / "tasks.json");
+        std::vector<fs::path> candidates;
+        if(!cfgUi.taskPath.empty()) {
+            candidates.push_back(cfgUi.taskPath);
+        }
+        candidates.push_back(fs::current_path() / "tasks.json");
+        candidates.push_back(fs::current_path() / "task.json");
+        candidates.push_back(fs::current_path() / ".." / "tasks.json");
+        candidates.push_back(fs::current_path() / ".." / "task.json");
+        candidates.push_back(fs::current_path() / ".." / ".." / "tasks.json");
+
+        for(const auto &candidate: candidates) {
+            if(candidate.empty()) {
+                continue;
+            }
+            fs::path absP = absoluteLexicalPath(candidate);
+            if(absP == target) {
+                continue;
+            }
+            std::error_code ec;
+            if(fs::exists(absP, ec) && !ec && fs::is_regular_file(absP, ec) && !ec) {
+                return absP;
+            }
+        }
+        return fs::path();
+    };
+
+    auto prepareDemoCollectionRoot = [&](const fs::path &saveRoot, fs::path &taskPathOut, std::string &error) {
+        taskPathOut.clear();
+        error.clear();
+        if(!cfg.demo.active) {
+            return true;
+        }
+
+        std::error_code ec;
+        fs::create_directories(saveRoot, ec);
+        if(ec) {
+            error = "Failed to create demo save_path: " + saveRoot.string() + " (" + ec.message() + ")";
+            return false;
+        }
+
+        const fs::path targetTaskPath = saveRoot / "tasks.json";
+        if(fs::exists(targetTaskPath, ec) && !ec) {
+            if(!fs::is_regular_file(targetTaskPath, ec) || ec) {
+                error = "Demo tasks.json path is not a file: " + targetTaskPath.string();
+                return false;
+            }
+            taskPathOut = targetTaskPath;
+            return true;
+        }
+
+        const fs::path sourceTaskPath = findDemoTaskTemplatePath(saveRoot);
+        if(sourceTaskPath.empty()) {
+            error = "Demo tasks.json template not found. Configure demo.collection.task_path.";
+            return false;
+        }
+
+        fs::copy_file(sourceTaskPath, targetTaskPath, fs::copy_options::none, ec);
+        if(ec) {
+            error = "Failed to copy tasks.json to " + targetTaskPath.string() + " (" + ec.message() + ")";
+            return false;
+        }
+        taskPathOut = targetTaskPath;
+        pushUiLog("Copied tasks.json: " + sourceTaskPath.string() + " -> " + targetTaskPath.string());
+        return true;
     };
 
     auto enterCapture = [&]() -> bool {
@@ -8444,10 +8528,20 @@ int run_collection(const AppConfig &cfg, const std::atomic_bool *cancel, EgoReco
 
         const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
         const std::string subject = trimString(cfgUi.subjectId);
+        fs::path preparedTaskPath;
+        std::string prepareError;
+        if(!prepareDemoCollectionRoot(saveRoot, preparedTaskPath, prepareError)) {
+            cfgUi.error = prepareError;
+            announce("enter_failed", "enter failed");
+            return false;
+        }
+        if(!preparedTaskPath.empty()) {
+            cfgUi.taskPath = preparedTaskPath;
+        }
         const fs::path taskPath = resolveCollectionTaskPath(saveRoot);
         auto tasks = loadTaskJson(taskPath);
         if(tasks.empty()) {
-            cfgUi.error = "task.json not found or empty at: " + taskPath.string();
+            cfgUi.error = "tasks.json not found or empty at: " + taskPath.string();
             announce("enter_failed", "enter failed");
             return false;
         }

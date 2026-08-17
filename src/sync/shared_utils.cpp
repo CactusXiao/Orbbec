@@ -341,7 +341,7 @@ AppConfig loadConfig(const fs::path &configPath) {
                     if(auto v = getBoolAny(collectionObj, { "ego", "enable_ego", "enableEgo" })) {
                         cfg.demo.collection.enableEgo = *v;
                     }
-                    if(auto v = getStringAny(collectionObj, { "save_path", "savePath", "save_root", "saveRoot", "outputDir" })) {
+                    if(auto v = getStringAny(collectionObj, { "save_root", "saveRoot", "save_path", "savePath", "outputDir" })) {
                         cfg.demo.collection.savePath = fs::path(*v);
                     }
                     if(auto v = getStringAny(collectionObj, { "task_path", "taskPath", "task_json", "taskJson" })) {
@@ -351,7 +351,7 @@ AppConfig loadConfig(const fs::path &configPath) {
                         cfg.demo.collection.subjectId = trimString(*v);
                     }
                     if(cfg.demo.collection.subjectId.empty()) {
-                        cfg.demo.collection.subjectId = "test";
+                        cfg.demo.collection.subjectId = "demo";
                     }
                     if(auto v = getDoubleAny(collectionObj, { "exposure_ms", "exposureMs", "colorExposureMs" })) {
                         cfg.demo.collection.exposureMs = static_cast<float>(std::max(0.0, *v));

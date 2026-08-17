@@ -159,9 +159,9 @@ struct DemoCollectionConfig {
     bool     enableMultiview = true;
     bool     enableFisheyes  = false;
     bool     enableEgo       = true;
-    fs::path savePath;
+    fs::path savePath        = "/data/demo";
     fs::path taskPath;
-    std::string subjectId    = "test";
+    std::string subjectId    = "demo";
     float    exposureMs      = -1.0f;
     int      brightness      = -2;
 };

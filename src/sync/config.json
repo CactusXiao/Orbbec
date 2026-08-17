@@ -18,9 +18,9 @@
             "multiview": true,
             "fisheyes": true,
             "ego": true,
-            "save_path": "./collection_000",
+            "save_path": "/data/demo",
             "task_path": "../../tasks.json",
-            "subject_id": "test",
+            "subject_id": "demo",
             "exposure_ms": 0.8,
             "brightness": -1
         }
