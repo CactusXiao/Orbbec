@@ -17,7 +17,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
     def test_episode_storage_name_is_human_readable_and_never_reuses_released_number(self) -> None:
         self.assertEqual(
             episode_storage_name("xiaojiazhou", "task-clean-the-bowl", 12),
-            "xiaojiazhou_task-clean-the-bowl_episode12",
+            "episode12",
         )
         subject = {
             "reservations": {
@@ -53,7 +53,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                     "task_name": "task-clean-the-bowl",
                 }
             )
-            self.assertEqual(reservation["storage_name"], "xiaojiazhou_task-clean-the-bowl_episode1")
+            self.assertEqual(reservation["storage_name"], "episode1")
             episode_uuid = reservation["reservation_id"]
             mapped = store.get_episode(episode_uuid)
             self.assertEqual(mapped["episode_id"], episode_uuid)  # type: ignore[index]
@@ -200,7 +200,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             )
             episode = store.get_episode("reservation_001")
             self.assertEqual(episode["subject_id"], "S001")  # type: ignore[index]
-            self.assertEqual(episode["storage_name"], "S001_pick_object_episode1")  # type: ignore[index]
+            self.assertEqual(episode["storage_name"], "episode1")  # type: ignore[index]
             self.assertEqual(episode["metadata"]["collection_operator_id"], "collector")  # type: ignore[index]
 
             uploader = NasUploader(
@@ -223,24 +223,24 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(auto_jobs[0]["payload"]["frames"], [1, 2])
             self.assertEqual(auto_jobs[0]["payload"]["cameras"], ["00"])
             self.assertIn("/episodes/reservation_001", render_workflow_stage_page(service.workflow_stage("auto_label")))
-            nas_episode_dir = nas_root / "S001" / "pick_object" / "S001_pick_object_episode1"
+            nas_episode_dir = nas_root / "S001" / "pick_object" / "episode1"
             self.assertTrue(nas_episode_dir.is_dir())
             manifest = json.loads((nas_episode_dir / ".orbbec_upload_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["episode_uuid"], "reservation_001")
-            self.assertEqual(manifest["storage_name"], "S001_pick_object_episode1")
+            self.assertEqual(manifest["storage_name"], "episode1")
 
     def test_capture_side_upload_confirm_skips_backend_upload_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             nas_root = tmp_path / "nas"
-            episode_dir = nas_root / "S001" / "pick_object" / "S001_pick_object_episode1"
+            episode_dir = nas_root / "S001" / "pick_object" / "episode1"
             (episode_dir / "00" / "RGB").mkdir(parents=True)
             (episode_dir / "00" / "RGB" / "00001.png").write_bytes(b"rgb")
             (episode_dir / "00" / "RGB" / "00002.png").write_bytes(b"rgb2")
             (episode_dir / "timestamps.csv").write_text("ref_timestamp_us\n1\n", encoding="utf-8")
 
             nas_prefix = "nas://ego-test"
-            episode_uri = f"{nas_prefix}/S001/pick_object/S001_pick_object_episode1"
+            episode_uri = f"{nas_prefix}/S001/pick_object/episode1"
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
             service = JobService(store, nas_mounts={nas_prefix: str(nas_root)})
             service.record_collection_confirm(
@@ -263,7 +263,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(status["upload"]["status"], "succeeded")
             self.assertEqual(status["upload"]["phase"], "capture_uploaded")
             self.assertEqual(status["upload"]["nas_uri"], episode_uri)
-            self.assertEqual(status["episode"]["storage_name"], "S001_pick_object_episode1")
+            self.assertEqual(status["episode"]["storage_name"], "episode1")
             self.assertFalse(any(job["type"] == "upload" for job in status["jobs"]))
             self.assertTrue(any(job["type"] == "auto_label" for job in status["jobs"]))
             self.assertTrue(any(item["kind"] == "nas_episode" and item["uri"] == episode_uri for item in status["artifacts"]))

@@ -218,18 +218,12 @@ def _infer_subject_task_episode(path: Optional[Path]) -> Tuple[str, str, str]:
     return parts[-3], parts[-2], parts[-1]
 
 
-def _clean_storage_part(value: Any, fallback: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._-")
-    return text or fallback
-
-
 def _episode_storage_name(subject_id: Any, task_name: Any, episode_index: Any) -> str:
+    del subject_id, task_name
     index = _optional_int(episode_index)
     if index is None or index <= 0:
         return ""
-    subject = _clean_storage_part(subject_id, "subject")
-    task = _clean_storage_part(task_name, "task")
-    return f"{subject}_{task}_episode{index}"
+    return f"episode{index}"
 
 
 class JobService:

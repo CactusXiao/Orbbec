@@ -176,13 +176,14 @@ class WorkflowStore:
                     updated_by TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
                 );
-                PRAGMA user_version = 3;
+                PRAGMA user_version = 4;
                 """
             )
             self._ensure_episode_storage_columns(conn)
+            conn.execute("DROP INDEX IF EXISTS idx_episodes_storage_name")
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_storage_name "
-                "ON episodes(storage_name) WHERE storage_name <> ''"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_storage_location "
+                "ON episodes(subject_id, task_name, storage_name) WHERE storage_name <> ''"
             )
             timestamp = now_iso()
             for job_type in sorted(CONTROLLED_STAGE_JOB_TYPES):

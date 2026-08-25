@@ -8,11 +8,12 @@
 
 ```text
 episode_id:   <uuid>
-storage_name: <subject_id>_<task_name>_episode<episode_index>
+storage_name: episode<episode_index>
 ```
 
-后端 `episodes` 表中的 `episode_id -> storage_name -> episode_uri` 是唯一映射。`episode_index`
-一旦分配就不复用（包括预约释放后），避免旧 NAS 数据被新 episode 覆盖。
+后端 `episodes` 表用 `(subject_id, task_name, storage_name)` 唯一定位 NAS 目录，并维护
+`episode_id -> subject_id/task_name/storage_name -> episode_uri` 映射。`episode_index` 一旦分配就不复用
+（包括预约释放后），避免旧 NAS 数据被新 episode 覆盖。
 
 后端记录 episode 根 URI：
 
@@ -30,9 +31,9 @@ worker 必须将其映射到本机路径：
 
 ```text
 episode_id:   550e8400-e29b-41d4-a716-446655440000
-storage_name: xiaojiazhou_task-clean-the-bowl_episode12
-URI:          nas://ego/xiaojiazhou/task-clean-the-bowl/xiaojiazhou_task-clean-the-bowl_episode12
-Path:         /mnt/nas/xiaojiazhou/task-clean-the-bowl/xiaojiazhou_task-clean-the-bowl_episode12
+storage_name: episode12
+URI:          nas://ego/xiaojiazhou/task-clean-the-bowl/episode12
+Path:         /mnt/nas/xiaojiazhou/task-clean-the-bowl/episode12
 ```
 
 后端返回 `payload.resolved_data_path` 时优先使用该路径。
@@ -46,7 +47,7 @@ Path:         /mnt/nas/xiaojiazhou/task-clean-the-bowl/xiaojiazhou_task-clean-th
   "subject_id": "xiaojiazhou",
   "task_name": "task-clean-the-bowl",
   "episode_index": 12,
-  "storage_name": "xiaojiazhou_task-clean-the-bowl_episode12"
+  "storage_name": "episode12"
 }
 ```
 

@@ -599,15 +599,9 @@ def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
     return episode
 
 
-def clean_episode_storage_part(value: Any, fallback: str) -> str:
-    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._-")
-    return text or fallback
-
-
 def episode_storage_name(subject_id: str, task_name: str, episode_number: int) -> str:
-    subject = clean_episode_storage_part(subject_id, "subject")
-    task = clean_episode_storage_part(task_name, "task")
-    return f"{subject}_{task}_episode{int(episode_number)}"
+    del subject_id, task_name
+    return f"episode{int(episode_number)}"
 
 
 def html_escape(value: Any) -> str:

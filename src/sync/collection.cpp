@@ -9665,7 +9665,7 @@ static CaptureNasUploadResult uploadEpisodeToNas(const NasConfig &nas,
     const std::string subject = cleanNasPathPart(subjectId, "subject");
     const std::string task = cleanNasPathPart(taskName, "task");
     const std::string episode = reservedStorageName.empty()
-        ? subject + "_" + task + "_episode" + std::to_string(episodeNumber)
+        ? "episode" + std::to_string(episodeNumber)
         : cleanNasPathPart(reservedStorageName, "episode");
     const std::string uriPrefix = cleanNasUriPrefix(nas.uriPrefix);
     if(uriPrefix.empty()) {
