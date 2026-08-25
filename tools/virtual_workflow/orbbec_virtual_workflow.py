@@ -1180,7 +1180,13 @@ class NasSimulator:
         episode_id = str(payload.get("episode_id") or episode.get("episode_id") or f"episode_{uuid.uuid4().hex[:8]}")
         subject = str(payload.get("subject_id") or episode.get("subject_id") or "virtual_subject")
         task_name = str(payload.get("task_name") or episode.get("task_name") or "virtual_task")
-        episode_name = str(payload.get("episode") or episode.get("episode_name") or episode_id)
+        episode_name = str(
+            payload.get("storage_name")
+            or episode.get("storage_name")
+            or payload.get("episode")
+            or episode.get("episode_name")
+            or episode_id
+        )
         cameras = cameras_from_payload(payload, episode, self)
         frames = frames_from_payload(payload, episode, self, cameras)
         source = source_override if copy_source else None

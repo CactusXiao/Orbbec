@@ -84,7 +84,7 @@
         "baseUrl": "http://127.0.0.1:8765",
         "timeoutMs": 3000,
         "nas": {
-            "_comment": "Frontend-visible NAS deployment info. Backend startup still reads .env; Ubuntu mounts //192.168.50.177/ego at /mnt/nas.",
+            "_comment": "Capture-side NAS upload target. Backend .env keeps the same nas:// mapping for workflow resolution.",
             "enabled": true,
             "serverIp": "192.168.50.177",
             "shareName": "ego",

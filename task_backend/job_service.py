@@ -218,6 +218,20 @@ def _infer_subject_task_episode(path: Optional[Path]) -> Tuple[str, str, str]:
     return parts[-3], parts[-2], parts[-1]
 
 
+def _clean_storage_part(value: Any, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._-")
+    return text or fallback
+
+
+def _episode_storage_name(subject_id: Any, task_name: Any, episode_index: Any) -> str:
+    index = _optional_int(episode_index)
+    if index is None or index <= 0:
+        return ""
+    subject = _clean_storage_part(subject_id, "subject")
+    task = _clean_storage_part(task_name, "task")
+    return f"{subject}_{task}_episode{index}"
+
+
 class JobService:
     def __init__(
         self,
@@ -393,6 +407,16 @@ class JobService:
             nas_uri = str(upload_artifacts[-1].get("uri") or "")
         if not nas_uri and str(episode.get("episode_uri") or "").startswith("nas://"):
             nas_uri = str(episode.get("episode_uri") or "")
+        if upload_job is None and nas_uri:
+            status = "succeeded"
+            result = {
+                "phase": "capture_uploaded",
+                "percent": 100.0,
+                "nas_uri": nas_uri,
+                "collection_path": str(episode.get("collection_path") or ""),
+                "direct_from_capture": True,
+            }
+            percent_value = 100.0
         workflow_status = str(episode.get("status") or "planned")
         active_jobs = [
             job for job in all_jobs
@@ -415,7 +439,7 @@ class JobService:
                 "updated_at": str(episode.get("updated_at") or ""),
             },
             "upload": {
-                "available": upload_job is not None,
+                "available": upload_job is not None or bool(nas_uri),
                 "job_id": str(upload_job.get("job_id") or "") if upload_job else "",
                 "status": status,
                 "phase": str(result.get("phase") or ("complete" if status == "succeeded" else status)),
@@ -828,14 +852,19 @@ class JobService:
 
     def record_collection_reservation(self, reservation: Dict[str, Any]) -> None:
         operator_id = _human_operator_id(reservation, reservation.get("subject_id"))
+        storage_name = str(reservation.get("storage_name") or "").strip() or _episode_storage_name(
+            reservation.get("subject_id"), reservation.get("task_name"), reservation.get("episode_number")
+        )
         self.store.create_or_update_episode(
             episode_id=str(reservation.get("reservation_id") or ""),
             subject_id=str(reservation.get("subject_id") or ""),
             task_name=str(reservation.get("task_name") or ""),
             episode_index=_optional_int(reservation.get("episode_number")),
+            storage_name=storage_name,
             status="reserved_for_collection",
             metadata={
                 "reservation_id": reservation.get("reservation_id"),
+                "storage_name": storage_name,
                 "client_id": reservation.get("client_id"),
                 "collection_reserved_by": operator_id,
                 "source": "collection_api",
@@ -845,27 +874,67 @@ class JobService:
     def record_collection_confirm(self, reservation: Dict[str, Any]) -> None:
         episode_id = str(reservation.get("reservation_id") or "")
         collection_path = str(reservation.get("collection_path") or "")
+        episode_uri = str(reservation.get("episode_uri") or reservation.get("nas_uri") or "").strip()
         frame_count = _optional_int(reservation.get("frame_count"))
         operator_id = _human_operator_id(reservation, reservation.get("subject_id"))
+        storage_name = str(reservation.get("storage_name") or "").strip() or _episode_storage_name(
+            reservation.get("subject_id"), reservation.get("task_name"), reservation.get("episode_number")
+        )
         self.store.create_or_update_episode(
             episode_id=episode_id,
             subject_id=str(reservation.get("subject_id") or ""),
             task_name=str(reservation.get("task_name") or ""),
             episode_index=_optional_int(reservation.get("episode_number")),
-            status="captured",
-            episode_uri="",
+            storage_name=storage_name,
+            status="uploaded" if episode_uri else "captured",
+            episode_uri=episode_uri,
             collection_path=collection_path,
             frame_count=frame_count,
             metadata={
                 "reservation_id": reservation.get("reservation_id"),
+                "storage_name": storage_name,
                 "client_id": reservation.get("client_id"),
                 "idempotency_key": reservation.get("idempotency_key"),
+                "nas_uri": episode_uri,
                 "collection_operator_id": operator_id,
                 "collection_confirmed_by": operator_id,
                 "last_human_operator_id": operator_id,
                 "source": "collection_api",
+                "upload_mode": "capture_side" if episode_uri else "backend_upload",
             },
         )
+        if episode_uri:
+            existing_artifacts = self.store.artifacts_for_episode(episode_id)
+            if not any(str(item.get("kind") or "") == "nas_episode" and str(item.get("uri") or "") == episode_uri for item in existing_artifacts):
+                self.store.register_artifact(
+                    episode_id=episode_id,
+                    kind="nas_episode",
+                    uri=episode_uri,
+                    metadata={
+                        "source": "capture_side_uploader",
+                        "collection_path": collection_path,
+                        "confirmed_at": now_iso(),
+                    },
+                )
+            self._create_auto_label_jobs_from_upload(
+                episode_id,
+                {
+                    "episode_id": episode_id,
+                    "collection_path": collection_path,
+                    "episode_uri": episode_uri,
+                    "reason": "collection_uploaded_by_capture",
+                },
+                {
+                    "ok": True,
+                    "phase": "capture_uploaded",
+                    "percent": 100.0,
+                    "nas_uri": episode_uri,
+                    "completed_at": now_iso(),
+                    "direct_from_capture": True,
+                },
+                episode_uri,
+            )
+            return
         job_id = f"upload_{episode_id.replace('-', '_')}"
         payload = {
             "job_id": job_id,
@@ -892,6 +961,8 @@ class JobService:
             payload.setdefault("episode_id", episode.get("episode_id"))
             payload.setdefault("subject_id", episode.get("subject_id"))
             payload.setdefault("task_name", episode.get("task_name"))
+            payload.setdefault("episode_index", episode.get("episode_index"))
+            payload.setdefault("storage_name", episode.get("storage_name"))
             payload.setdefault("episode_uri", episode.get("episode_uri"))
             payload.setdefault("cameras", _label_camera_ids(episode.get("cameras") or []))
         self._strip_downstream_path_fields(payload)

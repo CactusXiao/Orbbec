@@ -587,8 +587,6 @@ def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
     for item in subject.get("reservations", {}).values():
         if item.get("task_name") != task_name:
             continue
-        if item.get("status") == "released":
-            continue
         try:
             episode = int(item.get("episode_number", 0))
         except (TypeError, ValueError):
@@ -599,6 +597,17 @@ def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
     while episode in used:
         episode += 1
     return episode
+
+
+def clean_episode_storage_part(value: Any, fallback: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("._-")
+    return text or fallback
+
+
+def episode_storage_name(subject_id: str, task_name: str, episode_number: int) -> str:
+    subject = clean_episode_storage_part(subject_id, "subject")
+    task = clean_episode_storage_part(task_name, "task")
+    return f"{subject}_{task}_episode{int(episode_number)}"
 
 
 def html_escape(value: Any) -> str:
@@ -1328,6 +1337,7 @@ class TaskBackend:
 
             reservation_id = str(uuid.uuid4())
             episode_number = next_episode_number(subject, task_name)
+            storage_name = episode_storage_name(subject_id, task_name, episode_number)
             reservation = {
                 "reservation_id": reservation_id,
                 "client_id": client_id,
@@ -1336,6 +1346,7 @@ class TaskBackend:
                 "reserved_by": operator_id,
                 "task_name": task_name,
                 "episode_number": episode_number,
+                "storage_name": storage_name,
                 "status": "reserved",
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
@@ -1346,6 +1357,7 @@ class TaskBackend:
                 "reservation_id": reservation_id,
                 "task_name": task_name,
                 "episode_number": episode_number,
+                "storage_name": storage_name,
             }
 
     def confirm(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1354,6 +1366,7 @@ class TaskBackend:
         task_name = str(payload.get("task_name", "")).strip()
         idempotency_key = str(payload.get("idempotency_key", "")).strip()
         collection_path = str(payload.get("collection_path", "")).strip()
+        episode_uri = str(payload.get("episode_uri") or payload.get("nas_uri") or "").strip()
         operator_id = operator_id_from_payload(payload, subject_id)
         try:
             episode_number = int(payload.get("episode_number"))
@@ -1377,6 +1390,10 @@ class TaskBackend:
                     reservation["operator_id"] = operator_id
                     reservation["confirmed_by"] = operator_id
                     reservation["updated_at"] = now_iso()
+                    if collection_path:
+                        reservation["collection_path"] = collection_path
+                    if episode_uri:
+                        reservation["episode_uri"] = episode_uri
                     self._workflow_hook("record_collection_confirm", reservation)
                 return progress_payload(subject_id, subject, self.tasks, state)
 
@@ -1387,6 +1404,9 @@ class TaskBackend:
                 raise BackendError(HTTPStatus.CONFLICT, "reservation does not match subject/task")
             if int(reservation.get("episode_number", -1)) != episode_number:
                 raise BackendError(HTTPStatus.CONFLICT, "reservation does not match episode_number")
+            storage_name = str(reservation.get("storage_name") or "").strip()
+            if storage_name and episode_uri and episode_uri.rstrip("/").rsplit("/", 1)[-1] != storage_name:
+                raise BackendError(HTTPStatus.CONFLICT, "episode_uri does not match reserved storage_name")
             if reservation.get("status") == "released":
                 raise BackendError(HTTPStatus.CONFLICT, "reservation has been released")
             if reservation.get("status") == "confirmed":
@@ -1398,6 +1418,10 @@ class TaskBackend:
                     reservation["operator_id"] = operator_id
                     reservation["confirmed_by"] = operator_id
                     reservation["updated_at"] = now_iso()
+                    if collection_path:
+                        reservation["collection_path"] = collection_path
+                    if episode_uri:
+                        reservation["episode_uri"] = episode_uri
                     self._workflow_hook("record_collection_confirm", reservation)
                 return progress_payload(subject_id, subject, self.tasks, state)
 
@@ -1408,6 +1432,8 @@ class TaskBackend:
             reservation["confirmed_by"] = operator_id
             reservation["idempotency_key"] = idempotency_key
             reservation["collection_path"] = collection_path
+            if episode_uri:
+                reservation["episode_uri"] = episode_uri
             duration_seconds = parse_nonnegative_float(payload.get("duration_seconds", payload.get("duration_sec")))
             if duration_seconds is not None:
                 reservation["duration_seconds"] = round(duration_seconds, 3)
@@ -2249,6 +2275,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ("任务", task_name),
         ("采集对象", item.get("subject_id", "")),
         ("Episode 序号", item.get("episode_number", "")),
+        ("NAS 目录名", item.get("storage_name") or workflow_episode.get("storage_name") or "-"),
         ("采集状态", status),
         ("采集时长", stats.get("duration_label", "-")),
         ("帧数", stats.get("frame_count_label", "-")),
@@ -2270,6 +2297,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ("上传文件", f"{upload_files_done} / {upload_files_total}"),
         ("上传字节", f"{format_bytes(upload_copied)} / {format_bytes(upload_total)}"),
         ("NAS Episode URI", upload_nas_uri or "-"),
+        ("UUID → NAS 目录", f"{reservation_id} → {workflow_episode.get('storage_name') or item.get('storage_name') or '-'}"),
         ("Workflow Episode URI", workflow_episode.get("episode_uri") or "-"),
         ("上传错误", upload_error or "-"),
     ]

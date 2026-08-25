@@ -529,6 +529,7 @@ bool TaskBackendClient::reserveEpisode(const std::string &clientId,
     TaskEpisodeReservation reservation;
     reservation.reservationId = jsonString(parsed, "reservation_id");
     reservation.taskName = jsonString(parsed, "task_name");
+    reservation.storageName = jsonString(parsed, "storage_name");
     reservation.episodeNumber = jsonInt(parsed, "episode_number", 0);
     cJSON_Delete(parsed);
     if(reservation.reservationId.empty() || reservation.taskName.empty() || reservation.episodeNumber <= 0) {
@@ -544,6 +545,7 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
                                        const std::string &taskName,
                                        int episodeNumber,
                                        const std::string &collectionPath,
+                                       const std::string &episodeUri,
                                        double durationSeconds,
                                        int frameCount,
                                        const std::string &idempotencyKey,
@@ -556,6 +558,9 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
     cJSON_AddStringToObject(root, "task_name", taskName.c_str());
     cJSON_AddNumberToObject(root, "episode_number", episodeNumber);
     cJSON_AddStringToObject(root, "collection_path", collectionPath.c_str());
+    if(!episodeUri.empty()) {
+        cJSON_AddStringToObject(root, "episode_uri", episodeUri.c_str());
+    }
     if(durationSeconds > 0.0) {
         cJSON_AddNumberToObject(root, "duration_seconds", durationSeconds);
     }

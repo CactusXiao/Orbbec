@@ -19,6 +19,7 @@ struct TaskBackendTask {
 struct TaskEpisodeReservation {
     std::string reservationId;
     std::string taskName;
+    std::string storageName;
     int episodeNumber = 0;
 };
 
@@ -78,6 +79,7 @@ public:
                         const std::string &taskName,
                         int episodeNumber,
                         const std::string &collectionPath,
+                        const std::string &episodeUri,
                         double durationSeconds,
                         int frameCount,
                         const std::string &idempotencyKey,

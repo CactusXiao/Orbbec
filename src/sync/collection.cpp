@@ -15,6 +15,9 @@
 #include <csignal>
 #include <cstring>
 #include <cstdlib>
+#include <future>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <unordered_set>
@@ -9355,6 +9358,7 @@ struct EpisodeReservationUi {
     bool        active = false;
     std::string reservationId;
     std::string taskName;
+    std::string storageName;
     int         episodeNumber = 0;
     fs::path    collectionPath;
     std::string idempotencyKey;
@@ -9362,11 +9366,17 @@ struct EpisodeReservationUi {
     int         frameCount = 0;
     bool        localFinalized = false;
     bool        countedComplete = false;
+    bool        nasUploadStarted = false;
+    bool        nasUploadFinished = false;
+    bool        nasUploadSucceeded = false;
+    std::string nasUri;
+    std::string nasUploadError;
 
     void clear() {
         active = false;
         reservationId.clear();
         taskName.clear();
+        storageName.clear();
         episodeNumber = 0;
         collectionPath.clear();
         idempotencyKey.clear();
@@ -9374,6 +9384,11 @@ struct EpisodeReservationUi {
         frameCount = 0;
         localFinalized = false;
         countedComplete = false;
+        nasUploadStarted = false;
+        nasUploadFinished = false;
+        nasUploadSucceeded = false;
+        nasUri.clear();
+        nasUploadError.clear();
     }
 };
 
@@ -9432,6 +9447,279 @@ static std::string uploadStatusLine(const TrackedUploadUi &tracked) {
         oss << " error: " << st.error;
     }
     return oss.str();
+}
+
+struct CaptureNasUploadResult {
+    bool        ok = false;
+    std::string episodeUri;
+    fs::path    destPath;
+    std::string error;
+    uint64_t    totalBytes = 0;
+    int         filesTotal = 0;
+};
+
+static std::string cleanNasPathPart(const std::string &value, const std::string &fallback) {
+    std::string out;
+    for(const char ch: trimString(value)) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if(std::isalnum(uch) || ch == '_' || ch == '-' || ch == '.') {
+            out.push_back(ch);
+        }
+        else if(!out.empty() && out.back() != '_') {
+            out.push_back('_');
+        }
+    }
+    while(!out.empty() && (out.back() == '_' || out.back() == '.' || out.back() == '-')) {
+        out.pop_back();
+    }
+    return out.empty() ? fallback : out;
+}
+
+static std::string cleanNasUriPrefix(std::string value) {
+    value = trimString(std::move(value));
+    while(value.size() > 1 && value.back() == '/') {
+        value.pop_back();
+    }
+    return value;
+}
+
+static std::string joinNasUriPath(const std::string &prefix,
+                                  const std::string &subject,
+                                  const std::string &task,
+                                  const std::string &episode) {
+    return cleanNasUriPrefix(prefix) + "/" + subject + "/" + task + "/" + episode;
+}
+
+static bool copyEpisodeTreeToNasTemp(const fs::path &source,
+                                     const fs::path &tmp,
+                                     uint64_t &totalBytes,
+                                     int &filesTotal,
+                                     std::string *errorMessage) {
+    std::error_code ec;
+    if(!fs::exists(source, ec) || !fs::is_directory(source, ec)) {
+        if(errorMessage) {
+            *errorMessage = "collection path is not a directory: " + source.string();
+        }
+        return false;
+    }
+    fs::remove_all(tmp, ec);
+    ec.clear();
+    fs::create_directories(tmp, ec);
+    if(ec) {
+        if(errorMessage) {
+            *errorMessage = "failed to create NAS temp dir " + tmp.string() + ": " + ec.message();
+        }
+        return false;
+    }
+
+    totalBytes = 0;
+    filesTotal = 0;
+    for(fs::recursive_directory_iterator it(source, ec), end; it != end; it.increment(ec)) {
+        if(ec) {
+            if(errorMessage) {
+                *errorMessage = "failed to scan collection path " + source.string() + ": " + ec.message();
+            }
+            return false;
+        }
+        const fs::path rel = fs::relative(it->path(), source, ec);
+        if(ec || rel.empty()) {
+            if(errorMessage) {
+                *errorMessage = "failed to calculate relative path under " + source.string();
+            }
+            return false;
+        }
+        const fs::path out = tmp / rel;
+        if(it->is_directory(ec)) {
+            fs::create_directories(out, ec);
+            if(ec) {
+                if(errorMessage) {
+                    *errorMessage = "failed to create NAS directory " + out.string() + ": " + ec.message();
+                }
+                return false;
+            }
+            continue;
+        }
+        if(!it->is_regular_file(ec)) {
+            continue;
+        }
+        fs::create_directories(out.parent_path(), ec);
+        if(ec) {
+            if(errorMessage) {
+                *errorMessage = "failed to create NAS parent " + out.parent_path().string() + ": " + ec.message();
+            }
+            return false;
+        }
+        const auto fileSize = fs::file_size(it->path(), ec);
+        if(ec) {
+            if(errorMessage) {
+                *errorMessage = "failed to stat " + it->path().string() + ": " + ec.message();
+            }
+            return false;
+        }
+        fs::copy_file(it->path(), out, fs::copy_options::overwrite_existing, ec);
+        if(ec) {
+            if(errorMessage) {
+                *errorMessage = "failed to copy " + it->path().string() + " to " + out.string() + ": " + ec.message();
+            }
+            return false;
+        }
+        totalBytes += static_cast<uint64_t>(fileSize);
+        filesTotal += 1;
+    }
+    return true;
+}
+
+static bool writeCaptureNasManifest(const fs::path &path,
+                                    const std::string &reservationId,
+                                    const std::string &subjectId,
+                                    const std::string &taskName,
+                                    int episodeNumber,
+                                    const std::string &storageName,
+                                    const fs::path &source,
+                                    const std::string &episodeUri,
+                                    int filesTotal,
+                                    uint64_t totalBytes,
+                                    std::string *errorMessage) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "episode_id", reservationId.c_str());
+    cJSON_AddStringToObject(root, "episode_uuid", reservationId.c_str());
+    cJSON_AddStringToObject(root, "subject_id", subjectId.c_str());
+    cJSON_AddStringToObject(root, "task_name", taskName.c_str());
+    cJSON_AddNumberToObject(root, "episode_index", episodeNumber);
+    cJSON_AddStringToObject(root, "storage_name", storageName.c_str());
+    cJSON_AddStringToObject(root, "source_path", source.string().c_str());
+    cJSON_AddStringToObject(root, "nas_uri", episodeUri.c_str());
+    cJSON_AddNumberToObject(root, "files_total", filesTotal);
+    cJSON_AddNumberToObject(root, "total_bytes", static_cast<double>(totalBytes));
+    cJSON_AddStringToObject(root, "completed_by", "capture_side_uploader");
+    cJSON_AddStringToObject(root, "storage_backend", "nas");
+    char *printed = cJSON_Print(root);
+    cJSON_Delete(root);
+    if(!printed) {
+        if(errorMessage) {
+            *errorMessage = "failed to serialize NAS manifest";
+        }
+        return false;
+    }
+    std::ofstream out(path, std::ios::binary);
+    if(!out) {
+        if(errorMessage) {
+            *errorMessage = "failed to open NAS manifest " + path.string();
+        }
+        cJSON_free(printed);
+        return false;
+    }
+    out << printed << "\n";
+    cJSON_free(printed);
+    return true;
+}
+
+static bool canReplaceNasEpisode(const fs::path &dest,
+                                 const std::string &reservationId,
+                                 std::string *errorMessage) {
+    std::error_code ec;
+    if(!fs::exists(dest, ec)) {
+        return true;
+    }
+    const fs::path manifestPath = dest / ".orbbec_upload_manifest.json";
+    std::ifstream in(manifestPath, std::ios::binary);
+    if(!in) {
+        if(errorMessage) {
+            *errorMessage = "NAS destination already exists without an upload manifest: " + dest.string();
+        }
+        return false;
+    }
+    const std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    cJSON *root = cJSON_Parse(content.c_str());
+    if(!root) {
+        if(errorMessage) {
+            *errorMessage = "NAS destination has an invalid upload manifest: " + manifestPath.string();
+        }
+        return false;
+    }
+    cJSON *idItem = cJSON_GetObjectItemCaseSensitive(root, "episode_uuid");
+    if(!cJSON_IsString(idItem)) {
+        idItem = cJSON_GetObjectItemCaseSensitive(root, "episode_id");
+    }
+    const std::string existingId = cJSON_IsString(idItem) && idItem->valuestring
+        ? std::string(idItem->valuestring)
+        : std::string();
+    cJSON_Delete(root);
+    if(existingId != reservationId) {
+        if(errorMessage) {
+            *errorMessage = "NAS destination belongs to another episode UUID: " + dest.string();
+        }
+        return false;
+    }
+    return true;
+}
+
+static CaptureNasUploadResult uploadEpisodeToNas(const NasConfig &nas,
+                                                 const fs::path &collectionPath,
+                                                 const std::string &subjectId,
+                                                 const std::string &taskName,
+                                                 const std::string &reservationId,
+                                                 int episodeNumber,
+                                                 const std::string &reservedStorageName) {
+    CaptureNasUploadResult result;
+    const std::string subject = cleanNasPathPart(subjectId, "subject");
+    const std::string task = cleanNasPathPart(taskName, "task");
+    const std::string episode = reservedStorageName.empty()
+        ? subject + "_" + task + "_episode" + std::to_string(episodeNumber)
+        : cleanNasPathPart(reservedStorageName, "episode");
+    const std::string uriPrefix = cleanNasUriPrefix(nas.uriPrefix);
+    if(uriPrefix.empty()) {
+        result.error = "NAS uriPrefix is empty";
+        return result;
+    }
+    const fs::path root = nas.mountPath;
+    if(root.empty()) {
+        result.error = "NAS mountPath is empty";
+        return result;
+    }
+    result.episodeUri = joinNasUriPath(uriPrefix, subject, task, episode);
+    result.destPath = root / subject / task / episode;
+    const fs::path tmp = root / ".upload_tmp" / (episode + ".capture_upload");
+
+    std::string error;
+    if(!copyEpisodeTreeToNasTemp(collectionPath, tmp, result.totalBytes, result.filesTotal, &error)) {
+        result.error = error;
+        return result;
+    }
+    if(!writeCaptureNasManifest(tmp / ".orbbec_upload_manifest.json",
+                                reservationId,
+                                subjectId,
+                                taskName,
+                                episodeNumber,
+                                episode,
+                                collectionPath,
+                                result.episodeUri,
+                                result.filesTotal,
+                                result.totalBytes,
+                                &error)) {
+        result.error = error;
+        return result;
+    }
+
+    std::error_code ec;
+    fs::create_directories(result.destPath.parent_path(), ec);
+    if(ec) {
+        result.error = "failed to create NAS destination parent " + result.destPath.parent_path().string() + ": " + ec.message();
+        return result;
+    }
+    if(!canReplaceNasEpisode(result.destPath, reservationId, &error)) {
+        result.error = error;
+        return result;
+    }
+    fs::remove_all(result.destPath, ec);
+    ec.clear();
+    fs::rename(tmp, result.destPath, ec);
+    if(ec) {
+        result.error = "failed to publish NAS episode " + result.destPath.string() + ": " + ec.message();
+        return result;
+    }
+    result.ok = true;
+    return result;
 }
 
 static TaskInfo taskInfoFromBackend(const TaskBackendTask &src) {
@@ -9756,6 +10044,8 @@ int run_collection(const AppConfig &cfg,
     VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
     std::deque<TrackedUploadUi> trackedUploads;
+    std::future<CaptureNasUploadResult> captureNasFuture;
+    std::string captureNasUploadReservationId;
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
@@ -10054,10 +10344,73 @@ int run_collection(const AppConfig &cfg,
         return true;
     };
 
+    auto captureNasUploadRunning = [&]() {
+        return captureNasFuture.valid()
+            && captureNasFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
+    };
+
+    auto startCaptureNasUploadForCurrentReservation = [&]() {
+        if(!currentReservation.active) {
+            capUi.msg = "NAS upload failed: no active reservation";
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        if(captureNasUploadRunning()) {
+            capUi.msg = "NAS upload still running...";
+            return false;
+        }
+        if(captureNasFuture.valid()) {
+            capUi.msg = "NAS upload result is pending UI processing";
+            return false;
+        }
+        const std::string subject = trimString(cfgUi.subjectId);
+        if(subject.empty()) {
+            capUi.msg = "NAS upload failed: subject is empty";
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        if(currentReservation.collectionPath.empty()) {
+            capUi.msg = "NAS upload failed: collection path is empty";
+            pushUiLog(capUi.msg);
+            return false;
+        }
+        currentReservation.nasUploadStarted = true;
+        currentReservation.nasUploadFinished = false;
+        currentReservation.nasUploadSucceeded = false;
+        currentReservation.nasUploadError.clear();
+        currentReservation.nasUri.clear();
+        captureNasUploadReservationId = currentReservation.reservationId;
+
+        const NasConfig nas = cfg.taskBackend.nas;
+        const fs::path collectionPath = currentReservation.collectionPath;
+        const std::string taskName = currentReservation.taskName;
+        const std::string reservationId = currentReservation.reservationId;
+        const int episodeNumber = currentReservation.episodeNumber;
+        const std::string storageName = currentReservation.storageName;
+        captureNasFuture = std::async(std::launch::async, [nas, collectionPath, subject, taskName, reservationId, episodeNumber, storageName]() {
+            return uploadEpisodeToNas(nas, collectionPath, subject, taskName, reservationId, episodeNumber, storageName);
+        });
+
+        capUi.msg = "NAS upload started...";
+        pushUiLog("NAS upload started: " + currentReservation.collectionPath.string());
+        return true;
+    };
+
     auto confirmReservationWithBackend = [&]() {
         if(!currentReservation.active) {
             capUi.msg = "Backend confirm failed: no active reservation";
             pushUiLog(capUi.msg);
+            return false;
+        }
+        if(cfg.taskBackend.nas.enabled && currentReservation.nasUri.empty()) {
+            if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
+                capUi.msg = "NAS upload still running...";
+                return false;
+            }
+            if(!startCaptureNasUploadForCurrentReservation()) {
+                return false;
+            }
+            captureState = CaptureState::BACKEND_SYNC_PENDING;
             return false;
         }
         std::vector<TaskBackendTask> refreshedTasks;
@@ -10068,6 +10421,7 @@ int run_collection(const AppConfig &cfg,
                                          currentReservation.taskName,
                                          currentReservation.episodeNumber,
                                          currentReservation.collectionPath.string(),
+                                         currentReservation.nasUri,
                                          currentReservation.durationSeconds,
                                          currentReservation.frameCount,
                                          currentReservation.idempotencyKey,
@@ -10098,6 +10452,65 @@ int run_collection(const AppConfig &cfg,
         }
         currentReservation.clear();
         return true;
+    };
+
+    auto pollCaptureNasUpload = [&]() {
+        if(!captureNasFuture.valid()) {
+            return;
+        }
+        if(captureNasFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            return;
+        }
+        CaptureNasUploadResult uploadResult;
+        try {
+            uploadResult = captureNasFuture.get();
+        }
+        catch(const std::exception &e) {
+            uploadResult.ok = false;
+            uploadResult.error = e.what();
+        }
+        catch(...) {
+            uploadResult.ok = false;
+            uploadResult.error = "unknown NAS upload error";
+        }
+        const std::string finishedReservationId = captureNasUploadReservationId;
+        captureNasUploadReservationId.clear();
+        if(!currentReservation.active || currentReservation.reservationId != finishedReservationId) {
+            return;
+        }
+        currentReservation.nasUploadFinished = true;
+        currentReservation.nasUploadSucceeded = uploadResult.ok;
+        currentReservation.nasUri = uploadResult.ok ? uploadResult.episodeUri : std::string();
+        currentReservation.nasUploadError = uploadResult.error;
+        if(!uploadResult.ok) {
+            capUi.msg = "NAS upload failed: " + uploadResult.error;
+            pushUiLog(capUi.msg);
+            captureState = CaptureState::BACKEND_SYNC_PENDING;
+            announce("confirm_failed", "nas upload failed");
+            return;
+        }
+        {
+            std::ostringstream oss;
+            oss << "NAS upload OK: " << uploadResult.episodeUri
+                << " files=" << uploadResult.filesTotal
+                << " bytes=" << uploadResult.totalBytes;
+            pushUiLog(oss.str());
+        }
+        capUi.msg = "NAS upload OK. Confirming backend...";
+        if(confirmReservationWithBackend()) {
+            capUi.msg = "Capture confirmed";
+            pushUiLog("Confirm OK. Backend received NAS URI.");
+            announce("confirm", "confirm");
+            recorder.clearStatus();
+            captureState = CaptureState::IDLE;
+            pendingResetAfterDrain = false;
+            resetDrainStatusTracking();
+            resetCameraReadyAnnouncement();
+        }
+        else {
+            captureState = CaptureState::BACKEND_SYNC_PENDING;
+            announce("confirm_failed", "confirm failed");
+        }
     };
 
     auto updateReadyState = [&]() {
@@ -10226,6 +10639,7 @@ int run_collection(const AppConfig &cfg,
         }
         auto fm = beginFrame(ms);
         pollTrackedUploads(false);
+        pollCaptureNasUpload();
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
             if(exitConfirmActive) {
@@ -10900,7 +11314,15 @@ int run_collection(const AppConfig &cfg,
                 break;
             case CaptureState::BACKEND_SYNC_PENDING:
                 sd = {"BACKEND SYNC PENDING", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
-                stateEmphasisLine = "Retry Confirm after backend is reachable";
+                if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
+                    stateEmphasisLine = "Uploading local episode to NAS";
+                }
+                else if(currentReservation.nasUploadFinished && !currentReservation.nasUploadSucceeded) {
+                    stateEmphasisLine = "NAS upload failed. Retry Confirm";
+                }
+                else {
+                    stateEmphasisLine = "Retry Confirm after backend is reachable";
+                }
                 if(currentReservation.active) {
                     stateFootnoteLine = currentReservation.taskName + " episode_" + std::to_string(currentReservation.episodeNumber);
                 }
@@ -11079,11 +11501,13 @@ int run_collection(const AppConfig &cfg,
             }
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
-            bool doSave     = uiButtonEx(ui, bSave,
-                                         captureState == CaptureState::BACKEND_SYNC_PENDING
-                                             ? "Retry Backend Confirm [Ctrl+3]"
-                                             : "Confirm [Ctrl+3]",
-                                         fm, allowSave);
+            std::string saveLabel = "Confirm [Ctrl+3]";
+            if(captureState == CaptureState::BACKEND_SYNC_PENDING) {
+                saveLabel = (currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished)
+                    ? "NAS Uploading..."
+                    : "Retry Backend Confirm [Ctrl+3]";
+            }
+            bool doSave     = uiButtonEx(ui, bSave, saveLabel, fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);
             bool doBackMenu = uiButtonEx(ui, bMenu,  "Menu",            fm, allowNav);
             bool doBackTasks = uiButtonEx(ui, bTasks,"Tasks",           fm, allowNav);
@@ -11328,6 +11752,7 @@ int run_collection(const AppConfig &cfg,
                     currentReservation.active = true;
                     currentReservation.reservationId = reservation.reservationId;
                     currentReservation.taskName = reservation.taskName;
+                    currentReservation.storageName = reservation.storageName;
                     currentReservation.episodeNumber = reservation.episodeNumber;
                     currentReservation.collectionPath = root / subject / reservation.taskName
                                                         / ("episode_" + std::to_string(reservation.episodeNumber));
@@ -11477,7 +11902,12 @@ int run_collection(const AppConfig &cfg,
                     else {
                         captureState = CaptureState::BACKEND_SYNC_PENDING;
                         pendingResetAfterDrain = false;
-                        announce("confirm_failed", "confirm failed");
+                        if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
+                            capUi.msg = "NAS upload running...";
+                        }
+                        else {
+                            announce("confirm_failed", "confirm failed");
+                        }
                     }
                 }
             }

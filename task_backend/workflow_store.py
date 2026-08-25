@@ -97,6 +97,7 @@ class WorkflowStore:
                     subject_id TEXT NOT NULL,
                     task_name TEXT NOT NULL,
                     episode_index INTEGER,
+                    storage_name TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     episode_uri TEXT,
                     collection_path TEXT,
@@ -175,10 +176,14 @@ class WorkflowStore:
                     updated_by TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
                 );
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 """
             )
             self._ensure_episode_storage_columns(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_storage_name "
+                "ON episodes(storage_name) WHERE storage_name <> ''"
+            )
             timestamp = now_iso()
             for job_type in sorted(CONTROLLED_STAGE_JOB_TYPES):
                 conn.execute(
@@ -224,6 +229,9 @@ class WorkflowStore:
             columns.add("episode_uri")
         if "collection_path" not in columns:
             conn.execute("ALTER TABLE episodes ADD COLUMN collection_path TEXT")
+            columns.add("collection_path")
+        if "storage_name" not in columns:
+            conn.execute("ALTER TABLE episodes ADD COLUMN storage_name TEXT NOT NULL DEFAULT ''")
 
     def create_or_update_episode(
         self,
@@ -232,6 +240,7 @@ class WorkflowStore:
         subject_id: str,
         task_name: str,
         episode_index: Optional[int] = None,
+        storage_name: str = "",
         status: str = "planned",
         episode_uri: str = "",
         collection_path: str = "",
@@ -243,6 +252,7 @@ class WorkflowStore:
         episode_id = str(episode_id or "").strip() or _new_id("episode")
         subject_id = str(subject_id or "").strip()
         task_name = str(task_name or "").strip()
+        storage_name = str(storage_name or "").strip()
         if not subject_id or not task_name:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "subject_id and task_name are required")
 
@@ -254,6 +264,7 @@ class WorkflowStore:
                 "subject_id": subject_id,
                 "task_name": task_name,
                 "episode_index": episode_index,
+                "storage_name": storage_name,
                 "status": status,
                 "episode_uri": episode_uri,
                 "collection_path": collection_path,
@@ -269,6 +280,7 @@ class WorkflowStore:
                         "subject_id": subject_id or existing["subject_id"],
                         "task_name": task_name or existing["task_name"],
                         "episode_index": episode_index if episode_index is not None else existing.get("episode_index"),
+                        "storage_name": storage_name or existing.get("storage_name", ""),
                         "status": status or existing["status"],
                         "episode_uri": episode_uri or existing.get("episode_uri", ""),
                         "collection_path": collection_path or existing.get("collection_path", ""),
@@ -281,17 +293,31 @@ class WorkflowStore:
                 )
             conn.execute(
                 """
-                INSERT OR REPLACE INTO episodes (
-                    episode_id, subject_id, task_name, episode_index, status,
+                INSERT INTO episodes (
+                    episode_id, subject_id, task_name, episode_index, storage_name, status,
                     episode_uri, collection_path, frame_count, cameras_json,
                     metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(episode_id) DO UPDATE SET
+                    subject_id = excluded.subject_id,
+                    task_name = excluded.task_name,
+                    episode_index = excluded.episode_index,
+                    storage_name = excluded.storage_name,
+                    status = excluded.status,
+                    episode_uri = excluded.episode_uri,
+                    collection_path = excluded.collection_path,
+                    frame_count = excluded.frame_count,
+                    cameras_json = excluded.cameras_json,
+                    metadata_json = excluded.metadata_json,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
                 """,
                 (
                     values["episode_id"],
                     values["subject_id"],
                     values["task_name"],
                     values["episode_index"],
+                    values["storage_name"],
                     values["status"],
                     values["episode_uri"],
                     values["collection_path"],
@@ -1187,6 +1213,7 @@ class WorkflowStore:
             "subject_id": row["subject_id"],
             "task_name": row["task_name"],
             "episode_index": row["episode_index"],
+            "storage_name": row["storage_name"] or "",
             "status": row["status"],
             "episode_uri": row["episode_uri"] or "",
             "collection_path": row["collection_path"] or "",

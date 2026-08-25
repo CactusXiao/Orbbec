@@ -58,6 +58,21 @@ def path_totals(root: Path) -> Tuple[int, int]:
     return files, bytes_total
 
 
+def ensure_replaceable_episode_destination(dest: Path, episode_id: str) -> None:
+    if not dest.exists():
+        return
+    manifest_path = dest / ".orbbec_upload_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError(f"NAS destination already exists without an upload manifest: {dest}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"NAS destination has an invalid upload manifest: {manifest_path}") from exc
+    existing_id = str(manifest.get("episode_uuid") or manifest.get("episode_id") or "").strip()
+    if existing_id != episode_id:
+        raise RuntimeError(f"NAS destination belongs to another episode UUID: {dest}")
+
+
 @dataclass
 class NasUploadConfig:
     enabled: bool = True
@@ -158,7 +173,10 @@ class NasUploader:
 
         subject = clean_path_part(payload.get("subject_id") or episode.get("subject_id"), "subject")
         task = clean_path_part(payload.get("task_name") or episode.get("task_name"), "task")
-        episode_part = clean_path_part(episode_id, "episode")
+        episode_part = clean_path_part(
+            episode.get("storage_name") or (episode.get("metadata") or {}).get("storage_name") or episode_id,
+            "episode",
+        )
         nas_uri = uri_join(self.config.uri_prefix, subject, task, episode_part)
         dest = self._nas_path_for_uri(nas_uri)
         tmp = self.config.root / ".upload_tmp" / f"{clean_path_part(job_id, 'upload')}.{uuid.uuid4().hex}"
@@ -240,6 +258,11 @@ class NasUploader:
         manifest = {
             "job_id": job_id,
             "episode_id": episode_id,
+            "episode_uuid": episode_id,
+            "subject_id": str(episode.get("subject_id") or ""),
+            "task_name": str(episode.get("task_name") or ""),
+            "episode_index": episode.get("episode_index"),
+            "storage_name": episode_part,
             "source_path": str(source),
             "nas_uri": nas_uri,
             "files_total": files_total,
@@ -263,6 +286,7 @@ class NasUploader:
         self._progress(job_id, progress)
 
         dest.parent.mkdir(parents=True, exist_ok=True)
+        ensure_replaceable_episode_destination(dest, episode_id)
         if dest.exists():
             if dest.is_dir():
                 shutil.rmtree(dest)
