@@ -9722,6 +9722,99 @@ static CaptureNasUploadResult uploadEpisodeToNas(const NasConfig &nas,
     return result;
 }
 
+static bool pathIsSameOrBelow(const fs::path &path, const fs::path &root) {
+    auto pathIt = path.begin();
+    const auto pathEnd = path.end();
+    for(auto rootIt = root.begin(), rootEnd = root.end(); rootIt != rootEnd; ++rootIt, ++pathIt) {
+        if(pathIt == pathEnd || *pathIt != *rootIt) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool deleteLocalEpisodeAfterNasUpload(const fs::path &collectionPath,
+                                             const fs::path &nasMountPath,
+                                             int episodeNumber,
+                                             std::string *errorMessage) {
+    if(collectionPath.empty()) {
+        if(errorMessage) {
+            *errorMessage = "local episode path is empty";
+        }
+        return false;
+    }
+    const std::string expectedName = "episode_" + std::to_string(episodeNumber);
+    if(collectionPath.filename() != expectedName) {
+        if(errorMessage) {
+            *errorMessage = "refusing to delete unexpected local episode path: " + collectionPath.string();
+        }
+        return false;
+    }
+
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(collectionPath, ec);
+    if(ec) {
+        if(errorMessage) {
+            *errorMessage = "failed to inspect local episode " + collectionPath.string() + ": " + ec.message();
+        }
+        return false;
+    }
+    if(!fs::exists(status)) {
+        return true;
+    }
+    if(fs::is_symlink(status) || !fs::is_directory(status)) {
+        if(errorMessage) {
+            *errorMessage = "refusing to delete a non-directory or symlink: " + collectionPath.string();
+        }
+        return false;
+    }
+
+    const fs::path resolvedLocal = fs::weakly_canonical(collectionPath, ec);
+    if(ec) {
+        if(errorMessage) {
+            *errorMessage = "failed to resolve local episode " + collectionPath.string() + ": " + ec.message();
+        }
+        return false;
+    }
+    if(!nasMountPath.empty()) {
+        const fs::path resolvedNas = fs::weakly_canonical(nasMountPath, ec);
+        if(ec) {
+            if(errorMessage) {
+                *errorMessage = "failed to resolve NAS mount " + nasMountPath.string() + ": " + ec.message();
+            }
+            return false;
+        }
+        if(pathIsSameOrBelow(resolvedLocal, resolvedNas)) {
+            if(errorMessage) {
+                *errorMessage = "refusing to delete an episode inside the NAS mount: " + resolvedLocal.string();
+            }
+            return false;
+        }
+    }
+
+    const auto removed = fs::remove_all(resolvedLocal, ec);
+    if(ec) {
+        if(errorMessage) {
+            *errorMessage = "failed to delete local episode " + resolvedLocal.string() + ": " + ec.message();
+        }
+        return false;
+    }
+    const bool stillExists = fs::exists(resolvedLocal, ec);
+    if(ec) {
+        if(errorMessage) {
+            *errorMessage = "failed to verify local cleanup " + resolvedLocal.string() + ": " + ec.message();
+        }
+        return false;
+    }
+    if(removed == 0 || stillExists) {
+        if(errorMessage) {
+            *errorMessage = "local episode still exists after cleanup: " + resolvedLocal.string();
+        }
+        return false;
+    }
+    return true;
+}
+
 static TaskInfo taskInfoFromBackend(const TaskBackendTask &src) {
     TaskInfo out;
     out.name = src.taskName;
@@ -10448,6 +10541,21 @@ int run_collection(const AppConfig &cfg,
             const std::string line = latestUploadLine();
             if(!line.empty()) {
                 pushUiLog(line);
+            }
+        }
+        if(cfg.taskBackend.nas.enabled
+           && cfg.taskBackend.nas.deleteLocalAfterUpload
+           && currentReservation.nasUploadSucceeded) {
+            std::string cleanupError;
+            const fs::path localEpisodePath = currentReservation.collectionPath;
+            if(deleteLocalEpisodeAfterNasUpload(localEpisodePath,
+                                                cfg.taskBackend.nas.mountPath,
+                                                currentReservation.episodeNumber,
+                                                &cleanupError)) {
+                pushUiLog("Local episode deleted after NAS upload: " + localEpisodePath.string());
+            }
+            else {
+                pushUiLog("WARNING: NAS upload is safe, but local episode cleanup failed: " + cleanupError);
             }
         }
         currentReservation.clear();

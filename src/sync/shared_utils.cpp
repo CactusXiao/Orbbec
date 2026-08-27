@@ -871,6 +871,9 @@ AppConfig loadConfig(const fs::path &configPath) {
                     if(auto v = getBool(nasObj, "enabled")) {
                         cfg.taskBackend.nas.enabled = *v;
                     }
+                    if(auto v = getBool(nasObj, "deleteLocalAfterUpload")) {
+                        cfg.taskBackend.nas.deleteLocalAfterUpload = *v;
+                    }
                     if(auto v = getString(nasObj, "serverIp")) {
                         cfg.taskBackend.nas.serverIp = trimString(*v);
                     }

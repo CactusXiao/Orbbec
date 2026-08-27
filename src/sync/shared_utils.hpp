@@ -160,7 +160,8 @@ struct VoiceFeedbackConfig {
 };
 
 struct NasConfig {
-    bool        enabled   = true;
+    bool        enabled                = true;
+    bool        deleteLocalAfterUpload = true;
     std::string serverIp;
     std::string shareName;
     std::string sharePath;

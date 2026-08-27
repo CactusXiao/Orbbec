@@ -195,6 +195,7 @@ Array form is also accepted:
   "timeoutMs": 3000,
   "nas": {
     "enabled": true,
+    "deleteLocalAfterUpload": true,
     "serverIp": "192.168.50.177",
     "shareName": "ego",
     "sharePath": "//192.168.50.177/ego",
@@ -207,6 +208,9 @@ Array form is also accepted:
 This `nas` block is frontend-visible deployment information for the collection
 app. Backend startup remains owned by `.env` (`ORBBEC_NAS_ROOT`,
 `ORBBEC_NAS_URI_PREFIX`, and `ORBBEC_NAS_MOUNTS_JSON`).
+When `deleteLocalAfterUpload` is true, the collection app deletes only the
+completed local episode directory after both the atomic NAS publish and backend
+confirmation succeed. Upload or confirmation failures always retain local data.
 
 Environment overrides:
 
