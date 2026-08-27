@@ -28,13 +28,29 @@ def query_episode(db_path: Path, episode_id: str) -> Dict[str, Any]:
     uri = f"file:{db_path}?mode=ro"
     with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
         connection.execute("PRAGMA query_only = ON")
+        quality_columns = {
+            str(column[1]) for column in connection.execute("PRAGMA table_info(quality_queue)")
+        }
+        if "episode_id" not in quality_columns:
+            quality_state_expression = "NULL"
+            quality_join = ""
+        elif "queue_state" in quality_columns:
+            quality_state_expression = "q.queue_state"
+            quality_join = "LEFT JOIN quality_queue AS q ON q.episode_id = e.episode_id"
+        else:
+            # The deployed legacy queue contains only work waiting for QC.  A
+            # row therefore has the same meaning as the newer `pending` state.
+            quality_state_expression = (
+                "CASE WHEN q.episode_id IS NULL THEN NULL ELSE 'pending' END"
+            )
+            quality_join = "LEFT JOIN quality_queue AS q ON q.episode_id = e.episode_id"
         row = connection.execute(
-            """
+            f"""
             SELECT e.episode_id, e.state, e.updated_at, e.generation,
                    e.manifest_sha256, e.result_manifest_sha256,
-                   q.queue_state
+                   {quality_state_expression}
             FROM episodes AS e
-            LEFT JOIN quality_queue AS q ON q.episode_id = e.episode_id
+            {quality_join}
             WHERE e.episode_id = ?
             """,
             (episode_id,),
