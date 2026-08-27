@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import ast
 import calendar
 import json
 import re
 import shutil
+import struct
 import time
 import uuid
 from http import HTTPStatus
@@ -25,7 +27,7 @@ _FRAME_RE = re.compile(r"^(\d+)\.[^.]+$")
 _NON_LABEL_CAMERA_TOKENS = ("ego", "pico", "fisheye")
 AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
 STAGE_ARTIFACT_KINDS = {
-    "auto_label": {"pred_2d", "auto_2d", "mano_episode"},
+    "auto_label": {"pred_2d", "auto_2d", "optimized_pose", "mano_episode"},
     "mano_opt": {"mano_segment_patch"},
     "qc": {"qc_report"},
     "manual_label": {"manual_2d", "corrected_2d"},
@@ -817,12 +819,19 @@ class JobService:
         result = json_object(body.get("result"), "result")
         if not result:
             result = {k: v for k, v in body.items() if k not in {"artifacts", "artifact"}}
+        artifacts = self._artifacts_from_body(body)
+        if str(before.get("type") or "") == "auto_label" and self._is_publisher_bridge_job(before, result):
+            self._validate_publisher_bridge_completion(before, result, artifacts)
         operator_id = _human_operator_id(body, result)
         if operator_id:
             result["operator_id"] = operator_id
         job, changed = self.store.complete_job(job_id=job_id, result=result)
-        if changed:
-            self._after_job_complete(job, result, self._artifacts_from_body(body))
+        # Publisher Bridge completion is also a repair operation.  If the job
+        # row reached succeeded but a prior process interruption happened while
+        # registering artifacts or queuing QC, an idempotent retry finishes the
+        # downstream state transition.
+        if changed or self._is_publisher_bridge_job(job, result):
+            self._after_job_complete(job, result, artifacts)
         enriched = self.enrich_job(job)
         enriched["completed"] = True
         enriched["changed"] = changed
@@ -1322,14 +1331,19 @@ class JobService:
             self.store.update_episode_status(episode_id, "uploaded")
             self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
-            if not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts) and payload.get("episode_uri"):
+            publisher_bridge_job = self._is_publisher_bridge_job(job, result)
+            if (
+                not publisher_bridge_job
+                and not any(str(artifact.get("kind") or "") in {"pred_2d", "auto_2d"} for artifact in artifacts)
+                and payload.get("episode_uri")
+            ):
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="pred_2d",
                     uri=uri_join(str(payload.get("episode_uri")), "pred_2d"),
                     metadata={"source_job_id": job.get("job_id")},
                 )
-            if not any(str(artifact.get("kind") or "") == "mano_episode" for artifact in artifacts):
+            if not publisher_bridge_job and not any(str(artifact.get("kind") or "") == "mano_episode" for artifact in artifacts):
                 self._register_default_mano_episode(episode_id, job, result)
             if self._all_episode_jobs_succeeded(episode_id, "auto_label"):
                 self.store.update_episode_status(episode_id, "mano_optimized")
@@ -1919,6 +1933,138 @@ class JobService:
             return uri[len(prefix):]
         return ""
 
+    @staticmethod
+    def _is_publisher_bridge_job(job: Dict[str, Any], result: Dict[str, Any]) -> bool:
+        worker_id = str(result.get("worker_id") or job.get("lease_owner") or "").strip()
+        return worker_id.startswith("publisher_bridge:")
+
+    @staticmethod
+    def _npy_header(path: Path) -> Tuple[Tuple[int, ...], str, bool]:
+        """Read an NPY shape/dtype using only the backend's standard library."""
+        try:
+            with path.open("rb") as handle:
+                if handle.read(6) != b"\x93NUMPY":
+                    raise ValueError("missing NPY magic")
+                version = handle.read(2)
+                if len(version) != 2:
+                    raise ValueError("truncated NPY version")
+                if version[0] == 1:
+                    raw_length = handle.read(2)
+                    if len(raw_length) != 2:
+                        raise ValueError("truncated NPY header length")
+                    header_length = struct.unpack("<H", raw_length)[0]
+                elif version[0] in {2, 3}:
+                    raw_length = handle.read(4)
+                    if len(raw_length) != 4:
+                        raise ValueError("truncated NPY header length")
+                    header_length = struct.unpack("<I", raw_length)[0]
+                else:
+                    raise ValueError(f"unsupported NPY version {version[0]}.{version[1]}")
+                raw_header = handle.read(header_length)
+            encoding = "utf-8" if version[0] == 3 else "latin1"
+            header = ast.literal_eval(raw_header.decode(encoding).strip())
+            if not isinstance(header, dict):
+                raise ValueError("NPY header is not a mapping")
+            shape_value = header.get("shape")
+            if not isinstance(shape_value, tuple):
+                raise ValueError("NPY shape is not a tuple")
+            shape = tuple(int(value) for value in shape_value)
+            return shape, str(header.get("descr") or ""), bool(header.get("fortran_order"))
+        except (OSError, UnicodeError, ValueError, SyntaxError, struct.error) as exc:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"invalid NPY artifact {path}: {exc}") from exc
+
+    def _validate_publisher_bridge_completion(
+        self,
+        job: Dict[str, Any],
+        result: Dict[str, Any],
+        artifacts: List[Dict[str, Any]],
+    ) -> None:
+        kinds = {str(artifact.get("kind") or "").strip() for artifact in artifacts}
+        missing = {"optimized_pose", "mano_episode"} - kinds
+        if missing:
+            raise WorkflowError(
+                HTTPStatus.BAD_REQUEST,
+                "Publisher Bridge completion is missing artifacts: " + ", ".join(sorted(missing)),
+            )
+
+        payload = dict(job.get("payload") or {})
+        episode = self.store.get_episode(str(job.get("episode_id") or "")) or {}
+        episode_uri = str(episode.get("episode_uri") or payload.get("episode_uri") or "").strip()
+        episode_dir = self.nas_root_dir_from_uri(episode_uri)
+        if episode_dir is None:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "Publisher Bridge job has no resolvable NAS episode URI")
+
+        optimized_pose_dir = episode_dir / "optimized_pose"
+        if not optimized_pose_dir.is_dir():
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"optimized_pose artifact is missing: {optimized_pose_dir}")
+        pose_files: List[Tuple[int, Path]] = []
+        seen_frames = set()
+        for pose_path in optimized_pose_dir.glob("*.npy"):
+            if not pose_path.stem.isdigit():
+                continue
+            frame = int(pose_path.stem)
+            if frame in seen_frames:
+                raise WorkflowError(HTTPStatus.BAD_REQUEST, f"duplicate optimized_pose frame: {frame}")
+            seen_frames.add(frame)
+            shape, descr, fortran_order = self._npy_header(pose_path)
+            if shape != (2, 99) or descr not in {"<f4", ">f4", "=f4", "|f4"} or fortran_order:
+                raise WorkflowError(
+                    HTTPStatus.BAD_REQUEST,
+                    f"optimized_pose frame must be C-order float32 (2,99), got shape={shape} dtype={descr}: {pose_path}",
+                )
+            pose_files.append((frame, pose_path))
+        pose_files.sort(key=lambda value: value[0])
+        pose_frames = [frame for frame, _ in pose_files]
+        if not pose_frames:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"optimized_pose has no numeric frames: {optimized_pose_dir}")
+
+        frames = _as_int_list(result.get("frames"))
+        if frames != pose_frames:
+            raise WorkflowError(
+                HTTPStatus.BAD_REQUEST,
+                f"Publisher Bridge result frames do not match optimized_pose files: result={frames}, files={pose_frames}",
+            )
+        generation = _optional_int(result.get("generation")) or 0
+        result_sha256 = str(result.get("result_manifest_sha256") or "").strip()
+        if generation <= 0 or len(result_sha256) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in result_sha256):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "Publisher Bridge result generation/hash is invalid")
+
+        mano_dir = episode_dir / "mano" / "episode"
+        meta_path = mano_dir / "mano_episode.json"
+        joints_path = mano_dir / "joints_3d.npy"
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"invalid MANO completion marker {meta_path}: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"MANO completion marker must be an object: {meta_path}")
+        source = metadata.get("source")
+        if not isinstance(source, dict):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"MANO completion marker is missing source metadata: {meta_path}")
+        metadata_frames = _as_int_list(metadata.get("frames"))
+        expected_metadata = (
+            int(metadata.get("schema_version") or 0) == 1
+            and str(metadata.get("kind") or "") == "orbbec_mano_3d_episode"
+            and str(metadata.get("coordinate_system") or "") == "episode_world"
+            and str(metadata.get("joints_3d_file") or "") == "joints_3d.npy"
+            and metadata_frames == frames
+            and str(source.get("kind") or "") == "optimized_pose"
+            and _as_int_list(source.get("shape")) == [2, 99]
+            and int(source.get("generation") or 0) == generation
+            and str(source.get("result_manifest_sha256") or "") == result_sha256
+        )
+        if not expected_metadata:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"MANO completion marker does not match Publisher result: {meta_path}")
+        joints_shape, joints_descr, joints_fortran = self._npy_header(joints_path)
+        expected_joints_shape = (len(frames), 2, 21, 3)
+        if joints_shape != expected_joints_shape or joints_descr not in {"<f4", ">f4", "=f4", "|f4"} or joints_fortran:
+            raise WorkflowError(
+                HTTPStatus.BAD_REQUEST,
+                f"joints_3d must be C-order float32 {expected_joints_shape}, got shape={joints_shape} dtype={joints_descr}",
+            )
+        if _as_int_list(result.get("joints_3d_shape")) != list(expected_joints_shape):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "Publisher Bridge result joints_3d_shape does not match artifact")
+
     def _register_artifact_from_payload(self, episode_id: str, artifact: Dict[str, Any]) -> None:
         kind = str(artifact.get("kind") or "").strip()
         episode = self.store.get_episode(episode_id) or {}
@@ -1932,6 +2078,9 @@ class JobService:
         if not kind or not uri:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "artifact kind and episode_uri are required")
         metadata = json_object(artifact.get("metadata"), "artifact.metadata")
+        for existing in self.store.artifacts_for_episode(episode_id):
+            if str(existing.get("kind") or "") == kind and str(existing.get("uri") or "") == uri:
+                return
         self.store.register_artifact(
             episode_id=episode_id,
             kind=kind,
@@ -1950,6 +2099,8 @@ class JobService:
             return ""
         if kind in {"pred_2d", "auto_2d"}:
             return uri_join(episode_uri, "pred_2d")
+        if kind == "optimized_pose":
+            return uri_join(episode_uri, "optimized_pose")
         if kind == "mano_episode":
             return uri_join(episode_uri, "mano", "episode")
         if kind == "qc_report":

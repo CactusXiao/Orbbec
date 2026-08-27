@@ -18,6 +18,7 @@ import math
 import os
 import re
 import secrets
+import signal
 import socket
 import sys
 import tempfile
@@ -34,11 +35,13 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 try:
     from .job_service import JobService
     from .nas_uploader import NasUploadConfig, NasUploader
+    from .publisher_bridge import PublisherBridge, PublisherBridgeConfig
     from .workflow_models import WorkflowError
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
     from nas_uploader import NasUploadConfig, NasUploader  # type: ignore
+    from publisher_bridge import PublisherBridge, PublisherBridgeConfig  # type: ignore
     from workflow_models import WorkflowError  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
@@ -215,6 +218,17 @@ def env_int(env: Dict[str, str], default: int, *keys: str) -> int:
     except ValueError as exc:
         joined = ", ".join(keys)
         raise ValueError(f"invalid integer in .env for {joined}: {value!r}") from exc
+
+
+def env_float(env: Dict[str, str], default: float, *keys: str) -> float:
+    value = env_get(env, *keys)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        joined = ", ".join(keys)
+        raise ValueError(f"invalid number in .env for {joined}: {value!r}") from exc
 
 
 def env_bool(env: Dict[str, str], default: bool, *keys: str) -> bool:
@@ -2910,6 +2924,46 @@ def main(argv: Optional[List[str]] = None) -> int:
             uri_prefix=nas_uri_prefix,
         ),
     )
+    publisher_bridge_enabled = env_bool(env, False, "ORBBEC_PUBLISHER_BRIDGE_ENABLED")
+    mano_python = env_path(env, "ORBBEC_MANO_PYTHON")
+    mano_toolkit_root = env_path(env, "ORBBEC_MANO_TOOLKIT_ROOT")
+    mano_model_dir = env_path(env, "ORBBEC_MANO_MODEL_DIR")
+    if publisher_bridge_enabled:
+        missing_bridge_env = [
+            name
+            for name, value in (
+                ("ORBBEC_MANO_PYTHON", mano_python),
+                ("ORBBEC_MANO_TOOLKIT_ROOT", mano_toolkit_root),
+                ("ORBBEC_MANO_MODEL_DIR", mano_model_dir),
+            )
+            if value is None
+        ]
+        if missing_bridge_env:
+            raise ValueError("Publisher Bridge is enabled but required configuration is missing: " + ", ".join(missing_bridge_env))
+    publisher_bridge = PublisherBridge(
+        workflow_service,
+        PublisherBridgeConfig(
+            enabled=publisher_bridge_enabled,
+            max_inflight=env_int(env, 4, "ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT"),
+            poll_seconds=env_float(env, 20.0, "ORBBEC_PUBLISHER_BRIDGE_POLL_SECONDS"),
+            lease_seconds=env_int(env, 300, "ORBBEC_PUBLISHER_BRIDGE_LEASE_SECONDS"),
+            heartbeat_seconds=env_float(env, 60.0, "ORBBEC_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS"),
+            command_timeout_seconds=env_float(env, 120.0, "ORBBEC_PUBLISHER_BRIDGE_COMMAND_TIMEOUT_SECONDS"),
+            publisher_ssh_host=env_get(env, "ORBBEC_PUBLISHER_BRIDGE_SSH_HOST") or "synology",
+            publisher_publish_command=(
+                env_get(env, "ORBBEC_PUBLISHER_BRIDGE_PUBLISH_COMMAND")
+                or "/usr/local/sbin/nas-uploader-publish"
+            ),
+            publisher_status_command=(
+                env_get(env, "ORBBEC_PUBLISHER_BRIDGE_STATUS_COMMAND")
+                or "/usr/local/sbin/nas-uploader-status"
+            ),
+            mano_python=mano_python or Path("/__orbbec_mano_python_not_configured__"),
+            mano_toolkit_root=mano_toolkit_root or Path("/__orbbec_mano_toolkit_not_configured__"),
+            mano_model_dir=mano_model_dir or Path("/__orbbec_mano_model_not_configured__"),
+            mano_default_shape_path=env_path(env, "ORBBEC_MANO_DEFAULT_SHAPE_PATH"),
+        ),
+    )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
     runtime = BackendRuntime(registry, workflow_service)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
@@ -2920,19 +2974,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("[task-backend] auto_label_after_upload=always auto_label_scope=episode", file=sys.stderr)
     print(f"[task-backend] nas={'enabled' if nas_enabled else 'disabled'} root={nas_root} uri={nas_uri_prefix}", file=sys.stderr)
     print(f"[task-backend] nas_mounts={nas_mounts}", file=sys.stderr)
+    print(
+        f"[task-backend] publisher_bridge={'enabled' if publisher_bridge_enabled else 'disabled'} "
+        f"max_inflight={publisher_bridge.config.max_inflight}",
+        file=sys.stderr,
+    )
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
     print(f"[task-backend] listening http://{host}:{port} ({host_info})", file=sys.stderr)
     print("[task-backend] open the web setup page and start one task-file instance", file=sys.stderr)
 
     server = TaskHTTPServer((host, port), RequestHandler, runtime)
+    previous_sigterm: Any = None
+    if threading.current_thread() is threading.main_thread():
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def _graceful_sigterm(_signum: int, _frame: Any) -> None:
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, _graceful_sigterm)
     try:
         nas_uploader.start()
+        publisher_bridge.start()
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[task-backend] stopping", file=sys.stderr)
     finally:
+        publisher_bridge.stop()
         nas_uploader.stop()
         server.server_close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
     return 0
 
 

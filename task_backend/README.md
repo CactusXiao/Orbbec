@@ -54,6 +54,20 @@ ORBBEC_NAS_ROOT=/mnt/nas
 ORBBEC_NAS_URI_PREFIX=nas://ego
 ORBBEC_NAS_MOUNTS_JSON={"nas://ego":"/mnt/nas"}
 
+# Publisher Bridge is started and stopped by task_backend/server.py.
+ORBBEC_PUBLISHER_BRIDGE_ENABLED=1
+ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT=4
+ORBBEC_PUBLISHER_BRIDGE_POLL_SECONDS=20
+ORBBEC_PUBLISHER_BRIDGE_LEASE_SECONDS=300
+ORBBEC_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS=60
+
+# The backend stays dependency-free; MANO conversion runs in this environment.
+ORBBEC_MANO_PYTHON=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python
+ORBBEC_MANO_TOOLKIT_ROOT=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits
+ORBBEC_MANO_MODEL_DIR=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano
+# Optional shared shape fallback. Subject-level /mnt/nas/<subject>/shape.npy wins.
+# ORBBEC_MANO_DEFAULT_SHAPE_PATH=/path/to/shape.npy
+
 # Upload success always queues auto_label jobs; the old
 # ORBBEC_AUTO_LABEL_AFTER_UPLOAD switch is ignored.
 # Optional seed file for the setup page:
@@ -277,6 +291,31 @@ The push API remains available only for manual backfill or repair.
 The main workflow is `uploaded -> auto_label -> mano_opt -> qc -> finalized`.
 When QC fails, the backend creates failed-frame segments for manual correction;
 each corrected segment then gets only a segment-level `mano_opt` patch job.
+
+When Publisher Bridge is enabled, each Bridge slot leases one episode-level
+`auto_label` job for its entire Publisher lifecycle. It idempotently publishes
+the three-part NAS episode ID, polls the fixed NAS status API, heartbeats the
+backend lease, and waits until `optimized_pose/` has returned. It then runs the
+shared MANO conversion in `ORBBEC_MANO_PYTHON`, atomically writes
+`mano/episode/joints_3d.npy` and `mano_episode.json`, and completes the same
+`auto_label` job with `optimized_pose` and `mano_episode` artifacts. Completion
+creates the QC job directly; no episode-level `mano_opt` job is inserted.
+
+`ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT` limits backend jobs held by the Bridge,
+not Publisher GPU jobs. On backend shutdown, slots stop leasing, release jobs
+still in flight, and leave already-published Publisher episodes untouched so a
+restart can re-lease and resume from Publisher status.
+
+Before enabling the Bridge, install `publisher/nas-uploader-status` on the NAS
+as `/usr/local/sbin/nas-uploader-status` and grant the capture host SSH user
+passwordless sudo access to that exact command. The command opens
+`/volume1/ego/.nas-uploader/state/episodes.sqlite3` in SQLite read-only mode and
+queries one episode by primary key; it does not depend on a container `status`
+subcommand. Verify it from the backend host before startup:
+
+```bash
+ssh synology sudo /usr/local/sbin/nas-uploader-status subject/task/episode
+```
 
 Upload status can be read by reservation/episode ID:
 

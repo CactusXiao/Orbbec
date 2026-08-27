@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Fixed read-only SSH API for one NAS Publisher episode."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import sys
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict
+
+
+STATE_DB = Path("/volume1/ego/.nas-uploader/state/episodes.sqlite3")
+
+
+def validate_episode_id(value: str) -> str:
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or len(path.parts) != 3
+        or any(part in {"", ".", ".."} or "/" in part or "\\" in part for part in path.parts)
+    ):
+        raise ValueError(f"episode must be subject/task/episode: {value}")
+    return path.as_posix()
+
+
+def query_episode(db_path: Path, episode_id: str) -> Dict[str, Any]:
+    uri = f"file:{db_path}?mode=ro"
+    with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
+        connection.execute("PRAGMA query_only = ON")
+        row = connection.execute(
+            """
+            SELECT e.episode_id, e.state, e.updated_at, e.generation,
+                   e.manifest_sha256, e.result_manifest_sha256,
+                   q.queue_state
+            FROM episodes AS e
+            LEFT JOIN quality_queue AS q ON q.episode_id = e.episode_id
+            WHERE e.episode_id = ?
+            """,
+            (episode_id,),
+        ).fetchone()
+    if row is None:
+        return {"episode_id": episode_id, "found": False}
+    return {
+        "episode_id": row[0],
+        "found": True,
+        "state": row[1],
+        "updated_at": row[2],
+        "generation": int(row[3]),
+        "manifest_sha256": row[4],
+        "result_manifest_sha256": row[5],
+        "quality_queue_state": row[6],
+    }
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: nas-uploader-status subject/task/episode", file=sys.stderr)
+        return 2
+    try:
+        episode_id = validate_episode_id(sys.argv[1])
+        payload = query_episode(STATE_DB, episode_id)
+    except (ValueError, OSError, sqlite3.Error) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
