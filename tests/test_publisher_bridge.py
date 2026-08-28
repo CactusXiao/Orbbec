@@ -10,7 +10,12 @@ from pathlib import Path
 import numpy as np
 
 from task_backend.job_service import JobService
-from task_backend.publisher_bridge import PublisherBridge, PublisherBridgeConfig
+from task_backend.publisher_bridge import (
+    ManualPublisherBridge,
+    ManualPublisherBridgeConfig,
+    PublisherBridge,
+    PublisherBridgeConfig,
+)
 from task_backend.workflow_store import WorkflowStore
 
 
@@ -22,6 +27,7 @@ class FakePublisher:
         self.statuses = list(statuses)
         self.status_calls: list[str] = []
         self.published: list[str] = []
+        self.manual_published: list[str] = []
 
     def status(self, episode_id: str) -> dict:
         self.status_calls.append(episode_id)
@@ -31,6 +37,9 @@ class FakePublisher:
 
     def publish(self, episode_id: str) -> None:
         self.published.append(episode_id)
+
+    def publish_manual(self, episode_id: str) -> None:
+        self.manual_published.append(episode_id)
 
 
 class FakeMaterializer:
@@ -72,6 +81,162 @@ class FakeMaterializer:
 
 
 class PublisherBridgeTest(unittest.TestCase):
+    def test_manual_bridge_runs_two_episode_slots_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = WorkflowStore(root / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(root)})
+            for index in (1, 2):
+                episode_id = f"episode_{index}"
+                episode_dir = root / "S001" / "pick_object" / episode_id
+                pose_dir = episode_dir / "optimized_pose"
+                pose_dir.mkdir(parents=True)
+                np.save(pose_dir / "00000.npy", np.zeros((2, 99), dtype=np.float32), allow_pickle=False)
+                store.create_or_update_episode(
+                    episode_id=episode_id,
+                    subject_id="S001",
+                    task_name="pick_object",
+                    status="manual_3d_pending",
+                    episode_uri=f"nas://ego/S001/pick_object/{episode_id}",
+                    cameras=["00"],
+                )
+                store.create_segment(
+                    segment_id=f"segment_{index}",
+                    episode_id=episode_id,
+                    start_frame=0,
+                    end_frame=0,
+                    status="mano_queued",
+                )
+                store.create_job(
+                    job_id=f"manual_3d_{episode_id}",
+                    job_type="manual_3d",
+                    episode_id=episode_id,
+                    payload={
+                        "episode_id": episode_id,
+                        "episode_uri": f"nas://ego/S001/pick_object/{episode_id}",
+                        "cameras": ["00"],
+                        "frames": [0],
+                        "scope": "episode",
+                    },
+                )
+
+            status = {
+                "found": True,
+                "state": "relabeled",
+                "generation": 4,
+                "result_manifest_sha256": RESULT_SHA256,
+            }
+            publisher = FakePublisher([status] * 6)
+            bridge = ManualPublisherBridge(
+                service,
+                ManualPublisherBridgeConfig(
+                    enabled=True,
+                    max_inflight=2,
+                    poll_seconds=0.001,
+                    lease_seconds=10,
+                    heartbeat_seconds=1,
+                    completion_poll_count=3,
+                    mano_python=Path(sys.executable),
+                    mano_toolkit_root=root,
+                    mano_model_dir=root,
+                ),
+                publisher_client=publisher,
+                materializer=FakeMaterializer(),
+                hostname="capture-host",
+            )
+            bridge.start()
+            self.assertEqual(len(bridge.threads), 2)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if all(
+                    store.jobs_for_episode(f"episode_{index}", "manual_3d")[0]["status"] == "succeeded"
+                    for index in (1, 2)
+                ):
+                    break
+                time.sleep(0.01)
+            bridge.stop(timeout=2.0)
+
+            self.assertEqual(
+                sorted(publisher.manual_published),
+                ["S001/pick_object/episode_1", "S001/pick_object/episode_2"],
+            )
+            self.assertTrue(
+                all(
+                    store.jobs_for_episode(f"episode_{index}", "manual_3d")[0]["status"] == "succeeded"
+                    for index in (1, 2)
+                )
+            )
+
+    def test_manual_bridge_publishes_one_episode_and_assumes_complete_after_three_polls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            episode_dir = root / "S001" / "pick_object" / "episode1"
+            pose_dir = episode_dir / "optimized_pose"
+            pose_dir.mkdir(parents=True)
+            np.save(pose_dir / "00002.npy", np.zeros((2, 99), dtype=np.float32), allow_pickle=False)
+
+            store = WorkflowStore(root / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(root)})
+            store.create_or_update_episode(
+                episode_id="episode_uuid",
+                subject_id="S001",
+                task_name="pick_object",
+                status="mano_optimized",
+                episode_uri="nas://ego/S001/pick_object/episode1",
+                cameras=["00"],
+            )
+            store.create_job(
+                job_id="qc_episode_uuid",
+                job_type="qc",
+                episode_id="episode_uuid",
+                payload={"frames": [2]},
+            )
+            service.lease_job({"type": "qc", "worker_id": "qc"})
+            service.complete_job(
+                "qc_episode_uuid",
+                {"result": {"passed": False, "segments": [{"start_frame": 2, "end_frame": 2}]}},
+            )
+            service.lease_label_episode({"operator_id": "labeler"})
+            service.complete_label_episode(
+                "episode_uuid",
+                {
+                    "result": {"operator_id": "labeler"},
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"scope": "episode"}}],
+                },
+            )
+
+            status = {
+                "episode_id": "S001/pick_object/episode1",
+                "found": True,
+                "state": "relabeled",
+                "generation": 7,
+                "result_manifest_sha256": RESULT_SHA256,
+            }
+            publisher = FakePublisher([status, status, status])
+            bridge = ManualPublisherBridge(
+                service,
+                ManualPublisherBridgeConfig(
+                    poll_seconds=0.001,
+                    lease_seconds=10,
+                    heartbeat_seconds=1,
+                    completion_poll_count=3,
+                ),
+                publisher_client=publisher,
+                materializer=FakeMaterializer(),
+                hostname="capture-host",
+            )
+
+            self.assertTrue(bridge.process_once(1))
+
+            manual_job = store.jobs_for_episode("episode_uuid", "manual_3d")[0]
+            self.assertEqual(manual_job["status"], "succeeded")
+            self.assertEqual(manual_job["result"]["completion_poll_count"], 3)
+            self.assertTrue(manual_job["result"]["temporary_completion_policy"])
+            self.assertEqual(publisher.manual_published, ["S001/pick_object/episode1"])
+            self.assertEqual(len(publisher.status_calls), 3)
+            self.assertTrue(all(segment["status"] == "mano_succeeded" for segment in store.segments_for_episode("episode_uuid")))
+            self.assertEqual((store.get_episode("episode_uuid") or {})["status"], "finalized")
+
     def test_config_preserves_virtualenv_python_launcher_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

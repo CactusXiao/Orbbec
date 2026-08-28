@@ -290,21 +290,21 @@ class BackendClient:
 
     def lease_label_job(self, operator_id: str, lease_seconds: int = 600) -> Json:
         return self.post(
-            "/api/v1/label/segments/lease",
+            "/api/v1/label/episodes/lease",
             {"operator_id": operator_id, "lease_seconds": lease_seconds},
         )
 
-    def heartbeat_label_job(self, job_id: str, operator_id: str, lease_seconds: int = 600) -> Json:
+    def heartbeat_label_job(self, episode_id: str, operator_id: str, lease_seconds: int = 600) -> Json:
         return self.post(
-            f"/api/v1/label/segments/{quote(job_id, safe='')}/heartbeat",
+            f"/api/v1/label/episodes/{quote(episode_id, safe='')}/heartbeat",
             {"operator_id": operator_id, "lease_seconds": lease_seconds, "status": "running"},
         )
 
-    def complete_label_job(self, job_id: str, result: Json, artifacts: Optional[List[Json]] = None) -> Json:
+    def complete_label_job(self, episode_id: str, result: Json, artifacts: Optional[List[Json]] = None) -> Json:
         body: Json = {"result": result}
         if artifacts:
             body["artifacts"] = artifacts
-        return self.post(f"/api/v1/label/segments/{quote(job_id, safe='')}/complete", body)
+        return self.post(f"/api/v1/label/episodes/{quote(episode_id, safe='')}/complete", body)
 
 
 @dataclass
@@ -1289,23 +1289,19 @@ class NasSimulator:
         write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base)
         return uri_join(episode_uri, "mano", "episode")
 
-    def write_mano_segment_patch(
+    def write_manual_mano_episode_artifact(
         self,
         episode_uri: str,
-        segment_id: str,
+        manual_label_job_id: str,
         cameras: Sequence[str],
         frames: Sequence[int],
-        rgb_path_template: str = "",
     ) -> str:
         base = self.nas_path_for_uri(episode_uri)
-        source_dir = self.manual_2d_source_path(episode_uri, segment_id)
+        source_dir = base / "manual_2d" / "segments" / clean_id(manual_label_job_id, "manual_label")
         require_2d_inputs_available(source_dir, cameras, frames, label="manual_2d")
-        out = base / "mano" / "segments" / clean_id(segment_id, "segment")
-        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base, segment_id=segment_id)
-        return uri_join(episode_uri, "mano", "segments", segment_id)
-
-    def manual_2d_source_path(self, episode_uri: str, segment_id: str) -> Path:
-        return self.nas_path_for_uri(str(episode_uri or "").rstrip("/")) / "manual_2d" / "segments" / clean_id(segment_id, "segment")
+        out = base / "mano" / "episode"
+        write_mano_3d_artifact(out, frames, cameras, source_dir=source_dir, episode_dir=base)
+        return uri_join(episode_uri, "mano", "episode")
 
 
 def as_string_list(value: Any) -> List[str]:
@@ -1439,13 +1435,16 @@ def write_mano_artifact_for_payload(
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
 ) -> Tuple[str, str]:
     episode_uri = str(payload.get("episode_uri") or "")
-    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
     if not episode_uri.startswith(nas.uri_prefix):
-        label = "segment mano_opt" if scope == "segment" else "episode 3d"
-        raise BackendError(f"{label} requires episode_uri under configured NAS prefix: {episode_uri}")
-    segment_id = str(payload.get("segment_id") or "")
-    if scope == "segment":
-        return "mano_segment_patch", nas.write_mano_segment_patch(episode_uri, segment_id, cameras, frames, rgb_path_template)
+        raise BackendError(f"episode 3d requires episode_uri under configured NAS prefix: {episode_uri}")
+    manual_label_job_id = str(payload.get("source_manual_label_job_id") or "").strip()
+    if manual_label_job_id:
+        return "mano_episode", nas.write_manual_mano_episode_artifact(
+            episode_uri,
+            manual_label_job_id,
+            cameras,
+            frames,
+        )
     return "mano_episode", nas.write_mano_episode_artifact(episode_uri, cameras, frames, rgb_path_template)
 
 
@@ -1514,38 +1513,24 @@ def seed_manual_label_jobs(args: argparse.Namespace) -> int:
     client = BackendClient(args.backend_url, timeout=args.timeout)
     nas = NasSimulator(args.nas_root, args.nas_uri_prefix)
     count = 0
-    stop = False
     for task in load_label_tasks(args.jsonl, args.limit):
-        segments = split_task_segments(task, args.frames_per_segment)
-        for segment_index, segment_task in enumerate(segments, 1):
-            if args.max_jobs and count >= args.max_jobs:
-                stop = True
-                break
-            episode_uri = nas.materialize_task(segment_task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
-            suffix = f"_s{segment_index:04d}" if len(segments) > 1 else ""
-            job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}{suffix}"
-            body = payload_from_task(segment_task, episode_uri, job_id, "seeded_from_label_jsonl")
-            body["payload"] = {
-                "segment_index": segment_index,
-                "segment_count": len(segments),
-                "frames_per_segment": int(args.frames_per_segment or 0),
-            }
-            result = client.create_manual_label_job(body)
-            segment = result.get("segment", {})
-            count += 1
-            print_event(
-                "manual_segment_seeded",
-                segment_id=segment.get("segment_id", job_id),
-                episode_id=task.episode_id,
-                episode_uri=episode_uri,
-                frames=len(segment_task.frames),
-                segment_index=segment_index,
-                segment_count=len(segments),
-                status=segment.get("status"),
-            )
-        if stop:
+        if args.max_jobs and count >= args.max_jobs:
             break
-    print_event("manual_segment_seed_done", count=count)
+        episode_uri = nas.materialize_task(task, copy_source=args.copy_source, max_frames=args.max_materialized_frames)
+        job_id = f"{clean_id(args.job_prefix)}_{task.episode_id}"
+        body = payload_from_task(task, episode_uri, job_id, "seeded_from_label_jsonl")
+        result = client.create_manual_label_job(body)
+        job = result.get("job", {})
+        count += 1
+        print_event(
+            "manual_episode_seeded",
+            job_id=job.get("job_id", job_id),
+            episode_id=task.episode_id,
+            episode_uri=episode_uri,
+            frames=len(task.frames),
+            status=job.get("status"),
+        )
+    print_event("manual_episode_seed_done", count=count)
     return 0
 
 
@@ -1711,19 +1696,17 @@ def handle_auto_label_once(client: BackendClient, nas: NasSimulator, args: argpa
     return True
 
 
-def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
-    owner = args.worker_id or f"virtual_mano_opt_{os.getpid()}"
+def handle_manual_3d_once(client: BackendClient, nas: NasSimulator, args: argparse.Namespace) -> bool:
+    """Development substitute for Manual Publisher Bridge; always episode scoped."""
+    owner = args.worker_id or f"virtual_manual_3d_{os.getpid()}"
     try:
-        leased = client.lease_job("mano_opt", owner, args.lease_seconds)
+        leased = client.lease_job("manual_3d", owner, args.lease_seconds)
     except NoJobAvailable:
         return False
     job = leased.get("job") or {}
     episode = leased.get("episode") or {}
     payload = enriched_payload(leased)
     client.heartbeat_job(str(job["job_id"]), owner, args.lease_seconds)
-    scope = str(payload.get("scope") or payload.get("mano_scope") or "episode").strip().lower()
-    if scope != "segment":
-        raise BackendError(f"mano-opt worker only supports segment scope after workflow merge: {job.get('job_id')}")
     cameras = cameras_from_payload(payload, episode, nas)
     frames = frames_from_payload(payload, episode, nas, cameras)
     if args.max_materialized_frames > 0:
@@ -1733,19 +1716,19 @@ def handle_mano_opt_once(client: BackendClient, nas: NasSimulator, args: argpars
         str(job["job_id"]),
         {
             "ok": True,
-            "scope": scope,
-            "segment_id": payload.get("segment_id") or "",
-            "frames_optimized": frames,
+            "frames": frames,
+            "completion_policy": "virtual_manual_3d_worker",
             "virtual_worker": owner,
         },
-        artifacts=[{"kind": kind, "metadata": {"worker_id": owner, "mock": False, "scope": scope, "segment_id": payload.get("segment_id") or ""}}],
+        artifacts=[
+            {"kind": "optimized_pose", "metadata": {"source_job_id": job["job_id"], "mock": True}},
+            {"kind": kind, "metadata": {"source_job_id": job["job_id"], "mock": False, "scope": "episode"}},
+        ],
     )
     print_event(
-        "mano_opt_completed",
+        "manual_3d_episode_completed",
         job_id=job["job_id"],
         episode_id=payload.get("episode_id"),
-        segment_id=payload.get("segment_id") or "",
-        scope=scope,
         uri=uri,
     )
     return True
@@ -1831,16 +1814,16 @@ def virtual_failed_segments(frames: Sequence[int]) -> List[Json]:
 WORKER_HANDLERS = {
     "upload": handle_upload_once,
     "auto-label": handle_auto_label_once,
-    "mano-opt": handle_mano_opt_once,
+    "manual-3d": handle_manual_3d_once,
     "qc": handle_qc_once,
 }
 
 
 def parse_workers(raw: str) -> List[str]:
     if raw == "default":
-        return ["upload", "auto-label", "mano-opt", "qc"]
+        return ["upload", "auto-label", "qc", "manual-3d"]
     if raw == "all":
-        return ["upload", "auto-label", "mano-opt", "qc"]
+        return ["upload", "auto-label", "qc", "manual-3d"]
     workers = [part.strip() for part in raw.split(",") if part.strip()]
     bad = [worker for worker in workers if worker not in WORKER_HANDLERS]
     if bad:

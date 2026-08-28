@@ -34,14 +34,26 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
     from .job_service import JobService
+    from .nas_status_sync import NasStatusSync, NasStatusSyncConfig
     from .nas_uploader import NasUploadConfig, NasUploader
-    from .publisher_bridge import PublisherBridge, PublisherBridgeConfig
+    from .publisher_bridge import (
+        ManualPublisherBridge,
+        ManualPublisherBridgeConfig,
+        PublisherBridge,
+        PublisherBridgeConfig,
+    )
     from .workflow_models import WorkflowError
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
+    from nas_status_sync import NasStatusSync, NasStatusSyncConfig  # type: ignore
     from nas_uploader import NasUploadConfig, NasUploader  # type: ignore
-    from publisher_bridge import PublisherBridge, PublisherBridgeConfig  # type: ignore
+    from publisher_bridge import (  # type: ignore
+        ManualPublisherBridge,
+        ManualPublisherBridgeConfig,
+        PublisherBridge,
+        PublisherBridgeConfig,
+    )
     from workflow_models import WorkflowError  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
@@ -897,12 +909,13 @@ def status_class(status: str) -> str:
         "manual_correction_pending",
         "manual_correction_running",
         "pending_manual",
-        "segment_mano_optimizing",
+        "manual_3d_pending",
+        "manual_3d_optimizing",
         "mano_queued",
         "mano_running",
     }:
         return "warn"
-    if status in {"failed", "canceled", "qc_failed", "qc_bad_episode", "expired"}:
+    if status in {"failed", "canceled", "qc_failed", "qc_bad_episode", "manual_label_failed", "manual_3d_failed", "expired"}:
         return "bad"
     if status in {"released", "planned", "missing", "not queued", "-"}:
         return "muted"
@@ -1652,9 +1665,9 @@ def render_status_badge(status: str) -> str:
 
 WORKFLOW_STAGE_LABELS = [
     ("auto_label", "自动标注 + Episode 3D"),
-    ("mano_opt", "Segment 3D 优化"),
     ("qc", "质检结果"),
-    ("manual_segment", "人工纠偏"),
+    ("manual_label", "Episode 人工纠偏"),
+    ("manual_3d", "Episode 二次 3D 优化"),
 ]
 
 
@@ -2152,7 +2165,17 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     if segment_total:
         correction_detail = f"{segment_ready}/{segment_total} segments ready"
         correction_status = "finalized" if segment_ready == segment_total and workflow_status == "finalized" else workflow_status
-    elif workflow_status in {"qc_failed", "manual_correction_pending", "manual_correction_running", "segment_mano_optimizing"}:
+    elif workflow_status in {
+        "qc_failed",
+        "manual_correction_pending",
+        "manual_correction_running",
+        "manual_labeling",
+        "manual_labeled",
+        "manual_3d_pending",
+        "manual_3d_optimizing",
+        "manual_label_failed",
+        "manual_3d_failed",
+    }:
         correction_detail = "waiting for failed segments"
         correction_status = workflow_status
     else:
@@ -2213,15 +2236,31 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         reason = str(metadata.get("reason") or metadata.get("label") or "")
         operator_id = first_value(metadata.get("operator_id"), segment.get("operator_id"), segment.get("lease_owner"), fallback="-")
         error = str(segment.get("error") or "")
+        raw_segment_status = str(segment.get("status") or "")
+        manual_state = str(segment.get("manual_state") or "")
+        optimization_state = str(segment.get("optimization_3d_state") or "")
+        if not manual_state or not optimization_state:
+            if raw_segment_status == "pending_manual":
+                manual_state, optimization_state = "待人工标注", "等待人工标注"
+            elif raw_segment_status == "manual_labeling":
+                manual_state, optimization_state = "人工标注中", "等待人工标注"
+            elif raw_segment_status in {"manual_labeled", "mano_queued"}:
+                manual_state, optimization_state = "人工标注完成", "待3D优化"
+            elif raw_segment_status == "mano_running":
+                manual_state, optimization_state = "人工标注完成", "3D优化中"
+            elif raw_segment_status == "mano_succeeded":
+                manual_state, optimization_state = "人工标注完成", "3D优化完成"
+            else:
+                manual_state, optimization_state = "失败", "失败"
         segment_rows.append(
             "<tr>"
             f"<td class=\"mono\">{html_escape(segment.get('segment_id') or '-')}</td>"
             f"<td class=\"num\">{html_escape(frame_range)}</td>"
-            f"<td>{render_status_badge(str(segment.get('status') or '-'))}</td>"
+            f"<td>{render_status_badge(manual_state)}</td>"
+            f"<td>{render_status_badge(optimization_state)}</td>"
             f"<td>{html_escape(reason or '-')}</td>"
             f"<td class=\"mono\">{html_escape(operator_id)}</td>"
             f"<td class=\"mono\">{html_escape(segment.get('manual_2d_uri') or '-')}</td>"
-            f"<td class=\"mono\">{html_escape(segment.get('mano_patch_uri') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(error or '-')}</td>"
             "</tr>"
         )
@@ -2270,7 +2309,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             qc_operator,
         ),
         flow_row(
-            "5. 人工纠偏 / Segment 3D / 最终 3D",
+            "5. Episode 人工纠偏 / Episode 二次 3D",
             correction_status,
             workflow_info.get("updated_at") or workflow_episode.get("updated_at") or item.get("updated_at"),
             correction_detail,
@@ -2382,9 +2421,9 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         "<thead><tr><th>类型</th><th>URI</th><th>来源</th><th>创建时间</th></tr></thead><tbody>"
         + artifacts_html
         + "</tbody></table></div></section>"
-        "<section><h2>QC 失败分段 / 人工纠偏</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>Status</th><th>原因</th><th>操作员</th>"
-        "<th>Manual 2D</th><th>MANO Patch</th><th>Error</th></tr></thead><tbody>"
+        "<section><h2>QC 失败分段 / Episode 人工纠偏</h2><div class=\"wide\"><table>"
+        "<thead><tr><th>Segment</th><th class=\"num\">Frames</th><th>人工标注</th><th>3D 优化</th>"
+        "<th>原因</th><th>操作员</th><th>Manual 2D</th><th>Error</th></tr></thead><tbody>"
         + segments_html
         + "</tbody></table></div></section>"
         "<section><h2>Workflow Jobs</h2><div class=\"wide\"><table>"
@@ -2528,11 +2567,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
                 return
 
-            if parsed.path.startswith("/api/v1/label/jobs/"):
-                job_id = unquote(parsed.path[len("/api/v1/label/jobs/"):].strip("/")).strip()
-                if not job_id or "/" in job_id:
-                    raise BackendError(HTTPStatus.NOT_FOUND, "label job not found")
-                self._json_response(HTTPStatus.OK, self.workflow.get_job(job_id))
+            if parsed.path.startswith("/api/v1/label/episodes/"):
+                episode_id = unquote(parsed.path[len("/api/v1/label/episodes/"):].strip("/")).strip()
+                if not episode_id or "/" in episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "label episode not found")
+                self._json_response(HTTPStatus.OK, self.workflow.get_label_episode(episode_id))
                 return
 
             if parsed.path == "/api/v1/label/tasks":
@@ -2743,36 +2782,21 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(HTTPStatus.OK, self.workflow.create_dev_job(body))
             elif parsed.path == "/api/v1/jobs/lease":
                 self._json_response(HTTPStatus.OK, self.workflow.lease_job(body))
-            elif parsed.path == "/api/v1/label/segments/lease":
-                self._json_response(HTTPStatus.OK, self.workflow.lease_label_segment(body))
-            elif parsed.path == "/api/v1/label/jobs/lease":
-                self._json_response(HTTPStatus.OK, self.workflow.lease_label_segment(body))
+            elif parsed.path == "/api/v1/label/episodes/lease":
+                self._json_response(HTTPStatus.OK, self.workflow.lease_label_episode(body))
             else:
-                segment_action = self._path_job_action(parsed.path, "/api/v1/label/segments")
-                label_action = self._path_job_action(parsed.path, "/api/v1/label/jobs")
+                label_action = self._path_job_action(parsed.path, "/api/v1/label/episodes")
                 job_action = self._path_job_action(parsed.path, "/api/v1/jobs")
-                if segment_action is not None:
-                    segment_id, action = segment_action
+                if label_action is not None:
+                    episode_id, action = label_action
                     if action == "heartbeat":
-                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_segment(segment_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_episode(episode_id, body))
                     elif action == "complete":
-                        self._json_response(HTTPStatus.OK, self.workflow.complete_label_segment(segment_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.complete_label_episode(episode_id, body))
                     elif action == "release":
-                        self._json_response(HTTPStatus.OK, self.workflow.release_label_segment(segment_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.release_label_episode(episode_id, body))
                     elif action == "fail":
-                        self._json_response(HTTPStatus.OK, self.workflow.fail_label_segment(segment_id, body))
-                    else:
-                        raise BackendError(HTTPStatus.NOT_FOUND, "not found")
-                elif label_action is not None:
-                    job_id, action = label_action
-                    if action == "heartbeat":
-                        self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_segment(job_id, body))
-                    elif action == "complete":
-                        self._json_response(HTTPStatus.OK, self.workflow.complete_label_segment(job_id, body))
-                    elif action == "release":
-                        self._json_response(HTTPStatus.OK, self.workflow.release_label_segment(job_id, body))
-                    elif action == "fail":
-                        self._json_response(HTTPStatus.OK, self.workflow.fail_label_segment(job_id, body))
+                        self._json_response(HTTPStatus.OK, self.workflow.fail_label_episode(episode_id, body))
                     else:
                         raise BackendError(HTTPStatus.NOT_FOUND, "not found")
                 elif job_action is not None:
@@ -2925,10 +2949,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     publisher_bridge_enabled = env_bool(env, False, "ORBBEC_PUBLISHER_BRIDGE_ENABLED")
+    manual_publisher_bridge_enabled = env_bool(env, False, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_ENABLED")
     mano_python = env_path(env, "ORBBEC_MANO_PYTHON")
     mano_toolkit_root = env_path(env, "ORBBEC_MANO_TOOLKIT_ROOT")
     mano_model_dir = env_path(env, "ORBBEC_MANO_MODEL_DIR")
-    if publisher_bridge_enabled:
+    if publisher_bridge_enabled or manual_publisher_bridge_enabled:
         missing_bridge_env = [
             name
             for name, value in (
@@ -2964,6 +2989,66 @@ def main(argv: Optional[List[str]] = None) -> int:
             mano_default_shape_path=env_path(env, "ORBBEC_MANO_DEFAULT_SHAPE_PATH"),
         ),
     )
+    nas_status_sync_enabled = env_bool(
+        env,
+        True,
+        "ORBBEC_NAS_STATUS_SYNC_ENABLED",
+    )
+    manual_publisher_bridge = ManualPublisherBridge(
+        workflow_service,
+        ManualPublisherBridgeConfig(
+            enabled=manual_publisher_bridge_enabled,
+            max_inflight=env_int(env, 4, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_MAX_INFLIGHT"),
+            poll_seconds=env_float(env, 20.0, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_POLL_SECONDS"),
+            lease_seconds=env_int(env, 300, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_LEASE_SECONDS"),
+            heartbeat_seconds=env_float(env, 60.0, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS"),
+            command_timeout_seconds=env_float(env, 120.0, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_COMMAND_TIMEOUT_SECONDS"),
+            completion_poll_count=env_int(env, 3, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_COMPLETION_POLLS"),
+            wait_for_nas_qc_sync=nas_status_sync_enabled,
+            publisher_ssh_host=(
+                env_get(env, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_SSH_HOST")
+                or env_get(env, "ORBBEC_PUBLISHER_BRIDGE_SSH_HOST")
+                or "synology"
+            ),
+            publisher_publish_command=(
+                env_get(env, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_PUBLISH_COMMAND")
+                or env_get(env, "ORBBEC_PUBLISHER_BRIDGE_PUBLISH_COMMAND")
+                or "/usr/local/sbin/nas-uploader-publish"
+            ),
+            publisher_status_command=(
+                env_get(env, "ORBBEC_MANUAL_PUBLISHER_BRIDGE_STATUS_COMMAND")
+                or env_get(env, "ORBBEC_PUBLISHER_BRIDGE_STATUS_COMMAND")
+                or "/usr/local/sbin/nas-uploader-status"
+            ),
+            mano_python=mano_python or Path("/__orbbec_mano_python_not_configured__"),
+            mano_toolkit_root=mano_toolkit_root or Path("/__orbbec_mano_toolkit_not_configured__"),
+            mano_model_dir=mano_model_dir or Path("/__orbbec_mano_model_not_configured__"),
+            mano_default_shape_path=env_path(env, "ORBBEC_MANO_DEFAULT_SHAPE_PATH"),
+        ),
+    )
+    nas_status_sync = NasStatusSync(
+        workflow_store,
+        NasStatusSyncConfig(
+            enabled=nas_status_sync_enabled,
+            poll_seconds=env_float(env, 2.0, "ORBBEC_NAS_STATUS_SYNC_POLL_SECONDS"),
+            command_timeout_seconds=env_float(
+                env,
+                60.0,
+                "ORBBEC_NAS_STATUS_SYNC_COMMAND_TIMEOUT_SECONDS",
+            ),
+            retry_base_seconds=env_int(env, 5, "ORBBEC_NAS_STATUS_SYNC_RETRY_BASE_SECONDS"),
+            retry_max_seconds=env_int(env, 300, "ORBBEC_NAS_STATUS_SYNC_RETRY_MAX_SECONDS"),
+            ssh_host=(
+                env_get(env, "ORBBEC_NAS_STATUS_SYNC_SSH_HOST")
+                or env_get(env, "ORBBEC_PUBLISHER_BRIDGE_SSH_HOST")
+                or "synology"
+            ),
+            check_command=(
+                env_get(env, "ORBBEC_NAS_STATUS_SYNC_CHECK_COMMAND")
+                or "/usr/local/sbin/nas-uploader-check"
+            ),
+        ),
+    )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
     runtime = BackendRuntime(registry, workflow_service)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
@@ -2977,6 +3062,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(
         f"[task-backend] publisher_bridge={'enabled' if publisher_bridge_enabled else 'disabled'} "
         f"max_inflight={publisher_bridge.config.max_inflight}",
+        file=sys.stderr,
+    )
+    print(
+        f"[task-backend] manual_publisher_bridge={'enabled' if manual_publisher_bridge_enabled else 'disabled'} "
+        f"max_inflight={manual_publisher_bridge.config.max_inflight} "
+        f"completion_polls={manual_publisher_bridge.config.completion_poll_count}",
+        file=sys.stderr,
+    )
+    print(
+        f"[task-backend] nas_status_sync={'enabled' if nas_status_sync_enabled else 'disabled'} "
+        f"host={nas_status_sync.config.ssh_host}",
         file=sys.stderr,
     )
     print(f"[task-backend] data_root={data_root}", file=sys.stderr)
@@ -2995,10 +3091,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         nas_uploader.start()
         publisher_bridge.start()
+        manual_publisher_bridge.start()
+        nas_status_sync.start()
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[task-backend] stopping", file=sys.stderr)
     finally:
+        nas_status_sync.stop()
+        manual_publisher_bridge.stop()
         publisher_bridge.stop()
         nas_uploader.stop()
         server.server_close()

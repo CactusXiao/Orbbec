@@ -286,7 +286,7 @@ def correction_task_from_backend_payload(
         frames=frames,
         rgb_path_template="{camera}/RGB/{frame:05d}.png",
         prediction_dir=PREDICTION_DIR,
-        correction_dir=f"{MANUAL_SEGMENTS_DIR}/{str(payload.get('segment_id') or payload.get('job_id') or '').strip()}".rstrip("/"),
+        correction_dir=f"{MANUAL_SEGMENTS_DIR}/{str(payload.get('job_id') or '').strip()}".rstrip("/"),
         mano_episode_dir=MANO_EPISODE_DIR,
         nas_root_path=str(episode_dir),
     )

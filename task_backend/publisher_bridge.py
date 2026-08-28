@@ -115,6 +115,17 @@ class PublisherBridgeConfig:
                 )
 
 
+@dataclass
+class ManualPublisherBridgeConfig(PublisherBridgeConfig):
+    completion_poll_count: int = 3
+    wait_for_nas_qc_sync: bool = False
+
+    def validate(self) -> None:
+        super().validate()
+        if self.completion_poll_count <= 0:
+            raise ValueError("ORBBEC_MANUAL_PUBLISHER_BRIDGE_COMPLETION_POLLS must be greater than 0")
+
+
 class PublisherClient:
     def __init__(self, config: PublisherBridgeConfig, stop_event: threading.Event):
         self.config = config
@@ -138,8 +149,13 @@ class PublisherClient:
     def publish(self, episode_id: str) -> None:
         self._run_remote(self.config.publisher_publish_command, episode_id)
 
-    def _run_remote(self, command: str, episode_id: str) -> str:
-        remote_command = "sudo -- " + shlex.quote(command) + " " + shlex.quote(episode_id)
+    def publish_manual(self, episode_id: str) -> None:
+        self._run_remote(self.config.publisher_publish_command, "--manual-2d", episode_id)
+
+    def _run_remote(self, command: str, *arguments: str) -> str:
+        remote_command = "sudo -- " + " ".join(
+            [shlex.quote(command), *(shlex.quote(str(argument)) for argument in arguments)]
+        )
         argv = [
             "ssh",
             "-o",
@@ -510,3 +526,246 @@ class PublisherBridge:
         if episode_dir == mount_root or mount_root not in episode_dir.parents:
             raise ValueError(f"auto_label episode_uri escapes configured NAS mount: {episode_uri}")
         return publisher_episode_id, episode_dir
+
+
+class ManualPublisherBridge:
+    """Bridge one episode-level manual_3d job to one Publisher manual publish."""
+
+    def __init__(
+        self,
+        service: JobService,
+        config: ManualPublisherBridgeConfig,
+        *,
+        publisher_client: Optional[Any] = None,
+        materializer: Optional[Any] = None,
+        hostname: str = "",
+    ):
+        self.service = service
+        self.config = config
+        self.hostname = hostname or socket.gethostname()
+        self.stop_event = threading.Event()
+        self.publisher = publisher_client or PublisherClient(config, self.stop_event)
+        self.materializer = materializer or OptimizedPoseMaterializer(config, self.stop_event)
+        self.threads: List[threading.Thread] = []
+
+    def start(self) -> None:
+        if not self.config.enabled or self.threads:
+            return
+        self.config.validate()
+        self.stop_event.clear()
+        for slot_index in range(1, self.config.max_inflight + 1):
+            thread = threading.Thread(
+                target=self._run_slot,
+                args=(slot_index,),
+                name=f"manual-publisher-bridge-slot-{slot_index:02d}",
+                daemon=True,
+            )
+            self.threads.append(thread)
+            thread.start()
+        _log(
+            f"manual bridge started slots={self.config.max_inflight} "
+            f"poll={self.config.poll_seconds:g}s completion_polls={self.config.completion_poll_count}"
+        )
+
+    def stop(self, timeout: float = 15.0) -> None:
+        self.stop_event.set()
+        deadline = time.monotonic() + max(0.0, timeout)
+        for thread in self.threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        alive = [thread.name for thread in self.threads if thread.is_alive()]
+        if alive:
+            _log(f"manual bridge shutdown timed out while waiting for: {', '.join(alive)}")
+        self.threads = []
+
+    def worker_id(self, slot_index: int) -> str:
+        return f"manual_publisher_bridge:{self.hostname}:slot-{slot_index:02d}"
+
+    def _run_slot(self, slot_index: int) -> None:
+        while not self.stop_event.is_set():
+            try:
+                did_work = self.process_once(slot_index)
+            except BridgeShutdown:
+                break
+            except Exception as exc:
+                _log(f"manual slot-{slot_index:02d} error: {_format_error(exc)}")
+                did_work = False
+            if not did_work:
+                self.stop_event.wait(self.config.poll_seconds)
+
+    def process_once(self, slot_index: int) -> bool:
+        if self.stop_event.is_set():
+            return False
+        worker_id = self.worker_id(slot_index)
+        try:
+            leased = self.service.lease_job(
+                {
+                    "type": "manual_3d",
+                    "worker_id": worker_id,
+                    "lease_seconds": self.config.lease_seconds,
+                }
+            )
+        except WorkflowError as exc:
+            if exc.status in {HTTPStatus.NOT_FOUND, HTTPStatus.CONFLICT}:
+                return False
+            raise
+
+        job = dict(leased.get("job") or {})
+        payload = dict(leased.get("payload") or {})
+        episode = dict(leased.get("episode") or {})
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            raise RuntimeError("leased manual_3d job is missing job_id")
+
+        heartbeat = _LeaseHeartbeat(
+            self.service,
+            job_id=job_id,
+            worker_id=worker_id,
+            lease_seconds=self.config.lease_seconds,
+            interval_seconds=self.config.heartbeat_seconds,
+            bridge_stop=self.stop_event,
+        )
+        heartbeat.start()
+        finished = False
+        try:
+            finished = self._process_leased_job(job_id, worker_id, payload, episode)
+            return True
+        finally:
+            heartbeat.stop()
+            if not finished:
+                reason = "backend_shutdown" if self.stop_event.is_set() else "manual_publisher_bridge_interrupted"
+                try:
+                    self.service.release_job(job_id, {"reason": reason, "worker_id": worker_id})
+                except Exception as exc:
+                    _log(f"manual release failed job={job_id}: {_format_error(exc)}")
+
+    def _process_leased_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        payload: Dict[str, Any],
+        episode: Dict[str, Any],
+    ) -> bool:
+        episode_uri = str(payload.get("episode_uri") or episode.get("episode_uri") or "").strip()
+        try:
+            publisher_episode_id, episode_dir = PublisherBridge._resolve_episode(self, episode_uri)
+        except ValueError as exc:
+            error = f"invalid manual Publisher episode URI: {exc}"
+            self.service.fail_job(
+                job_id,
+                {"error": error, "result": {"ok": False, "worker_id": worker_id, "phase": "episode_validation"}},
+            )
+            return True
+
+        cameras = payload.get("cameras") if isinstance(payload.get("cameras"), list) else episode.get("cameras")
+        camera_ids = [str(value) for value in (cameras or [])]
+
+        while not self.stop_event.is_set():
+            current = self.service.store.get_job(job_id) or {}
+            progress = dict(current.get("result") or {})
+            try:
+                if self.config.wait_for_nas_qc_sync:
+                    sync_events = [
+                        event
+                        for event in self.service.store.list_nas_sync_events()
+                        if str(event.get("episode_id") or "") == str(current.get("episode_id") or "")
+                        and str(event.get("action") or "") == "quality_needs_labeling"
+                    ]
+                    if not sync_events or str(sync_events[-1].get("status") or "") != "succeeded":
+                        self.stop_event.wait(self.config.poll_seconds)
+                        continue
+                if not progress.get("manual_publish_started_at"):
+                    self.publisher.publish_manual(publisher_episode_id)
+                    progress = dict(
+                        self.service.update_job_progress(
+                            job_id,
+                            {
+                                "manual_publish_started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                                "manual_publish_episode_id": publisher_episode_id,
+                                "completion_poll_count": 0,
+                            },
+                        ).get("job", {}).get("result", {})
+                    )
+                    _log(f"manual published job={job_id} episode={publisher_episode_id}")
+
+                poll_count = int(progress.get("completion_poll_count") or 0)
+                last_status = progress.get("last_publisher_status")
+                while poll_count < self.config.completion_poll_count and not self.stop_event.is_set():
+                    status = self.publisher.status(publisher_episode_id)
+                    poll_count += 1
+                    last_status = status
+                    self.service.update_job_progress(
+                        job_id,
+                        {
+                            "completion_poll_count": poll_count,
+                            "last_publisher_status": status,
+                        },
+                    )
+                    if poll_count < self.config.completion_poll_count:
+                        self.stop_event.wait(self.config.poll_seconds)
+                if self.stop_event.is_set():
+                    break
+
+                status_obj = dict(last_status) if isinstance(last_status, dict) else {}
+                observed_generation = int(status_obj.get("generation") or 0)
+                observed_sha256 = str(status_obj.get("result_manifest_sha256") or "").strip()
+                generation = max(1, observed_generation)
+                result_sha256 = observed_sha256
+                if len(result_sha256) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in result_sha256):
+                    result_sha256 = "0" * 64
+                materialized = self.materializer.run(
+                    episode_dir=episode_dir,
+                    generation=generation,
+                    result_manifest_sha256=result_sha256,
+                    cameras=camera_ids,
+                )
+                frames = [int(value) for value in materialized.get("frames", [])]
+                result = {
+                    "ok": True,
+                    "worker_id": worker_id,
+                    "frames": frames,
+                    "generation": generation,
+                    "result_manifest_sha256": result_sha256,
+                    "observed_generation": observed_generation,
+                    "observed_result_manifest_sha256": observed_sha256,
+                    "joints_3d_shape": list(materialized.get("joints_3d_shape") or []),
+                    "materializer_reused": bool(materialized.get("reused")),
+                    "completion_policy": f"assumed_complete_after_{self.config.completion_poll_count}_polls",
+                    "completion_poll_count": self.config.completion_poll_count,
+                    "publisher_status_at_completion": status_obj,
+                    "temporary_completion_policy": True,
+                }
+                artifacts = [
+                    {
+                        "kind": "optimized_pose",
+                        "uri": uri_join(episode_uri, "optimized_pose"),
+                        "metadata": {"generation": generation, "source": "manual_3d", "source_job_id": job_id},
+                    },
+                    {
+                        "kind": "mano_episode",
+                        "uri": uri_join(episode_uri, "mano", "episode"),
+                        "metadata": {
+                            "generation": generation,
+                            "source": "manual_3d",
+                            "source_job_id": job_id,
+                            "scope": "episode",
+                        },
+                    },
+                ]
+                self.service.complete_job(job_id, {"result": result, "artifacts": artifacts})
+                _log(f"manual completed job={job_id} episode={publisher_episode_id} frames={len(frames)}")
+                return True
+            except MaterializerError as exc:
+                if exc.retryable:
+                    _log(f"manual job={job_id} 3D files not ready after assumed completion: {exc}")
+                    self.stop_event.wait(self.config.poll_seconds)
+                    continue
+                error = f"manual optimized_pose materialization failed: {exc}"
+                self.service.fail_job(
+                    job_id,
+                    {"error": error, "result": {"ok": False, "worker_id": worker_id, "phase": "mano_materialization"}},
+                )
+                return True
+            except (PublisherCommandError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+                _log(f"manual job={job_id} transient Publisher/NAS error: {_format_error(exc)}")
+                self.stop_event.wait(self.config.poll_seconds)
+        raise BridgeShutdown("backend is stopping")

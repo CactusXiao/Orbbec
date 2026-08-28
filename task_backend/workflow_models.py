@@ -24,24 +24,27 @@ EPISODE_STATUSES = {
     "manual_labeled",
     "manual_correction_pending",
     "manual_correction_running",
-    "segment_mano_optimizing",
+    "manual_3d_pending",
+    "manual_3d_optimizing",
+    "manual_label_failed",
+    "manual_3d_failed",
     "finalized",
 }
 
 JOB_TYPES = {
     "upload",
     "auto_label",
-    "mano_opt",
     "qc",
     "review",
     "manual_label",
+    "manual_3d",
 }
 
 CONTROLLED_STAGE_JOB_TYPES = {
     "auto_label",
-    "mano_opt",
     "qc",
-    "manual_segment",
+    "manual_label",
+    "manual_3d",
 }
 
 SEGMENT_STATUSES = {

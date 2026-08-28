@@ -176,8 +176,32 @@ class WorkflowStore:
                     updated_by TEXT NOT NULL DEFAULT '',
                     note TEXT NOT NULL DEFAULT ''
                 );
-                PRAGMA user_version = 4;
+
+                CREATE TABLE IF NOT EXISTS nas_sync_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    episode_id TEXT NOT NULL,
+                    nas_episode_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at TEXT NOT NULL,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_nas_sync_outbox_due
+                    ON nas_sync_outbox(status, next_attempt_at, created_at);
+                PRAGMA user_version = 5;
                 """
+            )
+            # A process may stop after claiming an event but before recording its
+            # result. Replaying the fixed NAS commands is safer than stranding the
+            # lifecycle transition forever.
+            conn.execute(
+                "UPDATE nas_sync_outbox SET status = 'pending', updated_at = ? WHERE status = 'running'",
+                (now_iso(),),
             )
             self._ensure_episode_storage_columns(conn)
             conn.execute("DROP INDEX IF EXISTS idx_episodes_storage_name")
@@ -233,6 +257,151 @@ class WorkflowStore:
             columns.add("collection_path")
         if "storage_name" not in columns:
             conn.execute("ALTER TABLE episodes ADD COLUMN storage_name TEXT NOT NULL DEFAULT ''")
+
+    def enqueue_nas_sync_event(
+        self,
+        *,
+        event_id: str,
+        episode_id: str,
+        nas_episode_id: str,
+        action: str,
+    ) -> Dict[str, Any]:
+        event_id = str(event_id or "").strip()
+        episode_id = str(episode_id or "").strip()
+        nas_episode_id = str(nas_episode_id or "").strip()
+        action = str(action or "").strip()
+        if not event_id or not episode_id or not nas_episode_id or not action:
+            raise WorkflowError(
+                HTTPStatus.BAD_REQUEST,
+                "event_id, episode_id, nas_episode_id, and action are required",
+            )
+        timestamp = now_iso()
+        with self.connect() as conn:
+            if self._get_episode_unlocked(conn, episode_id) is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO nas_sync_outbox (
+                    event_id, episode_id, nas_episode_id, action, status,
+                    attempt, next_attempt_at, last_error, created_at, updated_at,
+                    completed_at
+                ) VALUES (?, ?, ?, ?, 'pending', 0, ?, '', ?, ?, '')
+                """,
+                (event_id, episode_id, nas_episode_id, action, timestamp, timestamp, timestamp),
+            )
+            row = conn.execute(
+                "SELECT * FROM nas_sync_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"NAS sync event not found: {event_id}")
+            existing = self._row_to_nas_sync_event(row)
+            if existing["episode_id"] != episode_id or existing["action"] != action:
+                raise WorkflowError(HTTPStatus.CONFLICT, f"NAS sync event identity conflict: {event_id}")
+            return existing
+
+    def claim_nas_sync_event(self) -> Optional[Dict[str, Any]]:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT current.* FROM nas_sync_outbox AS current
+                WHERE current.status = 'pending' AND current.next_attempt_at <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM nas_sync_outbox AS earlier
+                      WHERE earlier.episode_id = current.episode_id
+                        AND earlier.rowid < current.rowid
+                        AND earlier.status <> 'succeeded'
+                  )
+                ORDER BY current.created_at, current.rowid
+                LIMIT 1
+                """,
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                return None
+            event_id = str(row["event_id"])
+            conn.execute(
+                """
+                UPDATE nas_sync_outbox
+                SET status = 'running', attempt = attempt + 1, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (timestamp, event_id),
+            )
+            claimed = conn.execute(
+                "SELECT * FROM nas_sync_outbox WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+            return self._row_to_nas_sync_event(claimed) if claimed is not None else None
+
+    def complete_nas_sync_event(self, event_id: str) -> Dict[str, Any]:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE nas_sync_outbox
+                SET status = 'succeeded', last_error = '', completed_at = ?, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (timestamp, timestamp, str(event_id or "").strip()),
+            )
+            if cursor.rowcount != 1:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"NAS sync event not found: {event_id}")
+            row = conn.execute(
+                "SELECT * FROM nas_sync_outbox WHERE event_id = ?",
+                (str(event_id or "").strip(),),
+            ).fetchone()
+            return self._row_to_nas_sync_event(row)
+
+    def retry_nas_sync_event(self, event_id: str, *, error: str, retry_seconds: int) -> Dict[str, Any]:
+        timestamp = now_iso()
+        next_attempt_at = _future_iso(max(1, int(retry_seconds or 1)))
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE nas_sync_outbox
+                SET status = 'pending', next_attempt_at = ?, last_error = ?, updated_at = ?
+                WHERE event_id = ?
+                """,
+                (next_attempt_at, str(error or ""), timestamp, str(event_id or "").strip()),
+            )
+            if cursor.rowcount != 1:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"NAS sync event not found: {event_id}")
+            row = conn.execute(
+                "SELECT * FROM nas_sync_outbox WHERE event_id = ?",
+                (str(event_id or "").strip(),),
+            ).fetchone()
+            return self._row_to_nas_sync_event(row)
+
+    def list_nas_sync_events(self, status: str = "") -> List[Dict[str, Any]]:
+        clean_status = str(status or "").strip()
+        query = "SELECT * FROM nas_sync_outbox"
+        params: Tuple[Any, ...] = ()
+        if clean_status:
+            query += " WHERE status = ?"
+            params = (clean_status,)
+        query += " ORDER BY created_at, rowid"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+            return [self._row_to_nas_sync_event(row) for row in rows]
+
+    @staticmethod
+    def _row_to_nas_sync_event(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "event_id": str(row["event_id"]),
+            "episode_id": str(row["episode_id"]),
+            "nas_episode_id": str(row["nas_episode_id"]),
+            "action": str(row["action"]),
+            "status": str(row["status"]),
+            "attempt": int(row["attempt"]),
+            "next_attempt_at": str(row["next_attempt_at"]),
+            "last_error": str(row["last_error"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+            "completed_at": str(row["completed_at"]),
+        }
 
     def create_or_update_episode(
         self,
@@ -680,6 +849,21 @@ class WorkflowStore:
             )
             return self._get_job_unlocked(conn, job_id) or job
 
+    def merge_job_result(self, *, job_id: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist non-terminal worker progress without changing the lease."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self._get_job_unlocked(conn, job_id)
+            if job is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+            merged = dict(job.get("result") or {})
+            merged.update(dict(values or {}))
+            conn.execute(
+                "UPDATE jobs SET result_json = ?, updated_at = ? WHERE job_id = ?",
+                (_json_dumps(merged), now_iso(), job_id),
+            )
+            return self._get_job_unlocked(conn, job_id) or job
+
     def update_job_progress(
         self,
         *,
@@ -910,290 +1094,102 @@ class WorkflowStore:
             rows = conn.execute(query, tuple(params)).fetchall()
             return [self._row_to_segment(row) for row in rows]
 
-    def list_leaseable_segments(
-        self,
-        *,
-        task_name: str = "",
-        subject_id: str = "",
-        episode_id: str = "",
-    ) -> List[Dict[str, Any]]:
-        clauses = [
-            "segments.status IN ('pending_manual', 'manual_labeling')",
-            "(segments.status = 'pending_manual' OR segments.lease_until IS NULL OR segments.lease_until = '' OR segments.lease_until <= ?)",
-        ]
-        params: List[Any] = [now_iso()]
-        task_name = str(task_name or "").strip()
-        subject_id = str(subject_id or "").strip()
-        episode_id = str(episode_id or "").strip()
-        if task_name:
-            clauses.append("episodes.task_name = ?")
-            params.append(task_name)
-        if subject_id:
-            clauses.append("episodes.subject_id = ?")
-            params.append(subject_id)
-        if episode_id:
-            clauses.append("segments.episode_id = ?")
-            params.append(episode_id)
-        query = """
-            SELECT segments.* FROM segments
-            JOIN episodes ON episodes.episode_id = segments.episode_id
-            WHERE """ + " AND ".join(clauses)
-        query += """
-            ORDER BY episodes.task_name, episodes.subject_id,
-                     episodes.episode_index IS NULL, episodes.episode_index,
-                     episodes.created_at, episodes.episode_id,
-                     segments.start_frame, segments.end_frame, segments.segment_id
-        """
+    def set_episode_segments_manual_labeling(self, *, episode_id: str, manual_job_id: str) -> List[Dict[str, Any]]:
+        timestamp = now_iso()
         with self.connect() as conn:
-            rows = conn.execute(query, tuple(params)).fetchall()
-            return [self._row_to_segment(row) for row in rows]
-
-    def lease_segment(
-        self,
-        *,
-        lease_owner: str,
-        lease_seconds: int = 600,
-        task_name: str = "",
-        subject_id: str = "",
-        episode_id: str = "",
-    ) -> Optional[Dict[str, Any]]:
-        lease_owner = str(lease_owner or "").strip()
-        if not lease_owner:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, "lease_owner is required")
-        lease_seconds = max(1, int(lease_seconds or 600))
-        task_name = str(task_name or "").strip()
-        subject_id = str(subject_id or "").strip()
-        episode_id = str(episode_id or "").strip()
-        now = now_iso()
-        lease_until = _future_iso(lease_seconds)
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            params: List[Any] = []
-            query = """
-                SELECT segments.* FROM segments
-                JOIN episodes ON episodes.episode_id = segments.episode_id
-                WHERE segments.status IN ('pending_manual', 'manual_labeling')
-            """
-            if task_name:
-                query += " AND episodes.task_name = ?"
-                params.append(task_name)
-            if subject_id:
-                query += " AND episodes.subject_id = ?"
-                params.append(subject_id)
-            if episode_id:
-                query += " AND segments.episode_id = ?"
-                params.append(episode_id)
-            query += """
-                ORDER BY episodes.task_name, episodes.subject_id,
-                         episodes.episode_index IS NULL, episodes.episode_index,
-                         episodes.created_at, episodes.episode_id,
-                         segments.start_frame, segments.end_frame, segments.segment_id
-            """
-            rows = conn.execute(query, tuple(params)).fetchall()
-            selected: Optional[sqlite3.Row] = None
-            for row in rows:
-                status = str(row["status"])
-                row_lease_until = str(row["lease_until"] or "")
-                if status == "pending_manual" or not row_lease_until or row_lease_until <= now:
-                    selected = row
-                    break
-            if selected is None:
-                return None
-            segment_id = str(selected["segment_id"])
-            manual_job_id = str(selected["manual_job_id"] or "") or f"manual_label_{segment_id}"
             conn.execute(
                 """
                 UPDATE segments
-                SET status = 'manual_labeling', lease_owner = ?, lease_until = ?,
-                    manual_job_id = ?, updated_at = ?
-                WHERE segment_id = ?
+                SET status = 'manual_labeling', manual_job_id = ?, error = '', updated_at = ?
+                WHERE episode_id = ? AND status IN ('pending_manual', 'manual_labeling')
                 """,
-                (lease_owner, lease_until, manual_job_id, now, segment_id),
+                (str(manual_job_id or ""), timestamp, str(episode_id or "")),
             )
-            return self._get_segment_unlocked(conn, segment_id)
+        return self.segments_for_episode(episode_id)
 
-    def heartbeat_segment(
-        self,
-        *,
-        segment_id: str,
-        lease_owner: str = "",
-        lease_seconds: int = 600,
-    ) -> Dict[str, Any]:
+    def reset_episode_segments_manual(self, *, episode_id: str) -> List[Dict[str, Any]]:
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            if segment.get("status") not in {"pending_manual", "manual_labeling"}:
-                return segment
-            if lease_owner and segment.get("lease_owner") and segment.get("lease_owner") != lease_owner:
-                raise WorkflowError(HTTPStatus.CONFLICT, "segment is leased by another owner")
             conn.execute(
                 """
                 UPDATE segments
-                SET status = 'manual_labeling', lease_until = ?, updated_at = ?
-                WHERE segment_id = ?
+                SET status = 'pending_manual', error = '', updated_at = ?
+                WHERE episode_id = ? AND status = 'manual_labeling'
                 """,
-                (_future_iso(max(1, int(lease_seconds or 600))), now_iso(), segment_id),
+                (now_iso(), str(episode_id or "")),
             )
-            return self._get_segment_unlocked(conn, segment_id) or segment
+        return self.segments_for_episode(episode_id)
 
-    def release_segment(self, *, segment_id: str, reason: str = "") -> Tuple[Dict[str, Any], bool]:
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            if segment.get("status") != "manual_labeling":
-                return segment, False
-            metadata = dict(segment.get("metadata") or {})
-            if reason:
-                metadata["last_release_reason"] = reason
-            conn.execute(
-                """
-                UPDATE segments
-                SET status = 'pending_manual', lease_owner = '', lease_until = '',
-                    metadata_json = ?, updated_at = ?
-                WHERE segment_id = ?
-                """,
-                (_json_dumps(metadata), now_iso(), segment_id),
-            )
-            updated = self._get_segment_unlocked(conn, segment_id)
-            if updated is None:
-                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"released segment not found: {segment_id}")
-            return updated, True
-
-    def complete_segment_manual(
+    def complete_episode_segments_manual(
         self,
         *,
-        segment_id: str,
+        episode_id: str,
+        manual_job_id: str,
         manual_2d_uri: str,
-        manual_job_id: str = "",
-        cleanup_manifest: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        manual_2d_uri = str(manual_2d_uri or "").strip()
-        if not manual_2d_uri:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, "manual_2d_uri is required")
+    ) -> List[Dict[str, Any]]:
+        timestamp = now_iso()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            merged_metadata = dict(segment.get("metadata") or {})
-            if metadata:
-                merged_metadata.update(metadata)
-            conn.execute(
-                """
-                UPDATE segments
-                SET status = 'manual_labeled', manual_2d_uri = ?, manual_job_id = ?,
-                    lease_owner = '', lease_until = '', cleanup_manifest_json = ?,
-                    metadata_json = ?, error = '', manual_completed_at = ?, updated_at = ?
-                WHERE segment_id = ?
-                """,
-                (
-                    manual_2d_uri,
-                    str(manual_job_id or segment.get("manual_job_id") or ""),
-                    _json_dumps(cleanup_manifest or segment.get("cleanup_manifest") or {}),
-                    _json_dumps(merged_metadata),
-                    now_iso(),
-                    now_iso(),
-                    segment_id,
-                ),
-            )
-            updated = self._get_segment_unlocked(conn, segment_id)
-            if updated is None:
-                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"completed segment not found: {segment_id}")
-            return updated
+            rows = conn.execute(
+                "SELECT * FROM segments WHERE episode_id = ? ORDER BY start_frame, end_frame, segment_id",
+                (str(episode_id or ""),),
+            ).fetchall()
+            if not rows:
+                raise WorkflowError(HTTPStatus.CONFLICT, f"episode has no manual segments: {episode_id}")
+            for row in rows:
+                segment = self._row_to_segment(row)
+                merged_metadata = dict(segment.get("metadata") or {})
+                merged_metadata.update(dict(metadata or {}))
+                conn.execute(
+                    """
+                    UPDATE segments
+                    SET status = 'manual_labeled', manual_job_id = ?, manual_2d_uri = ?,
+                        metadata_json = ?, error = '', manual_completed_at = ?, updated_at = ?
+                    WHERE segment_id = ?
+                    """,
+                    (
+                        str(manual_job_id or ""),
+                        str(manual_2d_uri or ""),
+                        _json_dumps(merged_metadata),
+                        timestamp,
+                        timestamp,
+                        str(segment.get("segment_id") or ""),
+                    ),
+                )
+        return self.segments_for_episode(episode_id)
 
-    def mark_segment_mano_queued(self, *, segment_id: str, mano_job_id: str) -> Dict[str, Any]:
-        return self._set_segment_status_fields(segment_id=segment_id, status="mano_queued", mano_job_id=mano_job_id)
-
-    def mark_segment_mano_running(self, *, segment_id: str, mano_job_id: str) -> Dict[str, Any]:
-        return self._set_segment_status_fields(segment_id=segment_id, status="mano_running", mano_job_id=mano_job_id)
-
-    def complete_segment_mano(self, *, segment_id: str, mano_patch_uri: str, mano_job_id: str = "") -> Dict[str, Any]:
-        mano_patch_uri = str(mano_patch_uri or "").strip()
-        if not mano_patch_uri:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, "mano_patch_uri is required")
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            timestamp = now_iso()
-            conn.execute(
-                """
-                UPDATE segments
-                SET status = 'mano_succeeded', mano_patch_uri = ?, mano_job_id = ?,
-                    error = '', mano_completed_at = ?, updated_at = ?
-                WHERE segment_id = ?
-                """,
-                (mano_patch_uri, str(mano_job_id or segment.get("mano_job_id") or ""), timestamp, timestamp, segment_id),
-            )
-            updated = self._get_segment_unlocked(conn, segment_id)
-            if updated is None:
-                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"completed segment not found: {segment_id}")
-            return updated
-
-    def fail_segment(
+    def set_episode_segments_mano_state(
         self,
         *,
-        segment_id: str,
-        error: str,
-        cleanup_manifest: Optional[Dict[str, Any]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        episode_id: str,
+        status: str,
+        mano_job_id: str,
+        error: str = "",
+    ) -> List[Dict[str, Any]]:
+        if status not in {"mano_queued", "mano_running", "mano_succeeded", "failed"}:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"unsupported episode segment 3D status: {status}")
+        timestamp = now_iso()
+        mano_completed_at = timestamp if status == "mano_succeeded" else ""
+        failed_at = timestamp if status == "failed" else ""
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            merged_metadata = dict(segment.get("metadata") or {})
-            if metadata:
-                merged_metadata.update(metadata)
-            timestamp = now_iso()
             conn.execute(
                 """
                 UPDATE segments
-                SET status = 'failed', lease_owner = '', lease_until = '',
-                    cleanup_manifest_json = ?, metadata_json = ?, error = ?,
-                    failed_at = ?, updated_at = ?
-                WHERE segment_id = ?
+                SET status = ?, mano_job_id = ?, mano_patch_uri = '', error = ?,
+                    mano_completed_at = ?, failed_at = ?, updated_at = ?
+                WHERE episode_id = ?
                 """,
                 (
-                    _json_dumps(cleanup_manifest or segment.get("cleanup_manifest") or {}),
-                    _json_dumps(merged_metadata),
-                    str(error or "segment failed"),
+                    status,
+                    str(mano_job_id or ""),
+                    str(error or ""),
+                    mano_completed_at,
+                    failed_at,
                     timestamp,
-                    timestamp,
-                    segment_id,
+                    str(episode_id or ""),
                 ),
             )
-            updated = self._get_segment_unlocked(conn, segment_id)
-            if updated is None:
-                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"failed segment not found: {segment_id}")
-            return updated
-
-    def _set_segment_status_fields(self, *, segment_id: str, status: str, mano_job_id: str = "") -> Dict[str, Any]:
-        status = require_segment_status(status)
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            segment = self._get_segment_unlocked(conn, segment_id)
-            if segment is None:
-                raise WorkflowError(HTTPStatus.NOT_FOUND, f"segment not found: {segment_id}")
-            conn.execute(
-                """
-                UPDATE segments
-                SET status = ?, mano_job_id = ?, updated_at = ?
-                WHERE segment_id = ?
-                """,
-                (status, str(mano_job_id or segment.get("mano_job_id") or ""), now_iso(), segment_id),
-            )
-            updated = self._get_segment_unlocked(conn, segment_id)
-            if updated is None:
-                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"updated segment not found: {segment_id}")
-            return updated
+        return self.segments_for_episode(episode_id)
 
     def _get_episode_unlocked(self, conn: sqlite3.Connection, episode_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()

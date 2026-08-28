@@ -79,7 +79,7 @@ def _episode_cache_key(episode_dir: Path, payload: Mapping[str, Any]) -> str:
     parts = [
         str(episode_dir.expanduser().resolve()),
         str(payload.get("episode_id") or ""),
-        str(payload.get("segment_id") or payload.get("job_id") or ""),
+        str(payload.get("job_id") or ""),
         str(payload.get("episode_uri") or ""),
     ]
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:20]

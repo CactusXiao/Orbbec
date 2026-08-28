@@ -237,7 +237,7 @@ class HomePage(ttk.Frame):
 
         queue = ttk.Frame(center, style="Panel.TFrame")
         queue.pack(padx=28, fill="both", pady=(8, 0))
-        ttk.Label(queue, text="Queued correction segments", style="Muted.TLabel").pack(anchor="w")
+        ttk.Label(queue, text="Queued correction episodes", style="Muted.TLabel").pack(anchor="w")
 
         queue_host = ttk.Frame(queue, style="Panel.TFrame")
         queue_host.pack(fill="both", pady=(6, 8))
@@ -338,7 +338,7 @@ class HomePage(ttk.Frame):
             self._queue_tree.focus(first)
             self._queue_notice.configure(text=f"{len(groups)} task group(s) loaded.")
         else:
-            self._queue_notice.configure(text="No queued correction segments.")
+            self._queue_notice.configure(text="No queued correction episodes.")
 
     def _load_selected_task_episodes(self, _event: Any = None) -> None:
         backend_url = (self._var_backend_url.get() or "").strip()
@@ -1567,12 +1567,18 @@ class LabelPage(ttk.Frame):
         session = self._backend_session
         if session is None or self._backend_completed:
             return True
-        segment_id = str(session.segment_id or session.job_id or "").strip()
+        segment_ids = [
+            str(item.get("segment_id") or "")
+            for item in (session.payload.get("segments") or [])
+            if isinstance(item, dict) and str(item.get("segment_id") or "")
+        ]
         artifacts = [
             {
                 "kind": "manual_2d",
                 "metadata": {
-                    "segment_id": segment_id,
+                    "scope": "episode",
+                    "episode_id": session.episode_id,
+                    "segment_ids": segment_ids,
                     "cameras": list(task.cameras),
                     "frames": list(task.frames),
                     "operator_id": session.operator_id,

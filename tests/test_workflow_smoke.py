@@ -76,7 +76,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "workflow.sqlite3"
             store = WorkflowStore(db_path)
-            for job_type in ("auto_label", "mano_opt", "qc", "manual_segment"):
+            for job_type in ("auto_label", "qc", "manual_label", "manual_3d"):
                 self.assertTrue(store.get_stage_control(job_type)["lease_enabled"])
 
             store.set_stage_control(job_type="auto_label", lease_enabled=False, updated_by="system", note="default paused")
@@ -160,14 +160,14 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         )
         self.assertIn("当前流程", html)
         self.assertIn("上传与存储", html)
-        self.assertIn("QC 失败分段 / 人工纠偏", html)
+        self.assertIn("QC 失败分段 / Episode 人工纠偏", html)
         self.assertIn("操作员", html)
         self.assertIn("collector", html)
         self.assertIn("qc_user", html)
         self.assertIn("labeler", html)
         self.assertIn("1. 采集预约 / 确认", html)
         self.assertIn("3. 自动标注 + Episode 3D", html)
-        self.assertIn("5. 人工纠偏 / Segment 3D / 最终 3D", html)
+        self.assertIn("5. Episode 人工纠偏 / Episode 二次 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
 
     def test_nas_uploader_always_queues_auto_label_after_upload(self) -> None:
@@ -289,7 +289,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 },
             )
             self.assertEqual(store.get_episode("episode_pass")["status"], "mano_optimized")  # type: ignore[index]
-            self.assertEqual(store.jobs_for_episode("episode_pass", "mano_opt"), [])
+            self.assertFalse(any(job["type"] == "manual_3d" for job in store.jobs_for_episode("episode_pass")))
 
             qc_jobs = store.jobs_for_episode("episode_pass", "qc")
             self.assertEqual(len(qc_jobs), 1)
@@ -310,9 +310,9 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
             self.assertEqual(manifest["qc"]["status"], "passed")
             self.assertEqual(manifest["base_3d"]["relative_path"], "mano/episode")
-            self.assertEqual(manifest["overrides"], [])
+            self.assertEqual(manifest["manual_segments"], [])
 
-    def test_qc_failure_segments_manual_segment_mano_patch_finalize(self) -> None:
+    def test_qc_failure_creates_one_episode_label_and_one_episode_3d_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_fail"
@@ -341,77 +341,43 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             segments = store.segments_for_episode("episode_fail")
             self.assertEqual([(s["start_frame"], s["end_frame"], s["status"]) for s in segments], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
-            self.assertEqual([(o["start_frame"], o["end_frame"], o["status"]) for o in manifest["overrides"]], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
+            self.assertEqual([(o["start_frame"], o["end_frame"], o["status"]) for o in manifest["manual_segments"]], [(10, 12, "pending_manual"), (20, 21, "pending_manual")])
             self.assertEqual(service.label_tasks()["tasks"][0]["segments"], 2)
             self.assertEqual(service.label_task_episodes("pick_object")["episodes"][0]["episode_id"], "episode_fail")
 
-            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
-            leased = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
-            self.assertEqual(leased["segment"]["start_frame"], 10)
-            self.assertEqual(leased["payload"]["frames"], [10, 11, 12])
+            leased = service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
+            self.assertEqual(len(leased["segments"]), 2)
+            self.assertEqual(leased["payload"]["frames"], [10, 11, 12, 20, 21])
             self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
-            self.assertNotIn("correction_dir", leased["payload"])
-            self.assertNotIn("episode_media", leased["payload"])
-            self.assertNotIn("rgb_path_template", leased["payload"])
+            self.assertEqual(leased["payload"]["scope"], "episode")
+            self.assertTrue(all(item["status"] == "manual_labeling" for item in store.segments_for_episode("episode_fail")))
 
-            first_segment_id = leased["segment"]["segment_id"]
-            completed = service.complete_label_segment(
-                first_segment_id,
+            completed = service.complete_label_episode(
+                "episode_fail",
                 {
-                    "result": {"operator_id": "labeler", "frames_completed": [10, 11, 12]},
-                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": first_segment_id}}],
+                    "result": {"operator_id": "labeler", "frames_completed": [10, 11, 12, 20, 21]},
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"scope": "episode"}}],
                 },
             )
-            self.assertEqual(completed["segment"]["status"], "mano_queued")
-            self.assertEqual(store.get_episode("episode_fail")["metadata"]["manual_correction_operator_id"], "labeler")  # type: ignore[index]
-            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
-            self.assertEqual(manifest["overrides"][0]["status"], "mano_queued")
-            self.assertEqual(manifest["overrides"][0]["manual_2d_relative_path"], f"manual_2d/segments/{first_segment_id}")
-            segment_mano = [job for job in store.jobs_for_episode("episode_fail", "mano_opt") if job["payload"].get("scope") == "segment"]
-            self.assertEqual(len(segment_mano), 1)
-            self.assertEqual(segment_mano[0]["payload"]["segment_id"], first_segment_id)
-            self.assertNotIn("rgb_path_template", segment_mano[0]["payload"])
-
+            self.assertTrue(completed["completed"])
+            manual_3d_jobs = store.jobs_for_episode("episode_fail", "manual_3d")
+            self.assertEqual(len(manual_3d_jobs), 1)
+            self.assertTrue(all(item["status"] == "mano_queued" for item in store.segments_for_episode("episode_fail")))
             service.complete_job(
-                segment_mano[0]["job_id"],
+                manual_3d_jobs[0]["job_id"],
                 {
-                    "result": {"ok": True},
-                    "artifacts": [{"kind": "mano_segment_patch", "metadata": {"segment_id": first_segment_id}}],
-                },
-            )
-            self.assertNotEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
-            manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
-            self.assertEqual(manifest["ready_override_count"], 1)
-            self.assertEqual(manifest["overrides"][0]["status"], "ready")
-            self.assertEqual(manifest["overrides"][0]["relative_path"], f"mano/segments/{first_segment_id}")
-
-            second = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
-            second_segment_id = second["segment"]["segment_id"]
-            self.assertEqual(second["segment"]["start_frame"], 20)
-            service.complete_label_segment(
-                second_segment_id,
-                {
-                    "result": {"operator_id": "labeler", "frames_completed": [20, 21]},
-                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": second_segment_id}}],
-                },
-            )
-            second_mano = [
-                job
-                for job in store.jobs_for_episode("episode_fail", "mano_opt")
-                if job["payload"].get("scope") == "segment" and job["payload"].get("segment_id") == second_segment_id
-            ][0]
-            service.complete_job(
-                second_mano["job_id"],
-                {
-                    "result": {"ok": True},
-                    "artifacts": [{"kind": "mano_segment_patch", "metadata": {"segment_id": second_segment_id}}],
+                    "result": {"ok": True, "completion_policy": "test"},
+                    "artifacts": [
+                        {"kind": "optimized_pose", "metadata": {"source_job_id": manual_3d_jobs[0]["job_id"]}},
+                        {"kind": "mano_episode", "metadata": {"source_job_id": manual_3d_jobs[0]["job_id"]}},
+                    ],
                 },
             )
             self.assertEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
             self.assertEqual(manifest["episode_status"], "finalized")
-            self.assertEqual(manifest["ready_override_count"], 2)
-            self.assertTrue(all(item["status"] == "ready" for item in manifest["overrides"]))
+            self.assertEqual(manifest["base_3d"]["source"], "manual_3d_episode")
+            self.assertTrue(all(item["status"] == "mano_succeeded" for item in manifest["manual_segments"]))
 
     def test_qc_bad_episode_does_not_create_manual_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -476,7 +442,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
 
             self.assertEqual(Path(resolved), (nas_root / "S001" / "pick_object" / "episode_001").resolve())
 
-    def test_manual_segment_lease_orders_by_task_episode_and_start_frame(self) -> None:
+    def test_manual_label_lease_orders_by_episode_and_returns_all_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
@@ -486,19 +452,21 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             store.create_segment(segment_id="late_001", episode_id="episode_late", start_frame=1, end_frame=1)
             store.create_segment(segment_id="early_005", episode_id="episode_early", start_frame=5, end_frame=5)
             store.create_segment(segment_id="early_002", episode_id="episode_early", start_frame=2, end_frame=3)
+            service._create_manual_label_episode_job("episode_late", reason="test")
+            service._create_manual_label_episode_job("episode_early", reason="test")
 
-            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
-            first = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object"})
-            self.assertEqual(first["segment"]["segment_id"], "early_002")
-            released = service.release_label_segment("early_002", {"reason": "smoke"})
+            first = service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object"})
+            self.assertEqual(first["episode"]["episode_id"], "episode_early")
+            self.assertEqual([item["segment_id"] for item in first["segments"]], ["early_002", "early_005"])
+            released = service.release_label_episode("episode_early", {"reason": "smoke"})
             self.assertTrue(released["released"])
-            second = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_early"})
-            self.assertEqual(second["segment"]["segment_id"], "early_002")
+            second = service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_early"})
+            self.assertEqual(second["episode"]["episode_id"], "episode_early")
 
             with self.assertRaises(WorkflowError):
-                service.lease_label_segment({"operator_id": "labeler", "task_name": "missing"})
+                service.lease_label_episode({"operator_id": "labeler", "task_name": "missing"})
 
-    def test_label_queue_lists_only_currently_leaseable_segments(self) -> None:
+    def test_label_queue_lists_only_currently_leaseable_episodes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             store = WorkflowStore(tmp_path / "workflow.sqlite3")
@@ -508,35 +476,38 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self._create_uploaded_episode(store, tmp_path, "episode_expired", frames=10, episode_index=3)
             store.create_segment(segment_id="active_seg", episode_id="episode_active", start_frame=1, end_frame=1)
             store.create_segment(segment_id="pending_seg", episode_id="episode_pending", start_frame=2, end_frame=2)
-            store.create_segment(segment_id="expired_seg", episode_id="episode_expired", start_frame=3, end_frame=3, status="manual_labeling")
-            store.lease_segment(lease_owner="active_labeler", lease_seconds=3600, task_name="pick_object", episode_id="episode_active")
+            store.create_segment(segment_id="expired_seg", episode_id="episode_expired", start_frame=3, end_frame=3)
+            active_job = service._create_manual_label_episode_job("episode_active", reason="test")
+            service._create_manual_label_episode_job("episode_pending", reason="test")
+            expired_job = service._create_manual_label_episode_job("episode_expired", reason="test")
+            service.lease_label_episode({"operator_id": "active_labeler", "episode_id": "episode_active", "lease_seconds": 3600})
+            service.lease_label_episode({"operator_id": "stale_labeler", "episode_id": "episode_expired", "lease_seconds": 60})
             with store.connect() as conn:
                 conn.execute(
-                    "UPDATE segments SET lease_owner = ?, lease_until = ? WHERE segment_id = ?",
-                    ("stale_labeler", "2000-01-01T00:00:00Z", "expired_seg"),
+                    "UPDATE jobs SET lease_until = ? WHERE job_id = ?",
+                    ("2000-01-01T00:00:00Z", expired_job["job_id"]),
                 )
 
             tasks = service.label_tasks()["tasks"]
             self.assertEqual(len(tasks), 1)
             self.assertEqual(tasks[0]["segments"], 2)
-            self.assertEqual(tasks[0]["pending_segments"], 1)
-            self.assertEqual(tasks[0]["leased_segments"], 1)
+            self.assertEqual(tasks[0]["pending_episodes"], 1)
+            self.assertEqual(tasks[0]["leased_episodes"], 1)
 
             episodes = {item["episode_id"]: item for item in service.label_task_episodes("pick_object")["episodes"]}
             self.assertNotIn("episode_active", episodes)
             self.assertEqual(episodes["episode_pending"]["segments"], 1)
             self.assertEqual(episodes["episode_expired"]["segments"], 1)
-            self.assertEqual(episodes["episode_expired"]["leased_segments"], 1)
+            self.assertEqual(episodes["episode_expired"]["job_status"], "leased")
 
-            service.set_stage_leasing("manual_segment", True, {"updated_by": "smoke"})
             with self.assertRaises(WorkflowError) as cm:
-                service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_active"})
+                service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_active"})
             self.assertEqual(cm.exception.status, HTTPStatus.NOT_FOUND)
 
-            leased = service.lease_label_segment({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_expired"})
-            self.assertEqual(leased["segment"]["segment_id"], "expired_seg")
+            leased = service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_expired"})
+            self.assertEqual(leased["episode"]["episode_id"], "episode_expired")
 
-    def test_segment_mano_failure_requeues_only_segment_and_cleans_attempt_outputs(self) -> None:
+    def test_manual_3d_failure_marks_whole_episode_failed_and_cleans_attempt_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             episode_dir = tmp_path / "S001" / "pick_object" / "episode_retry"
@@ -552,19 +523,17 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self._create_uploaded_episode(store, tmp_path, "episode_retry", frames=1)
             store.register_artifact(episode_id="episode_retry", kind="pred_2d", uri="nas://ego/S001/pick_object/episode_retry/pred_2d")
             store.register_artifact(episode_id="episode_retry", kind="mano_episode", uri="nas://ego/S001/pick_object/episode_retry/mano/episode")
-            segment = store.create_segment(segment_id="retry_seg", episode_id="episode_retry", start_frame=0, end_frame=0)
-            service.complete_label_segment(
-                segment["segment_id"],
+            store.create_segment(segment_id="retry_seg", episode_id="episode_retry", start_frame=0, end_frame=0)
+            service._create_manual_label_episode_job("episode_retry", reason="test")
+            service.lease_label_episode({"operator_id": "labeler", "episode_id": "episode_retry"})
+            service.complete_label_episode(
+                "episode_retry",
                 {
                     "result": {"operator_id": "labeler"},
-                    "artifacts": [{"kind": "manual_2d", "metadata": {"segment_id": "retry_seg"}}],
+                    "artifacts": [{"kind": "manual_2d", "metadata": {"scope": "episode"}}],
                 },
             )
-            mano_job = [
-                job
-                for job in store.jobs_for_episode("episode_retry", "mano_opt")
-                if job["payload"].get("scope") == "segment"
-            ][0]
+            mano_job = store.jobs_for_episode("episode_retry", "manual_3d")[0]
 
             service.fail_job(
                 mano_job["job_id"],
@@ -578,12 +547,9 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertTrue(any(item["kind"] == "pred_2d" for item in store.artifacts_for_episode("episode_retry")))
             updated_segment = store.get_segment("retry_seg")
             self.assertIsNotNone(updated_segment)
-            self.assertEqual(updated_segment["status"], "mano_queued")  # type: ignore[index]
-            segment_mano_jobs = [job for job in store.jobs_for_episode("episode_retry", "mano_opt") if job["payload"].get("scope") == "segment"]
-            self.assertEqual(len(segment_mano_jobs), 2)
-            self.assertEqual(segment_mano_jobs[0]["status"], "failed")
-            self.assertEqual(segment_mano_jobs[1]["status"], "queued")
-            self.assertEqual(segment_mano_jobs[1]["payload"]["segment_id"], "retry_seg")
+            self.assertEqual(updated_segment["status"], "failed")  # type: ignore[index]
+            self.assertEqual((store.get_episode("episode_retry") or {})["status"], "manual_3d_failed")
+            self.assertEqual(len(store.jobs_for_episode("episode_retry", "manual_3d")), 1)
 
     @staticmethod
     def _create_uploaded_episode(
@@ -612,7 +578,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         service.push_auto_label({"episode_id": episode_id, "pushed_by": "smoke"})
         for auto_job in store.jobs_for_episode(episode_id, "auto_label"):
             service.complete_job(auto_job["job_id"], {"result": {"ok": True}})
-        self.assertEqual(store.jobs_for_episode(episode_id, "mano_opt"), [])
+        self.assertFalse(any(job["type"] == "manual_3d" for job in store.jobs_for_episode(episode_id)))
 
 
 if __name__ == "__main__":

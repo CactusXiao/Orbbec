@@ -278,8 +278,9 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                     start_frame=120,
                     end_frame=121,
                 )
+                service._create_manual_label_episode_job("episode_000456", reason="smoke")
                 req = Request(
-                    base_url + "/api/v1/workflow/stages/manual_segment/enable",
+                    base_url + "/api/v1/workflow/stages/manual_label/enable",
                     data=json.dumps({"updated_by": "smoke"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -294,9 +295,10 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 episodes = client.label_task_episodes("pick_object")
                 self.assertEqual(episodes[0]["episode_id"], "episode_000456")
 
-                leased = client.lease_label_segment("labeler_01", lease_seconds=60, task_name="pick_object", episode_id="episode_000456")
-                job_id = leased["payload"]["segment_id"]
-                self.assertEqual(leased["segment"]["status"], "manual_labeling")
+                leased = client.lease_label_episode("labeler_01", lease_seconds=60, task_name="pick_object", episode_id="episode_000456")
+                job_id = leased["payload"]["episode_id"]
+                self.assertEqual(leased["job"]["status"], "leased")
+                self.assertEqual(len(leased["segments"]), 1)
                 self.assertEqual(NasEpisodeResolver({"nas://orbbec-test": str(tmp_path / "nas")}).resolve(leased["payload"]["episode_uri"]), nas_episode_dir.resolve())
                 self.assertEqual(leased["payload"]["frames"], [120, 121])
                 self.assertNotIn("episode_media", leased["payload"])
@@ -305,11 +307,12 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 completed = client.complete_label_job(
                     job_id,
                     result={"ok": True, "operator_id": "labeler_01"},
-                    artifacts=[{"kind": "manual_2d", "metadata": {"segment_id": job_id}}],
+                    artifacts=[{"kind": "manual_2d", "metadata": {"scope": "episode"}}],
                 )
-                self.assertEqual(completed["segment"]["status"], "mano_queued")
+                self.assertEqual(completed["job"]["status"], "succeeded")
+                self.assertEqual(len(service.store.jobs_for_episode("episode_000456", "manual_3d")), 1)
 
-                with urlopen(base_url + "/api/v1/workflow/stages/manual_segment", timeout=5) as resp:
+                with urlopen(base_url + "/api/v1/workflow/stages/manual_label", timeout=5) as resp:
                     stage = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(stage["stats"]["succeeded"], 1)
             finally:

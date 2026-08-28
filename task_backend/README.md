@@ -61,6 +61,24 @@ ORBBEC_PUBLISHER_BRIDGE_POLL_SECONDS=20
 ORBBEC_PUBLISHER_BRIDGE_LEASE_SECONDS=300
 ORBBEC_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS=60
 
+# Manual 2D -> Publisher -> episode-level secondary 3D bridge.
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_ENABLED=1
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_MAX_INFLIGHT=4
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_POLL_SECONDS=20
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_LEASE_SECONDS=300
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS=60
+# Temporary until Publisher exposes secondary-result correlation:
+ORBBEC_MANUAL_PUBLISHER_BRIDGE_COMPLETION_POLLS=3
+
+# Synchronize human QC lifecycle events back to the NAS server.
+# Enabled by default; set to 0 only for local workflows without NAS lifecycle APIs.
+ORBBEC_NAS_STATUS_SYNC_ENABLED=1
+ORBBEC_NAS_STATUS_SYNC_SSH_HOST=synology
+ORBBEC_NAS_STATUS_SYNC_POLL_SECONDS=2
+ORBBEC_NAS_STATUS_SYNC_COMMAND_TIMEOUT_SECONDS=60
+# Optional command overrides:
+# ORBBEC_NAS_STATUS_SYNC_CHECK_COMMAND=/usr/local/sbin/nas-uploader-check
+
 # The backend stays dependency-free; MANO conversion runs in this environment.
 ORBBEC_MANO_PYTHON=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python
 ORBBEC_MANO_TOOLKIT_ROOT=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits
@@ -292,9 +310,11 @@ registers a `nas_episode` artifact, and marks the episode `uploaded` only after
 the verified copy completes. Upload success immediately creates the
 episode-level `auto_label` job; this is no longer controlled by `.env`.
 The push API remains available only for manual backfill or repair.
-The main workflow is `uploaded -> auto_label -> mano_opt -> qc -> finalized`.
-When QC fails, the backend creates failed-frame segments for manual correction;
-each corrected segment then gets only a segment-level `mano_opt` patch job.
+The main workflow is `uploaded -> auto_label -> qc`. A passed QC finalizes the
+episode. A failed QC creates segment detail rows plus one episode-level
+`manual_label` job. Completing that job creates one episode-level `manual_3d`
+job; the manual Publisher Bridge publishes the whole episode once and writes a
+replacement episode 3D result.
 
 When Publisher Bridge is enabled, each Bridge slot leases one episode-level
 `auto_label` job for its entire Publisher lifecycle. It idempotently publishes
@@ -309,6 +329,18 @@ creates the QC job directly; no episode-level `mano_opt` job is inserted.
 not Publisher GPU jobs. On backend shutdown, slots stop leasing, release jobs
 still in flight, and leave already-published Publisher episodes untouched so a
 restart can re-lease and resume from Publisher status.
+
+Manual Publisher Bridge has its own configurable slot count and leases only
+episode-level `manual_3d` jobs. Each slot calls
+`nas-uploader-publish --manual-2d <subject/task/episode>` exactly once, with the
+publish-start marker and poll count persisted in the job result. The current
+temporary completion policy performs three successful status polls and then
+assumes the secondary optimization complete. It records
+`temporary_completion_policy=true` in the result so the placeholder is visible.
+When NAS status synchronization is enabled, the bridge waits for that episode's
+`result needs-labeling` outbox event to succeed before publishing manual 2D.
+After Publisher adds a manual-generation/result correlation field, replace this
+policy with that field without changing the episode job model.
 
 Before enabling the Bridge, install `publisher/nas-uploader-status` on the NAS
 as `/usr/local/sbin/nas-uploader-status` and grant the capture host SSH user
@@ -349,22 +381,24 @@ POST /api/v1/jobs/{job_id}/release
 {"type":"auto_label","worker_id":"auto_label_stub_01","lease_seconds":300}
 ```
 
-Manual correction leases failed QC segments, not episode jobs:
+Manual correction always leases one complete episode. The lease response carries
+all failed segment ranges in `segments` and in `payload.segments`:
 
 ```text
 GET  /api/v1/label/tasks
 GET  /api/v1/label/tasks/<task_name>/episodes
-POST /api/v1/label/segments/lease
-POST /api/v1/label/segments/{segment_id}/heartbeat
-POST /api/v1/label/segments/{segment_id}/complete
-POST /api/v1/label/segments/{segment_id}/release
-POST /api/v1/label/segments/{segment_id}/fail
+POST /api/v1/label/episodes/lease
+GET  /api/v1/label/episodes/{episode_id}
+POST /api/v1/label/episodes/{episode_id}/heartbeat
+POST /api/v1/label/episodes/{episode_id}/complete
+POST /api/v1/label/episodes/{episode_id}/release
+POST /api/v1/label/episodes/{episode_id}/fail
 ```
 
 Lease semantics:
 
-- only queued jobs/segments, or work with an expired lease, can be leased;
-- `auto_label`, `mano_opt`, `qc`, and `manual_segment` leases are open by default;
+- only queued jobs, or work with an expired lease, can be leased;
+- `auto_label`, `qc`, `manual_label`, and `manual_3d` leases are open by default;
   manually disabled stages return `HTTP 409` with `leasing disabled for job type: <type>`;
 - lease writes `lease_owner`, `lease_until`, and `status=leased`;
 - heartbeat extends the lease and may mark the job `running`;
@@ -375,7 +409,7 @@ Lease semantics:
 Workflow stage controls and snapshots:
 
 ```text
-GET  /api/v1/workflow/stages/<auto_label|mano_opt|qc|manual_segment>
+GET  /api/v1/workflow/stages/<auto_label|qc|manual_label|manual_3d>
 POST /api/v1/workflow/stages/<job_type>/enable
 POST /api/v1/workflow/stages/<job_type>/disable
 ```
@@ -392,10 +426,23 @@ one `task_name`, or all eligible episodes with `{"scope":"all"}` for repair
 or migration. An episode is eligible when it is `uploaded`, has a NAS/data URI,
 and has no existing `auto_label` job.
 
-`manual_segment` lease moves the Episode to `manual_correction_running`.
-Successful segment completion registers `manual_2d` and queues a segment-level
-`mano_opt`; when all failed segments have `mano_succeeded`, the Episode becomes
-`finalized`.
+`manual_label` leases and completes as one episode. Segment rows are detail and
+display records only. Completion registers the episode's `manual_2d`, marks all
+its segments as manually labeled, and queues exactly one `manual_3d` job.
+
+Human workflow state is synchronized to the NAS through a persistent outbox in
+the workflow SQLite database. The backend records `nas-uploader-check take`
+when a QC job is first leased, records either `result passed` or
+`result needs-labeling` after QC completion. A background worker executes these
+commands over SSH and retries transient failures without duplicating the
+business event. Manual publishing is owned exclusively by Manual Publisher Bridge.
+The NAS command receives the three-part path parsed from `episode_uri`, never
+the backend's internal Episode UUID.
+
+The NAS protocol currently has no result value for the backend's
+`qc_bad_episode` outcome. Such Episodes retain `nas_sync_status` set to
+`unsupported_bad_episode` and are not incorrectly reported as passed or as
+requiring manual labeling.
 
 ## Development Manual Label Jobs
 
@@ -421,8 +468,9 @@ curl -s http://127.0.0.1:8765/api/v1/dev/label/jobs \
   }'
 ```
 
-The endpoint creates a `pending_manual` segment. It requires a NAS `episode_uri`;
-the expected files live at fixed paths under that episode root.
+The endpoint creates one `pending_manual` segment detail and one episode-level
+`manual_label` job. It requires a NAS `episode_uri`; the expected files live at
+fixed paths under that episode root.
 
 There is also a development-only generic helper for stubbing `upload`,
 `auto_label`, `qc`, or `review` jobs:
@@ -431,9 +479,8 @@ There is also a development-only generic helper for stubbing `upload`,
 POST /api/v1/dev/jobs
 ```
 
-Completing the episode-level `auto_label` job registers or accepts `pred_2d`
-and queues one episode-level `mano_opt`.
-Completing episode `mano_opt` registers `mano_episode` and queues `qc`.
+Completing the episode-level `auto_label` job registers `pred_2d` and
+`mano_episode`, then queues `qc` directly.
 Completing `qc` with `{"result":{"passed":true}}` finalizes the episode.
 Completing `qc` with `passed:false` registers `qc_report`, creates failed
 segments from the returned closed intervals, and moves the episode to
@@ -453,7 +500,7 @@ the backend URL and operator ID:
 
 Click `Refresh Tasks` to load queued correction segments from the backend. The
 GUI groups them by `task_name`; select a task, select an episode, and click
-`Get Selected Episode` to lease that episode's next segment by `start_frame`.
+`Get Selected Episode` to lease that episode and all of its failed segments.
 Legacy JSONL remains available for debugging, but it is no longer the default
 task source.
 
@@ -461,16 +508,16 @@ The collection frontend also exposes a `Manual Label` button on the Collection
 Config page and the Task Select page. It launches the same `python3 -m
 label.main --config <path>` GUI as a separate window. The main app writes that
 launch config from `src/sync/config.json`, including backend URL, operator
-default, lease settings, and NAS mounts. The backend leases each label segment
-with a single `episode_uri`; the label frontend resolves that NAS root through
-the launch config's `nas_mounts` and writes corrected 2D arrays to:
+default, lease settings, and NAS mounts. The backend leases one episode with a
+single `episode_uri`; the label frontend resolves that NAS root through the
+launch config's `nas_mounts` and writes corrected 2D arrays to:
 
 ```text
-manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
+manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
 ```
 
-After all frames in the leased segment are complete, the GUI calls the backend
-complete endpoint and registers a `manual_2d` artifact. The local progress
+After all failed frames in the leased episode are complete, the GUI calls the
+episode complete endpoint and registers a `manual_2d` artifact. The local progress
 CSV is retained only as a temporary cache/legacy aid.
 
 ## Artifact Kinds
@@ -478,9 +525,8 @@ CSV is retained only as a temporary cache/legacy aid.
 Current artifact kind names:
 
 - `pred_2d` / `auto_2d`: automatic 2D output.
-- `manual_2d`: human-corrected segment 2D output.
-- `mano_episode`: episode-level MANO output from automatic 2D.
-- `mano_segment_patch`: segment MANO patch after manual correction.
+- `manual_2d`: human-corrected episode 2D output, with segment ranges retained as metadata.
+- `mano_episode`: episode-level MANO output from automatic or corrected 2D.
 - `qc_report`: quality-control report.
 
 If an existing auto-label pipeline emits `kp2d`, adapt it at the artifact

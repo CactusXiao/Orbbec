@@ -96,11 +96,11 @@ Enable the controlled stages and push uploaded episodes into auto-label:
 ```bash
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/auto_label/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
-curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/mano_opt/enable \
-  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/qc/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
-curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_segment/enable \
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_label/enable \
+  -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
+curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/stages/manual_3d/enable \
   -H 'Content-Type: application/json' -d '{"updated_by":"virtual_workflow"}'
 
 curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
@@ -108,26 +108,23 @@ curl -s -X POST http://127.0.0.1:8765/api/v1/workflow/episodes/push-auto-label \
 ```
 
 If QC fails, open the existing main-menu `Label` page/app. The label frontend
-leases the failed segments from the backend, opens the backend-resolved NAS
+leases the failed episode and all of its segments from the backend, opens the backend-resolved NAS
 episode path, and writes:
 
 ```text
-manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
+manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
 ```
 
-After the Label frontend completes a segment, the already-running virtual
-workers consume the new segment-level `mano_opt` job and write the segment
-patch.
-
-Repeat Label completion and `mano-opt` until the episode finalizes. The backend
-keeps the final NAS source map at:
+After the Label frontend completes the episode, the already-running virtual
+`manual-3d` worker consumes the single episode-level job and replaces the
+episode 3D result. The backend keeps the final NAS source map at:
 
 ```text
 workflow/final_3d_sources.json
 ```
 
-`default` and `all` workers both include only `upload`, `auto-label`,
-`mano-opt`, and `qc`; manual labeling stays in the real Label frontend.
+`default` and `all` workers include `upload`, `auto-label`, `qc`, and
+`manual-3d`; manual labeling stays in the real Label frontend.
 
 ## Simulate Captured Upload Jobs
 

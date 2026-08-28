@@ -32,7 +32,6 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     LabelTask,
     NasSimulator,
     handle_auto_label_once,
-    handle_mano_opt_once,
     handle_qc_once,
     handle_upload_once,
     build_parser,
@@ -405,10 +404,7 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 self.assertTrue((episode_dir / "pred_2d" / "00" / "00000.npy").exists())
                 self.assertTrue((episode_dir / "mano" / "episode" / "joints_3d.npy").exists())
                 self.assertFalse((episode_dir / "mano" / "episode" / "projected_2d").exists())
-                self.assertEqual(
-                    [job for job in store.jobs_for_episode("episode_full", "mano_opt") if job["payload"].get("scope") != "segment"],
-                    [],
-                )
+                self.assertFalse(any(job["type"] == "manual_3d" for job in store.jobs_for_episode("episode_full")))
 
                 random.seed(7)
                 self.assertTrue(handle_qc_once(client, nas, args))
@@ -423,36 +419,35 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                     self.assertGreaterEqual(length, 10)
                     self.assertLessEqual(length, 20)
 
-                completed_segments = 0
-                while True:
-                    try:
-                        leased = label_client.lease_label_segment(
-                            "real_label_storage_smoke",
-                            lease_seconds=60,
-                            task_name="pick_object",
-                            episode_id="episode_full",
-                        )
-                    except Exception as exc:
-                        if "no pending manual segment" in str(exc):
-                            break
-                        raise
-                    self._complete_segment_with_real_label_storage(label_client, leased, {nas_prefix: str(nas_root)})
-                    completed_segments += 1
-                    self.assertTrue(handle_mano_opt_once(client, nas, args))
+                leased = label_client.lease_label_episode(
+                    "real_label_storage_smoke",
+                    lease_seconds=60,
+                    task_name="pick_object",
+                    episode_id="episode_full",
+                )
+                self.assertEqual(len(leased["segments"]), len(segments))
+                self._complete_episode_with_real_label_storage(label_client, leased, {nas_prefix: str(nas_root)})
+                manual_3d = store.jobs_for_episode("episode_full", "manual_3d")[0]
+                service.complete_job(
+                    manual_3d["job_id"],
+                    {
+                        "result": {"ok": True, "completion_policy": "virtual_test"},
+                        "artifacts": [
+                            {"kind": "optimized_pose", "metadata": {"source_job_id": manual_3d["job_id"]}},
+                            {"kind": "mano_episode", "metadata": {"source_job_id": manual_3d["job_id"]}},
+                        ],
+                    },
+                )
 
-                self.assertEqual(completed_segments, len(segments))
                 final_episode = store.get_episode("episode_full")
                 self.assertEqual((final_episode or {}).get("status"), "finalized")
 
                 manifest_path = episode_dir / FINAL_3D_SOURCES_REL_PATH
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 self.assertEqual(manifest["episode_status"], "finalized")
-                self.assertEqual(manifest["ready_override_count"], len(segments))
+                self.assertEqual(manifest["base_3d"]["source"], "manual_3d_episode")
                 self.assertEqual(manifest["qc"]["relative_path"], "qc/qc_report.json")
-                for override in manifest["overrides"]:
-                    self.assertEqual(override["status"], "ready")
-                    self.assertTrue((episode_dir / str(override["manual_2d_relative_path"])).exists())
-                    self.assertTrue((episode_dir / str(override["relative_path"])).exists())
+                self.assertTrue(all(item["status"] == "mano_succeeded" for item in manifest["manual_segments"]))
             finally:
                 detector = getattr(args, "_interaction_hand_gt_detector", None)
                 if detector is not None:
@@ -580,9 +575,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
         return True
 
     @staticmethod
-    def _complete_segment_with_real_label_storage(label_client: LabelBackendClient, leased: dict, mounts: dict[str, str]) -> None:
+    def _complete_episode_with_real_label_storage(label_client: LabelBackendClient, leased: dict, mounts: dict[str, str]) -> None:
         payload = dict(leased.get("payload") or {})
-        segment = dict(leased.get("segment") or {})
         task = correction_task_from_backend_payload(payload, mounts=mounts)
         bundle = load_prediction_bundle(task, mode="pred")
         for frame in task.frames:
@@ -591,9 +585,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 apply_view_state_to_corrected(bundle, int(frame), cam, points, visible)
         save_corrected_array(bundle)
 
-        segment_id = str(segment.get("segment_id") or payload.get("segment_id") or "").strip()
         label_client.complete_label_job(
-            str(segment.get("segment_id") or payload.get("segment_id") or ""),
+            str(payload.get("episode_id") or ""),
             result={
                 "operator_id": "real_label_storage_smoke",
                 "frames_completed": list(task.frames),
@@ -602,7 +595,8 @@ class VirtualWorkflowToolSmokeTest(unittest.TestCase):
                 {
                     "kind": "manual_2d",
                     "metadata": {
-                        "segment_id": segment_id,
+                        "scope": "episode",
+                        "episode_id": str(payload.get("episode_id") or ""),
                         "cameras": list(task.cameras),
                         "frames": list(task.frames),
                         "operator_id": "real_label_storage_smoke",

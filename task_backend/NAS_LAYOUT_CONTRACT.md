@@ -210,7 +210,7 @@ QC 失败时，`segments` 使用：
 目录：
 
 ```text
-<episode>/manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
+<episode>/manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
 ```
 
 文件要求同 `pred_2d`：
@@ -224,47 +224,30 @@ QC 失败时，`segments` 使用：
 ```json
 {
   "kind": "manual_2d",
-  "uri": "nas://.../<episode>/manual_2d/segments/<segment_id>"
+  "uri": "nas://.../<episode>/manual_2d"
 }
 ```
 
-## 8. Segment 级 3D Patch 输出
+QC 返回的 segment 范围仍由后端保存并展示，但人工标注任务、目录所有权和
+完成动作均以整个 episode 为单位。
 
-目录：
+## 8. 人工返修后的 Episode 级 3D 输出
+
+二次优化覆盖同一个 episode 级稳定目录：
 
 ```text
-<episode>/mano/segments/<segment_id>/
+<episode>/mano/episode/
   joints_3d.npy
-  mano_patch.json
+  mano_episode.json
 ```
 
-`joints_3d.npy`：
-
-- dtype：`float32`
-- shape：`(N, 2, 21, 3)`
-- 只包含该 segment 的 `frames`
-
-`mano_patch.json` 最小字段：
+输出格式与首次 episode 级 MANO 相同；对应后端 artifact 为新一代
+`mano_episode`：
 
 ```json
 {
-  "schema_version": 1,
-  "kind": "orbbec_mano_3d_segment_patch",
-  "segment_id": "<segment_id>",
-  "frames": [10, 11, 12],
-  "cameras": ["00", "01"],
-  "joints_3d_file": "joints_3d.npy",
-  "coordinate_system": "declared_by_worker",
-  "model": "mano_v1"
-}
-```
-
-对应后端 artifact：
-
-```json
-{
-  "kind": "mano_segment_patch",
-  "uri": "nas://.../<episode>/mano/segments/<segment_id>"
+  "kind": "mano_episode",
+  "uri": "nas://.../<episode>/mano/episode"
 }
 ```
 
@@ -276,10 +259,8 @@ QC 失败时，`segments` 使用：
 <episode>/workflow/final_3d_sources.json
 ```
 
-worker 不得写该文件。它用于声明最终 3D 结果来源：
-
-- 默认使用 `mano/episode`
-- 对 QC 失败并返修成功的帧段，使用 `mano/segments/<segment_id>`
+worker 不得写该文件。它声明当前整个 episode 使用的 `mano/episode`，并
+附带人工返修 segment 的进度明细；不再存在逐 segment 的 3D 覆盖规则。
 
 ## 10. 写入规则
 
@@ -287,9 +268,9 @@ worker 不得写该文件。它用于声明最终 3D 结果来源：
 - 写入大文件必须先写临时文件，再原子 rename 到目标文件。
 - complete API 必须在文件全部落盘后调用。
 - URI 必须指向最终稳定目录或文件，不能指向临时路径。
-- 同一 job 重试时允许覆盖本 job 的未完成输出，不得覆盖其他 job 或其他 segment 输出。
+- 同一 job 重试时允许覆盖本 job 的未完成输出，不得覆盖其他 job 输出。
 - 文件名中的帧号固定为 5 位十进制：`00000.npy`。
-- 目录名、camera ID、segment ID 必须与后端 payload 保持一致。
+- 目录名、camera ID、manual label job ID 必须与后端 payload 保持一致。
 
 ## 11. 禁止事项
 
@@ -297,7 +278,6 @@ worker 不得写该文件。它用于声明最终 3D 结果来源：
 - 禁止 worker 写 `workflow/final_3d_sources.json`。
 - 禁止把自动标注结果写入 `manual_2d`。
 - 禁止把人工返修结果写入 `pred_2d`。
-- 禁止不同 segment 共用同一 `mano/segments/<segment_id>` 目录。
 - 禁止 complete 后继续修改已登记 artifact。
 
 ## 12. 最小验收
@@ -318,7 +298,7 @@ worker 不得写该文件。它用于声明最终 3D 结果来源：
 
 ```text
 <episode>/
-  manual_2d/segments/<segment_id>/<camera>/<frame:05d>.npy
-  mano/segments/<segment_id>/joints_3d.npy
-  mano/segments/<segment_id>/mano_patch.json
+  manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
+  mano/episode/joints_3d.npy
+  mano/episode/mano_episode.json
 ```
