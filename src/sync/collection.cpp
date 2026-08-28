@@ -2878,6 +2878,14 @@ public:
         std::string message;
     };
 
+    struct RgbWarmupReadiness {
+        size_t warmedCameras = 0;
+        size_t totalCameras = 0;
+        bool   allReady = false;
+        double remainingSeconds = 0.0;
+        std::string message;
+    };
+
     explicit MultiDeviceStreamingRecorder(AppConfig baseCfg, EgoRecorder *sharedEgoRecorder = nullptr)
         : cfg_(std::move(baseCfg)),
           egoRecorder_(sharedEgoRecorder ? *sharedEgoRecorder : ownedEgoRecorder_),
@@ -3259,6 +3267,71 @@ public:
                         oss << ", ";
                     }
                     oss << missing[i];
+                }
+            }
+        }
+        readiness.message = oss.str();
+        return readiness;
+    }
+
+    RgbWarmupReadiness rgbWarmupReadiness(double requiredSeconds) const {
+        RgbWarmupReadiness readiness;
+        requiredSeconds = std::max(0.0, requiredSeconds);
+
+        std::vector<std::pair<std::string, std::string>> cameras;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            cameras.reserve(buffers_.size());
+            for(const auto &kv: buffers_) {
+                cameras.emplace_back(kv.first, kv.second.camKey);
+            }
+        }
+        readiness.totalCameras = cameras.size();
+
+        std::vector<std::string> waiting;
+        {
+            std::lock_guard<std::mutex> lock(streamHealthMtx_);
+            for(const auto &camera: cameras) {
+                const auto it = streamHealth_.find(streamHealthKey(camera.first, CollectDataType::RGB));
+                double receivedSeconds = 0.0;
+                if(it != streamHealth_.end()
+                   && it->second.firstFrameSteady.time_since_epoch().count() != 0
+                   && it->second.lastFrameSteady.time_since_epoch().count() != 0) {
+                    receivedSeconds = std::chrono::duration_cast<std::chrono::duration<double>>(
+                        it->second.lastFrameSteady - it->second.firstFrameSteady).count();
+                }
+                if(receivedSeconds >= requiredSeconds) {
+                    readiness.warmedCameras++;
+                }
+                else {
+                    readiness.remainingSeconds = std::max(readiness.remainingSeconds,
+                                                          requiredSeconds - receivedSeconds);
+                    if(waiting.size() < 3) {
+                        waiting.push_back("cam" + camera.second);
+                    }
+                }
+            }
+        }
+
+        readiness.allReady = readiness.totalCameras > 0
+                          && readiness.warmedCameras == readiness.totalCameras;
+        std::ostringstream oss;
+        oss.setf(std::ios::fixed);
+        if(readiness.allReady) {
+            oss << "Initial RGB warm-up complete: " << readiness.totalCameras << " cameras received "
+                << std::setprecision(1) << requiredSeconds << " s";
+        }
+        else {
+            oss << "Initial RGB warm-up: " << readiness.warmedCameras << "/" << readiness.totalCameras
+                << " cameras, " << std::setprecision(1) << std::max(0.0, readiness.remainingSeconds)
+                << " s remaining";
+            if(!waiting.empty()) {
+                oss << "  waiting for ";
+                for(size_t i = 0; i < waiting.size(); ++i) {
+                    if(i > 0) {
+                        oss << ", ";
+                    }
+                    oss << waiting[i];
                 }
             }
         }
@@ -4685,6 +4758,7 @@ private:
         std::string displayName;
         CollectDataType type = CollectDataType::RGB;
         std::chrono::steady_clock::time_point startedSteady{};
+        std::chrono::steady_clock::time_point firstFrameSteady{};
         std::chrono::steady_clock::time_point lastFrameSteady{};
         uint64_t lastFrameTimestampUs = 0;
         bool requireTimestampAdvance = false;
@@ -6009,6 +6083,9 @@ private:
         auto it = streamHealth_.find(streamHealthKey(deviceSn, type));
         if(it == streamHealth_.end()) {
             return;
+        }
+        if(it->second.firstFrameSteady.time_since_epoch().count() == 0) {
+            it->second.firstFrameSteady = now;
         }
         it->second.lastFrameSteady = now;
         it->second.everReceived = true;
@@ -10151,6 +10228,10 @@ int run_collection(const AppConfig &cfg,
     bool cameraReadyAnnounced = false;
     bool extrinsicReadyChecked = false;
     bool extrinsicReadyPassed = false;
+    // This flag intentionally survives reset/confirm retries and is recreated only
+    // when run_collection is entered again.
+    bool initialRgbWarmupCompleted = false;
+    constexpr double kInitialRgbWarmupSeconds = 5.0;
     std::chrono::steady_clock::time_point drainStartedAt{};
     std::chrono::steady_clock::time_point nextDrainStatusLog{};
     std::unordered_map<std::string, cv::Mat> latestFrameCache;
@@ -11158,6 +11239,9 @@ int run_collection(const AppConfig &cfg,
                         page = CollectionPage::Capture;
                         announce("enter", "enter");
                         pushUiLog("Enter capture: " + keep);
+                        if(cfg.extrinsicHealth.enabled && cfgUi.enableMultiview && !initialRgbWarmupCompleted) {
+                            pushUiLog("Initial RGB warm-up started: every camera must receive a full 5 seconds before the first extrinsic check.");
+                        }
                         const std::string s = recorder.streamProfilesLine();
                         if(!s.empty()) {
                             pushUiLog(s);
@@ -11220,8 +11304,15 @@ int run_collection(const AppConfig &cfg,
             const bool selectedTaskComplete = taskSelected && isTaskComplete(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
             const bool selectedTaskClaimedByOther = taskSelected && capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].claimedByOther;
             const bool selectedTaskSelectable = taskSelected && isTaskSelectable(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)]);
+            const bool initialRgbWarmupRequired = cfg.extrinsicHealth.enabled && cfgUi.enableMultiview;
+            const auto initialRgbWarmup = recorder.rgbWarmupReadiness(kInitialRgbWarmupSeconds);
+            if(initialRgbWarmupRequired && !initialRgbWarmupCompleted && initialRgbWarmup.allReady) {
+                initialRgbWarmupCompleted = true;
+                pushUiLog(initialRgbWarmup.message);
+            }
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
-               && selectedTaskSelectable && !extrinsicReadyChecked) {
+               && selectedTaskSelectable && !extrinsicReadyChecked
+               && (!initialRgbWarmupRequired || initialRgbWarmupCompleted)) {
                 collectionSetStage("ui_extrinsic_ready_check");
                 pushUiLog("Checking camera extrinsics before READY...");
 
@@ -11384,7 +11475,12 @@ int run_collection(const AppConfig &cfg,
                     stateEmphasisLine = cameraReadiness.message;
                 }
                 else if(cameraReadiness.allReady) {
-                    if(extrinsicReadyChecked && !extrinsicReadyPassed) {
+                    if(initialRgbWarmupRequired && !initialRgbWarmupCompleted) {
+                        sd = {"WARMING UP", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                        stateEmphasisLine = initialRgbWarmup.message;
+                        stateFootnoteLine = "The first extrinsic check waits for 5 seconds of RGB from every camera";
+                    }
+                    else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
                         sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
                         stateEmphasisLine = "Extrinsic check failed";
                         stateFootnoteLine = "Fix AprilTags/cameras, then re-enter capture or restart cameras to retry";
@@ -11599,6 +11695,9 @@ int run_collection(const AppConfig &cfg,
                 }
                 else if(!cameraReadiness.allReady) {
                     startLabel = "Start (warming up)";
+                }
+                else if(initialRgbWarmupRequired && !initialRgbWarmupCompleted) {
+                    startLabel = "Start (RGB warm-up)";
                 }
                 else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
                     startLabel = "Start (check failed)";
