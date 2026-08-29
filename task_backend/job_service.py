@@ -1581,7 +1581,8 @@ class JobService:
         return frames
 
     def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any], *, reason: str = "mano_episode_succeeded") -> None:
-        if self.store.jobs_for_episode(episode_id, "qc"):
+        existing_qc_jobs = self.store.jobs_for_episode(episode_id, "qc")
+        if any(str(job.get("status") or "") != "canceled" for job in existing_qc_jobs):
             return
         episode = self.store.get_episode(episode_id)
         if episode is None:
@@ -1595,6 +1596,10 @@ class JobService:
         )
         base_id = _stable_id_part(episode_id, "episode")
         job_id = str(result.get("qc_job_id") or f"qc_{base_id}")
+        if existing_qc_jobs:
+            # A QC worker canceled after an upstream MANO reset may still send
+            # late heartbeats. Use a new id so it cannot attach to the new run.
+            job_id = f"{job_id}_retry_{len(existing_qc_jobs)}"
         payload = {
             "job_id": job_id,
             "episode_id": episode["episode_id"],

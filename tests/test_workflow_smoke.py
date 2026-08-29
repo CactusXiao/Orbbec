@@ -407,6 +407,29 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(manifest["base_3d"]["relative_path"], "mano/episode")
             self.assertEqual(manifest["manual_segments"], [])
 
+    def test_canceled_qc_is_recreated_with_new_id_after_upstream_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path)})
+            self._create_uploaded_episode(store, tmp_path, "episode_qc_retry", frames=2)
+            self._advance_to_qc_job(service, store, "episode_qc_retry")
+
+            original = store.jobs_for_episode("episode_qc_retry", "qc")[0]
+            store.cancel_job(job_id=original["job_id"], reason="upstream_mano_reset")
+            service._create_qc_job_from_existing_episode(
+                "episode_qc_retry",
+                {"ok": True},
+                reason="auto_label_episode_3d_succeeded",
+            )
+
+            qc_jobs = store.jobs_for_episode("episode_qc_retry", "qc")
+            self.assertEqual(len(qc_jobs), 2)
+            self.assertEqual(qc_jobs[0]["status"], "canceled")
+            self.assertEqual(qc_jobs[0]["result"]["cancel_reason"], "upstream_mano_reset")
+            self.assertEqual(qc_jobs[1]["status"], "queued")
+            self.assertNotEqual(qc_jobs[1]["job_id"], qc_jobs[0]["job_id"])
+
     def test_qc_failure_creates_one_episode_label_and_one_episode_3d_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

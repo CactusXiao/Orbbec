@@ -942,6 +942,32 @@ class WorkflowStore:
                 raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"failed job not found: {job_id}")
             return updated
 
+    def cancel_job(self, *, job_id: str, reason: str = "") -> Dict[str, Any]:
+        """Cancel an unfinished job while retaining its prior result for audit."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self._get_job_unlocked(conn, job_id)
+            if job is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+            if str(job["status"]) in TERMINAL_JOB_STATUSES:
+                return job
+            result = dict(job.get("result") or {})
+            if reason:
+                result["cancel_reason"] = str(reason)
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled', result_json = ?, lease_owner = NULL,
+                    lease_until = NULL, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (_json_dumps(result), now_iso(), job_id),
+            )
+            updated = self._get_job_unlocked(conn, job_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"canceled job not found: {job_id}")
+            return updated
+
     def release_job(self, *, job_id: str, reason: str = "") -> Tuple[Dict[str, Any], bool]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
