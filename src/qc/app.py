@@ -743,6 +743,7 @@ class DecodePage(ttk.Frame):
             "failed": "失败",
             "mesh_pending": "等待渲染 mesh",
             "mesh_rendering": "渲染 mesh",
+            "mesh_software_fallback": "软件渲染 mesh",
             "mesh_done": "mesh 完成",
         }
         self._tree.item(

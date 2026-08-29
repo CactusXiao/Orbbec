@@ -12,6 +12,28 @@ from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, nor
 
 
 class QcWorkerSmokeTest(unittest.TestCase):
+    def test_software_mesh_renderer_fallback_draws_surface(self) -> None:
+        try:
+            from src.qc.mesh_renderer import CameraMeshRenderer
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"mesh renderer dependency unavailable: {exc}")
+        renderer = CameraMeshRenderer(
+            camera="00",
+            width=32,
+            height=32,
+            intrinsics=np.asarray([[100.0, 0.0, 16.0], [0.0, 100.0, 16.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+            render_factor=1.0,
+        )
+        renderer.close()
+        vertices = np.asarray([[-0.08, -0.08, 1.0], [0.08, -0.08, 1.0], [0.0, 0.08, 1.0]], dtype=np.float32)
+        rendered = renderer.composite(
+            np.zeros((32, 32, 3), dtype=np.uint8),
+            {0: vertices, 1: vertices + np.asarray([0.02, 0.0, 0.0], dtype=np.float32)},
+            {0: np.asarray([[0, 1, 2]], dtype=np.int32), 1: np.asarray([[0, 1, 2]], dtype=np.int32)},
+        )
+
+        self.assertGreater(int(rendered.sum()), 0)
+
     def test_normalize_bad_frame_ranges_merges_overlap_touching_and_small_gaps(self) -> None:
         ranges = normalize_ranges([(20, 25), (10, 12), (13, 14), (30, 31)], max_gap_frames=5)
 

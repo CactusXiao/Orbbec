@@ -93,27 +93,57 @@ def _add_lights(scene: Any, pyrender: Any) -> None:
 
 
 class CameraMeshRenderer:
-    def __init__(self, *, width: int, height: int, intrinsics: np.ndarray, render_factor: float):
-        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
-        import pyrender
-        import trimesh
-
-        self.pyrender = pyrender
-        self.trimesh = trimesh
+    def __init__(self, *, camera: str, width: int, height: int, intrinsics: np.ndarray, render_factor: float):
+        self.camera = str(camera)
         self.width = int(width)
         self.height = int(height)
         self.factor = float(render_factor)
         self.intrinsics = np.asarray(intrinsics, dtype=np.float32)
-        self.renderer = pyrender.OffscreenRenderer(
-            viewport_width=max(1, int(round(self.width * self.factor))),
-            viewport_height=max(1, int(round(self.height * self.factor))),
-            point_size=1.0,
-        )
+        self.pyrender = None
+        self.trimesh = None
+        self.renderer = None
+        self._initialize_opengl()
+
+    def _initialize_opengl(self) -> None:
+        # QC runs as a desktop application. Prefer the host's working GLX/pyglet
+        # context when a display is present; reserve EGL for truly headless use.
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            os.environ.pop("PYOPENGL_PLATFORM", None)
+        else:
+            os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+        try:
+            import pyrender
+            import trimesh
+
+            self.pyrender = pyrender
+            self.trimesh = trimesh
+            self.renderer = pyrender.OffscreenRenderer(
+                viewport_width=max(1, int(round(self.width * self.factor))),
+                viewport_height=max(1, int(round(self.height * self.factor))),
+                point_size=1.0,
+            )
+        except Exception as exc:
+            self.pyrender = None
+            self.trimesh = None
+            self.renderer = None
+            _emit(
+                camera=self.camera,
+                status="mesh_software_fallback",
+                error=f"OpenGL unavailable; using software mesh renderer: {type(exc).__name__}: {exc}",
+            )
 
     def close(self) -> None:
-        self.renderer.delete()
+        if self.renderer is None:
+            return
+        try:
+            self.renderer.delete()
+        except Exception:
+            pass
+        self.renderer = None
 
     def composite(self, image: np.ndarray, vertices_by_hand: Mapping[int, np.ndarray], faces: Mapping[int, np.ndarray]) -> np.ndarray:
+        if self.renderer is None or self.pyrender is None or self.trimesh is None:
+            return self._software_composite(image, vertices_by_hand, faces)
         pyrender = self.pyrender
         scene = pyrender.Scene(bg_color=[0.0, 0.0, 0.0, 0.0], ambient_light=(0.25, 0.25, 0.25))
         for hand in (0, 1):
@@ -129,7 +159,18 @@ class CameraMeshRenderer:
         )
         scene.add_node(pyrender.Node(camera=camera, matrix=np.eye(4, dtype=np.float32)))
         _add_lights(scene, pyrender)
-        rgba, _ = self.renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
+        try:
+            rgba, _ = self.renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
+        except Exception as exc:
+            _emit(
+                camera=self.camera,
+                status="mesh_software_fallback",
+                error=f"OpenGL render failed; using software mesh renderer: {type(exc).__name__}: {exc}",
+            )
+            self.close()
+            self.pyrender = None
+            self.trimesh = None
+            return self._software_composite(image, vertices_by_hand, faces)
         layer = rgba.astype(np.float32) / 255.0
         if self.factor != 1.0:
             layer = cv2.resize(layer, (self.width, self.height), interpolation=cv2.INTER_AREA)
@@ -137,6 +178,45 @@ class CameraMeshRenderer:
         alpha = layer[:, :, 3:]
         composite_rgb = image_rgb * (1.0 - alpha) + layer[:, :, :3] * alpha
         return np.clip(composite_rgb[:, :, ::-1] * 255.0, 0.0, 255.0).astype(np.uint8)
+
+    def _software_composite(
+        self,
+        image: np.ndarray,
+        vertices_by_hand: Mapping[int, np.ndarray],
+        faces: Mapping[int, np.ndarray],
+    ) -> np.ndarray:
+        """Depth-sort and rasterize MANO triangles without an OpenGL context."""
+        triangles = []
+        k = self.intrinsics
+        for hand in (0, 1):
+            vertices = np.asarray(vertices_by_hand[hand], dtype=np.float32)
+            z = vertices[:, 2]
+            valid = np.isfinite(vertices).all(axis=1) & (z > 1e-6)
+            uv = np.full((len(vertices), 2), np.nan, dtype=np.float32)
+            uv[valid, 0] = vertices[valid, 0] / z[valid] * k[0, 0] + k[0, 2]
+            uv[valid, 1] = vertices[valid, 1] / z[valid] * k[1, 1] + k[1, 2]
+            base_rgb = np.asarray(HAND_COLORS_RGB[hand], dtype=np.float32) * 255.0
+            base_bgr = base_rgb[::-1]
+            for face in np.asarray(faces[hand], dtype=np.int32):
+                indices = face[:3]
+                if not np.all(valid[indices]):
+                    continue
+                points = uv[indices]
+                if not np.isfinite(points).all():
+                    continue
+                edge_a = vertices[indices[1]] - vertices[indices[0]]
+                edge_b = vertices[indices[2]] - vertices[indices[0]]
+                normal = np.cross(edge_a, edge_b)
+                normal_length = float(np.linalg.norm(normal))
+                facing = 0.0 if normal_length <= 1e-8 else abs(float(normal[2])) / normal_length
+                brightness = 0.58 + 0.42 * facing
+                color = tuple(int(value) for value in np.clip(base_bgr * brightness, 0, 255))
+                triangles.append((float(np.mean(z[indices])), np.rint(points).astype(np.int32), color))
+
+        rendered = image.copy()
+        for _depth, points, color in sorted(triangles, key=lambda item: item[0], reverse=True):
+            cv2.fillConvexPoly(rendered, points, color, lineType=cv2.LINE_AA)
+        return rendered
 
 
 def render_request(request: Mapping[str, Any]) -> None:
@@ -190,6 +270,7 @@ def render_request(request: Mapping[str, Any]) -> None:
                 renderer = renderers.get(camera)
                 if renderer is None:
                     renderer = CameraMeshRenderer(
+                        camera=camera,
                         width=width,
                         height=height,
                         intrinsics=camera_params[camera].k,
