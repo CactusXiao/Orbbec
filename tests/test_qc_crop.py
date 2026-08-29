@@ -49,6 +49,15 @@ class QcHandCropTest(unittest.TestCase):
         self.assertGreaterEqual(x1, 0.0)
         self.assertLessEqual(x2, 1000.0)
 
+    def test_impossible_aspect_keeps_both_hands_instead_of_trimming_focus_region(self) -> None:
+        # Simulates one hand near the top and the other near the bottom. A 16:9
+        # crop cannot span this full region within the source image width.
+        both_hands_region = (450.0, 0.0, 550.0, 800.0)
+
+        crop = expand_region_to_aspect(both_hands_region, (1000, 800), 16.0 / 9.0)
+
+        self.assertEqual(crop, both_hands_region)
+
 
 if __name__ == "__main__":
     unittest.main()

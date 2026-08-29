@@ -67,7 +67,12 @@ def _bounded_axis(center: float, size: float, limit: float) -> Tuple[float, floa
 
 
 def expand_region_to_aspect(region: Box, image_size: Tuple[int, int], target_aspect: float) -> Box:
-    """Expand an image-space region to a display aspect ratio, keeping it in bounds."""
+    """Expand a focus region to the display aspect without dropping focus content.
+
+    If the requested aspect cannot contain the entire region inside the source
+    image, keep the original region.  The canvas will letterbox that case so
+    both hands remain visible instead of cropping one away.
+    """
     iw, ih = float(image_size[0]), float(image_size[1])
     x1, y1, x2, y2 = region
     width, height = max(1.0, x2 - x1), max(1.0, y2 - y1)
@@ -75,12 +80,8 @@ def expand_region_to_aspect(region: Box, image_size: Tuple[int, int], target_asp
 
     crop_width = max(width, height * target_aspect)
     crop_height = crop_width / target_aspect
-    if crop_height > ih:
-        crop_height = ih
-        crop_width = crop_height * target_aspect
-    if crop_width > iw:
-        crop_width = iw
-        crop_height = crop_width / target_aspect
+    if crop_width > iw or crop_height > ih:
+        return region
 
     center_x, center_y = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     crop_x1 = _position_crop_axis(center_x, crop_width, iw, x1, x2)
