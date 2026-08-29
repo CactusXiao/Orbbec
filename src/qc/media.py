@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -51,6 +52,7 @@ class MeshRendererSettings:
     mano_toolkit_root: Path
     mano_model_dir: Path
     render_factor: float = 1.0
+    workers: int = 8
 
 
 def media_from_payload(payload: Mapping[str, Any], mounts: Mapping[str, str]) -> QcEpisodeMedia:
@@ -77,11 +79,11 @@ def prepare_qc_media(
     for camera in task.cameras:
         _emit(on_progress, camera, status="pending", decoded=_count_cached(cache_dir, camera, task.frames), total=total, error="")
 
-    for camera in task.cameras:
+    def prepare_camera(camera: str) -> None:
         decoded = _count_cached(cache_dir, camera, task.frames)
         if decoded >= total and total > 0:
             _emit(on_progress, camera, status="done", decoded=decoded, total=total, error="")
-            continue
+            return
         try:
             video_path, timestamp_path = _locate_rgb_video(task.episode_dir(), camera, payload)
             frame_map = _load_frame_map(timestamp_path)
@@ -100,9 +102,15 @@ def prepare_qc_media(
             has_original_frames = all(find_frame_path(task.episode_dir(), camera, frame, task.rgb_path_template) is not None for frame in task.frames)
             if has_original_frames:
                 _emit(on_progress, camera, status="done", decoded=total, total=total, error="", note="using existing RGB frames")
-                continue
+                return
             _emit(on_progress, camera, status="failed", decoded=decoded, total=total, error=str(exc))
             raise
+
+    cameras = [str(camera) for camera in task.cameras]
+    with ThreadPoolExecutor(max_workers=max(1, min(6, len(cameras)))) as executor:
+        futures = [executor.submit(prepare_camera, camera) for camera in cameras]
+        for future in as_completed(futures):
+            future.result()
     if mesh_renderer is not None:
         _prepare_mesh_frames(
             task=task,
@@ -170,6 +178,7 @@ def _prepare_mesh_frames(
         "mano_toolkit_root": str(settings.mano_toolkit_root),
         "mano_model_dir": str(settings.mano_model_dir),
         "render_factor": float(settings.render_factor),
+        "workers": max(1, int(settings.workers)),
     }
     cache_dir.mkdir(parents=True, exist_ok=True)
     fd, request_name = tempfile.mkstemp(prefix="mesh_render_", suffix=".json", dir=str(cache_dir))

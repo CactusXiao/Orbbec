@@ -378,6 +378,7 @@ bool launchQcFrontend(const AppConfig &cfg,
     cJSON_AddStringToObject(root, "mano_toolkit_root", frontend.manoToolkitRoot.string().c_str());
     cJSON_AddStringToObject(root, "mano_model_dir", frontend.manoModelDir.string().c_str());
     cJSON_AddNumberToObject(root, "mesh_render_factor", std::max(0.5, std::min(4.0, frontend.meshRenderFactor)));
+    cJSON_AddNumberToObject(root, "mesh_render_workers", std::max(1, std::min(32, frontend.meshRenderWorkers)));
     addNasMountsConfig(root, cfg.taskBackend.nas);
     const bool wroteConfig = writeJsonConfigFile(root, launchConfigPath, errorMessage);
     cJSON_Delete(root);
@@ -1029,6 +1030,9 @@ AppConfig loadConfig(const fs::path &configPath) {
                     }
                     if(auto v = getDouble(qcObj, "meshRenderFactor")) {
                         cfg.frontends.qc.meshRenderFactor = std::max(0.5, std::min(4.0, *v));
+                    }
+                    if(auto v = getInt(qcObj, "meshRenderWorkers")) {
+                        cfg.frontends.qc.meshRenderWorkers = std::max(1, std::min(32, *v));
                     }
                 }
             }

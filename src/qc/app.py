@@ -245,6 +245,7 @@ class QcWorkerApp(tk.Tk):
                         mano_toolkit_root=self.config.mano_toolkit_root,
                         mano_model_dir=self.config.mano_model_dir,
                         render_factor=self.config.mesh_render_factor,
+                        workers=self.config.mesh_render_workers,
                     ),
                 )
                 return media, None

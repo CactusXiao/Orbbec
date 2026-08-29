@@ -110,6 +110,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
                         "mano_toolkit_root": "/opt/mano/toolkit",
                         "mano_model_dir": "/opt/mano/models",
                         "mesh_render_factor": 1.5,
+                        "mesh_render_workers": 12,
                         "nas_mounts": {"nas://ego": "/mnt/nas"},
                     }
                 ),
@@ -133,6 +134,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(config.mano_toolkit_root, Path("/opt/mano/toolkit"))
             self.assertEqual(config.mano_model_dir, Path("/opt/mano/models"))
             self.assertEqual(config.mesh_render_factor, 1.5)
+            self.assertEqual(config.mesh_render_workers, 12)
             self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
 
     def test_video_progress_requires_playback_completion(self) -> None:

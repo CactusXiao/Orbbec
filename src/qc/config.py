@@ -26,6 +26,7 @@ class QcConfig:
     mano_toolkit_root: Path
     mano_model_dir: Path
     mesh_render_factor: float
+    mesh_render_workers: int
 
     @property
     def default_lease_seconds(self) -> int:
@@ -137,6 +138,7 @@ def load_qc_config(*, config_path: Optional[Path] = None, cwd: Optional[Path] = 
             base,
         ),
         mesh_render_factor=max(0.5, min(4.0, _float(data, "mesh_render_factor", 1.0))),
+        mesh_render_workers=max(1, min(32, _int(data, "mesh_render_workers", 8))),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

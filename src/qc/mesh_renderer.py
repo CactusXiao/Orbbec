@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.util
 import json
+import multiprocessing
 import os
 import sys
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 
 HAND_COLORS_RGB = {0: (0.85, 0.45, 0.45), 1: (0.65, 0.74, 0.86)}
+
+_WORKER_STATE: Dict[str, Any] = {}
+_WORKER_RENDERERS: Dict[str, "CameraMeshRenderer"] = {}
 
 
 def _emit(**fields: Any) -> None:
@@ -219,6 +225,85 @@ class CameraMeshRenderer:
         return rendered
 
 
+def _close_worker_renderers() -> None:
+    for renderer in _WORKER_RENDERERS.values():
+        renderer.close()
+    _WORKER_RENDERERS.clear()
+
+
+def _initialize_render_worker(state: Mapping[str, Any]) -> None:
+    """Initialize one process that renders complete six-view frame groups."""
+    global _WORKER_STATE
+    _WORKER_STATE = dict(state)
+    _WORKER_RENDERERS.clear()
+    cv2.setNumThreads(1)
+    atexit.register(_close_worker_renderers)
+
+
+def _render_frame_worker(frame: int, vertices_world: Mapping[int, np.ndarray]) -> Tuple[int, List[str]]:
+    if not _WORKER_STATE:
+        raise RuntimeError("mesh render worker was not initialized")
+    episode_dir = Path(str(_WORKER_STATE["episode_dir"]))
+    rgb_cache_dir = Path(str(_WORKER_STATE["rgb_cache_dir"]))
+    output_dir = Path(str(_WORKER_STATE["output_dir"]))
+    cameras = [str(value) for value in _WORKER_STATE["cameras"]]
+    camera_params = _WORKER_STATE["camera_params"]
+    faces = _WORKER_STATE["faces"]
+    factor = float(_WORKER_STATE["render_factor"])
+    rendered_cameras: List[str] = []
+
+    for camera in cameras:
+        target = output_dir / camera / f"{int(frame):05d}.jpg"
+        if target.is_file():
+            continue
+        source_path = _source_frame(episode_dir, rgb_cache_dir, camera, int(frame))
+        image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError(f"failed to read RGB frame: {source_path}")
+        height, width = image.shape[:2]
+        renderer = _WORKER_RENDERERS.get(camera)
+        if renderer is None:
+            renderer = CameraMeshRenderer(
+                camera=camera,
+                width=width,
+                height=height,
+                intrinsics=np.asarray(camera_params[camera]["k"], dtype=np.float32),
+                render_factor=factor,
+            )
+            _WORKER_RENDERERS[camera] = renderer
+
+        r = np.asarray(camera_params[camera]["r"], dtype=np.float32)
+        t = np.asarray(camera_params[camera]["t"], dtype=np.float32)
+        vertices_by_hand = {
+            hand: np.matmul(np.asarray(vertices_world[hand], dtype=np.float32), r.T) + t
+            for hand in (0, 1)
+        }
+        rendered = renderer.composite(image, vertices_by_hand, faces)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp.jpg")
+        if not cv2.imwrite(str(temporary), rendered, [cv2.IMWRITE_JPEG_QUALITY, 92]):
+            raise RuntimeError(f"failed to write mesh frame: {temporary}")
+        os.replace(temporary, target)
+        rendered_cameras.append(camera)
+    return int(frame), rendered_cameras
+
+
+def _world_vertices_for_frame(
+    *,
+    frame: int,
+    pose_dir: Path,
+    mano: Any,
+    betas: np.ndarray,
+    scales: np.ndarray,
+    layers: Mapping[int, Any],
+) -> Dict[int, np.ndarray]:
+    pose = mano.load_pose(pose_dir / f"{int(frame):05d}.npy")
+    outputs = mano.mano_outputs_from_pose(pose, betas, scales, layers)
+    return {
+        hand: outputs[hand]["vertices"][0].detach().cpu().numpy().astype(np.float32, copy=False)
+        for hand in (0, 1)
+    }
+
+
 def render_request(request: Mapping[str, Any]) -> None:
     import torch
 
@@ -232,6 +317,7 @@ def render_request(request: Mapping[str, Any]) -> None:
     cameras = [str(value) for value in request.get("cameras") or []][:6]
     frames = sorted({int(value) for value in request.get("frames") or []})
     factor = float(request.get("render_factor") or 1.0)
+    requested_workers = max(1, min(32, int(request.get("workers") or 1)))
     if not cameras or not frames:
         raise ValueError("mesh render request requires cameras and frames")
     pose_dir = episode_dir / "optimized_pose"
@@ -243,61 +329,100 @@ def render_request(request: Mapping[str, Any]) -> None:
     faces = {hand: mano.mano_faces(layers[hand]) for hand in (0, 1)}
     betas, scales = _load_shape_scale(episode_dir)
     camera_params = load_episode_cameras(episode_dir, cameras)
-    renderers: Dict[str, CameraMeshRenderer] = {}
     completed = {camera: 0 for camera in cameras}
     total = len(frames)
     progress_step = max(1, total // 100)
-    try:
-        for camera in cameras:
-            (output_dir / camera).mkdir(parents=True, exist_ok=True)
-            completed[camera] = sum(1 for frame in frames if (output_dir / camera / f"{frame:05d}.jpg").is_file())
-            _emit(camera=camera, status="mesh_pending", rendered=completed[camera], total=total)
+    for camera in cameras:
+        (output_dir / camera).mkdir(parents=True, exist_ok=True)
+        completed[camera] = sum(1 for frame in frames if (output_dir / camera / f"{frame:05d}.jpg").is_file())
+        _emit(camera=camera, status="mesh_pending", rendered=completed[camera], total=total)
 
-        for frame in frames:
-            targets = {camera: output_dir / camera / f"{frame:05d}.jpg" for camera in cameras}
-            missing_cameras = [camera for camera in cameras if not targets[camera].is_file()]
-            if not missing_cameras:
-                continue
-            pose_path = pose_dir / f"{frame:05d}.npy"
-            pose = mano.load_pose(pose_path)
-            outputs = mano.mano_outputs_from_pose(pose, betas, scales, layers)
-            for camera in missing_cameras:
-                source_path = _source_frame(episode_dir, rgb_cache_dir, camera, frame)
-                image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
-                if image is None:
-                    raise RuntimeError(f"failed to read RGB frame: {source_path}")
-                height, width = image.shape[:2]
-                renderer = renderers.get(camera)
-                if renderer is None:
-                    renderer = CameraMeshRenderer(
-                        camera=camera,
-                        width=width,
-                        height=height,
-                        intrinsics=camera_params[camera].k,
-                        render_factor=factor,
-                    )
-                    renderers[camera] = renderer
-                r = torch.as_tensor(camera_params[camera].r, dtype=torch.float32)
-                t = torch.as_tensor(camera_params[camera].t, dtype=torch.float32)
-                vertices_by_hand: Dict[int, np.ndarray] = {}
-                for hand in (0, 1):
-                    vertices = outputs[hand]["vertices"][0]
-                    vertices_camera = torch.matmul(vertices, r.transpose(0, 1)) + t
-                    vertices_by_hand[hand] = vertices_camera.detach().cpu().numpy()
-                rendered = renderer.composite(image, vertices_by_hand, faces)
-                target = targets[camera]
-                temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp.jpg")
-                if not cv2.imwrite(str(temporary), rendered, [cv2.IMWRITE_JPEG_QUALITY, 92]):
-                    raise RuntimeError(f"failed to write mesh frame: {temporary}")
-                os.replace(temporary, target)
-                completed[camera] += 1
-                if completed[camera] == total or completed[camera] % progress_step == 0:
-                    _emit(camera=camera, status="mesh_rendering", rendered=completed[camera], total=total)
-        for camera in cameras:
-            _emit(camera=camera, status="mesh_done", rendered=completed[camera], total=total)
-    finally:
-        for renderer in renderers.values():
-            renderer.close()
+    pending_frames = [
+        frame
+        for frame in frames
+        if any(not (output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
+    ]
+    worker_count = min(requested_workers, max(1, len(pending_frames)))
+    camera_state = {
+        camera: {
+            "k": np.asarray(camera_params[camera].k, dtype=np.float32),
+            "r": np.asarray(camera_params[camera].r, dtype=np.float32),
+            "t": np.asarray(camera_params[camera].t, dtype=np.float32),
+        }
+        for camera in cameras
+    }
+    worker_state = {
+        "episode_dir": str(episode_dir),
+        "rgb_cache_dir": str(rgb_cache_dir),
+        "output_dir": str(output_dir),
+        "cameras": cameras,
+        "camera_params": camera_state,
+        "faces": faces,
+        "render_factor": factor,
+    }
+
+    def record_result(result: Tuple[int, List[str]]) -> None:
+        _frame, rendered_cameras = result
+        for camera in rendered_cameras:
+            completed[camera] += 1
+            if completed[camera] == total or completed[camera] % progress_step == 0:
+                _emit(camera=camera, status="mesh_rendering", rendered=completed[camera], total=total)
+
+    if worker_count == 1:
+        _initialize_render_worker(worker_state)
+        try:
+            for frame in pending_frames:
+                vertices_world = _world_vertices_for_frame(
+                    frame=frame,
+                    pose_dir=pose_dir,
+                    mano=mano,
+                    betas=betas,
+                    scales=scales,
+                    layers=layers,
+                )
+                record_result(_render_frame_worker(frame, vertices_world))
+        finally:
+            _close_worker_renderers()
+    elif pending_frames:
+        # MANO is evaluated once per frame in the coordinator. Expensive image,
+        # rasterization, and JPEG work is distributed without duplicating MANO.
+        torch.set_num_threads(1)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        context = multiprocessing.get_context("spawn")
+        in_flight: Dict[Future[Tuple[int, List[str]]], int] = {}
+        with ProcessPoolExecutor(
+            max_workers=worker_count,
+            mp_context=context,
+            initializer=_initialize_render_worker,
+            initargs=(worker_state,),
+        ) as executor:
+            for frame in pending_frames:
+                vertices_world = _world_vertices_for_frame(
+                    frame=frame,
+                    pose_dir=pose_dir,
+                    mano=mano,
+                    betas=betas,
+                    scales=scales,
+                    layers=layers,
+                )
+                future = executor.submit(_render_frame_worker, frame, vertices_world)
+                in_flight[future] = frame
+                if len(in_flight) >= worker_count * 2:
+                    done, _not_done = wait(in_flight, return_when=FIRST_COMPLETED)
+                    for finished in done:
+                        in_flight.pop(finished, None)
+                        record_result(finished.result())
+            while in_flight:
+                done, _not_done = wait(in_flight, return_when=FIRST_COMPLETED)
+                for finished in done:
+                    in_flight.pop(finished, None)
+                    record_result(finished.result())
+
+    for camera in cameras:
+        _emit(camera=camera, status="mesh_done", rendered=completed[camera], total=total)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
