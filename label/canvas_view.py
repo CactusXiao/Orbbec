@@ -10,6 +10,8 @@ import tkinter.font as tkfont
 
 from PIL import Image, ImageTk
 
+from src.qc.crop import Box, expand_region_to_aspect
+
 
 Point = Tuple[float, float]
 HandPoints = List[List[Point]]
@@ -66,6 +68,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
         self._view = ViewState(scale=1.0, offset_x=0.0, offset_y=0.0)
         self._view_user_adjusted = False
+        self._focus_region: Optional[Box] = None
         self._points = self._empty_points()
         self._visible = self._none_visible()
         self._count_base = self._empty_counts()
@@ -128,6 +131,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._selection_current = None
         self._view = ViewState(scale=1.0, offset_x=0.0, offset_y=0.0)
         self._view_user_adjusted = False
+        self._focus_region = None
         self._show_message("No image")
 
     def set_image(self, path: Optional[Path]) -> None:
@@ -136,6 +140,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._base_image = None
         self._imgtk = None
         self._view_user_adjusted = False
+        self._focus_region = None
         if self._img_item is not None:
             self.delete(self._img_item)
             self._img_item = None
@@ -197,6 +202,18 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._drag_joint = None
         self._press_joint_candidate = None
         self._render_overlay()
+
+    def image_size(self) -> Optional[Tuple[int, int]]:
+        return None if self._base_image is None else self._base_image.size
+
+    def set_focus_region(self, region: Optional[Box]) -> None:
+        """Fit a source-image region to the canvas while preserving its aspect."""
+        self._focus_region = self._normalize_region(region)
+        self._view_user_adjusted = False
+        if self._base_image is None:
+            return
+        self._cancel_pending_fit()
+        self._fit_and_render_image()
 
     def get_hand_state(self) -> Tuple[HandPoints, HandVisible]:
         return self._copy_points(self._points), self._copy_visible(self._visible)
@@ -507,12 +524,14 @@ class ImageAnnotatorCanvas(tk.Canvas):
             return
         w = max(1, int(self.winfo_width()))
         h = max(1, int(self.winfo_height()))
-        iw, ih = self._base_image.size
-        scale = min(w / max(1, iw), h / max(1, ih))
+        x1, y1, x2, y2 = self._crop_region_for_aspect(w / max(1, h))
+        crop_width = max(1.0, x2 - x1)
+        crop_height = max(1.0, y2 - y1)
+        scale = min(w / crop_width, h / crop_height)
         scale = max(0.05, min(10.0, scale))
         self._view.scale = scale
-        self._view.offset_x = (w - iw * scale) / 2
-        self._view.offset_y = (h - ih * scale) / 2
+        self._view.offset_x = (w - crop_width * scale) / 2 - x1 * scale
+        self._view.offset_y = (h - crop_height * scale) / 2 - y1 * scale
 
     def _zoom_at(self, cx: int, cy: int, factor: float) -> None:
         old = self._view.scale
@@ -533,18 +552,53 @@ class ImageAnnotatorCanvas(tk.Canvas):
             return
         iw, ih = self._base_image.size
         scale = self._view.scale
-        tw = max(1, int(iw * scale))
-        th = max(1, int(ih * scale))
-        img = self._base_image.resize((tw, th), Image.BILINEAR)
+        canvas_width = max(1, int(self.winfo_width()))
+        canvas_height = max(1, int(self.winfo_height()))
+        source_x1 = max(0, int(math.floor(-self._view.offset_x / scale)))
+        source_y1 = max(0, int(math.floor(-self._view.offset_y / scale)))
+        source_x2 = min(iw, int(math.ceil((canvas_width - self._view.offset_x) / scale)))
+        source_y2 = min(ih, int(math.ceil((canvas_height - self._view.offset_y) / scale)))
+        if source_x2 <= source_x1 or source_y2 <= source_y1:
+            if self._img_item is not None:
+                self.delete(self._img_item)
+                self._img_item = None
+            return
+        img = self._base_image.crop((source_x1, source_y1, source_x2, source_y2))
+        tw = max(1, int(round((source_x2 - source_x1) * scale)))
+        th = max(1, int(round((source_y2 - source_y1) * scale)))
+        img = img.resize((tw, th), Image.BILINEAR)
         self._imgtk = ImageTk.PhotoImage(img)
-        x = self._view.offset_x
-        y = self._view.offset_y
+        x = self._view.offset_x + source_x1 * scale
+        y = self._view.offset_y + source_y1 * scale
         if self._img_item is None:
             self._img_item = self.create_image(x, y, anchor="nw", image=self._imgtk)
         else:
             self.coords(self._img_item, x, y)
             self.itemconfigure(self._img_item, image=self._imgtk)
         self.tag_lower(self._img_item)
+
+    def _normalize_region(self, region: Optional[Box]) -> Optional[Box]:
+        if region is None or self._base_image is None:
+            return None
+        iw, ih = self._base_image.size
+        try:
+            x1, y1, x2, y2 = (float(value) for value in region)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+            return None
+        x1, x2 = sorted((max(0.0, min(float(iw), x1)), max(0.0, min(float(iw), x2))))
+        y1, y2 = sorted((max(0.0, min(float(ih), y1)), max(0.0, min(float(ih), y2))))
+        if x2 - x1 < 1.0 or y2 - y1 < 1.0:
+            return None
+        return (x1, y1, x2, y2)
+
+    def _crop_region_for_aspect(self, target_aspect: float) -> Box:
+        if self._base_image is None:
+            return (0.0, 0.0, 1.0, 1.0)
+        iw, ih = self._base_image.size
+        region = self._focus_region or (0.0, 0.0, float(iw), float(ih))
+        return expand_region_to_aspect(region, (iw, ih), target_aspect)
 
     def _render_overlay(self, *, drag_hand: Optional[int] = None) -> None:
         self._clear_overlay_items()

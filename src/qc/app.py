@@ -19,6 +19,7 @@ except Exception:
 
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
+from .crop import hand_focus_region
 from .media import QcEpisodeMedia, cleanup_qc_cache, prepare_qc_media
 from .report import build_qc_result, write_qc_report
 from .state_store import QcProgress, QcStateStore, first_sample_after, format_seconds, normalize_ranges
@@ -829,12 +830,16 @@ class QcPage(ttk.Frame):
                 projected = None
                 issue = str(exc)
             if projected is None:
+                canvas.set_focus_region(None)
                 canvas.set_skeleton_overlay(None)
                 if not issue:
                     issue = describe_mano_projection_issue(media.episode_dir, media.mano_dir, cam, frame)
                 self._labels[cam].configure(text=f"Camera {cam}    无 MANO 投影：{issue}")
             else:
                 points, visible = projected
+                image_size = canvas.image_size()
+                region = None if image_size is None else hand_focus_region(points, visible, image_size=image_size)
+                canvas.set_focus_region(region)
                 canvas.set_skeleton_overlay(points, visible)
                 self._labels[cam].configure(text=f"Camera {cam}")
         self._build_bar()
