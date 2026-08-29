@@ -213,7 +213,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         html = render_episode_detail(model)
         self.assertNotIn("重试 (2,99) → joint3d", html)
 
-    def test_retry_joint3d_requeues_only_failed_publisher_materialization(self) -> None:
+    def test_retry_joint3d_starts_directly_without_queueing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = WorkflowStore(Path(tmp) / "workflow.sqlite3")
             service = JobService(store)
@@ -238,11 +238,17 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 },
             )
 
-            response = service.retry_joint3d_materialization("episode_retry", {"operator_id": "admin"})
+            response = service.start_joint3d_materialization_retry(
+                "episode_retry",
+                {"operator_id": "admin"},
+                worker_id="publisher_bridge:backend:direct-joint3d-retry",
+                lease_seconds=300,
+            )
 
-            self.assertTrue(response["requeued"])
+            self.assertEqual((response.get("job") or {}).get("status"), "running")
             retried = store.get_job("auto_label_episode_retry_episode") or {}
-            self.assertEqual(retried.get("status"), "queued")
+            self.assertEqual(retried.get("status"), "running")
+            self.assertNotEqual(retried.get("status"), "queued")
             self.assertEqual((retried.get("result") or {}).get("retry_requested_by"), "admin")
             self.assertEqual(
                 ((retried.get("result") or {}).get("previous_failure") or {}).get("phase"),
@@ -251,7 +257,12 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual((store.get_episode("episode_retry") or {}).get("status"), "auto_labeling")
 
             with self.assertRaises(WorkflowError) as raised:
-                service.retry_joint3d_materialization("episode_retry", {"operator_id": "admin"})
+                service.start_joint3d_materialization_retry(
+                    "episode_retry",
+                    {"operator_id": "admin"},
+                    worker_id="publisher_bridge:backend:direct-joint3d-retry",
+                    lease_seconds=300,
+                )
             self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
 
     def test_nas_uploader_always_queues_auto_label_after_upload(self) -> None:

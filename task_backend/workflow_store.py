@@ -969,14 +969,19 @@ class WorkflowStore:
                 raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"released job not found: {job_id}")
             return updated, True
 
-    def requeue_failed_job(
+    def start_failed_job_retry(
         self,
         *,
         job_id: str,
+        lease_owner: str,
+        lease_seconds: int,
         requested_by: str = "",
         reason: str = "",
     ) -> Dict[str, Any]:
-        """Move one failed job back to the queue while retaining its failure audit trail."""
+        """Start one direct retry while retaining the previous failure audit trail."""
+        lease_owner = str(lease_owner or "").strip()
+        if not lease_owner:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "lease_owner is required")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             job = self._get_job_unlocked(conn, job_id)
@@ -994,11 +999,17 @@ class WorkflowStore:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'queued', lease_owner = NULL, lease_until = NULL,
+                SET status = 'running', lease_owner = ?, lease_until = ?,
                     result_json = ?, updated_at = ?
                 WHERE job_id = ?
                 """,
-                (_json_dumps(retry_result), timestamp, job_id),
+                (
+                    lease_owner,
+                    _future_iso(max(1, int(lease_seconds or 300))),
+                    _json_dumps(retry_result),
+                    timestamp,
+                    job_id,
+                ),
             )
             updated = self._get_job_unlocked(conn, job_id)
             if updated is None:

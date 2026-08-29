@@ -509,10 +509,16 @@ class TaskInstanceRegistry:
 
 
 class BackendRuntime:
-    def __init__(self, registry: TaskInstanceRegistry, workflow_service: JobService):
+    def __init__(
+        self,
+        registry: TaskInstanceRegistry,
+        workflow_service: JobService,
+        publisher_bridge: Optional[PublisherBridge] = None,
+    ):
         self.registry = registry
         self.accounts = AccountStore(registry.data_root)
         self.workflow_service = workflow_service
+        self.publisher_bridge = publisher_bridge
         self.lock = threading.RLock()
         self.backend: Optional[TaskBackend] = None
         self.active_selection: Optional[Dict[str, Any]] = None
@@ -2132,7 +2138,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         auto_retry_action = (
             f"<form method=\"post\" action=\"/episodes/{url_part(reservation_id)}/retry-joint3d\">"
             "<button type=\"submit\" class=\"secondary\">重试 (2,99) → joint3d</button>"
-            "</form><div class=\"muted\">仅重跑转换</div>"
+            "</form><div class=\"muted\">直接重跑本地转换，不进入队列</div>"
         )
 
     segment_counts: Dict[str, int] = {}
@@ -2762,7 +2768,10 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not episode_id:
                     raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
                 form = self._read_form()
-                self.workflow.retry_joint3d_materialization(episode_id, form)
+                publisher_bridge = self.runtime.publisher_bridge
+                if publisher_bridge is None:
+                    raise WorkflowError(HTTPStatus.SERVICE_UNAVAILABLE, "Publisher Bridge is not configured")
+                publisher_bridge.retry_materialization_once(episode_id, form)
                 self._redirect(f"/episodes/{url_part(episode_id)}")
                 return
 
@@ -3078,7 +3087,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
-    runtime = BackendRuntime(registry, workflow_service)
+    runtime = BackendRuntime(registry, workflow_service, publisher_bridge)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
     if args.env_file.exists():
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)

@@ -335,7 +335,7 @@ class PublisherBridgeTest(unittest.TestCase):
             self.assertEqual(len(store.artifacts_for_episode("episode_uuid")), 2)
             self.assertEqual(len(store.jobs_for_episode("episode_uuid", "qc")), 1)
 
-    def test_joint3d_retry_reuses_labeled_publisher_result_without_republishing(self) -> None:
+    def test_joint3d_retry_runs_directly_without_queueing_or_republishing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pose_dir = root / "S001" / "pick_object" / "episode1" / "optimized_pose"
@@ -377,13 +377,14 @@ class PublisherBridgeTest(unittest.TestCase):
             self.assertEqual(failed_job["status"], "failed")
             self.assertTrue(failed_job["can_retry_joint3d"])
 
-            service.retry_joint3d_materialization("episode_uuid", {"operator_id": "admin"})
             bridge.materializer = FakeMaterializer()
-            self.assertTrue(bridge.process_once(1))
+            retry = bridge.retry_materialization_once("episode_uuid", {"operator_id": "admin"})
 
+            self.assertTrue(retry["completed"])
             retried_job = store.jobs_for_episode("episode_uuid", "auto_label")[0]
             self.assertEqual(retried_job["status"], "succeeded")
             self.assertEqual(publisher.published, [])
+            self.assertEqual(len(publisher.status_calls), 1)
             self.assertEqual(len(store.jobs_for_episode("episode_uuid", "qc")), 1)
 
     def test_backend_shutdown_releases_held_job_without_canceling_publisher(self) -> None:

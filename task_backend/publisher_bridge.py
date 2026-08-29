@@ -346,6 +346,112 @@ class PublisherBridge:
     def worker_id(self, slot_index: int) -> str:
         return f"publisher_bridge:{self.hostname}:slot-{slot_index:02d}"
 
+    def retry_materialization_once(self, episode_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Run one local (2,99) -> joint3d conversion without queueing or publishing."""
+        candidate = self.service.joint3d_materialization_retry_candidate(episode_id)
+        payload = dict(candidate.get("payload") or {})
+        episode = dict(candidate.get("episode") or {})
+        failed_result = dict((candidate.get("job") or {}).get("result") or {})
+        episode_uri = str(payload.get("episode_uri") or episode.get("episode_uri") or "").strip()
+        try:
+            publisher_episode_id, episode_dir = self._resolve_episode(episode_uri)
+        except ValueError as exc:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"invalid Publisher episode URI: {exc}") from exc
+
+        generation = int(failed_result.get("generation") or 0)
+        result_sha256 = str(failed_result.get("result_manifest_sha256") or "").strip()
+        if generation <= 0 or len(result_sha256) != 64:
+            # Compatibility for failures recorded before generation/hash were
+            # persisted. This is read-only and deliberately never publishes.
+            status = self.publisher.status(publisher_episode_id)
+            state = str(status.get("state") or "").strip().lower()
+            if not bool(status.get("found")) or state not in PUBLISHER_RESULT_STATES:
+                raise WorkflowError(
+                    HTTPStatus.CONFLICT,
+                    f"Publisher result is not ready for local joint3d conversion: {state or 'not found'}",
+                )
+            generation = int(status.get("generation") or 0)
+            result_sha256 = str(status.get("result_manifest_sha256") or "").strip()
+        if generation <= 0 or len(result_sha256) != 64:
+            raise WorkflowError(HTTPStatus.CONFLICT, "Publisher result generation/hash is invalid")
+
+        worker_id = f"publisher_bridge:{self.hostname}:direct-joint3d-retry"
+        started = self.service.start_joint3d_materialization_retry(
+            episode_id,
+            body,
+            worker_id=worker_id,
+            lease_seconds=self.config.lease_seconds,
+        )
+        job = dict(started.get("job") or {})
+        job_id = str(job.get("job_id") or "")
+        cameras = payload.get("cameras") if isinstance(payload.get("cameras"), list) else episode.get("cameras")
+        camera_ids = [str(value) for value in (cameras or [])]
+        heartbeat = _LeaseHeartbeat(
+            self.service,
+            job_id=job_id,
+            worker_id=worker_id,
+            lease_seconds=self.config.lease_seconds,
+            interval_seconds=self.config.heartbeat_seconds,
+            bridge_stop=self.stop_event,
+        )
+        heartbeat.start()
+        try:
+            materialized = self.materializer.run(
+                episode_dir=episode_dir,
+                generation=generation,
+                result_manifest_sha256=result_sha256,
+                cameras=camera_ids,
+            )
+            frames = [int(value) for value in materialized.get("frames", [])]
+            result = {
+                "ok": True,
+                "worker_id": worker_id,
+                "generation": generation,
+                "frames": frames,
+                "optimized_pose_shape": [2, 99],
+                "joints_3d_shape": list(materialized.get("joints_3d_shape") or []),
+                "result_manifest_sha256": result_sha256,
+                "materializer_reused": bool(materialized.get("reused")),
+                "direct_joint3d_retry": True,
+            }
+            artifacts = [
+                {
+                    "kind": "optimized_pose",
+                    "uri": uri_join(episode_uri, "optimized_pose"),
+                    "metadata": {"generation": generation, "frame_shape": [2, 99]},
+                },
+                {
+                    "kind": "mano_episode",
+                    "uri": uri_join(episode_uri, "mano", "episode"),
+                    "metadata": {"generation": generation, "coordinate_system": "episode_world"},
+                },
+            ]
+            self.service.complete_job(job_id, {"result": result, "artifacts": artifacts})
+            _log(f"direct joint3d retry completed job={job_id} episode={publisher_episode_id} frames={len(frames)}")
+            return {"completed": True, "episode_id": episode_id, "job_id": job_id, "frames": frames}
+        except Exception as exc:
+            current = self.service.store.get_job(job_id) or {}
+            if str(current.get("status") or "") not in {"succeeded", "failed", "canceled"}:
+                error = f"optimized_pose materialization failed: {exc}"
+                self.service.fail_job(
+                    job_id,
+                    {
+                        "error": error,
+                        "result": {
+                            "ok": False,
+                            "worker_id": worker_id,
+                            "phase": "mano_materialization",
+                            "generation": generation,
+                            "result_manifest_sha256": result_sha256,
+                            "direct_joint3d_retry": True,
+                        },
+                    },
+                )
+                _log(f"direct joint3d retry failed job={job_id}: {error}")
+            return {"completed": False, "episode_id": episode_id, "job_id": job_id, "error": str(exc)}
+        finally:
+            heartbeat.stop()
+
     def _run_slot(self, slot_index: int) -> None:
         worker_id = self.worker_id(slot_index)
         while not self.stop_event.is_set():
@@ -493,7 +599,13 @@ class PublisherBridge:
                     job_id,
                     {
                         "error": error,
-                        "result": {"ok": False, "worker_id": worker_id, "phase": "mano_materialization"},
+                        "result": {
+                            "ok": False,
+                            "worker_id": worker_id,
+                            "phase": "mano_materialization",
+                            "generation": generation,
+                            "result_manifest_sha256": result_sha256,
+                        },
                     },
                 )
                 _log(f"failed job={job_id}: {error}")

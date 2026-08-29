@@ -576,8 +576,8 @@ class JobService:
             "episodes": outcomes,
         }
 
-    def retry_joint3d_materialization(self, episode_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-        """Retry only the Publisher (2,99) -> joint3d materialization step."""
+    def joint3d_materialization_retry_candidate(self, episode_id: str) -> Dict[str, Any]:
+        """Return the failed Publisher job eligible for a direct joint3d retry."""
         episode_id = str(episode_id or "").strip()
         if not episode_id:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
@@ -593,11 +593,26 @@ class JobService:
                 HTTPStatus.CONFLICT,
                 "latest auto_label job is not a retryable (2,99) -> joint3d conversion failure",
             )
+        return self.enrich_job(job)
+
+    def start_joint3d_materialization_retry(
+        self,
+        episode_id: str,
+        body: Dict[str, Any],
+        *,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> Dict[str, Any]:
+        """Mark a failed conversion running for one direct, non-queued retry."""
+        candidate = self.joint3d_materialization_retry_candidate(episode_id)
+        job = dict(candidate.get("job") or {})
         requested_by = str(
             body.get("requested_by") or body.get("operator_id") or body.get("user") or "episode_page"
         ).strip() or "episode_page"
-        requeued = self.store.requeue_failed_job(
+        started = self.store.start_failed_job_retry(
             job_id=str(job.get("job_id") or ""),
+            lease_owner=worker_id,
+            lease_seconds=lease_seconds,
             requested_by=requested_by,
             reason="retry_joint3d_materialization",
         )
@@ -605,16 +620,12 @@ class JobService:
             episode_id,
             "auto_labeling",
             {
-                "joint3d_retry_job_id": requeued.get("job_id"),
-                "joint3d_retry_requested_at": requeued.get("updated_at"),
+                "joint3d_retry_job_id": started.get("job_id"),
+                "joint3d_retry_requested_at": started.get("updated_at"),
                 "joint3d_retry_requested_by": requested_by,
             },
         )
-        return {
-            "requeued": True,
-            "episode_id": episode_id,
-            "job": _compact_job(requeued),
-        }
+        return self.enrich_job(started)
 
     def label_tasks(self) -> Dict[str, Any]:
         jobs = [job for job in self.store.jobs_by_type("manual_label") if self._job_is_available_or_active(job)]
