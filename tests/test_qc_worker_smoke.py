@@ -36,6 +36,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
                 current_frame=20,
                 frames=[0, 10, 20],
                 bad_frame_ranges=[(12, 15)],
+                playback_complete=True,
             )
 
             store.save(progress)
@@ -44,6 +45,26 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].episode_id, "episode_001")
             self.assertEqual(loaded[0].bad_frame_ranges, [(12, 15)])
+            self.assertTrue(loaded[0].playback_complete)
+
+    def test_legacy_sampling_completion_migrates_to_video_completion(self) -> None:
+        progress = QcProgress.from_dict(
+            {
+                "schema_version": 1,
+                "task_name": "pick_object",
+                "episode_id": "episode_001",
+                "job_id": "qc_episode_001",
+                "worker_machine_id": "worker_a",
+                "lease_until": "2099-01-01T00:00:00Z",
+                "sample_interval": 10,
+                "current_frame": 21,
+                "frames": [0, 10, 20],
+            }
+        )
+
+        self.assertTrue(progress.playback_complete)
+        self.assertEqual(progress.current_frame, 20)
+        self.assertEqual(progress.schema_version, 2)
 
     def test_qc_config_loads_launch_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -62,6 +83,11 @@ class QcWorkerSmokeTest(unittest.TestCase):
                         "operator_id": "qc_operator_a",
                         "range_merge_gap_frames": 2,
                         "request_timeout_seconds": 4.5,
+                        "playback_fps": 24.0,
+                        "mesh_renderer_python": "/opt/mano/bin/python",
+                        "mano_toolkit_root": "/opt/mano/toolkit",
+                        "mano_model_dir": "/opt/mano/models",
+                        "mesh_render_factor": 1.5,
                         "nas_mounts": {"nas://ego": "/mnt/nas"},
                     }
                 ),
@@ -80,7 +106,28 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(config.operator_id, "qc_operator_a")
             self.assertEqual(config.range_merge_gap_frames, 2)
             self.assertEqual(config.request_timeout_seconds, 4.5)
+            self.assertEqual(config.playback_fps, 24.0)
+            self.assertEqual(config.mesh_renderer_python, "/opt/mano/bin/python")
+            self.assertEqual(config.mano_toolkit_root, Path("/opt/mano/toolkit"))
+            self.assertEqual(config.mano_model_dir, Path("/opt/mano/models"))
+            self.assertEqual(config.mesh_render_factor, 1.5)
             self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
+
+    def test_video_progress_requires_playback_completion(self) -> None:
+        progress = QcProgress(
+            task_name="pick_object",
+            episode_id="episode_001",
+            job_id="qc_episode_001",
+            worker_machine_id="worker_a",
+            lease_until="2099-01-01T00:00:00Z",
+            sample_interval=10,
+            current_frame=20,
+            frames=[0, 10, 20],
+        )
+
+        self.assertFalse(progress.is_complete)
+        progress.playback_complete = True
+        self.assertTrue(progress.is_complete)
 
     def test_qc_config_uses_cwd_for_default_local_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

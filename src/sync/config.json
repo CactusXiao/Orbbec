@@ -116,7 +116,12 @@
             "stateDir": "../../qc_state",
             "workerMachineId": "qc_machine_01",
             "rangeMergeGapFrames": 5,
-            "requestTimeoutSeconds": 10.0
+            "requestTimeoutSeconds": 10.0,
+            "playbackFps": 30.0,
+            "meshRendererPython": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python",
+            "manoToolkitRoot": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
+            "manoModelDir": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
+            "meshRenderFactor": 1.0
         }
     },
     "voiceFeedback": {

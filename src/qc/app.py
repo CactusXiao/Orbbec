@@ -10,19 +10,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from label.canvas_view import ImageAnnotatorCanvas
-    from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
     from label.theme import Theme, apply_theme
 except Exception:
     from ...label.canvas_view import ImageAnnotatorCanvas  # type: ignore
-    from ...label.mano_view import ManoViewRuntime, describe_mano_projection_issue  # type: ignore
     from ...label.theme import Theme, apply_theme  # type: ignore
 
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
-from .crop import hand_focus_region
-from .media import QcEpisodeMedia, cleanup_qc_cache, prepare_qc_media
+from .media import MeshRendererSettings, QcEpisodeMedia, cleanup_qc_cache, prepare_qc_media
 from .report import build_qc_result, write_qc_report
-from .state_store import QcProgress, QcStateStore, first_sample_after, format_seconds, normalize_ranges
+from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges
 
 
 class QcWorkerApp(tk.Tk):
@@ -205,6 +202,7 @@ class QcWorkerApp(tk.Tk):
                 leased.current_frame = progress.current_frame
                 leased.bad_frame_ranges = list(progress.bad_frame_ranges)
                 leased.checked_sample_frames = list(progress.checked_sample_frames)
+                leased.playback_complete = progress.playback_complete
                 leased.result_type = progress.result_type
                 self.state_store.save(leased)
                 return leased, None
@@ -225,6 +223,7 @@ class QcWorkerApp(tk.Tk):
         if progress is None:
             return
         self._current_progress = progress
+        self._schedule_heartbeat()
         self.prepare_episode(progress)
 
     def prepare_episode(self, progress: QcProgress) -> None:
@@ -241,6 +240,12 @@ class QcWorkerApp(tk.Tk):
                     mounts=self.config.nas_mounts,
                     tmp_dir=self.config.tmp_dir,
                     on_progress=progress_callback,
+                    mesh_renderer=MeshRendererSettings(
+                        python_executable=self.config.mesh_renderer_python,
+                        mano_toolkit_root=self.config.mano_toolkit_root,
+                        mano_model_dir=self.config.mano_model_dir,
+                        render_factor=self.config.mesh_render_factor,
+                    ),
                 )
                 return media, None
             except Exception as exc:
@@ -250,6 +255,7 @@ class QcWorkerApp(tk.Tk):
 
     def _after_media_ready(self, media: Optional[QcEpisodeMedia], error: Optional[str]) -> None:
         if error:
+            self._cancel_heartbeat()
             messagebox.showerror("数据准备失败", error)
             if self._last_task_name:
                 self.show_episodes(self._last_task_name)
@@ -329,6 +335,7 @@ class QcWorkerApp(tk.Tk):
         self._run_bg(work, done)
 
     def handle_interrupt(self, *, exit_after: bool) -> None:
+        self.qc_page.pause_playback()
         progress = self._current_progress
         if progress is None:
             if exit_after:
@@ -712,7 +719,7 @@ class DecodePage(ttk.Frame):
         self._tree.pack(fill="x")
 
     def reset(self, progress: QcProgress) -> None:
-        self._status.configure(text=f"Episode：{progress.episode_id}    采样间隔：{progress.sample_interval}")
+        self._status.configure(text=f"Episode：{progress.episode_id}    正在准备六视角 RGB 与 MANO mesh 视频帧")
         self._tree.delete(*self._tree.get_children())
         self._rows = {}
         for camera in progress.payload.get("cameras") or []:
@@ -734,6 +741,9 @@ class DecodePage(ttk.Frame):
             "decoding": "解码中",
             "done": "完成",
             "failed": "失败",
+            "mesh_pending": "等待渲染 mesh",
+            "mesh_rendering": "渲染 mesh",
+            "mesh_done": "mesh 完成",
         }
         self._tree.item(
             cam,
@@ -741,20 +751,114 @@ class DecodePage(ttk.Frame):
         )
 
 
+class FrameTimeline(tk.Canvas):
+    def __init__(self, master, *, on_seek: Callable[[int], None]):
+        super().__init__(master, height=34, bg=Theme.PANEL, highlightthickness=0, cursor="hand2")
+        self._frames: List[int] = []
+        self._current = 0
+        self._bad_ranges: List[Tuple[int, int]] = []
+        self._preview: Optional[Tuple[int, int]] = None
+        self._seek_enabled = True
+        self._on_seek = on_seek
+        self.bind("<Configure>", lambda _event: self._draw())
+        self.bind("<Button-1>", self._handle_click)
+
+    def set_data(
+        self,
+        *,
+        frames: List[int],
+        current: int,
+        bad_ranges: List[Tuple[int, int]],
+        preview: Optional[Tuple[int, int]] = None,
+        seek_enabled: bool = True,
+    ) -> None:
+        self._frames = list(frames)
+        self._current = int(current)
+        self._bad_ranges = list(bad_ranges)
+        self._preview = preview
+        self._seek_enabled = bool(seek_enabled)
+        self.configure(cursor="hand2" if self._seek_enabled else "arrow")
+        self._draw()
+
+    def _x_for_position(self, position: int) -> float:
+        width = max(1, int(self.winfo_width()))
+        left, right = 8.0, max(8.0, float(width) - 8.0)
+        if len(self._frames) <= 1:
+            return left
+        ratio = max(0.0, min(1.0, float(position) / float(len(self._frames) - 1)))
+        return left + ratio * (right - left)
+
+    def _position_for_frame(self, frame: int) -> int:
+        if not self._frames:
+            return 0
+        return min(range(len(self._frames)), key=lambda idx: abs(self._frames[idx] - int(frame)))
+
+    def _draw(self) -> None:
+        self.delete("all")
+        if not self._frames:
+            return
+        y1, y2 = 13, 23
+        x1, x2 = self._x_for_position(0), self._x_for_position(len(self._frames) - 1)
+        self.create_rectangle(x1, y1, x2, y2, fill=Theme.BORDER, outline="")
+        current_pos = self._position_for_frame(self._current)
+        current_x = self._x_for_position(current_pos)
+        self.create_rectangle(x1, y1, current_x, y2, fill=Theme.ACCENT, outline="")
+        for start, end in self._bad_ranges:
+            start_pos = self._position_for_frame(start)
+            end_pos = self._position_for_frame(end)
+            range_x1 = self._x_for_position(min(start_pos, end_pos))
+            range_x2 = max(range_x1 + 2.0, self._x_for_position(max(start_pos, end_pos)))
+            self.create_rectangle(
+                range_x1,
+                y1,
+                range_x2,
+                y2,
+                fill="#e5484d",
+                outline="",
+            )
+        if self._preview is not None:
+            start_pos = self._position_for_frame(self._preview[0])
+            end_pos = self._position_for_frame(self._preview[1])
+            range_x1 = self._x_for_position(min(start_pos, end_pos))
+            range_x2 = max(range_x1 + 2.0, self._x_for_position(max(start_pos, end_pos)))
+            self.create_rectangle(
+                range_x1,
+                y1,
+                range_x2,
+                y2,
+                fill="#f59e0b",
+                outline="",
+            )
+        self.create_line(current_x, 8, current_x, 28, fill="#ffffff", width=2)
+
+    def _handle_click(self, event: tk.Event) -> None:
+        if not self._seek_enabled or not self._frames:
+            return
+        width = max(1, int(self.winfo_width()))
+        ratio = max(0.0, min(1.0, (float(event.x) - 8.0) / max(1.0, float(width) - 16.0)))
+        position = int(round(ratio * max(0, len(self._frames) - 1)))
+        self._on_seek(position)
+
+
 class QcPage(ttk.Frame):
+    FRAME_STEP = 10
+
     def __init__(self, master, *, app: QcWorkerApp):
         super().__init__(master, style="TFrame")
         self.app = app
         self.progress: Optional[QcProgress] = None
         self.media: Optional[QcEpisodeMedia] = None
-        self.mano_runtime = ManoViewRuntime()
-        self.mode = "sampling"
+        self.mode = "playback"
         self.bad_anchor_frame = 0
         self.bad_cursor = 0
         self.bad_start: Optional[int] = None
         self.bad_end: Optional[int] = None
         self._canvases: Dict[str, ImageAnnotatorCanvas] = {}
         self._labels: Dict[str, ttk.Label] = {}
+        self._playing = False
+        self._play_after_id: Optional[str] = None
+        self._ticks_since_save = 0
+        self._busy_text = ""
         self._build()
 
     def _build(self) -> None:
@@ -767,19 +871,64 @@ class QcPage(ttk.Frame):
         self._busy = ttk.Label(self._top, text="", style="Muted.TLabel")
         self._busy.pack(side="right")
         self._grid = ttk.Frame(root, style="TFrame")
-        self._grid.pack(fill="both", expand=True, padx=10, pady=10)
-        self._bar = ttk.Frame(root, style="Panel.TFrame", padding=(10, 8))
-        self._bar.pack(fill="x")
+        self._grid.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+
+        timeline_host = ttk.Frame(root, style="Panel.TFrame", padding=(10, 2))
+        timeline_host.pack(fill="x")
+        self._timeline = FrameTimeline(timeline_host, on_seek=self.seek_position)
+        self._timeline.pack(fill="x")
+
+        self._playback_bar = ttk.Frame(root, style="Panel.TFrame", padding=(10, 8))
+        self._playback_bar.pack(fill="x")
+        self._prev_ten = ttk.Button(self._playback_bar, text="上十帧", style="Small.TButton", command=lambda: self.step_frames(-self.FRAME_STEP))
+        self._prev_ten.pack(side="left", padx=(0, 6))
+        self._prev_one = ttk.Button(self._playback_bar, text="上一帧", style="Small.TButton", command=lambda: self.step_frames(-1))
+        self._prev_one.pack(side="left", padx=(0, 6))
+        self._play_button = ttk.Button(self._playback_bar, text="播放", style="Primary.TButton", command=self.toggle_playback)
+        self._play_button.pack(side="left", padx=(0, 6))
+        self._next_one = ttk.Button(self._playback_bar, text="下一帧", style="Small.TButton", command=lambda: self.step_frames(1))
+        self._next_one.pack(side="left", padx=(0, 6))
+        self._next_ten = ttk.Button(self._playback_bar, text="下十帧", style="Small.TButton", command=lambda: self.step_frames(self.FRAME_STEP))
+        self._next_ten.pack(side="left", padx=(0, 12))
+        self._reject_button = ttk.Button(self._playback_bar, text="该帧不通过", style="Secondary.TButton", command=self.enter_bad_range)
+        self._reject_button.pack(side="left", padx=(0, 8))
+        self._bad_episode_button = ttk.Button(self._playback_bar, text="Episode 异常", style="Secondary.TButton", command=self.mark_bad_episode)
+        self._bad_episode_button.pack(side="left", padx=(0, 12))
+        self._playback_status = ttk.Label(self._playback_bar, text="", style="Muted.TLabel")
+        self._playback_status.pack(side="left")
+        self._submit_button = ttk.Button(self._playback_bar, text="提交", style="Primary.TButton", command=lambda: self.app.submit_current_progress())
+        self._submit_button.pack(side="right")
+        ttk.Button(self._playback_bar, text="退出程序", style="Secondary.TButton", command=self.app.request_exit).pack(side="right", padx=(0, 8))
+        ttk.Button(self._playback_bar, text="返回 Episode 列表", style="Secondary.TButton", command=lambda: self.app.handle_interrupt(exit_after=False)).pack(side="right", padx=(0, 8))
+
+        self._bad_bar = ttk.Frame(root, style="Panel.TFrame", padding=(10, 8))
+        ttk.Button(self._bad_bar, text="上十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-self.FRAME_STEP)).pack(side="left", padx=(0, 6))
+        ttk.Button(self._bad_bar, text="上一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-1)).pack(side="left", padx=(0, 6))
+        ttk.Button(self._bad_bar, text="设为坏帧起点", style="Secondary.TButton", command=self.set_bad_start).pack(side="left", padx=(0, 10))
+        self._bad_status = ttk.Label(self._bad_bar, text="", style="Muted.TLabel")
+        self._bad_status.pack(side="left", padx=(0, 10))
+        ttk.Button(self._bad_bar, text="设为坏帧终点", style="Secondary.TButton", command=self.set_bad_end).pack(side="left", padx=(0, 6))
+        ttk.Button(self._bad_bar, text="下一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(1)).pack(side="left", padx=(0, 6))
+        ttk.Button(self._bad_bar, text="下十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(self.FRAME_STEP)).pack(side="left", padx=(0, 10))
+        ttk.Button(self._bad_bar, text="确认坏帧区间", style="Primary.TButton", command=self.confirm_bad_range).pack(side="right")
+        ttk.Button(self._bad_bar, text="撤销", style="Secondary.TButton", command=self.cancel_bad_range).pack(side="right", padx=(0, 8))
 
     def set_session(self, progress: QcProgress, media: QcEpisodeMedia) -> None:
+        self.pause_playback(persist=False)
         self.progress = progress
         self.media = media
-        self.mode = "sampling"
+        self.mode = "playback"
+        if progress.frames and progress.current_frame not in progress.frames:
+            progress.current_frame = progress.frames[0]
         self._build_camera_grid(media.task.cameras)
         self._refresh()
 
     def set_busy(self, text: str) -> None:
-        self._busy.configure(text=text)
+        self._busy_text = str(text or "")
+        if self._busy_text:
+            self.pause_playback()
+        self._busy.configure(text=self._busy_text)
+        self._update_controls()
 
     def _build_camera_grid(self, cameras: List[str]) -> None:
         for child in self._grid.winfo_children():
@@ -805,117 +954,161 @@ class QcPage(ttk.Frame):
     def _refresh(self) -> None:
         progress = self.progress
         media = self.media
-        if progress is None or media is None:
+        if progress is None or media is None or not progress.frames:
             return
         frame = self._display_frame()
-        total_text = f"{progress.current_frame} / {progress.last_frame}" if progress.current_frame <= progress.last_frame else f"完成 / {progress.last_frame}"
         ranges = ", ".join(f"{a}-{b}" for a, b in progress.bad_frame_ranges) or "无"
         self._info.configure(
-            text=f"Task：{progress.task_name}    Episode：{progress.episode_id}    当前帧：{total_text}    采样间隔：{progress.sample_interval}    坏帧区间：{ranges}"
+            text=f"Task：{progress.task_name}    Episode：{progress.episode_id}    当前帧：{frame} / {progress.last_frame}    坏帧区间：{ranges}"
         )
         for cam, canvas in self._canvases.items():
             path = media.frame_path(cam, frame)
             canvas.set_image(path)
             canvas.set_read_only(True)
             canvas.set_annotation_visible(False)
-            issue = ""
-            try:
-                projected = self.mano_runtime.project_mano_frame(
-                    episode_dir=media.episode_dir,
-                    mano_dir=media.mano_dir,
-                    cam_id=cam,
-                    frame_idx=frame,
-                )
-            except Exception as exc:
-                projected = None
-                issue = str(exc)
-            if projected is None:
-                canvas.set_focus_region(None)
-                canvas.set_skeleton_overlay(None)
-                if not issue:
-                    issue = describe_mano_projection_issue(media.episode_dir, media.mano_dir, cam, frame)
-                self._labels[cam].configure(text=f"Camera {cam}    无 MANO 投影：{issue}")
+            canvas.set_focus_region(None)
+            canvas.set_skeleton_overlay(None)
+            canvas.set_mano_overlay(None)
+            if path is None or not path.is_file():
+                self._labels[cam].configure(text=f"Camera {cam}    mesh 帧缺失")
             else:
-                points, visible = projected
-                image_size = canvas.image_size()
-                region = None if image_size is None else hand_focus_region(points, visible, image_size=image_size)
-                canvas.set_focus_region(region)
-                canvas.set_skeleton_overlay(points, visible)
                 self._labels[cam].configure(text=f"Camera {cam}")
-        self._build_bar()
+        preview = None
+        if self.mode == "bad_range" and self.bad_start is not None:
+            preview = (self.bad_start, self.bad_end if self.bad_end is not None else self.bad_cursor)
+        self._timeline.set_data(
+            frames=progress.frames,
+            current=frame,
+            bad_ranges=progress.bad_frame_ranges,
+            preview=preview,
+            seek_enabled=self.mode == "playback" and not self._playing and not self._busy_text,
+        )
+        self._update_controls()
 
     def _display_frame(self) -> int:
-        progress = self.progress
-        if progress is None:
+        if self.progress is None:
             return 0
-        if self.mode == "bad_range":
-            return int(self.bad_cursor)
-        return min(int(progress.current_frame), int(progress.last_frame))
+        return int(self.bad_cursor if self.mode == "bad_range" else self.progress.current_frame)
 
-    def _build_bar(self) -> None:
-        for child in self._bar.winfo_children():
-            child.destroy()
+    def _current_position(self) -> int:
+        progress = self.progress
+        if progress is None or not progress.frames:
+            return 0
+        frame = self._display_frame()
+        try:
+            return progress.frames.index(frame)
+        except ValueError:
+            return min(range(len(progress.frames)), key=lambda idx: abs(progress.frames[idx] - frame))
+
+    @staticmethod
+    def _set_enabled(widget: ttk.Button, enabled: bool) -> None:
+        widget.state(["!disabled"] if enabled else ["disabled"])
+
+    def _update_controls(self) -> None:
+        progress = self.progress
         if self.mode == "bad_range":
-            self._build_bad_bar()
+            if self._playback_bar.winfo_manager():
+                self._playback_bar.pack_forget()
+            if not self._bad_bar.winfo_manager():
+                self._bad_bar.pack(fill="x")
+            self._bad_status.configure(
+                text=f"当前帧：{self.bad_cursor}    Start={self.bad_start if self.bad_start is not None else '-'}    End={self.bad_end if self.bad_end is not None else '-'}"
+            )
+            return
+        if self._bad_bar.winfo_manager():
+            self._bad_bar.pack_forget()
+        if not self._playback_bar.winfo_manager():
+            self._playback_bar.pack(fill="x")
+        disabled = progress is None or bool(self._busy_text)
+        paused_controls = not disabled and not self._playing
+        for button in (self._prev_ten, self._prev_one, self._next_one, self._next_ten, self._reject_button):
+            self._set_enabled(button, paused_controls)
+        self._set_enabled(self._bad_episode_button, not disabled)
+        self._set_enabled(self._play_button, not disabled)
+        self._set_enabled(self._submit_button, bool(progress and progress.is_complete and not disabled and not self._playing))
+        self._play_button.configure(text="暂停" if self._playing else "播放")
+        if progress is None:
+            status = ""
+        elif progress.playback_complete:
+            status = "已播放至末尾，可提交"
+        elif self._playing:
+            status = f"播放中 · 目标 {self.app.config.playback_fps:g} FPS"
         else:
-            self._build_sampling_bar()
+            status = "已暂停 · 播放至末尾后可提交"
+        self._playback_status.configure(text=status)
 
-    def _build_sampling_bar(self) -> None:
-        progress = self.progress
-        if progress is None:
-            return
-        ttk.Button(self._bar, text="上一采样帧", style="Small.TButton", command=self.prev_sample).pack(side="left", padx=(0, 8))
-        ttk.Label(self._bar, text=f"当前帧：{progress.current_frame if progress.current_frame <= progress.last_frame else '完成'} / {progress.last_frame}", style="Muted.TLabel").pack(side="left", padx=(0, 12))
-        ttk.Label(self._bar, text=f"采样间隔：{progress.sample_interval}", style="Muted.TLabel").pack(side="left", padx=(0, 16))
-        ttk.Button(self._bar, text="通过", style="Primary.TButton", command=self.mark_pass).pack(side="left", padx=(0, 8))
-        ttk.Button(self._bar, text="不通过", style="Secondary.TButton", command=self.enter_bad_range).pack(side="left", padx=(0, 8))
-        ttk.Button(self._bar, text="Episode 异常", style="Secondary.TButton", command=self.mark_bad_episode).pack(side="left", padx=(0, 16))
-        ttk.Button(self._bar, text="下一采样帧", style="Small.TButton", command=self.next_sample).pack(side="left", padx=(0, 16))
-        ttk.Button(self._bar, text="提交", style="Primary.TButton", command=lambda: self.app.submit_current_progress()).pack(side="right")
-        ttk.Button(self._bar, text="退出程序", style="Secondary.TButton", command=self.app.request_exit).pack(side="right", padx=(0, 8))
-        ttk.Button(self._bar, text="返回 Episode 列表", style="Secondary.TButton", command=lambda: self.app.handle_interrupt(exit_after=False)).pack(side="right", padx=(0, 8))
+    def toggle_playback(self) -> None:
+        if self._playing:
+            self.pause_playback()
+        else:
+            self.start_playback()
 
-    def _build_bad_bar(self) -> None:
+    def start_playback(self) -> None:
         progress = self.progress
-        if progress is None:
+        if progress is None or not progress.frames or self.mode != "playback" or self._busy_text:
             return
-        ttk.Button(self._bar, text="向前一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-1)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bar, text=f"向前 {progress.sample_interval} 帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-progress.sample_interval)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bar, text="设为坏帧起点", style="Secondary.TButton", command=self.set_bad_start).pack(side="left", padx=(0, 10))
-        ttk.Label(self._bar, text=f"当前帧：{self.bad_cursor}    Start={self.bad_start if self.bad_start is not None else '-'}    End={self.bad_end if self.bad_end is not None else '-'}", style="Muted.TLabel").pack(side="left", padx=(0, 10))
-        ttk.Button(self._bar, text="设为坏帧终点", style="Secondary.TButton", command=self.set_bad_end).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bar, text="向后一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(1)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bar, text=f"向后 {progress.sample_interval} 帧", style="Small.TButton", command=lambda: self.move_bad_cursor(progress.sample_interval)).pack(side="left", padx=(0, 10))
-        ttk.Button(self._bar, text="确认坏帧区间", style="Primary.TButton", command=self.confirm_bad_range).pack(side="right")
-        ttk.Button(self._bar, text="撤销", style="Secondary.TButton", command=self.cancel_bad_range).pack(side="right", padx=(0, 8))
+        if progress.playback_complete and self._current_position() >= len(progress.frames) - 1:
+            progress.current_frame = progress.frames[0]
+        self._playing = True
+        self._update_controls()
+        self._schedule_play_tick()
 
-    def prev_sample(self) -> None:
+    def pause_playback(self, *, persist: bool = True) -> None:
+        if self._play_after_id is not None:
+            try:
+                self.after_cancel(self._play_after_id)
+            except Exception:
+                pass
+            self._play_after_id = None
+        was_playing = self._playing
+        self._playing = False
+        if persist and was_playing:
+            self.app.save_current_progress()
+        self._update_controls()
+
+    def _schedule_play_tick(self) -> None:
+        delay_ms = max(1, int(round(1000.0 / self.app.config.playback_fps)))
+        self._play_after_id = self.after(delay_ms, self._play_tick)
+
+    def _play_tick(self) -> None:
+        self._play_after_id = None
         progress = self.progress
-        if progress is None:
+        if not self._playing or progress is None or not progress.frames:
             return
-        progress.current_frame = max(progress.first_frame, progress.current_frame - progress.sample_interval)
+        position = self._current_position()
+        if position >= len(progress.frames) - 1:
+            progress.playback_complete = True
+            self.pause_playback(persist=False)
+            self.app.save_current_progress()
+            self._refresh()
+            return
+        progress.current_frame = progress.frames[position + 1]
+        self._ticks_since_save += 1
+        if self._ticks_since_save >= max(1, int(round(self.app.config.playback_fps))):
+            self._ticks_since_save = 0
+            self.app.save_current_progress()
+        self._refresh()
+        self._schedule_play_tick()
+
+    def step_frames(self, delta: int) -> None:
+        progress = self.progress
+        if progress is None or not progress.frames or self._playing or self.mode != "playback":
+            return
+        position = max(0, min(len(progress.frames) - 1, self._current_position() + int(delta)))
+        progress.current_frame = progress.frames[position]
         self._persist_and_refresh()
 
-    def next_sample(self) -> None:
+    def seek_position(self, position: int) -> None:
         progress = self.progress
-        if progress is None:
+        if progress is None or not progress.frames or self._playing or self.mode != "playback":
             return
-        progress.current_frame = self._first_sample_after(progress.current_frame)
-        self._persist_and_refresh()
-
-    def mark_pass(self) -> None:
-        progress = self.progress
-        if progress is None or progress.current_frame > progress.last_frame:
-            return
-        if progress.current_frame not in progress.checked_sample_frames:
-            progress.checked_sample_frames.append(progress.current_frame)
-            progress.checked_sample_frames = sorted(set(progress.checked_sample_frames))
-        progress.current_frame = self._first_sample_after(progress.current_frame)
+        index = max(0, min(len(progress.frames) - 1, int(position)))
+        progress.current_frame = progress.frames[index]
         self._persist_and_refresh()
 
     def enter_bad_range(self) -> None:
         progress = self.progress
-        if progress is None or progress.current_frame > progress.last_frame:
+        if progress is None or self._playing:
             return
         self.mode = "bad_range"
         self.bad_anchor_frame = int(progress.current_frame)
@@ -926,20 +1119,22 @@ class QcPage(ttk.Frame):
 
     def move_bad_cursor(self, delta: int) -> None:
         progress = self.progress
-        if progress is None:
+        if progress is None or not progress.frames:
             return
-        lower = max(progress.first_frame, self.bad_anchor_frame - progress.sample_interval + 1)
-        upper = progress.last_frame
-        self.bad_cursor = max(lower, min(upper, self.bad_cursor + int(delta)))
+        anchor_position = progress.frames.index(self.bad_anchor_frame)
+        lower_position = max(0, anchor_position - self.FRAME_STEP + 1)
+        current_position = progress.frames.index(self.bad_cursor)
+        target_position = max(lower_position, min(len(progress.frames) - 1, current_position + int(delta)))
+        self.bad_cursor = progress.frames[target_position]
         self._refresh()
 
     def set_bad_start(self) -> None:
         self.bad_start = int(self.bad_cursor)
-        self._build_bar()
+        self._refresh()
 
     def set_bad_end(self) -> None:
         self.bad_end = int(self.bad_cursor)
-        self._build_bar()
+        self._refresh()
 
     def confirm_bad_range(self) -> None:
         progress = self.progress
@@ -956,8 +1151,10 @@ class QcPage(ttk.Frame):
             progress.bad_frame_ranges,
             max_gap_frames=self.app.config.range_merge_gap_frames,
         )
-        progress.current_frame = self._first_sample_after(self.bad_end)
-        self.mode = "sampling"
+        progress.current_frame = int(self.bad_end)
+        self.mode = "playback"
+        self.bad_start = None
+        self.bad_end = None
         self._persist_and_refresh()
 
     def cancel_bad_range(self) -> None:
@@ -965,7 +1162,7 @@ class QcPage(ttk.Frame):
         if progress is None:
             return
         progress.current_frame = self.bad_anchor_frame
-        self.mode = "sampling"
+        self.mode = "playback"
         self.bad_start = None
         self.bad_end = None
         self._persist_and_refresh()
@@ -974,22 +1171,12 @@ class QcPage(ttk.Frame):
         progress = self.progress
         if progress is None:
             return
+        self.pause_playback()
         if not ConfirmDialog.ask(self, "Episode 异常", "确认将整个 Episode 标记为异常？该结果不会进入人工返修段。"):
             return
         progress.result_type = "bad_episode"
         self.app.save_current_progress()
         self.app.submit_current_progress(bad_episode=True)
-
-    def _first_sample_after(self, frame: int) -> int:
-        progress = self.progress
-        if progress is None:
-            return frame
-        return first_sample_after(
-            int(frame),
-            first_frame=progress.first_frame,
-            last_frame=progress.last_frame,
-            sample_interval=progress.sample_interval,
-        )
 
     def _persist_and_refresh(self) -> None:
         self.app.save_current_progress()

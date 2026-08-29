@@ -21,6 +21,11 @@ class QcConfig:
     range_merge_gap_frames: int
     request_timeout_seconds: float
     nas_mounts: Dict[str, str]
+    playback_fps: float
+    mesh_renderer_python: str
+    mano_toolkit_root: Path
+    mano_model_dir: Path
+    mesh_render_factor: float
 
     @property
     def default_lease_seconds(self) -> int:
@@ -117,6 +122,21 @@ def load_qc_config(*, config_path: Optional[Path] = None, cwd: Optional[Path] = 
         range_merge_gap_frames=max(0, _int(data, "range_merge_gap_frames", 5)),
         request_timeout_seconds=max(1.0, _float(data, "request_timeout_seconds", 10.0)),
         nas_mounts=_mounts(data),
+        playback_fps=max(1.0, min(60.0, _float(data, "playback_fps", 30.0))),
+        mesh_renderer_python=_string(data, "mesh_renderer_python", "python3"),
+        mano_toolkit_root=_path(
+            data,
+            "mano_toolkit_root",
+            "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
+            base,
+        ),
+        mano_model_dir=_path(
+            data,
+            "mano_model_dir",
+            "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
+            base,
+        ),
+        mesh_render_factor=max(0.5, min(4.0, _float(data, "mesh_render_factor", 1.0))),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

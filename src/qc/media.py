@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
@@ -33,10 +36,21 @@ class QcEpisodeMedia:
         return self.episode_dir / self.task.mano_episode_dir
 
     def frame_path(self, camera: str, frame_idx: int) -> Optional[Path]:
+        rendered = self.cache_dir / "mesh" / str(camera) / f"{int(frame_idx):05d}.jpg"
+        if rendered.exists() and rendered.is_file():
+            return rendered
         cached = self.cache_dir / str(camera) / f"{int(frame_idx):05d}.png"
         if cached.exists() and cached.is_file():
             return cached
         return find_frame_path(self.episode_dir, camera, int(frame_idx), self.task.rgb_path_template)
+
+
+@dataclass(frozen=True)
+class MeshRendererSettings:
+    python_executable: str
+    mano_toolkit_root: Path
+    mano_model_dir: Path
+    render_factor: float = 1.0
 
 
 def media_from_payload(payload: Mapping[str, Any], mounts: Mapping[str, str]) -> QcEpisodeMedia:
@@ -52,6 +66,7 @@ def prepare_qc_media(
     mounts: Mapping[str, str],
     tmp_dir: Path,
     on_progress: Optional[ProgressCallback] = None,
+    mesh_renderer: Optional[MeshRendererSettings] = None,
 ) -> QcEpisodeMedia:
     task = correction_task_from_backend_payload(dict(payload), mounts=dict(mounts or {}))
     _validate_qc_episode(task)
@@ -88,6 +103,13 @@ def prepare_qc_media(
                 continue
             _emit(on_progress, camera, status="failed", decoded=decoded, total=total, error=str(exc))
             raise
+    if mesh_renderer is not None:
+        _prepare_mesh_frames(
+            task=task,
+            cache_dir=cache_dir,
+            settings=mesh_renderer,
+            on_progress=on_progress,
+        )
     return QcEpisodeMedia(task=task, cache_dir=cache_dir)
 
 
@@ -119,3 +141,98 @@ def _emit(callback: Optional[ProgressCallback], camera: str, **fields: Any) -> N
     payload = {"camera": camera}
     payload.update(fields)
     callback(camera, payload)
+
+
+def _prepare_mesh_frames(
+    *,
+    task: CorrectionTask,
+    cache_dir: Path,
+    settings: MeshRendererSettings,
+    on_progress: Optional[ProgressCallback],
+) -> None:
+    cameras = [str(camera) for camera in task.cameras[:6]]
+    frames = [int(frame) for frame in task.frames]
+    output_dir = cache_dir / "mesh"
+    total = len(frames)
+    if total <= 0:
+        raise ValueError("QC episode has no frames to render")
+    if all((output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras for frame in frames):
+        for camera in cameras:
+            _emit(on_progress, camera, status="mesh_done", decoded=total, rendered=total, total=total, error="")
+        return
+
+    request = {
+        "episode_dir": str(task.episode_dir()),
+        "rgb_cache_dir": str(cache_dir),
+        "output_dir": str(output_dir),
+        "cameras": cameras,
+        "frames": frames,
+        "mano_toolkit_root": str(settings.mano_toolkit_root),
+        "mano_model_dir": str(settings.mano_model_dir),
+        "render_factor": float(settings.render_factor),
+    }
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fd, request_name = tempfile.mkstemp(prefix="mesh_render_", suffix=".json", dir=str(cache_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(request, handle, ensure_ascii=False)
+        command = [str(settings.python_executable), "-m", "src.qc.mesh_renderer", "--request", request_name]
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"mesh renderer Python not found: {settings.python_executable}") from exc
+        output_lines: List[str] = []
+        assert process.stdout is not None
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            output_lines.append(line)
+            if len(output_lines) > 20:
+                output_lines.pop(0)
+            try:
+                status = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(status, dict):
+                continue
+            camera = str(status.get("camera") or "")
+            if camera:
+                rendered = int(status.get("rendered") or 0)
+                _emit(
+                    on_progress,
+                    camera,
+                    status=str(status.get("status") or "mesh_rendering"),
+                    decoded=rendered,
+                    rendered=rendered,
+                    total=int(status.get("total") or total),
+                    error="",
+                )
+        return_code = process.wait()
+        if return_code != 0:
+            detail = "\n".join(output_lines[-8:]) or f"exit code {return_code}"
+            raise RuntimeError(f"MANO mesh rendering failed: {detail}")
+    finally:
+        try:
+            Path(request_name).unlink()
+        except OSError:
+            pass
+
+    missing = [
+        f"{camera}/{frame:05d}.jpg"
+        for camera in cameras
+        for frame in frames
+        if not (output_dir / camera / f"{frame:05d}.jpg").is_file()
+    ]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise RuntimeError(f"mesh renderer completed with {len(missing)} missing frame(s): {preview}")
