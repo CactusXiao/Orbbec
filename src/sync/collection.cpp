@@ -1406,17 +1406,38 @@ private:
     }
 
     std::string buildBeepCommand() const {
+        const int frequencyHz = std::clamp(cfg_.recordTickFrequencyHz, 200, 2000);
+        const int durationMs = std::clamp(cfg_.recordTickDurationMs, 20, 500);
+        const double volume = std::clamp(cfg_.recordTickVolume, 0.01, 1.0);
+        const double durationSeconds = static_cast<double>(durationMs) / 1000.0;
+        const int ffplayVolume = std::clamp(static_cast<int>(std::lround(volume * 100.0)), 1, 100);
+        std::ostringstream tone;
+        tone << std::fixed << std::setprecision(3);
 #if defined(__APPLE__)
-        return "(if command -v osascript >/dev/null 2>&1; then osascript -e 'beep 1'; else printf '\\a'; fi)";
+        tone << "(if command -v ffplay >/dev/null 2>&1; then "
+             << "ffplay -nodisp -autoexit -loglevel quiet -volume " << ffplayVolume
+             << " -f lavfi -i 'sine=frequency=" << frequencyHz << ":duration=" << durationSeconds << "'; "
+             << "elif command -v play >/dev/null 2>&1; then "
+             << "play -q -n synth " << durationSeconds << " sine " << frequencyHz << " vol " << volume << "; "
+             << "elif command -v afplay >/dev/null 2>&1; then "
+             << "afplay -v " << volume << " /System/Library/Sounds/Tink.aiff; fi)";
 #else
         const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
         const std::string qDevice = shellQuote(device);
-        return "(if command -v beep >/dev/null 2>&1; then "
-               "beep -f 1200 -l 80; "
-               "elif command -v timeout >/dev/null 2>&1 && command -v speaker-test >/dev/null 2>&1; then "
-               "timeout 0.12s speaker-test -D " + qDevice + " -t sine -f 1200 -l 1 >/dev/null 2>&1 || true; "
-               "else printf '\\a'; fi)";
+        tone << "(if command -v ffplay >/dev/null 2>&1; then "
+             << "ffplay -nodisp -autoexit -loglevel quiet -volume " << ffplayVolume
+             << " -f lavfi -i 'sine=frequency=" << frequencyHz << ":duration=" << durationSeconds << "'; "
+             << "elif command -v play >/dev/null 2>&1; then "
+             << "play -q -n synth " << durationSeconds << " sine " << frequencyHz << " vol " << volume << "; "
+             << "elif command -v aplay >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then "
+             << "python3 -c 'import math,struct,sys,wave; "
+             << "rate=16000; count=int(rate*" << durationSeconds << "); "
+             << "w=wave.open(sys.stdout.buffer,\"wb\"); w.setparams((1,2,rate,count,\"NONE\",\"not compressed\")); "
+             << "w.writeframes(b\"\".join(struct.pack(\"<h\",int(32767*" << volume
+             << "*math.sin(2*math.pi*" << frequencyHz << "*i/rate))) for i in range(count))); w.close()' "
+             << "| aplay -q -D " << qDevice << "; fi)";
 #endif
+        return tone.str();
     }
 
     std::string buildCommand(const std::string &text) const {
@@ -10306,6 +10327,8 @@ int run_collection(const AppConfig &cfg,
     bool recordTickActive = false;
     std::chrono::steady_clock::time_point nextRecordTick{};
     std::chrono::steady_clock::time_point nextRecordElapsedAnnouncement{};
+    const auto recordTickInterval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(std::clamp(cfg.voiceFeedback.recordTickIntervalSeconds, 0.5, 3600.0)));
     auto formatRecordElapsedAnnouncement = [](int64_t elapsedSeconds) {
         elapsedSeconds = std::max<int64_t>(0, elapsedSeconds);
         const int64_t minutes = elapsedSeconds / 60;
@@ -10315,7 +10338,7 @@ int run_collection(const AppConfig &cfg,
     auto startRecordingTick = [&]() {
         const auto now = std::chrono::steady_clock::now();
         recordTickActive = true;
-        nextRecordTick = now + std::chrono::seconds(1);
+        nextRecordTick = now + recordTickInterval;
         nextRecordElapsedAnnouncement = now + std::chrono::seconds(15);
     };
     auto stopRecordingTick = [&]() {
@@ -10335,7 +10358,7 @@ int run_collection(const AppConfig &cfg,
         const auto now = std::chrono::steady_clock::now();
         if(!recordTickActive) {
             recordTickActive = true;
-            nextRecordTick = now + std::chrono::seconds(1);
+            nextRecordTick = now + recordTickInterval;
             nextRecordElapsedAnnouncement = now + std::chrono::seconds(15);
             return;
         }
@@ -10349,7 +10372,7 @@ int run_collection(const AppConfig &cfg,
         if(now >= nextRecordTick) {
             announce("record_tick", "di");
             do {
-                nextRecordTick += std::chrono::seconds(1);
+                nextRecordTick += recordTickInterval;
             } while(now >= nextRecordTick + std::chrono::milliseconds(200));
         }
     };

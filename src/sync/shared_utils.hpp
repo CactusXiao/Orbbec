@@ -156,6 +156,10 @@ struct VoiceFeedbackConfig {
     std::string rate          = "-8%";
     std::string pitch         = "+0Hz";
     bool        naturalOnly   = true;
+    double      recordTickIntervalSeconds = 5.0;
+    int         recordTickFrequencyHz      = 700;
+    int         recordTickDurationMs       = 60;
+    double      recordTickVolume           = 0.08;
     std::unordered_map<std::string, std::string> messages;
 };
 

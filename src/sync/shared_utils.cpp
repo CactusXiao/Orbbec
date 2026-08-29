@@ -839,6 +839,18 @@ AppConfig loadConfig(const fs::path &configPath) {
             else if(auto v = getBool(voiceObj, "disableMechanicalFallback")) {
                 cfg.voiceFeedback.naturalOnly = *v;
             }
+            if(auto v = getDouble(voiceObj, "recordTickIntervalSeconds")) {
+                cfg.voiceFeedback.recordTickIntervalSeconds = std::clamp(*v, 0.5, 3600.0);
+            }
+            if(auto v = getInt(voiceObj, "recordTickFrequencyHz")) {
+                cfg.voiceFeedback.recordTickFrequencyHz = std::clamp(*v, 200, 2000);
+            }
+            if(auto v = getInt(voiceObj, "recordTickDurationMs")) {
+                cfg.voiceFeedback.recordTickDurationMs = std::clamp(*v, 20, 500);
+            }
+            if(auto v = getDouble(voiceObj, "recordTickVolume")) {
+                cfg.voiceFeedback.recordTickVolume = std::clamp(*v, 0.01, 1.0);
+            }
             if(auto *messagesObj = cJSON_GetObjectItemCaseSensitive(voiceObj, "messages")) {
                 if(cJSON_IsObject(messagesObj)) {
                     cJSON *item = nullptr;
