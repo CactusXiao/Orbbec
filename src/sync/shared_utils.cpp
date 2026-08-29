@@ -380,6 +380,7 @@ bool launchQcFrontend(const AppConfig &cfg,
     cJSON_AddNumberToObject(root, "mesh_render_factor", std::max(0.5, std::min(4.0, frontend.meshRenderFactor)));
     cJSON_AddNumberToObject(root, "mesh_render_workers", std::max(1, std::min(32, frontend.meshRenderWorkers)));
     cJSON_AddBoolToObject(root, "mesh_prefer_integrated_gpu", frontend.meshPreferIntegratedGpu ? 1 : 0);
+    cJSON_AddNumberToObject(root, "mesh_prebuffer_frames", std::max(1, std::min(300, frontend.meshPrebufferFrames)));
     addNasMountsConfig(root, cfg.taskBackend.nas);
     const bool wroteConfig = writeJsonConfigFile(root, launchConfigPath, errorMessage);
     cJSON_Delete(root);
@@ -1037,6 +1038,9 @@ AppConfig loadConfig(const fs::path &configPath) {
                     }
                     if(auto v = getBool(qcObj, "meshPreferIntegratedGpu")) {
                         cfg.frontends.qc.meshPreferIntegratedGpu = *v;
+                    }
+                    if(auto v = getInt(qcObj, "meshPrebufferFrames")) {
+                        cfg.frontends.qc.meshPrebufferFrames = std::max(1, std::min(300, *v));
                     }
                 }
             }

@@ -122,8 +122,9 @@
             "manoToolkitRoot": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
             "manoModelDir": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
             "meshRenderFactor": 0.5,
-            "meshRenderWorkers": 16,
-            "meshPreferIntegratedGpu": true
+            "meshRenderWorkers": 6,
+            "meshPreferIntegratedGpu": true,
+            "meshPrebufferFrames": 30
         }
     },
     "voiceFeedback": {

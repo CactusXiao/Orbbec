@@ -200,8 +200,9 @@ struct QcFrontendConfig {
     fs::path    manoToolkitRoot = "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits";
     fs::path    manoModelDir = "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano";
     double      meshRenderFactor = 0.5;
-    int         meshRenderWorkers = 16;
+    int         meshRenderWorkers = 6;
     bool        meshPreferIntegratedGpu = true;
+    int         meshPrebufferFrames = 30;
 };
 
 struct TaskBackendConfig {

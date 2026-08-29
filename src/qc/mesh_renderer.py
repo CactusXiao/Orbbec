@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import sys
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
@@ -65,16 +66,27 @@ def _load_shape_scale(episode_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     return shape, np.asarray([[scale_value], [scale_value]], dtype=np.float32)
 
 
-def _source_frame(episode_dir: Path, rgb_cache_dir: Path, camera: str, frame: int) -> Path:
-    for suffix in ("jpg", "png"):
-        cached = rgb_cache_dir / camera / f"{frame:05d}.{suffix}"
-        if cached.is_file():
-            return cached
-    rgb_dir = episode_dir / camera / "RGB"
-    matches = sorted(path for path in rgb_dir.glob(f"{frame:05d}.*") if path.is_file())
-    if not matches:
-        raise FileNotFoundError(f"RGB frame not found: camera={camera} frame={frame}")
-    return matches[0]
+def _source_frame(
+    episode_dir: Path,
+    rgb_cache_dir: Path,
+    camera: str,
+    frame: int,
+    *,
+    wait_seconds: float = 0.0,
+) -> Path:
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        for suffix in ("jpg", "png"):
+            cached = rgb_cache_dir / camera / f"{frame:05d}.{suffix}"
+            if cached.is_file():
+                return cached
+        rgb_dir = episode_dir / camera / "RGB"
+        matches = sorted(path for path in rgb_dir.glob(f"{frame:05d}.*") if path.is_file())
+        if matches:
+            return matches[0]
+        if time.monotonic() >= deadline:
+            raise FileNotFoundError(f"RGB frame not found: camera={camera} frame={frame}")
+        time.sleep(0.01)
 
 
 def _create_hand_mesh(vertices: np.ndarray, faces: np.ndarray, color: Tuple[float, float, float], trimesh: Any) -> Any:
@@ -283,13 +295,20 @@ def _render_frame_worker(frame: int, vertices_world: Mapping[int, np.ndarray]) -
     camera_params = _WORKER_STATE["camera_params"]
     faces = _WORKER_STATE["faces"]
     factor = float(_WORKER_STATE["render_factor"])
+    source_wait_seconds = float(_WORKER_STATE.get("source_wait_seconds") or 0.0)
     rendered_cameras: List[str] = []
 
     for camera in cameras:
         target = output_dir / camera / f"{int(frame):05d}.jpg"
         if target.is_file():
             continue
-        source_path = _source_frame(episode_dir, rgb_cache_dir, camera, int(frame))
+        source_path = _source_frame(
+            episode_dir,
+            rgb_cache_dir,
+            camera,
+            int(frame),
+            wait_seconds=source_wait_seconds,
+        )
         image = cv2.imread(str(source_path), cv2.IMREAD_COLOR)
         if image is None:
             raise RuntimeError(f"failed to read RGB frame: {source_path}")
@@ -393,6 +412,7 @@ def render_request(request: Mapping[str, Any]) -> None:
         "faces": faces,
         "render_factor": factor,
         "prefer_integrated_gpu": bool(request.get("prefer_integrated_gpu", False)),
+        "source_wait_seconds": float(request.get("source_wait_seconds") or 0.0),
     }
 
     def record_result(result: Tuple[int, List[str]]) -> None:

@@ -28,6 +28,7 @@ class QcConfig:
     mesh_render_factor: float
     mesh_render_workers: int
     mesh_prefer_integrated_gpu: bool
+    mesh_prebuffer_frames: int
 
     @property
     def default_lease_seconds(self) -> int:
@@ -156,8 +157,9 @@ def load_qc_config(*, config_path: Optional[Path] = None, cwd: Optional[Path] = 
             base,
         ),
         mesh_render_factor=max(0.5, min(4.0, _float(data, "mesh_render_factor", 0.5))),
-        mesh_render_workers=max(1, min(32, _int(data, "mesh_render_workers", 16))),
+        mesh_render_workers=max(1, min(32, _int(data, "mesh_render_workers", 6))),
         mesh_prefer_integrated_gpu=_bool(data, "mesh_prefer_integrated_gpu", True),
+        mesh_prebuffer_frames=max(1, min(300, _int(data, "mesh_prebuffer_frames", 30))),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

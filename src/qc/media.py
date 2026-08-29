@@ -2,22 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 try:
     from label.mano_view import require_episode_calibration, require_mano_episode_artifact
     from label.storage import CorrectionTask, correction_task_from_backend_payload, find_frame_path
-    from label.video_frames import _decode_camera_frames, _load_frame_map, _locate_rgb_video
+    from label.video_frames import _decode_camera_frames, _decode_camera_frames_streaming, _load_frame_map, _locate_rgb_video
 except Exception:
     from ...label.mano_view import require_episode_calibration, require_mano_episode_artifact  # type: ignore
     from ...label.storage import CorrectionTask, correction_task_from_backend_payload, find_frame_path  # type: ignore
-    from ...label.video_frames import _decode_camera_frames, _load_frame_map, _locate_rgb_video  # type: ignore
+    from ...label.video_frames import _decode_camera_frames, _decode_camera_frames_streaming, _load_frame_map, _locate_rgb_video  # type: ignore
 
 
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
@@ -27,6 +30,8 @@ ProgressCallback = Callable[[str, Dict[str, Any]], None]
 class QcEpisodeMedia:
     task: CorrectionTask
     cache_dir: Path
+    requires_mesh: bool = False
+    preparation: Optional["_QcMediaPreparation"] = field(default=None, compare=False, repr=False)
 
     @property
     def episode_dir(self) -> Path:
@@ -40,6 +45,8 @@ class QcEpisodeMedia:
         rendered = self.cache_dir / "mesh" / str(camera) / f"{int(frame_idx):05d}.jpg"
         if rendered.exists() and rendered.is_file():
             return rendered
+        if self.requires_mesh:
+            return None
         cached_jpg = self.cache_dir / str(camera) / f"{int(frame_idx):05d}.jpg"
         if cached_jpg.exists() and cached_jpg.is_file():
             return cached_jpg
@@ -48,6 +55,23 @@ class QcEpisodeMedia:
             return cached
         return find_frame_path(self.episode_dir, camera, int(frame_idx), self.task.rgb_path_template)
 
+    def frame_ready(self, frame_idx: int) -> bool:
+        return all(self.frame_path(str(camera), int(frame_idx)) is not None for camera in self.task.cameras[:6])
+
+    @property
+    def preparation_error(self) -> Optional[str]:
+        return self.preparation.error if self.preparation is not None else None
+
+    @property
+    def preparation_done(self) -> bool:
+        return self.preparation is None or self.preparation.done
+
+    def close(self, *, cleanup: bool = False) -> None:
+        if self.preparation is not None:
+            self.preparation.stop()
+        if cleanup:
+            cleanup_qc_cache(self.cache_dir)
+
 
 @dataclass(frozen=True)
 class MeshRendererSettings:
@@ -55,8 +79,175 @@ class MeshRendererSettings:
     mano_toolkit_root: Path
     mano_model_dir: Path
     render_factor: float = 0.5
-    workers: int = 16
+    workers: int = 6
     prefer_integrated_gpu: bool = True
+    prebuffer_frames: int = 30
+
+
+class _QcMediaPreparation:
+    def __init__(
+        self,
+        *,
+        task: CorrectionTask,
+        payload: Mapping[str, Any],
+        cache_dir: Path,
+        settings: MeshRendererSettings,
+        on_progress: Optional[ProgressCallback],
+    ) -> None:
+        self.task = task
+        self.payload = payload
+        self.cache_dir = cache_dir
+        self.settings = settings
+        self.on_progress = on_progress
+        self.stop_event = threading.Event()
+        self.done_event = threading.Event()
+        self._error: Optional[str] = None
+        self._lock = threading.Lock()
+        self._renderer_process: Optional[subprocess.Popen[str]] = None
+        self._thread = threading.Thread(target=self._run, name="qc-media-preparation", daemon=True)
+
+    @property
+    def error(self) -> Optional[str]:
+        with self._lock:
+            return self._error
+
+    @property
+    def done(self) -> bool:
+        return self.done_event.is_set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self._terminate_renderer()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=15.0)
+
+    def register_renderer(self, process: Optional[subprocess.Popen[str]]) -> None:
+        with self._lock:
+            self._renderer_process = process
+        if process is not None and self.stop_event.is_set():
+            self._terminate_process(process)
+
+    def _terminate_renderer(self) -> None:
+        with self._lock:
+            process = self._renderer_process
+        if process is not None:
+            self._terminate_process(process)
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+
+    def _set_error(self, exc: BaseException) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = str(exc)
+
+    def _prepare_camera(self, camera: str) -> None:
+        total = len(self.task.frames)
+        decoded = _count_cached(self.cache_dir, camera, self.task.frames)
+        if decoded >= total and total > 0:
+            _emit(self.on_progress, camera, status="done", decoded=decoded, total=total, error="")
+            return
+        try:
+            video_path, timestamp_path = _locate_rgb_video(self.task.episode_dir(), camera, self.payload)
+            frame_map = _load_frame_map(timestamp_path)
+            _emit(
+                self.on_progress,
+                camera,
+                status="decoding",
+                decoded=decoded,
+                total=total,
+                error="",
+                video=str(video_path),
+            )
+            progress_step = max(1, total // 100)
+
+            def frame_decoded(_frame: int, published: int) -> None:
+                current = min(total, decoded + published)
+                if current == total or current % progress_step == 0:
+                    _emit(self.on_progress, camera, status="decoding", decoded=current, total=total, error="")
+
+            _decode_camera_frames_streaming(
+                video_path=video_path,
+                timestamp_path=timestamp_path,
+                frame_map=frame_map,
+                camera=camera,
+                frames=self.task.frames,
+                out_dir=self.cache_dir / camera,
+                image_extension="jpg",
+                jpeg_quality=2,
+                ffmpeg_threads=4,
+                stop_event=self.stop_event,
+                on_frame=frame_decoded,
+            )
+            decoded = _count_cached(self.cache_dir, camera, self.task.frames)
+            _emit(self.on_progress, camera, status="done", decoded=decoded, total=total, error="")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            has_original_frames = all(
+                find_frame_path(self.task.episode_dir(), camera, frame, self.task.rgb_path_template) is not None
+                for frame in self.task.frames
+            )
+            if has_original_frames:
+                _emit(
+                    self.on_progress,
+                    camera,
+                    status="done",
+                    decoded=total,
+                    total=total,
+                    error="",
+                    note="using existing RGB frames",
+                )
+                return
+            _emit(self.on_progress, camera, status="failed", decoded=decoded, total=total, error=str(exc))
+            raise
+
+    def _run(self) -> None:
+        cameras = [str(camera) for camera in self.task.cameras]
+        executor = ThreadPoolExecutor(max_workers=max(2, min(7, len(cameras) + 1)))
+        try:
+            futures = [executor.submit(self._prepare_camera, camera) for camera in cameras]
+            futures.append(
+                executor.submit(
+                    _prepare_mesh_frames,
+                    task=self.task,
+                    cache_dir=self.cache_dir,
+                    settings=self.settings,
+                    on_progress=self.on_progress,
+                    stop_event=self.stop_event,
+                    process_callback=self.register_renderer,
+                )
+            )
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except InterruptedError as exc:
+                    if not self.stop_event.is_set():
+                        self._set_error(exc)
+                    self.stop_event.set()
+                    self._terminate_renderer()
+                    break
+                except Exception as exc:
+                    self._set_error(exc)
+                    self.stop_event.set()
+                    self._terminate_renderer()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            self.register_renderer(None)
+            self.done_event.set()
 
 
 def media_from_payload(payload: Mapping[str, Any], mounts: Mapping[str, str]) -> QcEpisodeMedia:
@@ -80,8 +271,48 @@ def prepare_qc_media(
     cache_dir = Path(tmp_dir).expanduser().resolve() / episode_id
     cache_dir.mkdir(parents=True, exist_ok=True)
     total = len(task.frames)
+    if total <= 0:
+        raise ValueError("QC episode has no frames to prepare")
     for camera in task.cameras:
         _emit(on_progress, camera, status="pending", decoded=_count_cached(cache_dir, camera, task.frames), total=total, error="")
+
+    if mesh_renderer is not None:
+        media = QcEpisodeMedia(task=task, cache_dir=cache_dir, requires_mesh=True)
+        cameras = [str(camera) for camera in task.cameras[:6]]
+        if all(
+            (cache_dir / "mesh" / camera / f"{int(frame):05d}.jpg").is_file()
+            for camera in cameras
+            for frame in task.frames
+        ):
+            return media
+        preparation = _QcMediaPreparation(
+            task=task,
+            payload=dict(payload),
+            cache_dir=cache_dir,
+            settings=mesh_renderer,
+            on_progress=on_progress,
+        )
+        media = QcEpisodeMedia(
+            task=task,
+            cache_dir=cache_dir,
+            requires_mesh=True,
+            preparation=preparation,
+        )
+        preparation.start()
+        prebuffer_count = min(total, max(1, int(mesh_renderer.prebuffer_frames)))
+        prebuffer_frames = [int(frame) for frame in task.frames[:prebuffer_count]]
+        try:
+            while not all(media.frame_ready(frame) for frame in prebuffer_frames):
+                error = preparation.error
+                if error:
+                    raise RuntimeError(error)
+                if preparation.done:
+                    raise RuntimeError("mesh preparation stopped before the playback buffer was ready")
+                time.sleep(0.02)
+        except Exception:
+            preparation.stop()
+            raise
+        return media
 
     def prepare_camera(camera: str) -> None:
         decoded = _count_cached(cache_dir, camera, task.frames)
@@ -118,13 +349,6 @@ def prepare_qc_media(
         futures = [executor.submit(prepare_camera, camera) for camera in cameras]
         for future in as_completed(futures):
             future.result()
-    if mesh_renderer is not None:
-        _prepare_mesh_frames(
-            task=task,
-            cache_dir=cache_dir,
-            settings=mesh_renderer,
-            on_progress=on_progress,
-        )
     return QcEpisodeMedia(task=task, cache_dir=cache_dir)
 
 
@@ -168,6 +392,8 @@ def _prepare_mesh_frames(
     cache_dir: Path,
     settings: MeshRendererSettings,
     on_progress: Optional[ProgressCallback],
+    stop_event: Optional[threading.Event] = None,
+    process_callback: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
 ) -> None:
     cameras = [str(camera) for camera in task.cameras[:6]]
     frames = [int(frame) for frame in task.frames]
@@ -191,6 +417,7 @@ def _prepare_mesh_frames(
         "render_factor": float(settings.render_factor),
         "workers": max(1, int(settings.workers)),
         "prefer_integrated_gpu": bool(settings.prefer_integrated_gpu),
+        "source_wait_seconds": 300.0,
     }
     cache_dir.mkdir(parents=True, exist_ok=True)
     fd, request_name = tempfile.mkstemp(prefix="mesh_render_", suffix=".json", dir=str(cache_dir))
@@ -208,37 +435,48 @@ def _prepare_mesh_frames(
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                start_new_session=os.name != "nt",
             )
         except FileNotFoundError as exc:
             raise RuntimeError(f"mesh renderer Python not found: {settings.python_executable}") from exc
+        if process_callback is not None:
+            process_callback(process)
         output_lines: List[str] = []
-        assert process.stdout is not None
-        for raw_line in process.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-            output_lines.append(line)
-            if len(output_lines) > 20:
-                output_lines.pop(0)
-            try:
-                status = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(status, dict):
-                continue
-            camera = str(status.get("camera") or "")
-            if camera:
-                rendered = int(status.get("rendered") or 0)
-                _emit(
-                    on_progress,
-                    camera,
-                    status=str(status.get("status") or "mesh_rendering"),
-                    decoded=rendered,
-                    rendered=rendered,
-                    total=int(status.get("total") or total),
-                    error="",
-                )
-        return_code = process.wait()
+        try:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("mesh preparation stopped")
+                line = raw_line.strip()
+                if not line:
+                    continue
+                output_lines.append(line)
+                if len(output_lines) > 20:
+                    output_lines.pop(0)
+                try:
+                    status = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(status, dict):
+                    continue
+                camera = str(status.get("camera") or "")
+                if camera:
+                    rendered = int(status.get("rendered") or 0)
+                    _emit(
+                        on_progress,
+                        camera,
+                        status=str(status.get("status") or "mesh_rendering"),
+                        decoded=rendered,
+                        rendered=rendered,
+                        total=int(status.get("total") or total),
+                        error=str(status.get("error") or ""),
+                    )
+            return_code = process.wait()
+        finally:
+            if process_callback is not None:
+                process_callback(None)
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("mesh preparation stopped")
         if return_code != 0:
             detail = "\n".join(output_lines[-8:]) or f"exit code {return_code}"
             raise RuntimeError(f"MANO mesh rendering failed: {detail}")

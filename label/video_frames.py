@@ -7,9 +7,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import unquote
 
 try:
@@ -222,6 +224,117 @@ def _decode_camera_frames(
             os.replace(tmp_target, target)
 
 
+def _decode_camera_frames_streaming(
+    *,
+    video_path: Path,
+    timestamp_path: Optional[Path],
+    frame_map: Mapping[int, int],
+    camera: str,
+    frames: Sequence[int],
+    out_dir: Path,
+    ffmpeg_executable: str = "ffmpeg",
+    image_extension: str = "jpg",
+    jpeg_quality: int = 2,
+    ffmpeg_threads: int = 0,
+    stop_event: Optional[threading.Event] = None,
+    on_frame: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Decode frames in order and publish each completed image atomically.
+
+    Unlike ``_decode_camera_frames``, this function makes frames visible while
+    ffmpeg is still decoding. Published images are retained in ``out_dir`` so
+    callers can seek backwards without decoding the video again.
+    """
+    extension = str(image_extension or "jpg").strip().lower().lstrip(".")
+    if extension == "jpeg":
+        extension = "jpg"
+    if extension not in {"png", "jpg"}:
+        raise ValueError(f"unsupported decoded frame extension: {image_extension}")
+    requested = sorted({int(frame) for frame in frames if not isinstance(frame, bool)})
+    if not requested:
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    missing: List[Tuple[int, int]] = []
+    for frame in requested:
+        target = out_dir / f"{frame:05d}.{extension}"
+        if target.is_file():
+            continue
+        if frame_map:
+            if frame not in frame_map:
+                raise ValueError(f"frame {frame} is absent from {timestamp_path}")
+            video_idx = int(frame_map[frame])
+        else:
+            video_idx = frame
+        missing.append((frame, video_idx))
+    if not missing:
+        return
+
+    missing.sort(key=lambda item: item[1])
+    with tempfile.TemporaryDirectory(prefix=f"decode_{camera}_", dir=str(out_dir)) as tmp_name:
+        tmp = Path(tmp_name)
+        output_pattern = tmp / f"%06d.{extension}"
+        cmd = _ffmpeg_select_command(
+            video_path,
+            [video_idx for _, video_idx in missing],
+            output_pattern,
+            ffmpeg_executable=ffmpeg_executable,
+            jpeg_quality=jpeg_quality,
+            ffmpeg_threads=ffmpeg_threads,
+        )
+        with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            try:
+                process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=stderr_file)
+            except FileNotFoundError as exc:
+                raise RuntimeError(f"ffmpeg not found: {cmd[0]}") from exc
+
+            published = 0
+            try:
+                while published < len(missing):
+                    if stop_event is not None and stop_event.is_set():
+                        process.terminate()
+                        raise InterruptedError(f"RGB decoding stopped for camera {camera}")
+                    process_done = process.poll() is not None
+                    current = tmp / f"{published + 1:06d}.{extension}"
+                    following = tmp / f"{published + 2:06d}.{extension}"
+                    # ffmpeg opens the current output before it has finished
+                    # writing it. The next file (or process exit) proves that
+                    # the current image has been closed and is safe to publish.
+                    if current.is_file() and (following.exists() or process_done):
+                        frame, _video_idx = missing[published]
+                        target = out_dir / f"{frame:05d}.{extension}"
+                        temporary = out_dir / f".{target.name}.{os.getpid()}.tmp"
+                        shutil.move(str(current), str(temporary))
+                        os.replace(temporary, target)
+                        published += 1
+                        if on_frame is not None:
+                            on_frame(frame, published)
+                        continue
+                    if process_done:
+                        break
+                    time.sleep(0.01)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+
+            return_code = process.wait()
+            if stop_event is not None and stop_event.is_set():
+                raise InterruptedError(f"RGB decoding stopped for camera {camera}")
+            if return_code != 0:
+                stderr_file.seek(0)
+                detail = stderr_file.read().decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"ffmpeg failed for {video_path}: {detail}")
+            if published != len(missing):
+                raise RuntimeError(
+                    f"ffmpeg decoded {published} frame(s), expected {len(missing)} from {video_path}"
+                )
+
+
 def _run_ffmpeg_select(
     video_path: Path,
     video_indices: Sequence[int],
@@ -231,6 +344,32 @@ def _run_ffmpeg_select(
     jpeg_quality: int = 2,
     ffmpeg_threads: int = 0,
 ) -> None:
+    cmd = _ffmpeg_select_command(
+        video_path,
+        video_indices,
+        output_pattern,
+        ffmpeg_executable=ffmpeg_executable,
+        jpeg_quality=jpeg_quality,
+        ffmpeg_threads=ffmpeg_threads,
+    )
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"ffmpeg not found: {cmd[0]}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"ffmpeg failed for {video_path}: {detail}")
+
+
+def _ffmpeg_select_command(
+    video_path: Path,
+    video_indices: Sequence[int],
+    output_pattern: Path,
+    *,
+    ffmpeg_executable: str = "ffmpeg",
+    jpeg_quality: int = 2,
+    ffmpeg_threads: int = 0,
+) -> List[str]:
     ffmpeg = str(ffmpeg_executable or "ffmpeg").strip() or "ffmpeg"
     indices = [int(idx) for idx in video_indices]
     if indices and indices == list(range(indices[0], indices[-1] + 1)):
@@ -250,10 +389,4 @@ def _run_ffmpeg_select(
     if output_pattern.suffix.lower() in {".jpg", ".jpeg"}:
         cmd.extend(["-q:v", str(max(1, min(31, int(jpeg_quality))))])
     cmd.append(str(output_pattern))
-    try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"ffmpeg not found: {ffmpeg}") from exc
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(f"ffmpeg failed for {video_path}: {detail}")
+    return cmd

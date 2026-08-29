@@ -17,7 +17,7 @@ except Exception:
 
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
-from .media import MeshRendererSettings, QcEpisodeMedia, cleanup_qc_cache, prepare_qc_media
+from .media import MeshRendererSettings, QcEpisodeMedia, prepare_qc_media
 from .report import build_qc_result, write_qc_report
 from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges
 
@@ -247,6 +247,7 @@ class QcWorkerApp(tk.Tk):
                         render_factor=self.config.mesh_render_factor,
                         workers=self.config.mesh_render_workers,
                         prefer_integrated_gpu=self.config.mesh_prefer_integrated_gpu,
+                        prebuffer_frames=self.config.mesh_prebuffer_frames,
                     ),
                 )
                 return media, None
@@ -317,7 +318,7 @@ class QcWorkerApp(tk.Tk):
                 ]
                 self.client.complete_qc_job(progress.job_id, result=result, artifacts=artifacts, operator_id=self.config.operator_id)
                 self.state_store.delete(progress)
-                cleanup_qc_cache(media.cache_dir)
+                media.close(cleanup=True)
                 return True, None
             except Exception as exc:
                 return False, str(exc)
@@ -329,6 +330,7 @@ class QcWorkerApp(tk.Tk):
                 messagebox.showerror("提交失败", error or "后端没有确认提交成功。")
                 return
             messagebox.showinfo("提交成功", "后端已确认 QC 结果。")
+            self.qc_page.clear_session()
             self._current_progress = None
             self._current_media = None
             self._cancel_heartbeat()
@@ -377,7 +379,8 @@ class QcWorkerApp(tk.Tk):
                 return
             self.state_store.delete(progress)
             if media is not None:
-                cleanup_qc_cache(media.cache_dir)
+                media.close(cleanup=True)
+            self.qc_page.clear_session()
             self._current_progress = None
             self._current_media = None
             self._cancel_heartbeat()
@@ -390,6 +393,7 @@ class QcWorkerApp(tk.Tk):
 
     def preserve_current_progress(self, *, lease_seconds: int, exit_after: bool) -> None:
         progress = self._current_progress
+        media = self._current_media
         if progress is None:
             return
 
@@ -406,6 +410,8 @@ class QcWorkerApp(tk.Tk):
                     progress.lease_until = str(job.get("lease_until"))
                     progress.job = job
                 self.state_store.save(progress)
+                if media is not None:
+                    media.close(cleanup=True)
                 return True, None
             except Exception as exc:
                 self.state_store.save(progress)
@@ -417,6 +423,7 @@ class QcWorkerApp(tk.Tk):
                 messagebox.showerror("保留失败", error or "后端没有确认续租。")
                 return
             self._cancel_heartbeat()
+            self.qc_page.clear_session()
             self._current_progress = None
             self._current_media = None
             if exit_after:
@@ -442,6 +449,8 @@ class QcWorkerApp(tk.Tk):
                 self.state_store.save(progress)
             except Exception:
                 pass
+        if self._current_media is not None:
+            self._current_media.close(cleanup=True)
         self.destroy()
 
     def request_exit(self) -> None:
@@ -863,6 +872,10 @@ class QcPage(ttk.Frame):
         self._play_after_id: Optional[str] = None
         self._ticks_since_save = 0
         self._busy_text = ""
+        self._buffering = False
+        self._preparation_after_id: Optional[str] = None
+        self._frame_refresh_after_id: Optional[str] = None
+        self._preparation_error_shown = False
         self._build()
 
     def _build(self) -> None:
@@ -919,13 +932,50 @@ class QcPage(ttk.Frame):
 
     def set_session(self, progress: QcProgress, media: QcEpisodeMedia) -> None:
         self.pause_playback(persist=False)
+        self._cancel_preparation_monitor()
         self.progress = progress
         self.media = media
         self.mode = "playback"
+        self._buffering = False
+        self._preparation_error_shown = False
         if progress.frames and progress.current_frame not in progress.frames:
             progress.current_frame = progress.frames[0]
         self._build_camera_grid(media.task.cameras)
         self._refresh()
+        self._monitor_preparation()
+
+    def clear_session(self) -> None:
+        self.pause_playback(persist=False)
+        self._cancel_preparation_monitor()
+        self.progress = None
+        self.media = None
+        self._buffering = False
+
+    def _cancel_preparation_monitor(self) -> None:
+        for after_id in (self._preparation_after_id, self._frame_refresh_after_id):
+            if after_id is None:
+                continue
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._preparation_after_id = None
+        self._frame_refresh_after_id = None
+
+    def _monitor_preparation(self) -> None:
+        self._preparation_after_id = None
+        media = self.media
+        if media is None:
+            return
+        error = media.preparation_error
+        if error and not self._preparation_error_shown:
+            self._preparation_error_shown = True
+            self.pause_playback()
+            self.set_busy("后台准备失败")
+            messagebox.showerror("数据准备失败", error, parent=self)
+            return
+        if not media.preparation_done:
+            self._preparation_after_id = self.after(250, self._monitor_preparation)
 
     def set_busy(self, text: str) -> None:
         self._busy_text = str(text or "")
@@ -977,6 +1027,10 @@ class QcPage(ttk.Frame):
                 self._labels[cam].configure(text=f"Camera {cam}    mesh 帧缺失")
             else:
                 self._labels[cam].configure(text=f"Camera {cam}")
+        frame_ready = media.frame_ready(frame)
+        self._buffering = not frame_ready
+        if not frame_ready and not media.preparation_done and self._frame_refresh_after_id is None:
+            self._frame_refresh_after_id = self.after(30, self._retry_frame_refresh)
         preview = None
         if self.mode == "bad_range" and self.bad_start is not None:
             preview = (self.bad_start, self.bad_end if self.bad_end is not None else self.bad_cursor)
@@ -988,6 +1042,20 @@ class QcPage(ttk.Frame):
             seek_enabled=self.mode == "playback" and not self._playing and not self._busy_text,
         )
         self._update_controls()
+
+    def _retry_frame_refresh(self) -> None:
+        self._frame_refresh_after_id = None
+        media = self.media
+        if media is None:
+            return
+        if media.preparation_error:
+            self._monitor_preparation()
+            return
+        if media.frame_ready(self._display_frame()):
+            self._refresh()
+            return
+        if not media.preparation_done:
+            self._frame_refresh_after_id = self.after(30, self._retry_frame_refresh)
 
     def _display_frame(self) -> int:
         if self.progress is None:
@@ -1025,16 +1093,19 @@ class QcPage(ttk.Frame):
             self._playback_bar.pack(fill="x")
         disabled = progress is None or bool(self._busy_text)
         paused_controls = not disabled and not self._playing
-        for button in (self._prev_ten, self._prev_one, self._next_one, self._next_ten, self._reject_button):
+        for button in (self._prev_ten, self._prev_one, self._next_one, self._next_ten):
             self._set_enabled(button, paused_controls)
+        self._set_enabled(self._reject_button, paused_controls and not self._buffering)
         self._set_enabled(self._bad_episode_button, not disabled)
-        self._set_enabled(self._play_button, not disabled)
+        self._set_enabled(self._play_button, not disabled and (self._playing or not self._buffering))
         self._set_enabled(self._submit_button, bool(progress and progress.is_complete and not disabled and not self._playing))
         self._play_button.configure(text="暂停" if self._playing else "播放")
         if progress is None:
             status = ""
         elif progress.playback_complete:
             status = "已播放至末尾，可提交"
+        elif self._buffering:
+            status = "缓冲中 · 后台正在准备 mesh 帧"
         elif self._playing:
             status = f"播放中 · 目标 {self.app.config.playback_fps:g} FPS"
         else:
@@ -1066,6 +1137,8 @@ class QcPage(ttk.Frame):
             self._play_after_id = None
         was_playing = self._playing
         self._playing = False
+        if self.media is not None and self.progress is not None:
+            self._buffering = not self.media.frame_ready(self.progress.current_frame)
         if persist and was_playing:
             self.app.save_current_progress()
         self._update_controls()
@@ -1086,7 +1159,15 @@ class QcPage(ttk.Frame):
             self.app.save_current_progress()
             self._refresh()
             return
-        progress.current_frame = progress.frames[position + 1]
+        next_frame = progress.frames[position + 1]
+        media = self.media
+        if media is not None and not media.frame_ready(next_frame):
+            self._buffering = True
+            self._update_controls()
+            self._play_after_id = self.after(30, self._play_tick)
+            return
+        self._buffering = False
+        progress.current_frame = next_frame
         self._ticks_since_save += 1
         if self._ticks_since_save >= max(1, int(round(self.app.config.playback_fps))):
             self._ticks_since_save = 0

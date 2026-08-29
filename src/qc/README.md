@@ -32,13 +32,14 @@ python3 -m src.qc.main --config /tmp/orbbec_qc_frontend_config.json
   "mano_toolkit_root": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
   "mano_model_dir": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
   "mesh_render_factor": 0.5,
-  "mesh_render_workers": 16,
+  "mesh_render_workers": 6,
+  "mesh_prebuffer_frames": 30,
   "mesh_prefer_integrated_gpu": true,
   "nas_mounts": {"nas://ego": "/mnt/nas"}
 }
 ```
 
-`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。针对 9950X 实测配置为 16 进程、0.5 倍 mesh 图层，并优先选择 AMD 核显 EGL 设备；不存在可用 OpenGL 时会自动回退 CPU。
+`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。六路视频会边解码、边渲染；前 30 个完整六视角 mesh 帧准备好后即可播放，RGB 与 mesh 图片会保留到离开当前 Episode。针对 9950X 的播放并发实测配置为 6 个渲染进程、0.5 倍 mesh 图层，并优先选择 AMD 核显 EGL 设备；不存在可用 OpenGL 时会自动回退 CPU。
 
 ## 行为
 
