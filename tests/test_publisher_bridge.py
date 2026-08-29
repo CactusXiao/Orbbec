@@ -16,6 +16,7 @@ from task_backend.publisher_bridge import (
     MaterializerError,
     PublisherBridge,
     PublisherBridgeConfig,
+    _decode_materializer_stdout,
 )
 from task_backend.workflow_store import WorkflowStore
 
@@ -87,6 +88,16 @@ class FailingMaterializer:
 
 
 class PublisherBridgeTest(unittest.TestCase):
+    def test_materializer_stdout_tolerates_mano_dependency_warnings(self) -> None:
+        result = _decode_materializer_stdout(
+            "WARNING: You are using a MANO model, with only 10 shape coefficients.\n"
+            "WARNING: You are using a MANO model, with only 10 shape coefficients.\n"
+            '{"ok": true, "frames": [0, 1], "joints_3d_shape": [2, 2, 21, 3]}\n'
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["frames"], [0, 1])
+
     def test_manual_bridge_runs_two_episode_slots_concurrently(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

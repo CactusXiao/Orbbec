@@ -58,6 +58,23 @@ class MaterializerError(RuntimeError):
         self.retryable = retryable
 
 
+def _decode_materializer_stdout(stdout: str) -> Dict[str, Any]:
+    """Decode the final JSON result while tolerating dependency warnings on stdout."""
+    last_error: Optional[json.JSONDecodeError] = None
+    for line in reversed(str(stdout or "").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if isinstance(value, dict):
+            return value
+    detail = str(last_error) if last_error is not None else "stdout contained no JSON object"
+    raise MaterializerError(f"MANO materializer returned invalid JSON: {detail}", retryable=False)
+
+
 @dataclass
 class PublisherBridgeConfig:
     enabled: bool = False
@@ -243,10 +260,7 @@ class OptimizedPoseMaterializer:
             except (IndexError, json.JSONDecodeError):
                 pass
             raise MaterializerError(message or "MANO materializer failed", retryable=process.returncode == 75)
-        try:
-            value = json.loads(stdout)
-        except json.JSONDecodeError as exc:
-            raise MaterializerError(f"MANO materializer returned invalid JSON: {exc}", retryable=False) from exc
+        value = _decode_materializer_stdout(stdout)
         if not isinstance(value, dict) or not value.get("ok"):
             raise MaterializerError("MANO materializer did not report success", retryable=False)
         return value
