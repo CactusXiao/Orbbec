@@ -170,6 +170,90 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
         self.assertIn("5. Episode 人工纠偏 / Episode 二次 3D", html)
         self.assertNotIn("Raw Reservation JSON", html)
 
+    def test_episode_detail_shows_joint3d_retry_only_for_materialization_failure(self) -> None:
+        model = {
+            "reservation": {
+                "reservation_id": "episode_retry",
+                "task_name": "pick_object",
+                "subject_id": "S001",
+                "episode_number": 1,
+                "status": "confirmed",
+                "stats": {},
+            },
+            "task": {},
+            "metadata_pairs": [],
+            "workflow": {
+                "episode": {"metadata": {}},
+                "workflow": {"status": "auto_labeling", "job_count": 1},
+                "upload": {
+                    "available": True,
+                    "status": "succeeded",
+                    "nas_uri": "nas://ego/S001/pick_object/episode1",
+                },
+                "workflow_artifacts": [],
+                "segments": [],
+                "jobs": [
+                    {
+                        "job_id": "auto_label_episode_retry_episode",
+                        "type": "auto_label",
+                        "status": "failed",
+                        "can_retry_joint3d": True,
+                        "failure_phase": "mano_materialization",
+                        "error": "optimized_pose materialization failed",
+                    }
+                ],
+            },
+        }
+
+        html = render_episode_detail(model)
+        self.assertIn("重试 (2,99) → joint3d", html)
+        self.assertIn("/episodes/episode_retry/retry-joint3d", html)
+
+        model["workflow"]["jobs"][0]["can_retry_joint3d"] = False
+        html = render_episode_detail(model)
+        self.assertNotIn("重试 (2,99) → joint3d", html)
+
+    def test_retry_joint3d_requeues_only_failed_publisher_materialization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp) / "workflow.sqlite3")
+            service = JobService(store)
+            store.create_or_update_episode(
+                episode_id="episode_retry",
+                subject_id="S001",
+                task_name="pick_object",
+                status="auto_labeling",
+                episode_uri="nas://ego/S001/pick_object/episode_retry",
+            )
+            store.create_job(
+                job_id="auto_label_episode_retry_episode",
+                job_type="auto_label",
+                episode_id="episode_retry",
+                payload={"episode_uri": "nas://ego/S001/pick_object/episode_retry"},
+                status="failed",
+                result={
+                    "ok": False,
+                    "worker_id": "publisher_bridge:backend:slot-01",
+                    "phase": "mano_materialization",
+                    "error": "optimized_pose materialization failed: converter error",
+                },
+            )
+
+            response = service.retry_joint3d_materialization("episode_retry", {"operator_id": "admin"})
+
+            self.assertTrue(response["requeued"])
+            retried = store.get_job("auto_label_episode_retry_episode") or {}
+            self.assertEqual(retried.get("status"), "queued")
+            self.assertEqual((retried.get("result") or {}).get("retry_requested_by"), "admin")
+            self.assertEqual(
+                ((retried.get("result") or {}).get("previous_failure") or {}).get("phase"),
+                "mano_materialization",
+            )
+            self.assertEqual((store.get_episode("episode_retry") or {}).get("status"), "auto_labeling")
+
+            with self.assertRaises(WorkflowError) as raised:
+                service.retry_joint3d_materialization("episode_retry", {"operator_id": "admin"})
+            self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
+
     def test_nas_uploader_always_queues_auto_label_after_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

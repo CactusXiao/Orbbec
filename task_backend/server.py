@@ -2094,8 +2094,17 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         text = compact_value(value)
         return f"<span class=\"mono\">{html_escape(text)}</span>"
 
-    def flow_row(step: str, stage_status: str, updated_at: Any, detail: Any, artifact: Any = "", operator: Any = "") -> str:
+    def flow_row(
+        step: str,
+        stage_status: str,
+        updated_at: Any,
+        detail: Any,
+        artifact: Any = "",
+        operator: Any = "",
+        action_html: str = "",
+    ) -> str:
         artifact_html = uri_cell(artifact) if compact_value(artifact) != "-" else "<span class=\"muted\">-</span>"
+        action_cell = action_html or "<span class=\"muted\">-</span>"
         return (
             "<tr>"
             f"<td>{html_escape(step)}</td>"
@@ -2104,6 +2113,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             f"<td>{html_escape(compact_value(operator))}</td>"
             f"<td>{html_escape(compact_value(detail))}</td>"
             f"<td>{artifact_html}</td>"
+            f"<td>{action_cell}</td>"
             "</tr>"
         )
 
@@ -2117,6 +2127,13 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
     mano_episode_artifact = latest_artifact({"mano_episode"})
     qc_report_artifact = latest_artifact({"qc_report"})
     final_manifest_uri = upload_nas_uri.rstrip("/") + "/workflow/final_3d_sources.json" if upload_nas_uri else ""
+    auto_retry_action = ""
+    if bool(auto_job.get("can_retry_joint3d")):
+        auto_retry_action = (
+            f"<form method=\"post\" action=\"/episodes/{url_part(reservation_id)}/retry-joint3d\">"
+            "<button type=\"submit\" class=\"secondary\">重试 (2,99) → joint3d</button>"
+            "</form><div class=\"muted\">仅重跑转换</div>"
+        )
 
     segment_counts: Dict[str, int] = {}
     for segment in segments:
@@ -2299,6 +2316,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
             (str(auto_job.get("job_id") or "") + " | pred_2d + mano/episode") if auto_job else "waiting for push",
             mano_episode_artifact.get("uri") if mano_episode_artifact else auto_artifact.get("uri") if auto_artifact else "",
             "",
+            auto_retry_action,
         ),
         flow_row(
             "4. QC 质检",
@@ -2405,7 +2423,7 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         + "</div>"
         + failed_alert_html
         + "<section><h2>当前流程</h2><div class=\"wide\"><table>"
-        "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>操作员</th><th>说明</th><th>关键路径 / 产物</th></tr></thead><tbody>"
+        "<thead><tr><th>步骤</th><th>状态</th><th>更新时间</th><th>操作员</th><th>说明</th><th>关键路径 / 产物</th><th>操作</th></tr></thead><tbody>"
         + "\n".join(flow_rows)
         + "</tbody></table></div></section>"
         "<section><h2>采集信息</h2><div class=\"kv\">"
@@ -2735,6 +2753,16 @@ class RequestHandler(BaseHTTPRequestHandler):
                 form = self._read_form()
                 body = {**form, "episode_id": episode_id}
                 self.workflow.push_auto_label(body)
+                self._redirect(f"/episodes/{url_part(episode_id)}")
+                return
+
+            if parsed.path.startswith("/episodes/") and parsed.path.endswith("/retry-joint3d"):
+                raw_id = parsed.path[len("/episodes/"):-len("/retry-joint3d")]
+                episode_id = unquote(raw_id.strip("/")).strip()
+                if not episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                form = self._read_form()
+                self.workflow.retry_joint3d_materialization(episode_id, form)
                 self._redirect(f"/episodes/{url_part(episode_id)}")
                 return
 

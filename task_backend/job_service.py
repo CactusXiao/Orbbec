@@ -164,6 +164,16 @@ def _optional_int(value: Any) -> Optional[int]:
         return None
 
 
+def _is_joint3d_materialization_failure(job: Dict[str, Any]) -> bool:
+    result = dict(job.get("result") or {})
+    return (
+        str(job.get("type") or "") == "auto_label"
+        and str(job.get("status") or "") == "failed"
+        and str(result.get("phase") or "") == "mano_materialization"
+        and str(result.get("worker_id") or "").startswith("publisher_bridge:")
+    )
+
+
 def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
     payload = dict(job.get("payload") or {})
     result = dict(job.get("result") or {})
@@ -184,6 +194,10 @@ def _compact_job(job: Dict[str, Any]) -> Dict[str, Any]:
         out["operator_id"] = operator_id
     if result.get("error"):
         out["error"] = str(result.get("error") or "")
+    if result.get("phase"):
+        out["failure_phase"] = str(result.get("phase") or "")
+    if _is_joint3d_materialization_failure(job):
+        out["can_retry_joint3d"] = True
     return out
 
 
@@ -560,6 +574,46 @@ class JobService:
             "skipped": len(skipped),
             "jobs": created_jobs,
             "episodes": outcomes,
+        }
+
+    def retry_joint3d_materialization(self, episode_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Retry only the Publisher (2,99) -> joint3d materialization step."""
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
+        episode = self.store.get_episode(episode_id)
+        if episode is None:
+            raise WorkflowError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+        jobs = self.store.jobs_for_episode(episode_id, "auto_label")
+        if not jobs:
+            raise WorkflowError(HTTPStatus.NOT_FOUND, f"auto_label job not found: {episode_id}")
+        job = jobs[-1]
+        if not _is_joint3d_materialization_failure(job):
+            raise WorkflowError(
+                HTTPStatus.CONFLICT,
+                "latest auto_label job is not a retryable (2,99) -> joint3d conversion failure",
+            )
+        requested_by = str(
+            body.get("requested_by") or body.get("operator_id") or body.get("user") or "episode_page"
+        ).strip() or "episode_page"
+        requeued = self.store.requeue_failed_job(
+            job_id=str(job.get("job_id") or ""),
+            requested_by=requested_by,
+            reason="retry_joint3d_materialization",
+        )
+        self.store.update_episode_status(
+            episode_id,
+            "auto_labeling",
+            {
+                "joint3d_retry_job_id": requeued.get("job_id"),
+                "joint3d_retry_requested_at": requeued.get("updated_at"),
+                "joint3d_retry_requested_by": requested_by,
+            },
+        )
+        return {
+            "requeued": True,
+            "episode_id": episode_id,
+            "job": _compact_job(requeued),
         }
 
     def label_tasks(self) -> Dict[str, Any]:

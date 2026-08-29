@@ -13,6 +13,7 @@ from task_backend.job_service import JobService
 from task_backend.publisher_bridge import (
     ManualPublisherBridge,
     ManualPublisherBridgeConfig,
+    MaterializerError,
     PublisherBridge,
     PublisherBridgeConfig,
 )
@@ -78,6 +79,11 @@ class FakeMaterializer:
             "frames": frames,
             "joints_3d_shape": list(joints.shape),
         }
+
+
+class FailingMaterializer:
+    def run(self, *, episode_dir: Path, generation: int, result_manifest_sha256: str, cameras: list[str]) -> dict:
+        raise MaterializerError("converter error", retryable=False)
 
 
 class PublisherBridgeTest(unittest.TestCase):
@@ -327,6 +333,57 @@ class PublisherBridgeTest(unittest.TestCase):
                 },
             )
             self.assertEqual(len(store.artifacts_for_episode("episode_uuid")), 2)
+            self.assertEqual(len(store.jobs_for_episode("episode_uuid", "qc")), 1)
+
+    def test_joint3d_retry_reuses_labeled_publisher_result_without_republishing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pose_dir = root / "S001" / "pick_object" / "episode1" / "optimized_pose"
+            pose_dir.mkdir(parents=True)
+            np.save(pose_dir / "00002.npy", np.zeros((2, 99), dtype=np.float32), allow_pickle=False)
+
+            store = WorkflowStore(root / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(root)})
+            store.create_or_update_episode(
+                episode_id="episode_uuid",
+                subject_id="S001",
+                task_name="pick_object",
+                status="uploaded",
+                episode_uri="nas://ego/S001/pick_object/episode1",
+                cameras=["00"],
+            )
+            service.push_auto_label({"episode_id": "episode_uuid", "pushed_by": "test"})
+            publisher = FakePublisher(
+                [
+                    {
+                        "episode_id": "S001/pick_object/episode1",
+                        "found": True,
+                        "state": "labeled",
+                        "generation": 3,
+                        "result_manifest_sha256": RESULT_SHA256,
+                    }
+                ]
+            )
+            bridge = PublisherBridge(
+                service,
+                PublisherBridgeConfig(poll_seconds=0.01, lease_seconds=10, heartbeat_seconds=1),
+                publisher_client=publisher,
+                materializer=FailingMaterializer(),
+                hostname="capture-host",
+            )
+
+            self.assertTrue(bridge.process_once(1))
+            failed_job = service.upload_status("episode_uuid")["jobs"][0]
+            self.assertEqual(failed_job["status"], "failed")
+            self.assertTrue(failed_job["can_retry_joint3d"])
+
+            service.retry_joint3d_materialization("episode_uuid", {"operator_id": "admin"})
+            bridge.materializer = FakeMaterializer()
+            self.assertTrue(bridge.process_once(1))
+
+            retried_job = store.jobs_for_episode("episode_uuid", "auto_label")[0]
+            self.assertEqual(retried_job["status"], "succeeded")
+            self.assertEqual(publisher.published, [])
             self.assertEqual(len(store.jobs_for_episode("episode_uuid", "qc")), 1)
 
     def test_backend_shutdown_releases_held_job_without_canceling_publisher(self) -> None:

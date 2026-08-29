@@ -969,6 +969,42 @@ class WorkflowStore:
                 raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"released job not found: {job_id}")
             return updated, True
 
+    def requeue_failed_job(
+        self,
+        *,
+        job_id: str,
+        requested_by: str = "",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Move one failed job back to the queue while retaining its failure audit trail."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self._get_job_unlocked(conn, job_id)
+            if job is None:
+                raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+            if str(job.get("status") or "") != "failed":
+                raise WorkflowError(HTTPStatus.CONFLICT, "only a failed job can be retried")
+            timestamp = now_iso()
+            retry_result = {
+                "retry_requested_at": timestamp,
+                "retry_requested_by": str(requested_by or "api").strip() or "api",
+                "retry_reason": str(reason or "").strip(),
+                "previous_failure": dict(job.get("result") or {}),
+            }
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', lease_owner = NULL, lease_until = NULL,
+                    result_json = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (_json_dumps(retry_result), timestamp, job_id),
+            )
+            updated = self._get_job_unlocked(conn, job_id)
+            if updated is None:
+                raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"retried job not found: {job_id}")
+            return updated
+
     def create_segment(
         self,
         *,
