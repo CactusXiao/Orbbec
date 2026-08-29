@@ -9473,11 +9473,6 @@ struct EpisodeReservationUi {
     int         frameCount = 0;
     bool        localFinalized = false;
     bool        countedComplete = false;
-    bool        nasUploadStarted = false;
-    bool        nasUploadFinished = false;
-    bool        nasUploadSucceeded = false;
-    std::string nasUri;
-    std::string nasUploadError;
 
     void clear() {
         active = false;
@@ -9491,11 +9486,6 @@ struct EpisodeReservationUi {
         frameCount = 0;
         localFinalized = false;
         countedComplete = false;
-        nasUploadStarted = false;
-        nasUploadFinished = false;
-        nasUploadSucceeded = false;
-        nasUri.clear();
-        nasUploadError.clear();
     }
 };
 
@@ -9563,6 +9553,24 @@ struct CaptureNasUploadResult {
     std::string error;
     uint64_t    totalBytes = 0;
     int         filesTotal = 0;
+};
+
+struct CaptureNasFinalizeResult {
+    CaptureNasUploadResult upload;
+    bool                    backendConfirmed = false;
+    std::vector<TaskBackendTask> refreshedTasks;
+    std::string             backendError;
+    bool                    localCleanupAttempted = false;
+    bool                    localCleanupSucceeded = false;
+    std::string             localCleanupError;
+};
+
+struct CaptureNasFinalizeJob {
+    std::string reservationId;
+    std::string taskName;
+    int         episodeNumber = 0;
+    fs::path    collectionPath;
+    std::future<CaptureNasFinalizeResult> future;
 };
 
 static std::string cleanNasPathPart(const std::string &value, const std::string &fallback) {
@@ -9786,7 +9794,8 @@ static CaptureNasUploadResult uploadEpisodeToNas(const NasConfig &nas,
     }
     result.episodeUri = joinNasUriPath(uriPrefix, subject, task, episode);
     result.destPath = root / subject / task / episode;
-    const fs::path tmp = root / ".upload_tmp" / (episode + ".capture_upload");
+    const fs::path tmp = root / ".upload_tmp"
+                       / (cleanNasPathPart(reservationId, episode) + ".capture_upload");
 
     std::string error;
     if(!copyEpisodeTreeToNasTemp(collectionPath, tmp, result.totalBytes, result.filesTotal, &error)) {
@@ -10244,8 +10253,7 @@ int run_collection(const AppConfig &cfg,
     VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
     std::deque<TrackedUploadUi> trackedUploads;
-    std::future<CaptureNasUploadResult> captureNasFuture;
-    std::string captureNasUploadReservationId;
+    std::deque<CaptureNasFinalizeJob> captureNasFinalizeJobs;
     int logScroll = 0;
     CaptureState captureState = CaptureState::IDLE;
     bool pendingResetAfterDrain = false;
@@ -10419,6 +10427,20 @@ int run_collection(const AppConfig &cfg,
         for(const auto &task: backendTasks) {
             capUi.tasks.push_back(taskInfoFromBackend(task));
         }
+        // Backend progress does not include capture-side uploads that have not
+        // finished yet. Keep those accepted episodes counted in the UI so the
+        // operator cannot over-capture a task while uploads run in background.
+        for(auto &job: captureNasFinalizeJobs) {
+            if(job.future.valid()
+               && job.future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                continue;
+            }
+            const int taskIdx = findTaskIndexByName(capUi.tasks, job.taskName);
+            if(taskIdx >= 0) {
+                auto &task = capUi.tasks[static_cast<size_t>(taskIdx)];
+                task.completed = std::min(task.total, task.completed + 1);
+            }
+        }
 
         capUi.currentTaskIdx = keep.empty() ? -1 : findTaskIndexByName(capUi.tasks, keep);
         if(capUi.currentTaskIdx >= 0 && !isTaskSelectable(capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)])) {
@@ -10515,6 +10537,15 @@ int run_collection(const AppConfig &cfg,
     };
 
     auto latestUploadLine = [&]() -> std::string {
+        if(!captureNasFinalizeJobs.empty()) {
+            const auto &job = captureNasFinalizeJobs.front();
+            std::string line = "NAS " + job.taskName + " ep" + std::to_string(job.episodeNumber)
+                             + ": capture-side upload running in background";
+            if(captureNasFinalizeJobs.size() > 1) {
+                line += " (" + std::to_string(captureNasFinalizeJobs.size()) + " active)";
+            }
+            return line;
+        }
         if(trackedUploads.empty()) {
             return "";
         }
@@ -10554,23 +10585,10 @@ int run_collection(const AppConfig &cfg,
         return true;
     };
 
-    auto captureNasUploadRunning = [&]() {
-        return captureNasFuture.valid()
-            && captureNasFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
-    };
-
-    auto startCaptureNasUploadForCurrentReservation = [&]() {
+    auto enqueueCaptureNasFinalizeForCurrentReservation = [&]() {
         if(!currentReservation.active) {
             capUi.msg = "NAS upload failed: no active reservation";
             pushUiLog(capUi.msg);
-            return false;
-        }
-        if(captureNasUploadRunning()) {
-            capUi.msg = "NAS upload still running...";
-            return false;
-        }
-        if(captureNasFuture.valid()) {
-            capUi.msg = "NAS upload result is pending UI processing";
             return false;
         }
         const std::string subject = trimString(cfgUi.subjectId);
@@ -10584,25 +10602,66 @@ int run_collection(const AppConfig &cfg,
             pushUiLog(capUi.msg);
             return false;
         }
-        currentReservation.nasUploadStarted = true;
-        currentReservation.nasUploadFinished = false;
-        currentReservation.nasUploadSucceeded = false;
-        currentReservation.nasUploadError.clear();
-        currentReservation.nasUri.clear();
-        captureNasUploadReservationId = currentReservation.reservationId;
-
         const NasConfig nas = cfg.taskBackend.nas;
         const fs::path collectionPath = currentReservation.collectionPath;
         const std::string taskName = currentReservation.taskName;
         const std::string reservationId = currentReservation.reservationId;
         const int episodeNumber = currentReservation.episodeNumber;
         const std::string storageName = currentReservation.storageName;
-        captureNasFuture = std::async(std::launch::async, [nas, collectionPath, subject, taskName, reservationId, episodeNumber, storageName]() {
-            return uploadEpisodeToNas(nas, collectionPath, subject, taskName, reservationId, episodeNumber, storageName);
-        });
+        const std::string idempotencyKey = currentReservation.idempotencyKey;
+        const double durationSeconds = currentReservation.durationSeconds;
+        const int frameCount = currentReservation.frameCount;
+        const std::string backendUrl = cfg.taskBackend.baseUrl;
+        const int backendTimeoutMs = cfg.taskBackend.timeoutMs;
+        const std::string operatorIdForJob = collectionOperatorId;
+        const bool deleteLocalAfterUpload = nas.deleteLocalAfterUpload;
 
-        capUi.msg = "NAS upload started...";
-        pushUiLog("NAS upload started: " + currentReservation.collectionPath.string());
+        CaptureNasFinalizeJob job;
+        job.reservationId = reservationId;
+        job.taskName = taskName;
+        job.episodeNumber = episodeNumber;
+        job.collectionPath = collectionPath;
+        job.future = std::async(std::launch::async,
+                                [nas, collectionPath, subject, taskName, reservationId, episodeNumber,
+                                 storageName, idempotencyKey, durationSeconds, frameCount, backendUrl,
+                                 backendTimeoutMs, operatorIdForJob, deleteLocalAfterUpload]() {
+            CaptureNasFinalizeResult result;
+            result.upload = uploadEpisodeToNas(nas, collectionPath, subject, taskName,
+                                               reservationId, episodeNumber, storageName);
+            if(!result.upload.ok) {
+                return result;
+            }
+
+            TaskBackendClient workerBackend(backendUrl, backendTimeoutMs);
+            result.backendConfirmed = workerBackend.confirmEpisode(
+                reservationId, subject, taskName, episodeNumber, collectionPath.string(),
+                result.upload.episodeUri, durationSeconds, frameCount, idempotencyKey,
+                operatorIdForJob, result.refreshedTasks, &result.backendError);
+            if(!result.backendConfirmed) {
+                return result;
+            }
+
+            if(deleteLocalAfterUpload) {
+                result.localCleanupAttempted = true;
+                result.localCleanupSucceeded = deleteLocalEpisodeAfterNasUpload(
+                    collectionPath, nas.mountPath, episodeNumber, &result.localCleanupError);
+            }
+            return result;
+        });
+        captureNasFinalizeJobs.push_back(std::move(job));
+
+        if(!currentReservation.countedComplete) {
+            completedThisCollection += 1;
+            currentReservation.countedComplete = true;
+            const int taskIdx = findTaskIndexByName(capUi.tasks, taskName);
+            if(taskIdx >= 0) {
+                auto &task = capUi.tasks[static_cast<size_t>(taskIdx)];
+                task.completed = std::min(task.total, task.completed + 1);
+            }
+        }
+        capUi.msg = "Capture confirmed; NAS upload is running in background";
+        pushUiLog("Capture-side NAS upload queued: " + collectionPath.string());
+        currentReservation.clear();
         return true;
     };
 
@@ -10610,17 +10669,6 @@ int run_collection(const AppConfig &cfg,
         if(!currentReservation.active) {
             capUi.msg = "Backend confirm failed: no active reservation";
             pushUiLog(capUi.msg);
-            return false;
-        }
-        if(cfg.taskBackend.nas.enabled && currentReservation.nasUri.empty()) {
-            if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
-                capUi.msg = "NAS upload still running...";
-                return false;
-            }
-            if(!startCaptureNasUploadForCurrentReservation()) {
-                return false;
-            }
-            captureState = CaptureState::BACKEND_SYNC_PENDING;
             return false;
         }
         std::vector<TaskBackendTask> refreshedTasks;
@@ -10631,7 +10679,7 @@ int run_collection(const AppConfig &cfg,
                                          currentReservation.taskName,
                                          currentReservation.episodeNumber,
                                          currentReservation.collectionPath.string(),
-                                         currentReservation.nasUri,
+                                         "",
                                          currentReservation.durationSeconds,
                                          currentReservation.frameCount,
                                          currentReservation.idempotencyKey,
@@ -10660,81 +10708,63 @@ int run_collection(const AppConfig &cfg,
                 pushUiLog(line);
             }
         }
-        if(cfg.taskBackend.nas.enabled
-           && cfg.taskBackend.nas.deleteLocalAfterUpload
-           && currentReservation.nasUploadSucceeded) {
-            std::string cleanupError;
-            const fs::path localEpisodePath = currentReservation.collectionPath;
-            if(deleteLocalEpisodeAfterNasUpload(localEpisodePath,
-                                                cfg.taskBackend.nas.mountPath,
-                                                currentReservation.episodeNumber,
-                                                &cleanupError)) {
-                pushUiLog("Local episode deleted after NAS upload: " + localEpisodePath.string());
-            }
-            else {
-                pushUiLog("WARNING: NAS upload is safe, but local episode cleanup failed: " + cleanupError);
-            }
-        }
         currentReservation.clear();
         return true;
     };
 
-    auto pollCaptureNasUpload = [&]() {
-        if(!captureNasFuture.valid()) {
-            return;
-        }
-        if(captureNasFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
-            return;
-        }
-        CaptureNasUploadResult uploadResult;
-        try {
-            uploadResult = captureNasFuture.get();
-        }
-        catch(const std::exception &e) {
-            uploadResult.ok = false;
-            uploadResult.error = e.what();
-        }
-        catch(...) {
-            uploadResult.ok = false;
-            uploadResult.error = "unknown NAS upload error";
-        }
-        const std::string finishedReservationId = captureNasUploadReservationId;
-        captureNasUploadReservationId.clear();
-        if(!currentReservation.active || currentReservation.reservationId != finishedReservationId) {
-            return;
-        }
-        currentReservation.nasUploadFinished = true;
-        currentReservation.nasUploadSucceeded = uploadResult.ok;
-        currentReservation.nasUri = uploadResult.ok ? uploadResult.episodeUri : std::string();
-        currentReservation.nasUploadError = uploadResult.error;
-        if(!uploadResult.ok) {
-            capUi.msg = "NAS upload failed: " + uploadResult.error;
-            pushUiLog(capUi.msg);
-            captureState = CaptureState::BACKEND_SYNC_PENDING;
-            announce("confirm_failed", "nas upload failed");
-            return;
-        }
-        {
+    auto pollCaptureNasFinalizeJobs = [&]() {
+        for(auto it = captureNasFinalizeJobs.begin(); it != captureNasFinalizeJobs.end();) {
+            if(it->future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+                ++it;
+                continue;
+            }
+
+            CaptureNasFinalizeResult result;
+            try {
+                result = it->future.get();
+            }
+            catch(const std::exception &e) {
+                result.upload.error = e.what();
+            }
+            catch(...) {
+                result.upload.error = "unknown capture-side NAS finalization error";
+            }
+
+            const std::string taskName = it->taskName;
+            const int episodeNumber = it->episodeNumber;
+            if(!result.upload.ok || !result.backendConfirmed) {
+                const std::string error = !result.upload.ok ? result.upload.error : result.backendError;
+                pushUiLog("ERROR: background NAS finalize failed for " + taskName
+                          + " ep" + std::to_string(episodeNumber) + ": " + error);
+                const int taskIdx = findTaskIndexByName(capUi.tasks, taskName);
+                if(taskIdx >= 0) {
+                    auto &task = capUi.tasks[static_cast<size_t>(taskIdx)];
+                    task.completed = std::max(0, task.completed - 1);
+                }
+                completedThisCollection = std::max(0, completedThisCollection - 1);
+                announce("confirm_failed", "nas upload failed");
+                it = captureNasFinalizeJobs.erase(it);
+                continue;
+            }
+
             std::ostringstream oss;
-            oss << "NAS upload OK: " << uploadResult.episodeUri
-                << " files=" << uploadResult.filesTotal
-                << " bytes=" << uploadResult.totalBytes;
+            oss << "Capture-side NAS upload OK: " << result.upload.episodeUri
+                << " files=" << result.upload.filesTotal
+                << " bytes=" << result.upload.totalBytes;
             pushUiLog(oss.str());
-        }
-        capUi.msg = "NAS upload OK. Confirming backend...";
-        if(confirmReservationWithBackend()) {
-            capUi.msg = "Capture confirmed";
-            pushUiLog("Confirm OK. Backend received NAS URI.");
-            announce("confirm", "confirm");
-            recorder.clearStatus();
-            captureState = CaptureState::IDLE;
-            pendingResetAfterDrain = false;
-            resetDrainStatusTracking();
-            resetCameraReadyAnnouncement();
-        }
-        else {
-            captureState = CaptureState::BACKEND_SYNC_PENDING;
-            announce("confirm_failed", "confirm failed");
+            pushUiLog("Background backend confirm OK: " + taskName
+                      + " ep" + std::to_string(episodeNumber));
+            upsertTrackedUpload(it->reservationId, taskName, episodeNumber);
+            if(result.localCleanupAttempted) {
+                if(result.localCleanupSucceeded) {
+                    pushUiLog("Local episode deleted after NAS upload: " + it->collectionPath.string());
+                }
+                else {
+                    pushUiLog("WARNING: NAS upload is safe, but local episode cleanup failed: "
+                              + result.localCleanupError);
+                }
+            }
+            it = captureNasFinalizeJobs.erase(it);
         }
     };
 
@@ -10864,7 +10894,7 @@ int run_collection(const AppConfig &cfg,
         }
         auto fm = beginFrame(ms);
         pollTrackedUploads(false);
-        pollCaptureNasUpload();
+        pollCaptureNasFinalizeJobs();
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
             if(exitConfirmActive) {
@@ -11606,15 +11636,7 @@ int run_collection(const AppConfig &cfg,
                 break;
             case CaptureState::BACKEND_SYNC_PENDING:
                 sd = {"BACKEND SYNC PENDING", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
-                if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
-                    stateEmphasisLine = "Uploading local episode to NAS";
-                }
-                else if(currentReservation.nasUploadFinished && !currentReservation.nasUploadSucceeded) {
-                    stateEmphasisLine = "NAS upload failed. Retry Confirm";
-                }
-                else {
-                    stateEmphasisLine = "Retry Confirm after backend is reachable";
-                }
+                stateEmphasisLine = "Retry Confirm after the finalize request error is fixed";
                 if(currentReservation.active) {
                     stateFootnoteLine = currentReservation.taskName + " episode_" + std::to_string(currentReservation.episodeNumber);
                 }
@@ -11809,9 +11831,7 @@ int run_collection(const AppConfig &cfg,
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
             std::string saveLabel = "Confirm [Ctrl+3]";
             if(captureState == CaptureState::BACKEND_SYNC_PENDING) {
-                saveLabel = (currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished)
-                    ? "NAS Uploading..."
-                    : "Retry Backend Confirm [Ctrl+3]";
+                saveLabel = "Retry Confirm [Ctrl+3]";
             }
             bool doSave     = uiButtonEx(ui, bSave, saveLabel, fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);
@@ -12184,7 +12204,10 @@ int run_collection(const AppConfig &cfg,
                 }
                 else {
                     const double maxDiff = recorder.lastAlignedMaxDiffMs();
-                    if(confirmReservationWithBackend()) {
+                    const bool finalizeAccepted = cfg.taskBackend.nas.enabled
+                        ? enqueueCaptureNasFinalizeForCurrentReservation()
+                        : confirmReservationWithBackend();
+                    if(finalizeAccepted) {
                         if(maxDiff > 0.0) {
                             std::ostringstream oss;
                             oss.setf(std::ios::fixed);
@@ -12198,8 +12221,12 @@ int run_collection(const AppConfig &cfg,
                             announce("task_complete", "selected task episodes complete");
                         }
                         else if(capUi.currentTaskIdx >= 0 && capUi.currentTaskIdx < static_cast<int>(capUi.tasks.size())) {
-                            capUi.msg = "Capture confirmed";
-                            pushUiLog("Confirm OK. Same task next backend episode will be reserved on Start.");
+                            capUi.msg = cfg.taskBackend.nas.enabled
+                                ? "Capture confirmed; NAS upload running in background"
+                                : "Capture confirmed";
+                            pushUiLog(cfg.taskBackend.nas.enabled
+                                ? "Confirm accepted. Same task can continue while capture-side NAS upload runs."
+                                : "Confirm OK. Same task next backend episode will be reserved on Start.");
                             announce("confirm", "confirm");
                         }
                         else {
@@ -12216,12 +12243,7 @@ int run_collection(const AppConfig &cfg,
                     else {
                         captureState = CaptureState::BACKEND_SYNC_PENDING;
                         pendingResetAfterDrain = false;
-                        if(currentReservation.nasUploadStarted && !currentReservation.nasUploadFinished) {
-                            capUi.msg = "NAS upload running...";
-                        }
-                        else {
-                            announce("confirm_failed", "confirm failed");
-                        }
+                        announce("confirm_failed", "confirm failed");
                     }
                 }
             }

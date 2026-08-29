@@ -258,20 +258,21 @@ have to match any path on the backend machine.
    selected task.
 5. Start first reserves an episode from the backend.
 6. Local capture writes to `captureSaveRoot/subjectId/taskName/episode_N`.
-7. Confirm finalizes local data, then confirms the reservation with an
-   idempotency key.
-8. Backend confirm creates an `upload` job. The NAS uploader copies the
-   already-saved local episode asynchronously and records progress in the
-   workflow database.
-9. Upload success marks the episode `uploaded` and immediately queues one
-   episode-level `auto_label` job.
+7. Confirm finalizes local data and hands the episode to the collection app's
+   capture-side background upload queue.
+8. The collection UI immediately returns to READY/IDLE, so the next episode can
+   be captured while previous episodes upload to NAS.
+9. After the capture-side uploader atomically publishes the episode, it confirms
+   the backend reservation with the NAS URI. Upload success marks the episode
+   `uploaded` and immediately queues one episode-level `auto_label` job.
 10. The dashboard only shows workflow status; the push API remains available
     for repair/backfill and is idempotent when an `auto_label` job already exists.
-11. The collection UI returns to READY/IDLE after backend confirm succeeds. It
-   keeps polling upload progress by reservation ID and displays the latest NAS
-   status without blocking the next capture.
-12. If backend confirm fails, the UI enters `backend-sync-pending`; retry Confirm
-   uses the same reservation and idempotency key.
+11. The collection UI displays capture-side background upload status without
+   blocking the next capture.
+12. If a finalize request cannot be queued, the UI enters
+   `backend-sync-pending`; retry Confirm uses the same reservation and
+   idempotency key. Background upload or confirmation failures retain local data
+   and are reported in the collection log.
 13. Reset/Delete deletes local episode data and releases the reservation; it does
    not increase `completed`.
 14. The capture page has a `Tasks` button for returning to the standalone task
@@ -303,12 +304,11 @@ POST /api/v1/collection/episodes/confirm
 POST /api/v1/collection/episodes/release
 ```
 
-When collection confirms an episode, the workflow sidecar records an Episode
-with status `captured` and queues an `upload` job. The built-in NAS
-uploader leases this job, copies local data to the configured NAS root, updates progress,
-registers a `nas_episode` artifact, and marks the episode `uploaded` only after
-the verified copy completes. Upload success immediately creates the
-episode-level `auto_label` job; this is no longer controlled by `.env`.
+When collection confirms an episode, the capture-side background uploader copies
+local data to the configured NAS root and then confirms the backend with the NAS
+URI. The workflow sidecar registers a `nas_episode` artifact, marks the episode
+`uploaded`, and immediately creates the episode-level `auto_label` job; this is
+no longer controlled by `.env`.
 The push API remains available only for manual backfill or repair.
 The main workflow is `uploaded -> auto_label -> qc`. A passed QC finalizes the
 episode. A failed QC creates segment detail rows plus one episode-level
