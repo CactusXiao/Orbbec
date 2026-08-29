@@ -3409,11 +3409,18 @@ public:
                                             const std::string &taskName,
                                             int episodeN,
                                             std::string *statusLine = nullptr,
-                                            std::vector<std::string> *detailLines = nullptr) {
+                                            std::vector<std::string> *detailLines = nullptr,
+                                            std::string *resultStatusOut = nullptr) {
+        if(resultStatusOut) {
+            resultStatusOut->clear();
+        }
         const auto &health = cfg_.extrinsicHealth;
         if(!health.enabled) {
             if(statusLine) {
                 *statusLine = "Extrinsic check disabled";
+            }
+            if(resultStatusOut) {
+                *resultStatusOut = "disabled";
             }
             return true;
         }
@@ -3421,11 +3428,17 @@ public:
             if(statusLine) {
                 *statusLine = "Extrinsic check skipped: multiview disabled";
             }
+            if(resultStatusOut) {
+                *resultStatusOut = "skipped";
+            }
             return true;
         }
         if(!capturing_.load()) {
             if(statusLine) {
                 *statusLine = "Extrinsic check failed: cameras are not running";
+            }
+            if(resultStatusOut) {
+                *resultStatusOut = "error";
             }
             return false;
         }
@@ -3433,11 +3446,17 @@ public:
             if(statusLine) {
                 *statusLine = "Extrinsic check failed: init_extrinsic_path is empty";
             }
+            if(resultStatusOut) {
+                *resultStatusOut = "error";
+            }
             return false;
         }
         if(health.scriptPath.empty() || !fs::exists(health.scriptPath)) {
             if(statusLine) {
                 *statusLine = "Extrinsic check failed: script not found at " + health.scriptPath.string();
+            }
+            if(resultStatusOut) {
+                *resultStatusOut = "error";
             }
             return false;
         }
@@ -3454,6 +3473,9 @@ public:
         catch(const std::exception &ex) {
             if(statusLine) {
                 *statusLine = "Extrinsic check failed: cannot create debug directory: " + std::string(ex.what());
+            }
+            if(resultStatusOut) {
+                *resultStatusOut = "error";
             }
             return false;
         }
@@ -3485,7 +3507,10 @@ public:
             if(statusLine) {
                 *statusLine = "Extrinsic check inconclusive: not enough RGB/depth camera parameters";
             }
-            return !health.blockOnInconclusive;
+            if(resultStatusOut) {
+                *resultStatusOut = "inconclusive";
+            }
+            return true;
         }
         writeParamsJson(checkDir, paramsBuffers, { CollectDataType::RGB, CollectDataType::Depth }, cfg_.colorCloudRgbFrameOffset, cfg_.save);
         writeExtrinsicsJson(checkDir);
@@ -3566,6 +3591,9 @@ public:
         std::string resultSummary;
         std::vector<std::string> resultDetails;
         readExtrinsicHealthResult(resultJson, resultStatus, resultSummary, &resultDetails);
+        if(resultStatusOut) {
+            *resultStatusOut = resultStatus.empty() ? "error" : resultStatus;
+        }
         if(resultSummary.empty()) {
             resultSummary = trimString(output);
         }
@@ -3573,19 +3601,11 @@ public:
             resultSummary = "exit_code=" + std::to_string(exitCode);
         }
 
-        bool ok = false;
-        if(resultStatus == "pass") {
-            ok = true;
-        }
-        else if(resultStatus == "warn") {
-            ok = !health.blockOnWarn;
-        }
-        else if(resultStatus == "inconclusive") {
-            ok = !health.blockOnInconclusive;
-        }
-        else {
-            ok = false;
-        }
+        // A health-check result blocks collection only when it explicitly fails.
+        // Operational errors still block because no valid health result was produced.
+        const bool ok = resultStatus == "pass"
+                     || resultStatus == "warn"
+                     || resultStatus == "inconclusive";
 
         if(statusLine) {
             *statusLine = "Extrinsic check " + resultSummary;
@@ -10237,7 +10257,8 @@ int run_collection(const AppConfig &cfg,
     bool cameraFaultDrainCompleteLogged = false;
     bool cameraReadyAnnounced = false;
     bool extrinsicReadyChecked = false;
-    bool extrinsicReadyPassed = false;
+    bool extrinsicReadyAllowsStart = false;
+    std::string extrinsicReadyStatus;
     // This flag intentionally survives reset/confirm retries and is recreated only
     // when run_collection is entered again.
     bool initialCameraWarmupCompleted = false;
@@ -10326,7 +10347,8 @@ int run_collection(const AppConfig &cfg,
     auto resetCameraReadyAnnouncement = [&]() {
         cameraReadyAnnounced = false;
         extrinsicReadyChecked = false;
-        extrinsicReadyPassed = false;
+        extrinsicReadyAllowsStart = false;
+        extrinsicReadyStatus.clear();
     };
 
     auto beginDrainStatusTracking = [&]() {
@@ -11332,7 +11354,8 @@ int run_collection(const AppConfig &cfg,
                 const int episodeN = capUi.currentEpisode;
                 std::string checkLine;
                 std::vector<std::string> checkDetails;
-                extrinsicReadyPassed = recorder.runExtrinsicHealthCheckBeforeStart(root, subject, taskName, episodeN, &checkLine, &checkDetails);
+                extrinsicReadyAllowsStart = recorder.runExtrinsicHealthCheckBeforeStart(
+                    root, subject, taskName, episodeN, &checkLine, &checkDetails, &extrinsicReadyStatus);
                 extrinsicReadyChecked = true;
                 if(!checkLine.empty()) {
                     pushUiLog(checkLine);
@@ -11343,7 +11366,7 @@ int run_collection(const AppConfig &cfg,
             }
             const bool readyForStart = cameraReadiness.allReady
                                     && selectedTaskSelectable
-                                    && (extrinsicReadyChecked && extrinsicReadyPassed);
+                                    && (extrinsicReadyChecked && extrinsicReadyAllowsStart);
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady) {
                 if(readyForStart && !cameraReadyAnnounced) {
                     announce("ready", "ready");
@@ -11481,8 +11504,20 @@ int run_collection(const AppConfig &cfg,
                     stateFootnoteLine = "Select another task to continue";
                 }
                 else if(readyForStart) {
-                    sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
-                    stateEmphasisLine = cameraReadiness.message;
+                    if(extrinsicReadyStatus == "inconclusive") {
+                        sd = {"READY - INCONCLUSIVE", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                        stateEmphasisLine = "Extrinsic check inconclusive; collection is allowed";
+                        stateFootnoteLine = "Start now or use Resample Extrinsic Check";
+                    }
+                    else if(extrinsicReadyStatus == "warn") {
+                        sd = {"READY - CHECK WARNING", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
+                        stateEmphasisLine = "Extrinsic check warning; collection is allowed";
+                        stateFootnoteLine = "Start now or use Resample Extrinsic Check";
+                    }
+                    else {
+                        sd = {"READY", cv::Scalar(255, 255, 255), cv::Scalar(40, 40, 40)};
+                        stateEmphasisLine = cameraReadiness.message;
+                    }
                 }
                 else if(cameraReadiness.allReady) {
                     if(initialCameraWarmupRequired && !initialCameraWarmupCompleted) {
@@ -11490,10 +11525,17 @@ int run_collection(const AppConfig &cfg,
                         stateEmphasisLine = initialCameraWarmup.message;
                         stateFootnoteLine = "The first extrinsic check waits for 5 seconds of RGB and depth from every camera";
                     }
-                    else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
-                        sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
-                        stateEmphasisLine = "Extrinsic check failed";
-                        stateFootnoteLine = "Fix AprilTags/cameras, then re-enter capture or restart cameras to retry";
+                    else if(extrinsicReadyChecked && !extrinsicReadyAllowsStart) {
+                        if(extrinsicReadyStatus == "fail") {
+                            sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
+                            stateEmphasisLine = "Extrinsic check failed; collection is blocked";
+                            stateFootnoteLine = "Fix the setup, then use Resample Extrinsic Check";
+                        }
+                        else {
+                            sd = {"CHECK ERROR", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
+                            stateEmphasisLine = "Extrinsic check could not run";
+                            stateFootnoteLine = "Fix the check error, then use Resample Extrinsic Check";
+                        }
                     }
                     else {
                         sd = {"CHECKING", cv::Scalar(255, 220, 80), cv::Scalar(70, 55, 20)};
@@ -11684,10 +11726,19 @@ int run_collection(const AppConfig &cfg,
                                          || (captureState == CaptureState::DRAINING && !pendingResetAfterDrain));
             const bool allowNav    = !modalFault && !modalDelete && !modalExit
                                      && (captureState == CaptureState::IDLE || captureState == CaptureState::BACKEND_SYNC_PENDING);
+            const bool allowExtrinsicRecheck = !modalFault && !modalDelete && !modalExit
+                                             && captureState == CaptureState::IDLE
+                                             && !currentReservation.active
+                                             && cameraReadiness.allReady
+                                             && selectedTaskSelectable
+                                             && extrinsicReadyChecked
+                                             && cfg.extrinsicHealth.enabled
+                                             && cfgUi.enableMultiview;
 
             // --- 右侧按钮区 ---
             const int btnX = taskPanelX + 20;
             const int btnW = taskPanelW - 40;
+            cv::Rect bExtrinsicRecheck(btnX, winH - 330, btnW, 38);
             cv::Rect bStart(btnX, winH - 280, btnW, 50);
             cv::Rect bStop (btnX, winH - 220, btnW, 50);
             cv::Rect bSave (btnX, winH - 160, btnW, 50);
@@ -11709,13 +11760,14 @@ int run_collection(const AppConfig &cfg,
                 else if(initialCameraWarmupRequired && !initialCameraWarmupCompleted) {
                     startLabel = "Start (RGB/depth warm-up)";
                 }
-                else if(extrinsicReadyChecked && !extrinsicReadyPassed) {
-                    startLabel = "Start (check failed)";
+                else if(extrinsicReadyChecked && !extrinsicReadyAllowsStart) {
+                    startLabel = extrinsicReadyStatus == "fail" ? "Start (check failed)" : "Start (check error)";
                 }
                 else {
                     startLabel = "Start (checking)";
                 }
             }
+            bool doExtrinsicRecheck = uiButtonEx(ui, bExtrinsicRecheck, "Resample Extrinsic Check", fm, allowExtrinsicRecheck);
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
             std::string saveLabel = "Confirm [Ctrl+3]";
@@ -11939,6 +11991,12 @@ int run_collection(const AppConfig &cfg,
                         }
                     }
                 }
+            }
+            if(doExtrinsicRecheck) {
+                collectionSetStage("ui_extrinsic_recheck_requested");
+                resetCameraReadyAnnouncement();
+                capUi.msg = "Resampling extrinsic check...";
+                pushUiLog("Manual extrinsic resample requested.");
             }
             if(doBackMenu) {
                 collectionSetStage("ui_capture_back_menu");

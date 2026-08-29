@@ -110,7 +110,7 @@ struct ExtrinsicHealthConfig {
     int maxSnapshotAgeMs = 1000;
     int jpegQuality = 90;
     bool keepDebugSnapshots = false;
-    bool blockOnInconclusive = true;
+    bool blockOnInconclusive = false;
     bool blockOnWarn = false;
     bool requireAllCameras = true;
     int minSharedCamerasPerTag = 2;

@@ -44,7 +44,7 @@
         "maxSnapshotAgeMs": 1000,
         "jpegQuality": 90,
         "keepDebugSnapshots": false,
-        "blockOnInconclusive": true,
+        "blockOnInconclusive": false,
         "blockOnWarn": false,
         "requireAllCameras": true,
         "minSharedCamerasPerTag": 2,
