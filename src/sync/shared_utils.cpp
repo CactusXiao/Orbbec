@@ -373,6 +373,11 @@ bool launchQcFrontend(const AppConfig &cfg,
     cJSON_AddStringToObject(root, "state_dir", frontend.stateDir.string().c_str());
     cJSON_AddNumberToObject(root, "range_merge_gap_frames", std::max(0, frontend.rangeMergeGapFrames));
     cJSON_AddNumberToObject(root, "request_timeout_seconds", std::max(1.0, frontend.requestTimeoutSeconds));
+    cJSON_AddNumberToObject(root, "playback_fps", std::max(1.0, std::min(60.0, frontend.playbackFps)));
+    cJSON_AddStringToObject(root, "mesh_renderer_python", trimString(frontend.meshRendererPython).c_str());
+    cJSON_AddStringToObject(root, "mano_toolkit_root", frontend.manoToolkitRoot.string().c_str());
+    cJSON_AddStringToObject(root, "mano_model_dir", frontend.manoModelDir.string().c_str());
+    cJSON_AddNumberToObject(root, "mesh_render_factor", std::max(0.5, std::min(4.0, frontend.meshRenderFactor)));
     addNasMountsConfig(root, cfg.taskBackend.nas);
     const bool wroteConfig = writeJsonConfigFile(root, launchConfigPath, errorMessage);
     cJSON_Delete(root);
@@ -1007,6 +1012,23 @@ AppConfig loadConfig(const fs::path &configPath) {
                     }
                     else if(auto v = getInt(qcObj, "requestTimeoutMs")) {
                         cfg.frontends.qc.requestTimeoutSeconds = std::max(1.0, static_cast<double>(*v) / 1000.0);
+                    }
+                    if(auto v = getDouble(qcObj, "playbackFps")) {
+                        cfg.frontends.qc.playbackFps = std::max(1.0, std::min(60.0, *v));
+                    }
+                    if(auto v = getString(qcObj, "meshRendererPython")) {
+                        cfg.frontends.qc.meshRendererPython = trimString(*v);
+                    }
+                    if(auto v = getString(qcObj, "manoToolkitRoot")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.qc.manoToolkitRoot = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getString(qcObj, "manoModelDir")) {
+                        const std::string value = trimString(*v);
+                        cfg.frontends.qc.manoModelDir = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+                    }
+                    if(auto v = getDouble(qcObj, "meshRenderFactor")) {
+                        cfg.frontends.qc.meshRenderFactor = std::max(0.5, std::min(4.0, *v));
                     }
                 }
             }

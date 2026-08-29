@@ -195,6 +195,11 @@ struct QcFrontendConfig {
     std::string workerMachineId;
     int         rangeMergeGapFrames = 5;
     double      requestTimeoutSeconds = 10.0;
+    double      playbackFps = 30.0;
+    std::string meshRendererPython = "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python";
+    fs::path    manoToolkitRoot = "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits";
+    fs::path    manoModelDir = "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano";
+    double      meshRenderFactor = 1.0;
 };
 
 struct TaskBackendConfig {

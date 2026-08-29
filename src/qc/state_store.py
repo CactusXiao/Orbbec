@@ -107,11 +107,12 @@ class QcProgress:
     result_type: str = "in_progress"
     bad_frame_ranges: List[Range] = field(default_factory=list)
     checked_sample_frames: List[int] = field(default_factory=list)
+    playback_complete: bool = False
     payload: Dict[str, Any] = field(default_factory=dict)
     job: Dict[str, Any] = field(default_factory=dict)
     episode: Dict[str, Any] = field(default_factory=dict)
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
-    schema_version: int = 1
+    schema_version: int = 2
     kind: str = "orbbec_qc_local_progress"
     updated_at: str = field(default_factory=now_iso)
 
@@ -133,7 +134,7 @@ class QcProgress:
 
     @property
     def is_complete(self) -> bool:
-        return self.result_type == "bad_episode" or (bool(self.frames) and int(self.current_frame) > self.last_frame)
+        return self.result_type == "bad_episode" or bool(self.playback_complete)
 
     def touch(self) -> None:
         self.updated_at = now_iso()
@@ -153,6 +154,7 @@ class QcProgress:
             "result_type": self.result_type,
             "bad_frame_ranges": [[int(a), int(b)] for a, b in self.bad_frame_ranges],
             "checked_sample_frames": [int(frame) for frame in self.checked_sample_frames],
+            "playback_complete": bool(self.playback_complete),
             "payload": self.payload,
             "job": self.job,
             "episode": self.episode,
@@ -179,6 +181,11 @@ class QcProgress:
                 checked.append(int(frame))
             except (TypeError, ValueError):
                 continue
+        current_frame = int(obj.get("current_frame") or 0)
+        playback_complete = bool(obj.get("playback_complete", False))
+        if "playback_complete" not in obj and frames and current_frame > max(frames):
+            playback_complete = True
+            current_frame = max(frames)
         return cls(
             task_name=str(obj.get("task_name") or ""),
             episode_id=str(obj.get("episode_id") or ""),
@@ -186,16 +193,17 @@ class QcProgress:
             worker_machine_id=str(obj.get("worker_machine_id") or ""),
             lease_until=str(obj.get("lease_until") or ""),
             sample_interval=max(1, int(obj.get("sample_interval") or 10)),
-            current_frame=int(obj.get("current_frame") or 0),
+            current_frame=current_frame,
             frames=sorted(set(frames)),
             result_type=str(obj.get("result_type") or "in_progress"),
             bad_frame_ranges=ranges,
             checked_sample_frames=sorted(set(checked)),
+            playback_complete=playback_complete,
             payload=dict(obj.get("payload") or {}),
             job=dict(obj.get("job") or {}),
             episode=dict(obj.get("episode") or {}),
             artifacts=[dict(item) for item in obj.get("artifacts") or [] if isinstance(item, dict)],
-            schema_version=int(obj.get("schema_version") or 1),
+            schema_version=max(2, int(obj.get("schema_version") or 1)),
             kind=str(obj.get("kind") or "orbbec_qc_local_progress"),
             updated_at=str(obj.get("updated_at") or now_iso()),
         )
