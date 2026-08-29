@@ -75,6 +75,35 @@ def _decode_materializer_stdout(stdout: str) -> Dict[str, Any]:
     raise MaterializerError(f"MANO materializer returned invalid JSON: {detail}", retryable=False)
 
 
+def _materialization_provenance(result: Dict[str, Any]) -> Tuple[int, str]:
+    """Find generation/hash in the current result or its retry audit history."""
+    pending = [dict(result or {})]
+    while pending:
+        current = pending.pop(0)
+        try:
+            generation = int(current.get("generation") or 0)
+        except (TypeError, ValueError):
+            generation = 0
+        result_sha256 = str(current.get("result_manifest_sha256") or "").strip()
+        if generation > 0 and re.fullmatch(r"[0-9a-fA-F]{64}", result_sha256):
+            return generation, result_sha256
+        for key in ("previous_failure", "previous_success"):
+            nested = current.get(key)
+            if isinstance(nested, dict):
+                pending.append(dict(nested))
+    return 0, ""
+
+
+def _local_mano_provenance(episode_dir: Path) -> Tuple[int, str]:
+    metadata_path = episode_dir / "mano" / "episode" / "mano_episode.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0, ""
+    source = metadata.get("source") if isinstance(metadata, dict) else None
+    return _materialization_provenance(source if isinstance(source, dict) else {})
+
+
 @dataclass
 class PublisherBridgeConfig:
     enabled: bool = False
@@ -372,22 +401,14 @@ class PublisherBridge:
         except ValueError as exc:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, f"invalid Publisher episode URI: {exc}") from exc
 
-        generation = int(failed_result.get("generation") or 0)
-        result_sha256 = str(failed_result.get("result_manifest_sha256") or "").strip()
+        generation, result_sha256 = _materialization_provenance(failed_result)
         if generation <= 0 or len(result_sha256) != 64:
-            # Compatibility for failures recorded before generation/hash were
-            # persisted. This is read-only and deliberately never publishes.
-            status = self.publisher.status(publisher_episode_id)
-            state = str(status.get("state") or "").strip().lower()
-            if not bool(status.get("found")) or state not in PUBLISHER_RESULT_STATES:
-                raise WorkflowError(
-                    HTTPStatus.CONFLICT,
-                    f"Publisher result is not ready for local joint3d conversion: {state or 'not found'}",
-                )
-            generation = int(status.get("generation") or 0)
-            result_sha256 = str(status.get("result_manifest_sha256") or "").strip()
+            generation, result_sha256 = _local_mano_provenance(episode_dir)
         if generation <= 0 or len(result_sha256) != 64:
-            raise WorkflowError(HTTPStatus.CONFLICT, "Publisher result generation/hash is invalid")
+            raise WorkflowError(
+                HTTPStatus.CONFLICT,
+                "Local optimized_pose generation/hash is unavailable for joint3d conversion",
+            )
 
         worker_id = f"publisher_bridge:{self.hostname}:direct-joint3d-retry"
         started = self.service.start_joint3d_materialization_retry(

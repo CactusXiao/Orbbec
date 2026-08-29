@@ -388,6 +388,40 @@ class PublisherBridgeTest(unittest.TestCase):
             self.assertEqual(failed_job["status"], "failed")
             self.assertTrue(failed_job["can_retry_joint3d"])
 
+            # An administrative reset keeps provenance under previous_success.
+            # The direct local retry must not depend on the Publisher's current
+            # workflow state, which may already have advanced to QC.
+            raw_failed = store.get_job("auto_label_episode_uuid_episode") or {}
+            failed_result = dict(raw_failed.get("result") or {})
+            with store.connect() as conn:
+                conn.execute(
+                    "UPDATE jobs SET result_json = ? WHERE job_id = ?",
+                    (
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "worker_id": failed_result["worker_id"],
+                                "phase": "mano_materialization",
+                                "error": "joint3d reset for retry",
+                                "previous_success": {
+                                    "generation": failed_result["generation"],
+                                    "result_manifest_sha256": failed_result["result_manifest_sha256"],
+                                },
+                            }
+                        ),
+                        "auto_label_episode_uuid_episode",
+                    ),
+                )
+            publisher.statuses = [
+                {
+                    "episode_id": "S001/pick_object/episode1",
+                    "found": True,
+                    "state": "quality_labeling",
+                    "generation": 3,
+                    "result_manifest_sha256": RESULT_SHA256,
+                }
+            ]
+
             bridge.materializer = FakeMaterializer()
             retry = bridge.retry_materialization_once("episode_uuid", {"operator_id": "admin"})
 
