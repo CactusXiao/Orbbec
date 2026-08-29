@@ -251,6 +251,8 @@ def materialize(
         "cameras": [str(camera) for camera in cameras],
         "joints_3d_file": "joints_3d.npy",
         "coordinate_system": "episode_world",
+        "hand_order": list(mano.MANO_HAND_ORDER),
+        "joint_order": list(mano.SMPLX_MANO_JOINT_NAMES),
         "source": {
             "kind": "optimized_pose",
             "shape": list(EXPECTED_POSE_SHAPE),

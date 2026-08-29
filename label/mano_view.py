@@ -42,6 +42,17 @@ _SMPLX_MANO_TO_APP_ORDER = (
 )
 
 
+def mano_joints_to_annotation_order(joints_3d: np.ndarray) -> np.ndarray:
+    """Adapt canonical SMPL-X MANO joints for the annotation canvas only."""
+    joints = np.asarray(joints_3d)
+    if joints.shape != (_HAND_COUNT, _JOINT_COUNT, 3):
+        raise ValueError(
+            "canonical MANO joints must have shape "
+            f"({_HAND_COUNT}, {_JOINT_COUNT}, 3), got {joints.shape}"
+        )
+    return joints[:, list(_SMPLX_MANO_TO_APP_ORDER), :]
+
+
 @dataclass(frozen=True)
 class CameraParams:
     k: np.ndarray
@@ -78,7 +89,11 @@ class ManoViewRuntime:
         joints_3d = self._load_mano_frame_joints(mano_dir, int(frame_idx))
         if joints_3d is None:
             return None
-        return self.project_skeleton(episode_dir=episode_dir, cam_id=cam_id, joints_3d=joints_3d)
+        # Stored MANO artifacts remain in the canonical smplx order used by
+        # mano/mano(1).py. The annotation canvas uses contiguous finger chains,
+        # so adapt only at this UI boundary instead of changing the artifact.
+        annotation_joints = mano_joints_to_annotation_order(joints_3d)
+        return self.project_skeleton(episode_dir=episode_dir, cam_id=cam_id, joints_3d=annotation_joints)
 
     def has_mano_frame(
         self,

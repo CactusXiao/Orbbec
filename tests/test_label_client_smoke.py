@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.env_config import load_label_config
-from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
+from label.mano_view import ManoViewRuntime, describe_mano_projection_issue, mano_joints_to_annotation_order
 from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
 from label.video_frames import ensure_decoded_rgb_frames
@@ -158,6 +158,19 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertFalse(visible[1][0])
             self.assertTrue(np.isnan(points[1][0][0]))
             self.assertTrue(np.isnan(points[1][0][1]))
+
+    def test_mano_source_adapts_canonical_smplx_order_only_for_annotation_display(self) -> None:
+        canonical = np.zeros((2, 21, 3), dtype=np.float32)
+        canonical[:, :, 0] = np.arange(21, dtype=np.float32)
+
+        annotation = mano_joints_to_annotation_order(canonical)
+
+        self.assertEqual(annotation[0, 1, 0], 13.0)  # thumb MCP
+        self.assertEqual(annotation[0, 4, 0], 16.0)  # thumb tip
+        self.assertEqual(annotation[0, 5, 0], 1.0)   # index MCP
+        self.assertEqual(annotation[0, 9, 0], 4.0)   # middle MCP
+        self.assertEqual(annotation[0, 13, 0], 10.0)  # ring MCP
+        self.assertEqual(annotation[0, 17, 0], 7.0)   # pinky MCP
 
     def test_mano_source_reloads_when_npy_changes(self) -> None:
         try:
