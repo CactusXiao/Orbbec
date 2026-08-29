@@ -246,6 +246,7 @@ class QcWorkerApp(tk.Tk):
                         mano_model_dir=self.config.mano_model_dir,
                         render_factor=self.config.mesh_render_factor,
                         workers=self.config.mesh_render_workers,
+                        prefer_integrated_gpu=self.config.mesh_prefer_integrated_gpu,
                     ),
                 )
                 return media, None
@@ -744,6 +745,7 @@ class DecodePage(ttk.Frame):
             "failed": "失败",
             "mesh_pending": "等待渲染 mesh",
             "mesh_rendering": "渲染 mesh",
+            "mesh_gpu": "核显渲染 mesh",
             "mesh_software_fallback": "软件渲染 mesh",
             "mesh_done": "mesh 完成",
         }

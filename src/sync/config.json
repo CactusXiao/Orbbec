@@ -121,8 +121,9 @@
             "meshRendererPython": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python",
             "manoToolkitRoot": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
             "manoModelDir": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
-            "meshRenderFactor": 1.0,
-            "meshRenderWorkers": 12
+            "meshRenderFactor": 0.5,
+            "meshRenderWorkers": 16,
+            "meshPreferIntegratedGpu": true
         }
     },
     "voiceFeedback": {

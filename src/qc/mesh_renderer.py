@@ -66,9 +66,10 @@ def _load_shape_scale(episode_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def _source_frame(episode_dir: Path, rgb_cache_dir: Path, camera: str, frame: int) -> Path:
-    cached = rgb_cache_dir / camera / f"{frame:05d}.png"
-    if cached.is_file():
-        return cached
+    for suffix in ("jpg", "png"):
+        cached = rgb_cache_dir / camera / f"{frame:05d}.{suffix}"
+        if cached.is_file():
+            return cached
     rgb_dir = episode_dir / camera / "RGB"
     matches = sorted(path for path in rgb_dir.glob(f"{frame:05d}.*") if path.is_file())
     if not matches:
@@ -111,15 +112,24 @@ class CameraMeshRenderer:
         self._initialize_opengl()
 
     def _initialize_opengl(self) -> None:
-        # QC runs as a desktop application. Prefer the host's working GLX/pyglet
-        # context when a display is present; reserve EGL for truly headless use.
-        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        prefer_integrated = os.environ.get("ORBBEC_MESH_PREFER_INTEGRATED_GPU", "0") == "1"
+        # The 9950X QC hosts use the AMD iGPU even when another display adapter is
+        # installed. EGL lets us select that DRM device without depending on Xorg.
+        if prefer_integrated:
+            os.environ["PYOPENGL_PLATFORM"] = "egl"
+        elif os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
             os.environ.pop("PYOPENGL_PLATFORM", None)
         else:
             os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
         try:
             import pyrender
             import trimesh
+
+            if prefer_integrated and os.environ.get("PYOPENGL_PLATFORM") == "egl":
+                was_selected = os.environ.get("EGL_DEVICE_ID") is not None
+                selected = self._select_integrated_egl_device()
+                if selected is not None and not was_selected:
+                    _emit(camera=self.camera, status="mesh_gpu", device=selected)
 
             self.pyrender = pyrender
             self.trimesh = trimesh
@@ -137,6 +147,26 @@ class CameraMeshRenderer:
                 status="mesh_software_fallback",
                 error=f"OpenGL unavailable; using software mesh renderer: {type(exc).__name__}: {exc}",
             )
+
+    @staticmethod
+    def _select_integrated_egl_device() -> str | None:
+        if os.environ.get("EGL_DEVICE_ID") is not None:
+            return f"EGL device {os.environ['EGL_DEVICE_ID']}"
+        from pyrender.platforms.egl import query_devices
+
+        devices = query_devices()
+        for index, device in enumerate(devices):
+            name = str(device.name or "")
+            card = Path(name).name
+            vendor_path = Path("/sys/class/drm") / card / "device" / "vendor"
+            try:
+                vendor = vendor_path.read_text(encoding="utf-8").strip().lower()
+            except OSError:
+                continue
+            if vendor == "0x1002":
+                os.environ["EGL_DEVICE_ID"] = str(index)
+                return f"{name} (AMD, EGL_DEVICE_ID={index})"
+        return None
 
     def close(self) -> None:
         if self.renderer is None:
@@ -236,6 +266,9 @@ def _initialize_render_worker(state: Mapping[str, Any]) -> None:
     global _WORKER_STATE
     _WORKER_STATE = dict(state)
     _WORKER_RENDERERS.clear()
+    if bool(_WORKER_STATE.get("prefer_integrated_gpu", False)):
+        os.environ["ORBBEC_MESH_PREFER_INTEGRATED_GPU"] = "1"
+        os.environ["PYOPENGL_PLATFORM"] = "egl"
     cv2.setNumThreads(1)
     atexit.register(_close_worker_renderers)
 
@@ -359,6 +392,7 @@ def render_request(request: Mapping[str, Any]) -> None:
         "camera_params": camera_state,
         "faces": faces,
         "render_factor": factor,
+        "prefer_integrated_gpu": bool(request.get("prefer_integrated_gpu", False)),
     }
 
     def record_result(result: Tuple[int, List[str]]) -> None:

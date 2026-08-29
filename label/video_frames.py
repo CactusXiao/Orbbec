@@ -170,7 +170,15 @@ def _decode_camera_frames(
     frames: Sequence[int],
     out_dir: Path,
     ffmpeg_executable: str = "ffmpeg",
+    image_extension: str = "png",
+    jpeg_quality: int = 2,
+    ffmpeg_threads: int = 0,
 ) -> None:
+    extension = str(image_extension or "png").strip().lower().lstrip(".")
+    if extension == "jpeg":
+        extension = "jpg"
+    if extension not in {"png", "jpg"}:
+        raise ValueError(f"unsupported decoded frame extension: {image_extension}")
     requested = sorted({int(frame) for frame in frames if not isinstance(frame, bool)})
     if not requested:
         return
@@ -178,7 +186,7 @@ def _decode_camera_frames(
 
     missing: List[Tuple[int, int]] = []
     for frame in requested:
-        target = out_dir / f"{frame:05d}.png"
+        target = out_dir / f"{frame:05d}.{extension}"
         if target.exists() and target.is_file():
             continue
         if frame_map:
@@ -197,16 +205,18 @@ def _decode_camera_frames(
         _run_ffmpeg_select(
             video_path,
             [video_idx for _, video_idx in missing],
-            tmp / "%06d.png",
+            tmp / f"%06d.{extension}",
             ffmpeg_executable=ffmpeg_executable,
+            jpeg_quality=jpeg_quality,
+            ffmpeg_threads=ffmpeg_threads,
         )
-        outputs = sorted(tmp.glob("*.png"))
+        outputs = sorted(tmp.glob(f"*.{extension}"))
         if len(outputs) != len(missing):
             raise RuntimeError(
                 f"ffmpeg decoded {len(outputs)} frame(s), expected {len(missing)} from {video_path}"
             )
         for output_path, (frame, _video_idx) in zip(outputs, missing):
-            target = out_dir / f"{frame:05d}.png"
+            target = out_dir / f"{frame:05d}.{extension}"
             tmp_target = out_dir / f".{target.name}.{os.getpid()}.tmp"
             shutil.move(str(output_path), str(tmp_target))
             os.replace(tmp_target, target)
@@ -218,23 +228,28 @@ def _run_ffmpeg_select(
     output_pattern: Path,
     *,
     ffmpeg_executable: str = "ffmpeg",
+    jpeg_quality: int = 2,
+    ffmpeg_threads: int = 0,
 ) -> None:
     ffmpeg = str(ffmpeg_executable or "ffmpeg").strip() or "ffmpeg"
-    selects = "+".join(f"eq(n\\,{int(idx)})" for idx in video_indices)
+    indices = [int(idx) for idx in video_indices]
+    if indices and indices == list(range(indices[0], indices[-1] + 1)):
+        selects = f"between(n\\,{indices[0]}\\,{indices[-1]})"
+    else:
+        selects = "+".join(f"eq(n\\,{idx})" for idx in indices)
     cmd = [
         ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
-        "-i",
-        str(video_path),
-        "-vf",
-        f"select={selects}",
-        "-vsync",
-        "0",
-        str(output_pattern),
     ]
+    if int(ffmpeg_threads) > 0:
+        cmd.extend(["-threads", str(max(1, int(ffmpeg_threads)))])
+    cmd.extend(["-i", str(video_path), "-vf", f"select={selects}", "-vsync", "0"])
+    if output_pattern.suffix.lower() in {".jpg", ".jpeg"}:
+        cmd.extend(["-q:v", str(max(1, min(31, int(jpeg_quality))))])
+    cmd.append(str(output_pattern))
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError as exc:

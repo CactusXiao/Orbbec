@@ -27,6 +27,7 @@ class QcConfig:
     mano_model_dir: Path
     mesh_render_factor: float
     mesh_render_workers: int
+    mesh_prefer_integrated_gpu: bool
 
     @property
     def default_lease_seconds(self) -> int:
@@ -85,6 +86,23 @@ def _float(data: Mapping[str, Any], key: str, default: float) -> float:
         raise ValueError(f"invalid number for {key}: {value!r}") from exc
 
 
+def _bool(data: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = data.get(key)
+    if value is None or value == "":
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if isinstance(value, (int, float)) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"invalid boolean for {key}: {value!r}")
+
+
 def _path(data: Mapping[str, Any], key: str, default: str, base_dir: Path) -> Path:
     raw = str(data.get(key) or default).strip()
     path = Path(raw).expanduser()
@@ -137,8 +155,9 @@ def load_qc_config(*, config_path: Optional[Path] = None, cwd: Optional[Path] = 
             "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
             base,
         ),
-        mesh_render_factor=max(0.5, min(4.0, _float(data, "mesh_render_factor", 1.0))),
-        mesh_render_workers=max(1, min(32, _int(data, "mesh_render_workers", 8))),
+        mesh_render_factor=max(0.5, min(4.0, _float(data, "mesh_render_factor", 0.5))),
+        mesh_render_workers=max(1, min(32, _int(data, "mesh_render_workers", 16))),
+        mesh_prefer_integrated_gpu=_bool(data, "mesh_prefer_integrated_gpu", True),
     )
     config.tmp_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)

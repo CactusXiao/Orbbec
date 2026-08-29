@@ -31,20 +31,21 @@ python3 -m src.qc.main --config /tmp/orbbec_qc_frontend_config.json
   "mesh_renderer_python": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python",
   "mano_toolkit_root": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits",
   "mano_model_dir": "/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano",
-  "mesh_render_factor": 1.0,
-  "mesh_render_workers": 12,
+  "mesh_render_factor": 0.5,
+  "mesh_render_workers": 16,
+  "mesh_prefer_integrated_gpu": true,
   "nas_mounts": {"nas://ego": "/mnt/nas"}
 }
 ```
 
-`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。`mesh_render_workers` 控制并行渲染进程数，9950X 主机建议从 12 开始。
+`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。针对 9950X 实测配置为 16 进程、0.5 倍 mesh 图层，并优先选择 AMD 核显 EGL 设备；不存在可用 OpenGL 时会自动回退 CPU。
 
 ## 行为
 
 - Task / Episode 列表来自后端 `qc` stage 的可租 job。
 - 双击 Episode 后才会正式租借。
 - 本机保留的有效进度会合并显示，并显示剩余租期倒计时。
-- 六路 RGB H.265 会并行解码到配置里的 `tmp_dir/<episode_id>/<camera>/<frame>.png`。
+- 六路 RGB H.265 会并行解码为高质量 JPEG 缓存，旧 PNG 缓存仍可继续使用。
 - `<episode>/optimized_pose/<frame>.npy` 会按 `mano/pose_mesh.py` 的方式生成 MANO 表面，并预渲染到 `tmp_dir/<episode_id>/mesh/<camera>/<frame>.jpg`。
 - 六个视角使用同一个播放帧游标，不裁剪画面；播放时可暂停，暂停后可前后移动 1 帧或 10 帧。
 - 暂停后可把当前帧标记为不通过并选择坏帧区间；确认后的区间在播放进度条中显示为红色。

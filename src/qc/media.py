@@ -40,6 +40,9 @@ class QcEpisodeMedia:
         rendered = self.cache_dir / "mesh" / str(camera) / f"{int(frame_idx):05d}.jpg"
         if rendered.exists() and rendered.is_file():
             return rendered
+        cached_jpg = self.cache_dir / str(camera) / f"{int(frame_idx):05d}.jpg"
+        if cached_jpg.exists() and cached_jpg.is_file():
+            return cached_jpg
         cached = self.cache_dir / str(camera) / f"{int(frame_idx):05d}.png"
         if cached.exists() and cached.is_file():
             return cached
@@ -51,8 +54,9 @@ class MeshRendererSettings:
     python_executable: str
     mano_toolkit_root: Path
     mano_model_dir: Path
-    render_factor: float = 1.0
-    workers: int = 8
+    render_factor: float = 0.5
+    workers: int = 16
+    prefer_integrated_gpu: bool = True
 
 
 def media_from_payload(payload: Mapping[str, Any], mounts: Mapping[str, str]) -> QcEpisodeMedia:
@@ -95,6 +99,9 @@ def prepare_qc_media(
                 camera=camera,
                 frames=task.frames,
                 out_dir=cache_dir / camera,
+                image_extension="jpg",
+                jpeg_quality=2,
+                ffmpeg_threads=4,
             )
             decoded = _count_cached(cache_dir, camera, task.frames)
             _emit(on_progress, camera, status="done", decoded=decoded, total=total, error="")
@@ -140,7 +147,11 @@ def _count_cached(cache_dir: Path, camera: str, frames: List[int]) -> int:
     cam_dir = Path(cache_dir) / str(camera)
     if not cam_dir.exists() or not cam_dir.is_dir():
         return 0
-    return sum(1 for frame in frames if (cam_dir / f"{int(frame):05d}.png").exists())
+    return sum(
+        1
+        for frame in frames
+        if (cam_dir / f"{int(frame):05d}.jpg").is_file() or (cam_dir / f"{int(frame):05d}.png").is_file()
+    )
 
 
 def _emit(callback: Optional[ProgressCallback], camera: str, **fields: Any) -> None:
@@ -179,6 +190,7 @@ def _prepare_mesh_frames(
         "mano_model_dir": str(settings.mano_model_dir),
         "render_factor": float(settings.render_factor),
         "workers": max(1, int(settings.workers)),
+        "prefer_integrated_gpu": bool(settings.prefer_integrated_gpu),
     }
     cache_dir.mkdir(parents=True, exist_ok=True)
     fd, request_name = tempfile.mkstemp(prefix="mesh_render_", suffix=".json", dir=str(cache_dir))

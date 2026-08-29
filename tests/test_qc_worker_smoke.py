@@ -5,13 +5,43 @@ import numpy as np
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from label.video_frames import _run_ffmpeg_select
 from src.qc.config import load_qc_config
-from src.qc.media import prepare_qc_media
+from src.qc.media import _count_cached, prepare_qc_media
 from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, normalize_ranges
 
 
 class QcWorkerSmokeTest(unittest.TestCase):
+    def test_qc_jpeg_decode_uses_compact_contiguous_select(self) -> None:
+        with patch("label.video_frames.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stderr = ""
+            run.return_value.stdout = ""
+            _run_ffmpeg_select(
+                Path("rgb.h265"),
+                [10, 11, 12],
+                Path("%06d.jpg"),
+                jpeg_quality=2,
+                ffmpeg_threads=4,
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("select=between(n\\,10\\,12)", command)
+        self.assertIn("-q:v", command)
+        self.assertIn("-threads", command)
+
+    def test_qc_cache_counts_jpeg_and_legacy_png(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            camera_dir = root / "00"
+            camera_dir.mkdir()
+            (camera_dir / "00000.jpg").write_bytes(b"jpg")
+            (camera_dir / "00001.png").write_bytes(b"png")
+
+            self.assertEqual(_count_cached(root, "00", [0, 1, 2]), 2)
+
     def test_software_mesh_renderer_fallback_draws_surface(self) -> None:
         try:
             from src.qc.mesh_renderer import CameraMeshRenderer
@@ -111,6 +141,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
                         "mano_model_dir": "/opt/mano/models",
                         "mesh_render_factor": 1.5,
                         "mesh_render_workers": 12,
+                        "mesh_prefer_integrated_gpu": False,
                         "nas_mounts": {"nas://ego": "/mnt/nas"},
                     }
                 ),
@@ -135,6 +166,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(config.mano_model_dir, Path("/opt/mano/models"))
             self.assertEqual(config.mesh_render_factor, 1.5)
             self.assertEqual(config.mesh_render_workers, 12)
+            self.assertFalse(config.mesh_prefer_integrated_gpu)
             self.assertEqual(config.nas_mounts, {"nas://ego": "/mnt/nas"})
 
     def test_video_progress_requires_playback_completion(self) -> None:
