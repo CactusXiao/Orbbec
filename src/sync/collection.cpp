@@ -10259,6 +10259,8 @@ int run_collection(const AppConfig &cfg,
     bool extrinsicReadyChecked = false;
     bool extrinsicReadyAllowsStart = false;
     std::string extrinsicReadyStatus;
+    bool manualExtrinsicRecheckPending = false;
+    bool manualExtrinsicRecheckScreenShown = false;
     // This flag intentionally survives reset/confirm retries and is recreated only
     // when run_collection is entered again.
     bool initialCameraWarmupCompleted = false;
@@ -10349,6 +10351,8 @@ int run_collection(const AppConfig &cfg,
         extrinsicReadyChecked = false;
         extrinsicReadyAllowsStart = false;
         extrinsicReadyStatus.clear();
+        manualExtrinsicRecheckPending = false;
+        manualExtrinsicRecheckScreenShown = false;
     };
 
     auto beginDrainStatusTracking = [&]() {
@@ -11342,11 +11346,21 @@ int run_collection(const AppConfig &cfg,
                 initialCameraWarmupCompleted = true;
                 pushUiLog(initialCameraWarmup.message);
             }
+            bool deferExtrinsicCheckForUi = false;
+            if(manualExtrinsicRecheckPending && !manualExtrinsicRecheckScreenShown) {
+                // Render one CHECKING frame before the synchronous check occupies
+                // the UI thread, so the operator sees the log and disabled Start.
+                manualExtrinsicRecheckScreenShown = true;
+                deferExtrinsicCheckForUi = true;
+            }
             if(!cameraFaultActive && captureState == CaptureState::IDLE && cameraReadiness.allReady
                && selectedTaskSelectable && !extrinsicReadyChecked
+               && !deferExtrinsicCheckForUi
                && (!initialCameraWarmupRequired || initialCameraWarmupCompleted)) {
                 collectionSetStage("ui_extrinsic_ready_check");
-                pushUiLog("Checking camera extrinsics before READY...");
+                const bool isManualRecheck = manualExtrinsicRecheckPending;
+                pushUiLog(isManualRecheck ? "Resampling camera extrinsics..."
+                                          : "Checking camera extrinsics before READY...");
 
                 const fs::path root = fs::path(trimString(cfgUi.saveRoot));
                 const std::string subject = trimString(cfgUi.subjectId);
@@ -11357,6 +11371,28 @@ int run_collection(const AppConfig &cfg,
                 extrinsicReadyAllowsStart = recorder.runExtrinsicHealthCheckBeforeStart(
                     root, subject, taskName, episodeN, &checkLine, &checkDetails, &extrinsicReadyStatus);
                 extrinsicReadyChecked = true;
+                if(isManualRecheck) {
+                    manualExtrinsicRecheckPending = false;
+                    manualExtrinsicRecheckScreenShown = false;
+                    // Ignore clicks made while the synchronous sampler was running.
+                    fm.clicked = false;
+                    ms.clicked = false;
+                    if(extrinsicReadyStatus == "pass") {
+                        capUi.msg = "Extrinsic recheck passed";
+                    }
+                    else if(extrinsicReadyStatus == "warn") {
+                        capUi.msg = "Extrinsic recheck warning; collection allowed";
+                    }
+                    else if(extrinsicReadyStatus == "inconclusive") {
+                        capUi.msg = "Extrinsic recheck inconclusive; collection allowed";
+                    }
+                    else if(extrinsicReadyStatus == "fail") {
+                        capUi.msg = "Extrinsic recheck failed; collection blocked";
+                    }
+                    else {
+                        capUi.msg = "Extrinsic recheck error; collection blocked";
+                    }
+                }
                 if(!checkLine.empty()) {
                     pushUiLog(checkLine);
                 }
@@ -11714,7 +11750,8 @@ int run_collection(const AppConfig &cfg,
             const bool modalFault = !modalExit && cameraFaultActive;
             const bool modalDelete = !modalExit && !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
             const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE)
-                                     && !modalExit && !currentReservation.active && readyForStart;
+                                     && !modalExit && !currentReservation.active
+                                     && !manualExtrinsicRecheckPending && readyForStart;
             const bool allowStop   = !modalFault && !modalDelete && !modalExit && (captureState == CaptureState::RECORDING);
             const bool allowSave   = !modalFault && !modalDelete && !modalExit
                                      && ((captureState == CaptureState::STOPPED_READY && recorder.hasData())
@@ -11995,6 +12032,8 @@ int run_collection(const AppConfig &cfg,
             if(doExtrinsicRecheck) {
                 collectionSetStage("ui_extrinsic_recheck_requested");
                 resetCameraReadyAnnouncement();
+                manualExtrinsicRecheckPending = true;
+                manualExtrinsicRecheckScreenShown = false;
                 capUi.msg = "Resampling extrinsic check...";
                 pushUiLog("Manual extrinsic resample requested.");
             }
