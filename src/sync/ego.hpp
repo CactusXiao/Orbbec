@@ -52,6 +52,9 @@ struct EgoHevcSample {
     uint64_t sequence = 0;
     int sourceFrameIndex = -1;
     bool codecConfig = false;
+    bool keyFrame = false;
+    // The consumer must discard decoder state before consuming this sample.
+    bool decoderReset = false;
     uint64_t receivedUnixUs = 0;
     std::string headerJson;
     std::vector<uint8_t> payload;
@@ -76,6 +79,9 @@ public:
     bool beginSession(const std::filesystem::path &episodeDir,
                       const std::string &sessionName,
                       std::string *errorMessage = nullptr);
+    // Starts the PICO stream without creating any session files or directories.
+    bool beginPreviewSession(const std::string &sessionName,
+                             std::string *errorMessage = nullptr);
     bool requestStopSession(std::string *errorMessage = nullptr);
     bool stopSessionAndWait(std::chrono::milliseconds timeout, std::string *errorMessage = nullptr);
     bool isSessionActive() const;
@@ -85,6 +91,7 @@ public:
     int videoFrameIndexForSourceFrame(int sourceFrameIndex) const;
     bool popHevcSample(EgoHevcSample &out, std::chrono::milliseconds timeout);
     void clearHevcSamples(bool keepCodecConfig = true);
+    void requestHevcKeyFrameResync();
 
 private:
     class Impl;

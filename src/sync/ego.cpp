@@ -935,6 +935,18 @@ public:
     bool beginSession(const std::filesystem::path &episodeDir,
                       const std::string &sessionName,
                       std::string *errorMessage) {
+        return beginSessionInternal(episodeDir, sessionName, true, errorMessage);
+    }
+
+    bool beginPreviewSession(const std::string &sessionName,
+                             std::string *errorMessage) {
+        return beginSessionInternal({}, sessionName, false, errorMessage);
+    }
+
+    bool beginSessionInternal(const std::filesystem::path &episodeDir,
+                              const std::string &sessionName,
+                              bool persistToDisk,
+                              std::string *errorMessage) {
         if(!isConnected()) {
             if(errorMessage) {
                 *errorMessage = "PICO ego client is not connected";
@@ -963,7 +975,7 @@ public:
         }
 
         auto writer = std::make_unique<SessionWriter>();
-        if(!writer->open(episodeDir, safeName, config_, timeCalibration ? &(*timeCalibration) : nullptr, errorMessage)) {
+        if(!writer->open(episodeDir, safeName, config_, timeCalibration ? &(*timeCalibration) : nullptr, persistToDisk, errorMessage)) {
             return false;
         }
 
@@ -996,7 +1008,8 @@ public:
             closeSessionLocked("start_send_failed");
             return false;
         }
-        std::cerr << "[ego] START sent session=" << safeName << std::endl;
+        std::cerr << "[ego] START sent session=" << safeName
+                  << " storage=" << (persistToDisk ? "disk" : "memory") << std::endl;
         return true;
     }
 
@@ -1077,6 +1090,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(hevcMtx_);
             hevcQueue_.clear();
+            hevcAwaitingKeyFrame_ = false;
             if(!keepCodecConfig) {
                 latestCodecConfigSamples_.clear();
             }
@@ -1085,6 +1099,15 @@ public:
                     hevcQueue_.push_back(sample);
                 }
             }
+        }
+        hevcCv_.notify_all();
+    }
+
+    void requestHevcKeyFrameResync() {
+        {
+            std::lock_guard<std::mutex> lock(hevcMtx_);
+            hevcQueue_.clear();
+            hevcAwaitingKeyFrame_ = true;
         }
         hevcCv_.notify_all();
     }
@@ -1110,8 +1133,11 @@ private:
                   const std::string &sessionName,
                   const EgoModuleConfig &config,
                   const TimeCalibrationResult *timeCalibration,
+                  bool persistToDisk,
                   std::string *errorMessage) {
             sessionName_ = sessionName;
+            persistToDisk_ = persistToDisk;
+            maxFrameMappings_ = std::max<size_t>(1, config.maxBufferedFrames);
             egoDir_ = episodeDir / "ego";
             rgbDir_ = egoDir_ / "RGB";
             videoPath_ = rgbDir_ / "rgb.h265";
@@ -1139,6 +1165,11 @@ private:
             timestampsTmpPath_ = timestampsPath_;
             timestampsTmpPath_ += ".tmp";
 
+            startedUnixUs_ = unixUsNow();
+            if(!persistToDisk_) {
+                return true;
+            }
+
             try {
                 std::filesystem::create_directories(rgbDir_);
                 if(!writeEgoCameraParamsJson(egoDir_, config, errorMessage)) {
@@ -1163,13 +1194,15 @@ private:
                 close("open_failed");
                 return false;
             }
-            startedUnixUs_ = unixUsNow();
             logRaw("{\"event\":\"session_open\",\"server_unix_us\":" + std::to_string(startedUnixUs_) + "}");
             writeTimeCalibrationSnapshot();
             return true;
         }
 
         void writeCameraJson(const std::vector<uint8_t> &payload) {
+            if(!persistToDisk_) {
+                return;
+            }
             std::ofstream ofs(cameraPath_, std::ios::binary | std::ios::out | std::ios::trunc);
             if(ofs.is_open() && !payload.empty()) {
                 ofs.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
@@ -1179,19 +1212,25 @@ private:
         }
 
         void writeMetadataHeader(const std::vector<uint8_t> &payload) {
-            metadata_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            metadata_.flush();
+            if(persistToDisk_) {
+                metadata_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+                metadata_.flush();
+            }
             logEventWithBytes("metadata_header", payload.size());
         }
 
         void writeMetadataRow(const std::vector<uint8_t> &payload) {
-            metadata_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            if(persistToDisk_) {
+                metadata_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            }
             metadataRows_++;
         }
 
         void writeTimestampHeader(const std::vector<uint8_t> &payload) {
-            timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            timestamps_.flush();
+            if(persistToDisk_) {
+                timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+                timestamps_.flush();
+            }
             timestampHeader_ = splitCsvSimple(std::string(reinterpret_cast<const char *>(payload.data()), payload.size()));
             if(!timestampHeader_.empty() && timestampHeader_.back().empty()) {
                 timestampHeader_.pop_back();
@@ -1204,7 +1243,9 @@ private:
         }
 
         std::optional<EgoFrame> writeTimestampRow(const std::vector<uint8_t> &payload, uint64_t sequence) {
-            timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            if(persistToDisk_) {
+                timestamps_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+            }
             timestampRows_++;
             const std::string line(reinterpret_cast<const char *>(payload.data()), payload.size());
             const auto cols = splitCsvSimple(line);
@@ -1259,6 +1300,11 @@ private:
                 if(it == videoFrameBySourceFrame_.end()) {
                     videoFrameIndex = static_cast<int>(hevcVideoFrames_);
                     videoFrameBySourceFrame_[sample.frameIndex] = videoFrameIndex;
+                    videoFrameSourceOrder_.push_back(sample.frameIndex);
+                    while(!persistToDisk_ && videoFrameSourceOrder_.size() > maxFrameMappings_) {
+                        videoFrameBySourceFrame_.erase(videoFrameSourceOrder_.front());
+                        videoFrameSourceOrder_.pop_front();
+                    }
                     hevcVideoFrames_++;
                 }
                 else {
@@ -1266,18 +1312,21 @@ private:
                 }
             }
 
-            const auto pos = video_.tellp();
-            const uint64_t offset = pos == std::ofstream::pos_type(-1) ? videoBytes_ : static_cast<uint64_t>(pos);
-            if(!payload.empty()) {
-                video_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
-            }
-            if(video_) {
-                videoBytes_ += payload.size();
-                hevcSamplesWritten_++;
-                video_.flush();
-            }
-            else {
-                lastError_ = "failed to write ego HEVC payload";
+            uint64_t offset = 0;
+            if(persistToDisk_) {
+                const auto pos = video_.tellp();
+                offset = pos == std::ofstream::pos_type(-1) ? videoBytes_ : static_cast<uint64_t>(pos);
+                if(!payload.empty()) {
+                    video_.write(reinterpret_cast<const char *>(payload.data()), static_cast<std::streamsize>(payload.size()));
+                }
+                if(video_) {
+                    videoBytes_ += payload.size();
+                    hevcSamplesWritten_++;
+                    video_.flush();
+                }
+                else {
+                    lastError_ = "failed to write ego HEVC payload";
+                }
             }
             logHevcSampleEvent("hevc_sample", sample, offset, videoFrameIndex);
             return videoFrameIndex >= 0 ? sample.frameIndex : -1;
@@ -1312,6 +1361,9 @@ private:
             }
             closed_ = true;
             endedUnixUs_ = unixUsNow();
+            if(!persistToDisk_) {
+                return;
+            }
             logRaw("{\"event\":\"session_close\",\"server_unix_us\":" + std::to_string(endedUnixUs_)
                    + ",\"reason\":" + jsonString(reason) + "}");
 
@@ -1479,6 +1531,9 @@ private:
         std::string timeCalibrationStatus_ = "disabled";
         std::optional<TimeCalibrationResult> timeCalibration_;
         std::unordered_map<int, int> videoFrameBySourceFrame_;
+        std::deque<int> videoFrameSourceOrder_;
+        size_t maxFrameMappings_ = 1;
+        bool persistToDisk_ = true;
         std::string lastError_;
         std::string clientSummaryJson_ = "{}";
     };
@@ -1859,6 +1914,7 @@ private:
             sample.sourceFrameIndex = static_cast<int>(*frameIndex);
         }
         sample.codecConfig = jsonBoolField(packet.headerJson, "is_codec_config").value_or(sample.sourceFrameIndex < 0);
+        sample.keyFrame = jsonBoolField(packet.headerJson, "is_keyframe").value_or(false);
         sample.receivedUnixUs = unixUsNow();
         sample.headerJson = packet.headerJson;
         sample.payload = packet.payload;
@@ -1870,9 +1926,67 @@ private:
                 latestCodecConfigSamples_.clear();
                 latestCodecConfigSamples_.push_back(sample);
             }
+
+            if(hevcAwaitingKeyFrame_) {
+                if(sample.codecConfig || !sample.keyFrame || latestCodecConfigSamples_.empty()) {
+                    return;
+                }
+                bool resetMarked = false;
+                for(const auto &configSample : latestCodecConfigSamples_) {
+                    EgoHevcSample queuedConfig = configSample;
+                    if(!resetMarked) {
+                        queuedConfig.decoderReset = true;
+                        resetMarked = true;
+                    }
+                    hevcQueue_.push_back(std::move(queuedConfig));
+                }
+                if(!resetMarked) {
+                    sample.decoderReset = true;
+                }
+                hevcQueue_.push_back(std::move(sample));
+                hevcAwaitingKeyFrame_ = false;
+                hevcCv_.notify_all();
+                return;
+            }
+
             hevcQueue_.push_back(std::move(sample));
-            while(hevcQueue_.size() > 96) {
-                hevcQueue_.pop_front();
+            if(hevcQueue_.size() > kMaxLiveHevcSamples) {
+                auto newestKeyFrame = hevcQueue_.end();
+                for(auto it = hevcQueue_.begin(); it != hevcQueue_.end(); ++it) {
+                    if(!it->codecConfig && it->keyFrame) {
+                        newestKeyFrame = it;
+                    }
+                }
+
+                if(newestKeyFrame == hevcQueue_.end() || latestCodecConfigSamples_.empty()) {
+                    hevcQueue_.clear();
+                    hevcAwaitingKeyFrame_ = true;
+                }
+                else {
+                    std::deque<EgoHevcSample> decodableTail;
+                    for(auto it = newestKeyFrame; it != hevcQueue_.end(); ++it) {
+                        if(!it->codecConfig) {
+                            decodableTail.push_back(std::move(*it));
+                        }
+                    }
+                    hevcQueue_.clear();
+                    bool resetMarked = false;
+                    for(const auto &configSample : latestCodecConfigSamples_) {
+                        EgoHevcSample queuedConfig = configSample;
+                        if(!resetMarked) {
+                            queuedConfig.decoderReset = true;
+                            resetMarked = true;
+                        }
+                        hevcQueue_.push_back(std::move(queuedConfig));
+                    }
+                    if(!resetMarked && !decodableTail.empty()) {
+                        decodableTail.front().decoderReset = true;
+                    }
+                    while(!decodableTail.empty()) {
+                        hevcQueue_.push_back(std::move(decodableTail.front()));
+                        decodableTail.pop_front();
+                    }
+                }
             }
         }
         hevcCv_.notify_all();
@@ -1928,6 +2042,8 @@ private:
     std::deque<EgoHevcSample> hevcQueue_;
     std::vector<EgoHevcSample> latestCodecConfigSamples_;
     uint64_t nextHevcSequence_ = 0;
+    bool hevcAwaitingKeyFrame_ = false;
+    static constexpr size_t kMaxLiveHevcSamples = 96;
 };
 
 int EgoRecorder::Impl::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
@@ -1978,6 +2094,11 @@ bool EgoRecorder::beginSession(const std::filesystem::path &episodeDir,
     return impl_->beginSession(episodeDir, sessionName, errorMessage);
 }
 
+bool EgoRecorder::beginPreviewSession(const std::string &sessionName,
+                                      std::string *errorMessage) {
+    return impl_->beginPreviewSession(sessionName, errorMessage);
+}
+
 bool EgoRecorder::requestStopSession(std::string *errorMessage) {
     return impl_->requestStopSession(errorMessage);
 }
@@ -2008,6 +2129,10 @@ bool EgoRecorder::popHevcSample(EgoHevcSample &out, std::chrono::milliseconds ti
 
 void EgoRecorder::clearHevcSamples(bool keepCodecConfig) {
     impl_->clearHevcSamples(keepCodecConfig);
+}
+
+void EgoRecorder::requestHevcKeyFrameResync() {
+    impl_->requestHevcKeyFrameResync();
 }
 
 }  // namespace sync_app

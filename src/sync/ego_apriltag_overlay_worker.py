@@ -352,6 +352,18 @@ def parse_camera_image(camera: dict[str, Any], payload: bytes) -> np.ndarray | N
     return arr.reshape(height, width, 3).copy()
 
 
+def parse_ego_image(request: dict[str, Any], payload: bytes) -> np.ndarray | None:
+    return parse_camera_image(
+        {
+            "rgb_width": request.get("ego_rgb_width", 0),
+            "rgb_height": request.get("ego_rgb_height", 0),
+            "rgb_offset": request.get("ego_rgb_offset", 0),
+            "rgb_size": request.get("ego_rgb_size", 0),
+        },
+        payload,
+    )
+
+
 def camera_matrix(camera: dict[str, Any]) -> np.ndarray:
     intrinsic = camera.get("intrinsic", {})
     sx = float(camera.get("rgb_scale_x", 1.0)) or 1.0
@@ -600,7 +612,10 @@ def handle_frame_request(state: WorkerState, request: dict[str, Any], payload: b
             **ref_stats,
         }
 
-    ego_frame, video_reason = state.video_source.read(video_path, ego_frame_index)
+    ego_frame = parse_ego_image(request, payload)
+    video_reason = ""
+    if ego_frame is None:
+        ego_frame, video_reason = state.video_source.read(video_path, ego_frame_index)
     if ego_frame is None:
         return {
             "ok": False,
@@ -610,6 +625,10 @@ def handle_frame_request(state: WorkerState, request: dict[str, Any], payload: b
             "lines": [],
             **ref_stats,
         }
+
+    model_width, model_height = ego_model.image_size
+    if ego_frame.shape[1] != model_width or ego_frame.shape[0] != model_height:
+        ego_frame = cv2.resize(ego_frame, (model_width, model_height), interpolation=cv2.INTER_LINEAR)
 
     detections, detection_reason, detection_space = detect_ego_apriltags(ego_frame, detector, ego_model)
     detected_ids = sorted({int(tag_id) for tag_id, _ in detections})

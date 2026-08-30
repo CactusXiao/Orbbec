@@ -368,7 +368,7 @@ struct EgoAprilTagCameraPacket {
 struct EgoAprilTagRequest {
     uint64_t frameId = 0;
     int      egoVideoFrameIndex = -1;
-    fs::path egoVideoPath;
+    cv::Mat  egoRgbBgr;
     fs::path egoCameraParamsPath;
     std::vector<EgoAprilTagCameraPacket> cameras;
 };
@@ -1864,10 +1864,13 @@ private:
         oss << std::setprecision(9);
         oss << "{\"type\":\"frame\",\"frame_id\":" << req.frameId
             << ",\"ego_video_frame_index\":" << req.egoVideoFrameIndex
-            << ",\"ego_video_path\":" << jsonStringLocal(req.egoVideoPath.string())
             << ",\"ego_camera_params_path\":" << jsonStringLocal(req.egoCameraParamsPath.string())
+            << ",\"ego_rgb_width\":" << req.egoRgbBgr.cols
+            << ",\"ego_rgb_height\":" << req.egoRgbBgr.rows
+            << ",\"ego_rgb_offset\":0"
+            << ",\"ego_rgb_size\":" << matByteSize(req.egoRgbBgr)
             << ",\"tag_family\":\"tag36h11\",\"tag_size_m\":0.096,\"cameras\":[";
-        uint64_t payloadOffset = 0;
+        uint64_t payloadOffset = static_cast<uint64_t>(matByteSize(req.egoRgbBgr));
         for(size_t i = 0; i < req.cameras.size(); ++i) {
             const auto &cam = req.cameras[i];
             const uint64_t rgbBytes = static_cast<uint64_t>(matByteSize(cam.rgbBgr));
@@ -1923,6 +1926,9 @@ private:
             return false;
         }
         if(!json.empty() && !writeAllFd(stdinFd, json.data(), json.size())) {
+            return false;
+        }
+        if(!req.egoRgbBgr.empty() && !writeAllFd(stdinFd, req.egoRgbBgr.data, matByteSize(req.egoRgbBgr))) {
             return false;
         }
         for(const auto &cam : req.cameras) {
@@ -2212,14 +2218,16 @@ private:
         (void)recorder;
         publishStatus("PICO RGB live preview is unsupported on Windows");
 #else
-        if(!launchDecoder()) {
-            publishStatus("PICO RGB ffmpeg start failed");
-            return;
-        }
-        recorder->clearHevcSamples(true);
-        publishStatus("PICO RGB waiting for live H265");
-        auto restartDecoder = [&]() {
+        recorder->requestHevcKeyFrameResync();
+        publishStatus("PICO RGB waiting for H265 config and key frame");
+        auto restartDecoder = [&](bool waitForKeyFrame) {
             publishStatus("PICO RGB decoder restarting");
+            if(waitForKeyFrame) {
+                recorder->requestHevcKeyFrameResync();
+                closeDecoder();
+                publishStatus("PICO RGB waiting for H265 key frame");
+                return !stopRequested_.load();
+            }
             closeDecoder();
             if(stopRequested_.load()) {
                 return false;
@@ -2229,8 +2237,7 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(150));
                 return false;
             }
-            recorder->clearHevcSamples(true);
-            publishStatus("PICO RGB waiting for live H265");
+            publishStatus("PICO RGB decoder resynchronized");
             return true;
         };
 
@@ -2242,8 +2249,11 @@ private:
             if(sample.payload.empty()) {
                 continue;
             }
+            if(sample.decoderReset && !restartDecoder(false)) {
+                break;
+            }
             if(sample.codecConfig) {
-                if(!writeSample(sample) && !restartDecoder()) {
+                if(!writeSample(sample) && !restartDecoder(true)) {
                     break;
                 }
                 continue;
@@ -2254,7 +2264,7 @@ private:
             if(stopRequested_.load()) {
                 break;
             }
-            if(!writeSample(sample) && !restartDecoder()) {
+            if(!writeSample(sample) && !restartDecoder(true)) {
                 break;
             }
             if(!sample.codecConfig && latestFrameIndex() < 0) {
@@ -3731,14 +3741,6 @@ private:
         }
     }
 
-    fs::path resolveEgoPreviewEpisodeDir() const {
-        fs::path base = cfg_.outputDir.empty() ? (fs::current_path() / "interaction_ego_preview") : cfg_.outputDir;
-        if(base.is_relative()) {
-            base = (fs::current_path() / base).lexically_normal();
-        }
-        return base / "interaction_ego_preview";
-    }
-
     EgoModuleConfig buildInteractionEgoConfig() const {
         EgoModuleConfig egoCfg = cfg_.ego;
         egoCfg.enabled = true;
@@ -3762,6 +3764,10 @@ private:
 
     bool wantsPicoRgbPreview() const {
         return imageType_ == ImageType::RGB && (cfg_.demo.active || rgbImageSource_ == RgbImageSource::Pico);
+    }
+
+    bool needsPicoRgbDecoder() const {
+        return wantsPicoRgbPreview() || showEgoAprilTags_;
     }
 
     bool wantsEgoPreviewSession() const {
@@ -3832,24 +3838,14 @@ private:
         lastEgoSessionAttemptUs_ = attemptUs;
         setEgoAprilTagStatus("PICO connected; starting preview session");
 
-        egoPreviewEpisodeDir_ = resolveEgoPreviewEpisodeDir();
-        try {
-            fs::create_directories(egoPreviewEpisodeDir_);
-        }
-        catch(const std::exception &ex) {
-            setEgoAprilTagStatus(std::string("PICO preview dir failed: ") + ex.what());
-            return false;
-        }
-        if(!egoRecorder_.beginSession(egoPreviewEpisodeDir_, "interaction_preview", &err)) {
+        if(!egoRecorder_.beginPreviewSession("interaction_preview", &err)) {
             setEgoAprilTagStatus("PICO preview session failed: " + err);
             return false;
         }
 
-        egoVideoPath_ = egoPreviewEpisodeDir_ / "ego" / "RGB" / "rgb.h265";
-        egoCameraParamsPath_ = egoPreviewEpisodeDir_ / "ego" / "camera_params.json";
-        latestEgoFrame_.reset();
+        egoCameraParamsPath_ = cfg_.ego.cameraParamsPath;
         lastEgoTagSubmitUs_ = 0;
-        setEgoAprilTagStatus("PICO preview session active; waiting for RGB frames");
+        setEgoAprilTagStatus("PICO memory preview active; waiting for RGB frames");
         return true;
     }
 
@@ -3864,9 +3860,6 @@ private:
             if(ownsEgoRecorder_ && !wantsEgoPreviewSession()) {
                 egoRecorder_.stop();
             }
-            if(!wantsPicoRgbPreview()) {
-                latestEgoFrame_.reset();
-            }
             lastEgoTagSubmitUs_ = 0;
             if(!wantsEgoPreviewSession()) {
                 lastEgoSessionAttemptUs_ = 0;
@@ -3876,9 +3869,7 @@ private:
         }
 
         showEgoAprilTags_ = true;
-        egoVideoPath_.clear();
         egoCameraParamsPath_.clear();
-        latestEgoFrame_.reset();
         lastEgoTagSubmitUs_ = 0;
         lastEgoSessionAttemptUs_ = 0;
         egoTagWorker_.setScriptPath(resolveEgoAprilTagWorkerScriptPath());
@@ -4713,25 +4704,13 @@ private:
         gtWorker_.submitLatest(std::move(req));
     }
 
-    void pollEgoFrames() {
-        if(!wantsEgoPreviewSession() || !egoRecorder_.isRunning()) {
-            return;
-        }
-        EgoFrame frame;
-        int      popped = 0;
-        while(popped < 32 && egoRecorder_.popFrame(frame, std::chrono::milliseconds(0))) {
-            latestEgoFrame_ = frame;
-            popped++;
-        }
-    }
-
     EgoAprilTagRequest buildEgoAprilTagRequest(const std::unordered_map<int, CachedFrameBundle> &frames, uint64_t frameId) const {
         EgoAprilTagRequest req;
         req.frameId = frameId;
-        req.egoVideoPath = egoVideoPath_;
         req.egoCameraParamsPath = egoCameraParamsPath_;
-        if(latestEgoFrame_.has_value()) {
-            req.egoVideoFrameIndex = latestEgoFrame_->videoFrameIndex;
+        req.egoVideoFrameIndex = latestPicoRgbVideoFrameIndex_;
+        if(!latestPicoRgbFrame_.empty()) {
+            req.egoRgbBgr = latestPicoRgbFrame_.clone();
         }
 
         for(const auto &kv : frames) {
@@ -4793,23 +4772,22 @@ private:
         if(!ensureEgoAprilTagPreviewSession(frameId)) {
             return;
         }
-        pollEgoFrames();
         if(egoTagWorker_.hasPendingRequest()) {
             return;
         }
         if(lastEgoTagSubmitUs_ != 0 && frameId > lastEgoTagSubmitUs_ && frameId - lastEgoTagSubmitUs_ < 120000) {
             return;
         }
-        if(!latestEgoFrame_.has_value()) {
+        if(latestPicoRgbFrame_.empty()) {
             setEgoAprilTagStatus("PICO preview session active; waiting for PICO RGB frames");
             return;
         }
-        if(latestEgoFrame_->videoFrameIndex < 0) {
+        if(latestPicoRgbVideoFrameIndex_ < 0) {
             setEgoAprilTagStatus("PICO RGB received; waiting for H265 video frame");
             return;
         }
-        if(egoVideoPath_.empty() || egoCameraParamsPath_.empty()) {
-            setEgoAprilTagStatus("PICO tags missing preview paths");
+        if(egoCameraParamsPath_.empty()) {
+            setEgoAprilTagStatus("PICO tags missing camera parameters");
             return;
         }
 
@@ -4854,7 +4832,7 @@ private:
     }
 
     void updatePicoRgbPreviewIfNeeded(uint64_t frameId) {
-        if(!wantsPicoRgbPreview()) {
+        if(!needsPicoRgbDecoder()) {
             return;
         }
         if(!ensureEgoAprilTagPreviewSession(frameId)) {
@@ -6157,7 +6135,7 @@ private:
                 if(rgbImageSource_ == RgbImageSource::Pico) {
                     picoRgbStatusLine_ = "Starting PICO RGB preview";
                 }
-                else {
+                else if(!showEgoAprilTags_) {
                     clearPicoRgbPreview();
                 }
                 stopEgoPreviewSessionIfUnused();
@@ -6903,10 +6881,7 @@ private:
     EgoRecorder ownedEgoRecorder_;
     EgoRecorder &egoRecorder_;
     bool ownsEgoRecorder_ = true;
-    fs::path egoPreviewEpisodeDir_;
-    fs::path egoVideoPath_;
     fs::path egoCameraParamsPath_;
-    std::optional<EgoFrame> latestEgoFrame_;
     std::string egoTagStatusLine_ = "PICO tags off";
     FisheyeRecorder fisheyeRecorder_;
     std::vector<uint8_t> fisheyeVisible_;
