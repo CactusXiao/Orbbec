@@ -553,18 +553,19 @@ class ViewerSessionManager:
         return sources, sorted(set(frames)), max(1.0, min(60.0, fps))
 
     def _decode_jobs(self, session: ViewerSession) -> List[Tuple[str, Path, Path, bool]]:
-        jobs: List[Tuple[str, Path, Path, bool]] = []
+        rgb_jobs: List[Tuple[str, Path, Path, bool]] = []
+        depth_jobs: List[Tuple[str, Path, Path, bool]] = []
         seen: set = set()
         for source in session.sources:
             if source.rgb_video and source.decoded_rgb:
                 key = str(source.rgb_video)
                 if key not in seen:
-                    jobs.append((f"{source.label} RGB", source.rgb_video, source.decoded_rgb, False))
+                    rgb_jobs.append((f"{source.label} RGB", source.rgb_video, source.decoded_rgb, False))
                     seen.add(key)
             if source.depth_video and source.decoded_depth:
                 key = str(source.depth_video)
                 if key not in seen:
-                    jobs.append((f"{source.label} Depth", source.depth_video, source.decoded_depth, True))
+                    depth_jobs.append((f"{source.label} Depth", source.depth_video, source.decoded_depth, True))
                     seen.add(key)
         # Decode any additional recorded containers too.  This mirrors the native
         # viewer's up-front decoded_pic preparation and prevents a later modality
@@ -575,9 +576,14 @@ class ViewerSessionManager:
                 continue
             rel = video.relative_to(session.episode_dir)
             depth = "depth" in {part.lower() for part in rel.parts} or "depth" in video.stem.lower()
-            jobs.append((str(rel), video, session.temp_dir / "decoded_extra" / rel.parent / video.stem, depth))
+            job = (str(rel), video, session.temp_dir / "decoded_extra" / rel.parent / video.stem, depth)
+            (depth_jobs if depth else rgb_jobs).append(job)
             seen.add(key)
-        return jobs
+        # Match QC's per-camera scheduling: start every RGB camera decoder first.
+        # The shared pool then admits Depth jobs as RGB workers become available,
+        # instead of the previous RGB/Depth interleaving that only started about
+        # half of the RGB cameras at once.
+        return rgb_jobs + depth_jobs
 
     def _decode_video(self, session: ViewerSession, video: Path, output: Path, depth: bool) -> None:
         if session.cancel.is_set():
