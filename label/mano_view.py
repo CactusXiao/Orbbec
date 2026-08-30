@@ -53,6 +53,17 @@ def mano_joints_to_annotation_order(joints_3d: np.ndarray) -> np.ndarray:
     return joints[:, list(_SMPLX_MANO_TO_APP_ORDER), :]
 
 
+def mano_visibility_to_annotation_order(visibility: np.ndarray) -> np.ndarray:
+    """Apply the same canonical-MANO to canvas order used for joint coordinates."""
+    values = np.asarray(visibility, dtype=bool)
+    if values.shape != (_HAND_COUNT, _JOINT_COUNT):
+        raise ValueError(
+            "canonical MANO visibility must have shape "
+            f"({_HAND_COUNT}, {_JOINT_COUNT}), got {values.shape}"
+        )
+    return values[:, list(_SMPLX_MANO_TO_APP_ORDER)]
+
+
 @dataclass(frozen=True)
 class CameraParams:
     k: np.ndarray

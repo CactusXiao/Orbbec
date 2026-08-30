@@ -508,13 +508,12 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def _on_right_down(self, evt) -> None:
         if self._locate_joint is not None:
-            schematic_hit = self._editable_schematic_hit(evt.x, evt.y)
-            if schematic_hit is not None:
-                self._begin_joint_location(schematic_hit)
+            if self._editable_schematic_hit(evt.x, evt.y) is not None:
+                self._cancel_joint_location()
                 return
             if self._place_located_joint(evt.x, evt.y):
                 return
-            self._panning = False
+            self._cancel_joint_location()
             return
 
         if not self._read_only and self._base_image is not None:
@@ -811,7 +810,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         item = self.create_text(
             w * 0.5,
             24,
-            text=f"定位模式：{hand_label}关节 {joint}，在图像目标位置再次右键完成定位（Esc 取消）",
+            text=f"定位模式：{hand_label}关节 {joint}，右键图像完成定位，右键图外退出（Esc 取消）",
             fill="#ffffff",
         )
         self._overlay_items.append(item)

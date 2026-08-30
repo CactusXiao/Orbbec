@@ -16,6 +16,7 @@ try:
     from .storage import (
         CorrectionProgress,
         CorrectionTask,
+        JOINTS_VIS_DIR,
         PredictionBundle,
         apply_view_state_to_corrected,
         correction_task_from_backend_payload,
@@ -23,6 +24,7 @@ try:
         find_frame_path,
         load_correction_progress,
         load_correction_tasks,
+        load_joint_visibility,
         load_prediction_bundle,
         save_corrected_array,
         save_correction_progress,
@@ -30,7 +32,12 @@ try:
         view_state_from_bundle,
     )
     from .theme import Theme, apply_theme
-    from .mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
+    from .mano_view import (
+        ManoMeshResult,
+        ManoViewRuntime,
+        describe_mano_projection_issue,
+        mano_visibility_to_annotation_order,
+    )
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
     from .env_config import LabelConfig, load_label_config
@@ -40,6 +47,7 @@ except Exception:
     from storage import (
         CorrectionProgress,
         CorrectionTask,
+        JOINTS_VIS_DIR,
         PredictionBundle,
         apply_view_state_to_corrected,
         correction_task_from_backend_payload,
@@ -47,6 +55,7 @@ except Exception:
         find_frame_path,
         load_correction_progress,
         load_correction_tasks,
+        load_joint_visibility,
         load_prediction_bundle,
         save_corrected_array,
         save_correction_progress,
@@ -54,7 +63,12 @@ except Exception:
         view_state_from_bundle,
     )
     from theme import Theme, apply_theme
-    from mano_view import ManoMeshResult, ManoViewRuntime, describe_mano_projection_issue
+    from mano_view import (
+        ManoMeshResult,
+        ManoViewRuntime,
+        describe_mano_projection_issue,
+        mano_visibility_to_annotation_order,
+    )
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
     from env_config import LabelConfig, load_label_config
@@ -970,10 +984,21 @@ class LabelPage(ttk.Frame):
 
     def _build_modified_view_state(self, frame_idx: int, cam_id: str) -> Tuple[HandPoints, HandVisible]:
         bundle = self._ensure_bundle("correct")
-        if source_frame_path(bundle, frame_idx, cam_id) is not None:
-            return view_state_from_bundle(bundle, frame_idx, cam_id)
-
         original = self._build_mano_3d_view_state(frame_idx, cam_id)
+        if source_frame_path(bundle, frame_idx, cam_id) is not None:
+            saved_points, saved_visible = view_state_from_bundle(bundle, frame_idx, cam_id)
+            if original is None:
+                return saved_points, saved_visible
+            original_points, _original_visible = original
+            # Corrected files encode invisible points as (-1,-1). Keep their
+            # original projected position in memory so making a joint visible
+            # again writes a real coordinate instead of persisting (-1,-1).
+            for hand in range(2):
+                for joint in range(21):
+                    if not saved_visible[hand][joint]:
+                        saved_points[hand][joint] = original_points[hand][joint]
+            return saved_points, saved_visible
+
         if original is None:
             return self._hidden_points(), self._none_visible()
         return self._copy_view_state(original)
@@ -1001,7 +1026,27 @@ class LabelPage(ttk.Frame):
                 cam_id,
                 frame_idx,
             )
-        return state
+            return None
+
+        points, projected_visible = state
+        try:
+            original_visible = load_joint_visibility(
+                task.episode_dir() / JOINTS_VIS_DIR,
+                cam_id,
+                frame_idx,
+            )
+        except Exception as exc:
+            self._mano_projection_errors[err_key] = str(exc)
+            return None
+        if original_visible is None:
+            return points, projected_visible
+
+        ordered_visible = mano_visibility_to_annotation_order(original_visible).tolist()
+        visible = [
+            [bool(projected_visible[hand][joint] and ordered_visible[hand][joint]) for joint in range(21)]
+            for hand in range(2)
+        ]
+        return points, visible
 
     @staticmethod
     def _is_hidden_point(point: Tuple[float, float]) -> bool:
@@ -1540,8 +1585,6 @@ class LabelPage(ttk.Frame):
         if missing > 0:
             messagebox.showwarning("Notice", f"未标注完全：还有 {missing} 个关节点的可见视角数少于 2。")
             self._refresh_view()
-            return
-        if not self._ask_yes_no("Confirm", "Confirm that all views have been corrected?"):
             return
 
         frame_idx = task.frames[self._frame_pos]

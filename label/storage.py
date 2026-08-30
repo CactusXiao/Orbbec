@@ -24,6 +24,7 @@ _JOINT_COUNT = 21
 PREDICTION_DIR = "pred_2d"
 MANUAL_SEGMENTS_DIR = "manual_2d/segments"
 MANO_EPISODE_DIR = "mano/episode"
+JOINTS_VIS_DIR = "joints_vis"
 
 
 @dataclass(frozen=True)
@@ -458,6 +459,29 @@ def load_frame_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Option
     arr = _load_prediction_view(path)
     _validate_prediction_view(arr, path)
     return _visibility_from_array(np.asarray(arr, dtype=float)).astype(bool).tolist()
+
+
+def load_joint_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Optional[List[List[bool]]]:
+    """Load the automatic-label visibility mask for one camera frame."""
+    path = find_optional_prediction_frame_path(base_dir, cam_id, frame_idx)
+    if path is None:
+        return None
+    try:
+        arr = np.load(path)
+    except Exception as exc:
+        raise ValueError(f"Failed to load joint visibility npy: {path}") from exc
+
+    values = np.asarray(arr)
+    if values.shape == (_HAND_COUNT, _JOINT_COUNT, 1):
+        values = values[:, :, 0]
+    if values.shape != (_HAND_COUNT, _JOINT_COUNT):
+        raise ValueError(
+            "Joint visibility frame array must have shape (2,21) or (2,21,1), "
+            f"got {values.shape}: {path}"
+        )
+    if values.dtype.kind not in {"b", "i", "u", "f"}:
+        raise ValueError(f"Joint visibility frame array must be numeric or bool: {path}")
+    return np.logical_and(np.isfinite(values), values > 0).astype(bool).tolist()
 
 
 def _sample_for(bundle: PredictionBundle, frame_idx: int, cam_id: str) -> PredictionSample:

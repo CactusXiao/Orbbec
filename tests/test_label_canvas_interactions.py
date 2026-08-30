@@ -65,7 +65,7 @@ class LabelCanvasInteractionTest(unittest.TestCase):
         self.assertEqual(canvas.history_pushes, 1)
         self.assertEqual(canvas.render_calls, 1)
 
-    def test_location_click_outside_image_keeps_mode_active(self) -> None:
+    def test_placement_rejects_outside_image_without_mutating_target(self) -> None:
         class CanvasStub:
             _locate_joint = (1, 3)
             _base_image = SimpleNamespace(size=(100, 80))
@@ -80,6 +80,52 @@ class LabelCanvasInteractionTest(unittest.TestCase):
 
         self.assertFalse(placed)
         self.assertEqual(canvas._locate_joint, (1, 3))
+
+    def test_right_click_outside_image_cancels_location_mode(self) -> None:
+        class CanvasStub:
+            _locate_joint = (1, 3)
+            _panning = False
+
+            @staticmethod
+            def _editable_schematic_hit(_x, _y):
+                return None
+
+            @staticmethod
+            def _place_located_joint(_x, _y):
+                return False
+
+            def _cancel_joint_location(self):
+                self._locate_joint = None
+                self.cancelled = True
+
+        canvas = CanvasStub()
+        ImageAnnotatorCanvas._on_right_down(canvas, SimpleNamespace(x=10, y=20))
+
+        self.assertTrue(canvas.cancelled)
+        self.assertIsNone(canvas._locate_joint)
+
+    def test_right_clicking_schematic_while_locating_exits_without_retargeting(self) -> None:
+        class CanvasStub:
+            _locate_joint = (0, 2)
+            _panning = False
+
+            @staticmethod
+            def _editable_schematic_hit(_x, _y):
+                return (1, 8)
+
+            @staticmethod
+            def _place_located_joint(_x, _y):
+                raise AssertionError("schematic click must not place the joint on the image")
+
+            def _cancel_joint_location(self):
+                self._locate_joint = None
+                self.cancelled = True
+
+        canvas = CanvasStub()
+        ImageAnnotatorCanvas._on_right_down(canvas, SimpleNamespace(x=50, y=60))
+
+        self.assertTrue(canvas.cancelled)
+        self.assertIsNone(canvas._locate_joint)
 
     def test_location_mode_fades_all_image_annotations_except_target_joint(self) -> None:
         class CanvasStub:

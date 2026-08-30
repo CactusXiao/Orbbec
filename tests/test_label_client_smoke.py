@@ -15,7 +15,15 @@ from label.app import SOURCE_LABELS, SOURCE_ORDER, LabelPage
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.env_config import load_label_config
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue, mano_joints_to_annotation_order
-from label.storage import PredictionBundle, correction_task_from_backend_payload, find_frame_path
+from label.storage import (
+    PredictionBundle,
+    apply_view_state_to_corrected,
+    correction_task_from_backend_payload,
+    find_frame_path,
+    load_joint_visibility,
+    save_corrected_array,
+    view_state_from_bundle,
+)
 from label.tracking import CoTrackerRuntime
 from label.video_frames import ensure_decoded_rgb_frames
 from task_backend.job_service import JobService
@@ -100,14 +108,81 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
 
                 @staticmethod
                 def _build_mano_3d_view_state(_frame_idx, _cam_id):
-                    raise AssertionError("saved modified view should take precedence over the original view")
+                    return (
+                        [[(100.0 + joint, 200.0 + joint) for joint in range(21)] for _ in range(2)],
+                        [[True for _ in range(21)] for _ in range(2)],
+                    )
 
             points, visible = LabelPage._build_modified_view_state(PageStub(), 5, "00")
+            self.assertEqual(points[0][0], (25.0, 25.0))
+            self.assertTrue(visible[0][0])
+            self.assertEqual(points[1][4], (104.0, 204.0))
+            self.assertFalse(visible[1][4])
 
-        self.assertEqual(points[0][0], (25.0, 25.0))
-        self.assertTrue(visible[0][0])
-        self.assertEqual(points[1][4], (-1.0, -1.0))
-        self.assertFalse(visible[1][4])
+            visible[1][4] = True
+            apply_view_state_to_corrected(bundle, 5, "00", points, visible)
+            save_corrected_array(bundle)
+            reloaded_points, reloaded_visible = view_state_from_bundle(bundle, 5, "00")
+
+        self.assertEqual(reloaded_points[1][4], (104.0, 204.0))
+        self.assertTrue(reloaded_visible[1][4])
+
+    def test_original_view_uses_joints_vis_in_canvas_joint_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp)
+            visibility_dir = episode_dir / "joints_vis" / "00"
+            visibility_dir.mkdir(parents=True)
+            original_visibility = np.zeros((2, 21), dtype=np.float32)
+            original_visibility[0, 13] = 1.0  # canonical MANO thumb MCP
+            original_visibility[1, 1] = 1.0   # canonical MANO index MCP
+            np.save(visibility_dir / "00005.npy", original_visibility)
+
+            projected = (
+                [[(10.0 + joint, 20.0 + joint) for joint in range(21)] for _ in range(2)],
+                [[True for _ in range(21)] for _ in range(2)],
+            )
+
+            class TaskStub:
+                key = "task"
+                mano_episode_dir = "mano/episode"
+
+                @staticmethod
+                def episode_dir():
+                    return episode_dir
+
+            class RuntimeStub:
+                @staticmethod
+                def project_mano_frame(**_kwargs):
+                    return projected
+
+            class PageStub:
+                _active_task = TaskStub()
+                _mano_projection_errors = {}
+
+                @staticmethod
+                def _mano_runtime_instance():
+                    return RuntimeStub()
+
+            points, visible = LabelPage._build_mano_3d_view_state(PageStub(), 5, "00")
+
+        self.assertEqual(points, projected[0])
+        self.assertTrue(visible[0][1])   # thumb MCP in the canvas order
+        self.assertTrue(visible[1][5])   # index MCP in the canvas order
+        self.assertFalse(visible[0][13])
+
+    def test_joint_visibility_loader_accepts_bool_or_numeric_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            (base_dir / "00").mkdir()
+            mask = np.zeros((2, 21, 1), dtype=np.int8)
+            mask[0, 3, 0] = 1
+            mask[1, 7, 0] = -1
+            np.save(base_dir / "00" / "5.npy", mask)
+
+            visible = load_joint_visibility(base_dir, "00", 5)
+
+        self.assertTrue(visible[0][3])
+        self.assertFalse(visible[1][7])
 
     def test_modified_source_caches_canvas_edits_before_switching_views(self) -> None:
         original = (
