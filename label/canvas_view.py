@@ -85,6 +85,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._pan_last: Tuple[int, int] = (0, 0)
         self._drag_joint: Optional[Tuple[int, int]] = None
         self._drag_history_pushed = False
+        self._locate_joint: Optional[Tuple[int, int]] = None
         self._press_joint_candidate: Optional[Tuple[int, int]] = None
         self._left_pressed = False
         self._selecting = False
@@ -104,6 +105,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self.bind("<Button-4>", self._on_wheel_linux)
         self.bind("<Button-5>", self._on_wheel_linux)
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Escape>", self._on_escape)
 
     def clear(self) -> None:
         self._cancel_pending_fit()
@@ -126,6 +128,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._cancel_selection_timer()
         self._left_pressed = False
         self._selecting = False
+        self._locate_joint = None
         self._press_joint_candidate = None
         self._selection_start = None
         self._selection_current = None
@@ -136,6 +139,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def set_image(self, path: Optional[Path]) -> None:
         self._cancel_pending_fit()
+        self._locate_joint = None
+        self._panning = False
         self._img_path = path
         self._base_image = None
         self._imgtk = None
@@ -164,6 +169,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._fit_and_render_image()
 
     def set_hand_state(self, points: HandPoints, visible: HandVisible) -> None:
+        self._locate_joint = None
+        self._panning = False
         self._points = self._coerce_points(points)
         self._visible = self._coerce_visible(visible)
         self._history = []
@@ -189,6 +196,9 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def set_annotation_visible(self, visible: bool) -> None:
         self._annotation_visible = bool(visible)
+        if not self._annotation_visible:
+            self._locate_joint = None
+            self._panning = False
         self._cancel_selection_timer()
         self._selecting = False
         self._drag_joint = None
@@ -197,6 +207,9 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = bool(read_only)
+        if self._read_only:
+            self._locate_joint = None
+            self._panning = False
         self._cancel_selection_timer()
         self._selecting = False
         self._drag_joint = None
@@ -221,6 +234,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
     def ignore_view(self) -> None:
         if self._read_only:
             return
+        self._locate_joint = None
         self._push_history()
         self._visible = [[False for _ in range(self._JOINT_COUNT)] for _ in range(self._HAND_COUNT)]
         self._render_overlay()
@@ -228,6 +242,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
     def undo(self) -> None:
         if self._read_only:
             return
+        self._locate_joint = None
         if not self._history:
             return
         self._points, self._visible = self._history.pop()
@@ -342,6 +357,9 @@ class ImageAnnotatorCanvas(tk.Canvas):
         if self._read_only:
             self._cancel_selection_timer()
             return
+        if self._locate_joint is not None:
+            self._cancel_selection_timer()
+            return
         schematic_hit = self._editable_schematic_hit(evt.x, evt.y)
         if schematic_hit is not None:
             self._cancel_selection_timer()
@@ -369,7 +387,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._selection_after_id = self.after(380, self._begin_selection)
 
     def _on_left_drag(self, evt) -> None:
-        if self._read_only:
+        if self._read_only or self._locate_joint is not None:
             return
         if self._selecting:
             self._selection_current = (evt.x, evt.y)
@@ -402,7 +420,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._render_overlay(drag_hand=hand)
 
     def _on_left_up(self, evt) -> None:
-        if self._read_only:
+        if self._read_only or self._locate_joint is not None:
             self._cancel_selection_timer()
             self._left_pressed = False
             self._drag_joint = None
@@ -422,7 +440,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._render_overlay()
 
     def _on_left_double(self, evt) -> None:
-        if self._read_only:
+        if self._read_only or self._locate_joint is not None:
             self._cancel_selection_timer()
             return
         self._cancel_selection_timer()
@@ -489,6 +507,24 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._selection_after_id = None
 
     def _on_right_down(self, evt) -> None:
+        if self._locate_joint is not None:
+            schematic_hit = self._editable_schematic_hit(evt.x, evt.y)
+            if schematic_hit is not None:
+                self._begin_joint_location(schematic_hit)
+                return
+            if self._place_located_joint(evt.x, evt.y):
+                return
+            self._panning = False
+            return
+
+        if not self._read_only and self._base_image is not None:
+            target = self._editable_schematic_hit(evt.x, evt.y)
+            if target is None:
+                target = self._nearest_joint(evt.x, evt.y, max_dist=14.0)
+            if target is not None:
+                self._begin_joint_location(target)
+                return
+
         self._panning = True
         self._pan_last = (evt.x, evt.y)
 
@@ -506,6 +542,53 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def _on_right_up(self, _evt) -> None:
         self._panning = False
+
+    def _on_escape(self, _evt=None) -> None:
+        self._cancel_joint_location()
+
+    def _begin_joint_location(self, target: Tuple[int, int]) -> None:
+        if self._read_only or self._base_image is None:
+            return
+        self._cancel_selection_timer()
+        self._left_pressed = False
+        self._selecting = False
+        self._drag_joint = None
+        self._drag_history_pushed = False
+        self._press_joint_candidate = None
+        self._selection_start = None
+        self._selection_current = None
+        self._panning = False
+        self._locate_joint = target
+        try:
+            self.focus_set()
+        except Exception:
+            pass
+        self._render_overlay()
+
+    def _place_located_joint(self, x: float, y: float) -> bool:
+        target = self._locate_joint
+        if target is None or self._base_image is None:
+            return False
+        x_img, y_img = self._canvas_to_image(x, y)
+        iw, ih = self._base_image.size
+        if not (0.0 <= x_img <= float(iw) and 0.0 <= y_img <= float(ih)):
+            return False
+
+        hand, joint = target
+        self._push_history()
+        self._points[hand][joint] = self._clamp_to_image(x_img, y_img)
+        self._visible[hand][joint] = True
+        self._locate_joint = None
+        self._panning = False
+        self._render_overlay()
+        return True
+
+    def _cancel_joint_location(self) -> None:
+        if self._locate_joint is None:
+            return
+        self._locate_joint = None
+        self._panning = False
+        self._render_overlay()
 
     def _on_wheel_linux(self, evt) -> None:
         if evt.num == 4:
@@ -602,19 +685,22 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def _render_overlay(self, *, drag_hand: Optional[int] = None) -> None:
         self._clear_overlay_items()
+        locate_target = self._locate_joint
         if self._annotation_visible:
             for hand in range(self._HAND_COUNT):
-                faded = drag_hand == hand
+                faded = locate_target is not None or drag_hand == hand
                 self._render_hand_bones(hand, faded=faded)
         self._render_skeleton_overlay()
         self._render_mano_overlay()
         if self._annotation_visible:
             for hand in range(self._HAND_COUNT):
-                faded = drag_hand == hand
-                self._render_hand_points(hand, faded=faded)
+                faded = locate_target is not None or drag_hand == hand
+                focus_joint = locate_target[1] if locate_target is not None and locate_target[0] == hand else None
+                self._render_hand_points(hand, faded=faded, focus_joint=focus_joint)
             self._render_selection_rect()
             self._render_visibility_schematic()
             self._render_count_schematic()
+            self._render_joint_location_hint()
 
     def _render_hand_bones(self, hand: int, *, faded: bool) -> None:
         for a, b in self._SKELETON_EDGES:
@@ -698,21 +784,37 @@ class ImageAnnotatorCanvas(tk.Canvas):
                 item = self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline=color)
                 self._overlay_items.append(item)
 
-    def _render_hand_points(self, hand: int, *, faded: bool) -> None:
+    def _render_hand_points(self, hand: int, *, faded: bool, focus_joint: Optional[int] = None) -> None:
         for joint in range(self._JOINT_COUNT):
             if self._is_hidden_point(self._points[hand][joint]):
                 continue
             cx, cy = self._image_to_canvas(*self._points[hand][joint])
-            r = 2
-            color = self._joint_color(hand, joint, faded=faded)
-            if self._visible[hand][joint]:
-                opts = {"fill": color, "outline": color}
+            focused = focus_joint == joint
+            point_faded = faded and not focused
+            r = 5 if focused else 2
+            color = self._joint_color(hand, joint, faded=point_faded)
+            if self._visible[hand][joint] or focused:
+                opts = {"fill": color, "outline": "#ffffff" if focused else color, "width": 2 if focused else 1}
             else:
-                opts = {"fill": ""}
-            if faded:
+                opts = {"fill": "", "outline": color}
+            if point_faded:
                 opts["stipple"] = "gray50"
             item = self.create_oval(cx - r, cy - r, cx + r, cy + r, **opts)
             self._overlay_items.append(item)
+
+    def _render_joint_location_hint(self) -> None:
+        if self._locate_joint is None:
+            return
+        hand, joint = self._locate_joint
+        hand_label = "左手" if hand == 0 else "右手"
+        w = max(1, int(self.winfo_width()))
+        item = self.create_text(
+            w * 0.5,
+            24,
+            text=f"定位模式：{hand_label}关节 {joint}，在图像目标位置再次右键完成定位（Esc 取消）",
+            fill="#ffffff",
+        )
+        self._overlay_items.append(item)
 
     def _render_selection_rect(self) -> None:
         if not self._selecting or self._selection_start is None or self._selection_current is None:
@@ -737,11 +839,14 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self._overlay_items.append(item)
         for joint, (x, y) in enumerate(coords):
             r = max(6, int(round(scale * 0.125)))
+            focused = self._locate_joint == (hand, joint)
+            outline = "#ffffff" if focused else ("#111111" if self._visible[hand][joint] else "#d0d0d0")
+            outline_width = 3 if focused else (1 if self._visible[hand][joint] else 2)
             if self._visible[hand][joint]:
                 color = self._visibility_schematic_color(hand, joint)
-                item = self.create_oval(x - r, y - r, x + r, y + r, fill=color, outline="#111111", width=1)
+                item = self.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=outline, width=outline_width)
             else:
-                item = self.create_oval(x - r, y - r, x + r, y + r, fill="", outline="#d0d0d0", width=2)
+                item = self.create_oval(x - r, y - r, x + r, y + r, fill="", outline=outline, width=outline_width)
             self._overlay_items.append(item)
 
     def _render_count_schematic(self) -> None:
@@ -832,10 +937,13 @@ class ImageAnnotatorCanvas(tk.Canvas):
         for joint, (x, y) in enumerate(coords):
             color = self._count_color(counts[joint])
             r = 4
+            focused = self._locate_joint == (hand, joint)
+            outline = "#ffffff" if focused else ("#111111" if color is not None else "#5a5a5a")
+            outline_width = 2 if focused else 1
             if color is None:
-                item = self.create_oval(x - r, y - r, x + r, y + r, fill="", outline="#5a5a5a", width=1)
+                item = self.create_oval(x - r, y - r, x + r, y + r, fill="", outline=outline, width=outline_width)
             else:
-                item = self.create_oval(x - r, y - r, x + r, y + r, fill=color, outline="#111111", width=1)
+                item = self.create_oval(x - r, y - r, x + r, y + r, fill=color, outline=outline, width=outline_width)
             self._overlay_items.append(item)
 
     def _schematic_point(self, hand: int, joint: int, cx: float, cy: float, scale: float) -> Tuple[float, float]:

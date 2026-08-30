@@ -11,11 +11,11 @@ import unittest
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from label.app import LabelPage
+from label.app import SOURCE_LABELS, SOURCE_ORDER, LabelPage
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.env_config import load_label_config
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue, mano_joints_to_annotation_order
-from label.storage import correction_task_from_backend_payload, find_frame_path
+from label.storage import PredictionBundle, correction_task_from_backend_payload, find_frame_path
 from label.tracking import CoTrackerRuntime
 from label.video_frames import ensure_decoded_rgb_frames
 from task_backend.job_service import JobService
@@ -24,7 +24,92 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
-    def test_mano_source_caches_canvas_edits_before_switching_views(self) -> None:
+    def test_only_original_and_modified_views_are_exposed(self) -> None:
+        self.assertEqual(SOURCE_ORDER, ("mano", "correct"))
+        self.assertEqual(SOURCE_LABELS, {"mano": "原始视角", "correct": "修改后视角"})
+
+    def test_modified_view_starts_from_original_when_no_saved_correction_exists(self) -> None:
+        original = (
+            [[(10.0, 20.0) for _ in range(21)] for _ in range(2)],
+            [[True for _ in range(21)] for _ in range(2)],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = PredictionBundle(
+                mode="correct",
+                episode_dir=root,
+                prediction_dir=root / "pred_2d",
+                pred_dir=root / "manual_2d",
+                corrected_dir=root / "manual_2d",
+                samples={},
+            )
+
+            class PageStub:
+                @staticmethod
+                def _ensure_bundle(_source):
+                    return bundle
+
+                @staticmethod
+                def _build_mano_3d_view_state(_frame_idx, _cam_id):
+                    return original
+
+                @staticmethod
+                def _copy_view_state(state):
+                    points, visible = state
+                    return (
+                        [[(float(x), float(y)) for x, y in hand] for hand in points],
+                        [[bool(value) for value in hand] for hand in visible],
+                    )
+
+                @staticmethod
+                def _hidden_points():
+                    return [[(-1.0, -1.0) for _ in range(21)] for _ in range(2)]
+
+                @staticmethod
+                def _none_visible():
+                    return [[False for _ in range(21)] for _ in range(2)]
+
+            initialized = LabelPage._build_modified_view_state(PageStub(), 5, "00")
+
+        self.assertEqual(initialized, original)
+        self.assertIsNot(initialized, original)
+        self.assertIsNot(initialized[0], original[0])
+        self.assertIsNot(initialized[1], original[1])
+
+    def test_modified_view_reloads_saved_correction_when_returning_to_confirmed_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corrected_dir = root / "manual_2d"
+            (corrected_dir / "00").mkdir(parents=True)
+            corrected = np.full((2, 21, 2), 25.0, dtype=np.float32)
+            corrected[1, 4] = [-1.0, -1.0]
+            np.save(corrected_dir / "00" / "00005.npy", corrected)
+            bundle = PredictionBundle(
+                mode="correct",
+                episode_dir=root,
+                prediction_dir=root / "pred_2d",
+                pred_dir=corrected_dir,
+                corrected_dir=corrected_dir,
+                samples={},
+            )
+
+            class PageStub:
+                @staticmethod
+                def _ensure_bundle(_source):
+                    return bundle
+
+                @staticmethod
+                def _build_mano_3d_view_state(_frame_idx, _cam_id):
+                    raise AssertionError("saved modified view should take precedence over the original view")
+
+            points, visible = LabelPage._build_modified_view_state(PageStub(), 5, "00")
+
+        self.assertEqual(points[0][0], (25.0, 25.0))
+        self.assertTrue(visible[0][0])
+        self.assertEqual(points[1][4], (-1.0, -1.0))
+        self.assertFalse(visible[1][4])
+
+    def test_modified_source_caches_canvas_edits_before_switching_views(self) -> None:
         original = (
             [[(10.0, 20.0) for _ in range(21)] for _ in range(2)],
             [[True for _ in range(21)] for _ in range(2)],
@@ -39,7 +124,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 return edited
 
         class PageStub:
-            _mode = "mano"
+            _mode = "correct"
             _view_states = {"00": original}
             _source_state_cache = {}
             _canvas = CanvasStub()
@@ -63,7 +148,37 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         LabelPage._cache_current_source_state(page)
 
         self.assertEqual(page._view_states["00"], edited)
-        self.assertEqual(page._source_state_cache[("task", 0, "00", "mano")], edited)
+        self.assertEqual(page._source_state_cache[("task", 0, "00", "correct")], edited)
+
+    def test_original_view_is_read_only_and_modified_view_is_editable(self) -> None:
+        class CanvasStub:
+            def __init__(self):
+                self.read_only = None
+                self.annotation_visible = None
+
+            def set_read_only(self, value):
+                self.read_only = value
+
+            def set_annotation_visible(self, value):
+                self.annotation_visible = value
+
+        class PageStub:
+            _mode = "mano"
+            _canvas = CanvasStub()
+
+            @staticmethod
+            def _visualization_active():
+                return False
+
+        page = PageStub()
+        LabelPage._sync_visualization_canvas_state(page)
+        self.assertTrue(page._canvas.read_only)
+        self.assertTrue(page._canvas.annotation_visible)
+
+        page._mode = "correct"
+        LabelPage._sync_visualization_canvas_state(page)
+        self.assertFalse(page._canvas.read_only)
+        self.assertTrue(page._canvas.annotation_visible)
 
     def test_label_app_loads_mount_from_launch_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

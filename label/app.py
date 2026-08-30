@@ -62,13 +62,10 @@ except Exception:
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
 SourceStateCache = Dict[Tuple[str, int, str, str], Tuple[HandPoints, HandVisible]]
-SOURCE_ORDER = ("mano", "pred", "correct", "last", "tracking")
+SOURCE_ORDER = ("mano", "correct")
 SOURCE_LABELS = {
-    "mano": "MANO",
-    "pred": "Pred",
-    "correct": "Correct",
-    "last": "Last",
-    "tracking": "Tracking",
+    "mano": "原始视角",
+    "correct": "修改后视角",
 }
 STATUS_DONE_COLOR = "#46d36b"
 STATUS_TODO_COLOR = "#ff5c5c"
@@ -444,7 +441,7 @@ class LabelPage(ttk.Frame):
         self._decode_generation: int = 0
         self._decode_thread: Optional[threading.Thread] = None
         self._decode_cache_dir: Optional[Path] = None
-        self._mode: str = "pred"
+        self._mode: str = "correct"
         self._tasks: List[CorrectionTask] = []
         self._tasks_by_key: Dict[str, CorrectionTask] = {}
         self._progress: Dict[str, CorrectionProgress] = {}
@@ -556,7 +553,7 @@ class LabelPage(ttk.Frame):
         self._jsonl_path = None
         self._backend_session = None
         self._backend_completed = False
-        self._mode = "pred"
+        self._mode = "correct"
         self._tasks = []
         self._tasks_by_key = {}
         self._progress = {}
@@ -595,7 +592,7 @@ class LabelPage(ttk.Frame):
         self._backend_session = None
         self._backend_completed = False
         self._jsonl_path = str(p)
-        return self._apply_session_tasks(tasks, progress, f"Tasks: {p}", initial_source="pred")
+        return self._apply_session_tasks(tasks, progress, f"Tasks: {p}", initial_source="correct")
 
     def _set_backend_session(self, session: LabelJobSession) -> bool:
         try:
@@ -617,7 +614,7 @@ class LabelPage(ttk.Frame):
         self._backend_session = session
         self._backend_completed = False
         self._jsonl_path = None
-        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...", initial_source="mano")
+        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...", initial_source="correct")
         if self._frame_status is not None:
             self._frame_status.configure(text="正在解码 RGB 帧...", fg=STATUS_TODO_COLOR)
         self._schedule_backend_heartbeat()
@@ -686,7 +683,7 @@ class LabelPage(ttk.Frame):
             progress,
             f"Backend job: {self._backend_session.job_id if self._backend_session else task.key}",
             auto_open_first=True,
-            initial_source="mano",
+            initial_source="correct",
         )
 
     def _cleanup_decode_cache(self) -> None:
@@ -706,7 +703,7 @@ class LabelPage(ttk.Frame):
         info_prefix: str,
         *,
         auto_open_first: bool = False,
-        initial_source: str = "pred",
+        initial_source: str = "correct",
     ) -> bool:
         self._mode = self._normalize_source(initial_source)
         self._tasks = tasks
@@ -730,7 +727,7 @@ class LabelPage(ttk.Frame):
             done = rec.done_count if rec else 0
             self._tree.insert("", "end", iid=task.key, values=(task.display_name, done, task.total_frames))
 
-        self._info.configure(text=f"{info_prefix}    View Source: {self._source_label()}")
+        self._info.configure(text=f"{info_prefix}    视图：{self._source_label()}")
         if self._frame_status is not None:
             self._frame_status.configure(text="")
         if auto_open_first and self._tasks:
@@ -904,7 +901,7 @@ class LabelPage(ttk.Frame):
 
     def _normalize_source(self, source: str) -> str:
         source = (source or "").strip().lower()
-        return source if source in SOURCE_ORDER else "pred"
+        return source if source in SOURCE_ORDER else "correct"
 
     def _copy_view_state(self, state: Tuple[HandPoints, HandVisible]) -> Tuple[HandPoints, HandVisible]:
         points, visible = state
@@ -962,11 +959,24 @@ class LabelPage(ttk.Frame):
                 return self._hidden_points(), self._none_visible()
             return state
 
+        if source == "correct":
+            return self._build_modified_view_state(frame_idx, cam_id)
+
         bundle = self._ensure_bundle(source)
         if self._is_source_missing(source, frame_idx, cam_id):
             return self._hidden_points(), self._none_visible()
 
         return view_state_from_bundle(bundle, frame_idx, cam_id)
+
+    def _build_modified_view_state(self, frame_idx: int, cam_id: str) -> Tuple[HandPoints, HandVisible]:
+        bundle = self._ensure_bundle("correct")
+        if source_frame_path(bundle, frame_idx, cam_id) is not None:
+            return view_state_from_bundle(bundle, frame_idx, cam_id)
+
+        original = self._build_mano_3d_view_state(frame_idx, cam_id)
+        if original is None:
+            return self._hidden_points(), self._none_visible()
+        return self._copy_view_state(original)
 
     def _build_mano_3d_view_state(self, frame_idx: int, cam_id: str) -> Optional[Tuple[HandPoints, HandVisible]]:
         task = self._active_task
@@ -1146,8 +1156,13 @@ class LabelPage(ttk.Frame):
             if self._has_any_visible(visible):
                 return label
             return f"{label} (missing: {self._mano_projection_error(frame_idx, cam_id)})"
-        if source == "tracking":
-            return label if self._has_any_visible(visible) else f"{label} (missing)"
+        if source == "correct":
+            bundle = self._ensure_bundle("correct")
+            if source_frame_path(bundle, frame_idx, cam_id) is not None:
+                return label
+            if self._has_any_visible(visible):
+                return f"{label}（初始值）"
+            return f"{label} (missing original: {self._mano_projection_error(frame_idx, cam_id)})"
         if self._is_source_missing(source, frame_idx, cam_id):
             return f"{label} (missing)"
         return label
@@ -1176,7 +1191,7 @@ class LabelPage(ttk.Frame):
         return False
 
     def _source_button_text(self) -> str:
-        return f"View Source: {self._source_label()}"
+        return f"视图：{self._source_label()}"
 
     def _update_source_button(self) -> None:
         if self._source_btn is not None:
@@ -1236,7 +1251,7 @@ class LabelPage(ttk.Frame):
     def _sync_visualization_canvas_state(self) -> None:
         active = self._visualization_active()
         try:
-            self._canvas.set_read_only(active)
+            self._canvas.set_read_only(active or self._mode == "mano")
             self._canvas.set_annotation_visible(not active)
         except Exception:
             pass
@@ -1425,7 +1440,7 @@ class LabelPage(ttk.Frame):
             text=(
                 f"Task: {task.display_name}    Camera: {cam_id} ({self._cam_idx + 1}/{len(self._camera_ids)})    "
                 f"Frame: {frame_idx} ({self._frame_pos + 1}/{task.total_frames})    "
-                f"View Source: {self._view_source_status(source, frame_idx, cam_id, visible)}    Done: {done}/{task.total_frames}"
+                f"视图：{self._view_source_status(source, frame_idx, cam_id, visible)}    Done: {done}/{task.total_frames}"
             )
         )
         if self._frame_status is not None:
@@ -1514,6 +1529,9 @@ class LabelPage(ttk.Frame):
             return
         if not self._camera_ids:
             messagebox.showwarning("Notice", "No camera directories found for the current task.")
+            return
+        if self._mode != "correct":
+            messagebox.showwarning("Notice", "请切换到“修改后视角”再确认标注。")
             return
 
         self._cache_current_source_state()
