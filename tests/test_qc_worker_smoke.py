@@ -9,7 +9,13 @@ from unittest.mock import patch
 
 from label.video_frames import _run_ffmpeg_select
 from src.qc.config import load_qc_config
-from src.qc.media import _count_cached, prepare_qc_media
+from src.qc.media import (
+    _count_cached,
+    _load_reference_to_ego_frames,
+    _qc_view_cameras,
+    prepare_qc_media,
+)
+from src.qc.report import build_qc_result, write_ego_pose_qc_report
 from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, normalize_ranges
 
 
@@ -88,6 +94,7 @@ class QcWorkerSmokeTest(unittest.TestCase):
                 current_frame=20,
                 frames=[0, 10, 20],
                 bad_frame_ranges=[(12, 15)],
+                ego_bad_frame_ranges=[(16, 18)],
                 playback_complete=True,
             )
 
@@ -97,7 +104,117 @@ class QcWorkerSmokeTest(unittest.TestCase):
             self.assertEqual(len(loaded), 1)
             self.assertEqual(loaded[0].episode_id, "episode_001")
             self.assertEqual(loaded[0].bad_frame_ranges, [(12, 15)])
+            self.assertEqual(loaded[0].ego_bad_frame_ranges, [(16, 18)])
             self.assertTrue(loaded[0].playback_complete)
+
+    def test_ego_pose_ranges_are_recorded_without_failing_mano_qc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "episode_001"
+            result = build_qc_result(
+                episode_id="episode_001",
+                worker_id="worker_a",
+                bad_ranges=[],
+            )
+            path = write_ego_pose_qc_report(
+                episode_dir=episode_dir,
+                episode_id="episode_001",
+                worker_id="worker_a",
+                operator_id="operator_a",
+                bad_ranges=[(10, 14)],
+            )
+
+            report = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(result["passed"])
+            self.assertEqual(path, episode_dir / "ego" / "ego_pose_qc.json")
+            self.assertEqual(report["segments"], [{"start_frame": 10, "end_frame": 14}])
+
+    def test_pico_timestamp_mapping_preserves_duplicate_ego_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp)
+            timestamp_dir = episode_dir / "ego" / "RGB"
+            timestamp_dir.mkdir(parents=True)
+            (timestamp_dir / "rgb.h265.timestamps.csv").write_text(
+                "frame_index,ego_frame_index\n00000,0\n00001,0\n00002,1\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(_load_reference_to_ego_frames(episode_dir), {0: 0, 1: 0, 2: 1})
+
+    def test_qc_view_cameras_selects_requested_four_views_and_pico(self) -> None:
+        from label.storage import CorrectionTask
+
+        task = CorrectionTask(
+            line_no=1,
+            root="/tmp",
+            subject="S001",
+            task="pick_object",
+            episode="episode_001",
+            cameras=["00", "01", "02", "03", "04", "05"],
+            frames=[0],
+        )
+
+        self.assertEqual(_qc_view_cameras(task, include_ego=True), ["00", "02", "03", "05", "ego"])
+
+    def test_loads_new_ego_pose_frame_structure_and_fisheye_calibration(self) -> None:
+        try:
+            from src.qc.mesh_renderer import load_ego_camera, load_ego_extrinsics
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"mesh renderer dependency unavailable: {exc}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp)
+            ego_dir = episode_dir / "ego"
+            ego_dir.mkdir()
+            transform = np.eye(4, dtype=np.float32)
+            transform[0, 3] = 0.25
+            (episode_dir / "ego_pose.json").write_text(
+                json.dumps(
+                    {
+                        "coordinate_convention": {"reference_view": "00"},
+                        "frames": [
+                            {
+                                "frame_index": "00007",
+                                "T_ego_from_reference": transform.tolist(),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (ego_dir / "camera_params.json").write_text(
+                json.dumps(
+                    {
+                        "ego": {
+                            "RGB": {
+                                "intrinsic": {
+                                    "fx": 400.0,
+                                    "fy": 401.0,
+                                    "cx": 320.0,
+                                    "cy": 240.0,
+                                    "width": 640,
+                                    "height": 480,
+                                },
+                                "distortion": {
+                                    "modelName": "opencv_fisheye",
+                                    "k1": 0.1,
+                                    "k2": 0.2,
+                                    "k3": 0.3,
+                                    "k4": 0.4,
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            transforms = load_ego_extrinsics(episode_dir)
+            intrinsic, distortion, image_size = load_ego_camera(episode_dir)
+
+            np.testing.assert_allclose(transforms[7], transform)
+            np.testing.assert_allclose(intrinsic, [[400, 0, 320], [0, 401, 240], [0, 0, 1]])
+            np.testing.assert_allclose(distortion.reshape(-1), [0.1, 0.2, 0.3, 0.4])
+            self.assertEqual(image_size, (640, 480))
 
     def test_legacy_sampling_completion_migrates_to_video_completion(self) -> None:
         progress = QcProgress.from_dict(

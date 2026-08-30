@@ -18,7 +18,7 @@ except Exception:
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
 from .media import MeshRendererSettings, QcEpisodeMedia, prepare_qc_media
-from .report import build_qc_result, write_qc_report
+from .report import build_qc_result, write_ego_pose_qc_report, write_qc_report
 from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges
 
 
@@ -201,6 +201,7 @@ class QcWorkerApp(tk.Tk):
                 )
                 leased.current_frame = progress.current_frame
                 leased.bad_frame_ranges = list(progress.bad_frame_ranges)
+                leased.ego_bad_frame_ranges = list(progress.ego_bad_frame_ranges)
                 leased.checked_sample_frames = list(progress.checked_sample_frames)
                 leased.playback_complete = progress.playback_complete
                 leased.result_type = progress.result_type
@@ -285,8 +286,10 @@ class QcWorkerApp(tk.Tk):
             messagebox.showwarning("尚未完成", "当前 Episode 还没有检查到末尾，暂不能提交。")
             return
         bad_ranges = normalize_ranges(progress.bad_frame_ranges, max_gap_frames=self.config.range_merge_gap_frames)
+        ego_bad_ranges = normalize_ranges(progress.ego_bad_frame_ranges, max_gap_frames=self.config.range_merge_gap_frames)
         report_ranges = [] if bad_episode else bad_ranges
         progress.bad_frame_ranges = bad_ranges
+        progress.ego_bad_frame_ranges = ego_bad_ranges
         result = build_qc_result(
             episode_id=progress.episode_id,
             worker_id=self.config.worker_machine_id,
@@ -304,6 +307,13 @@ class QcWorkerApp(tk.Tk):
                     result=result,
                     bad_ranges=report_ranges,
                     sample_interval=progress.sample_interval,
+                )
+                write_ego_pose_qc_report(
+                    episode_dir=media.episode_dir,
+                    episode_id=progress.episode_id,
+                    worker_id=self.config.worker_machine_id,
+                    operator_id=self.config.operator_id,
+                    bad_ranges=ego_bad_ranges,
                 )
                 artifacts = [
                     {
@@ -730,10 +740,15 @@ class DecodePage(ttk.Frame):
         self._tree.pack(fill="x")
 
     def reset(self, progress: QcProgress) -> None:
-        self._status.configure(text=f"Episode：{progress.episode_id}    正在准备六视角 RGB 与 MANO mesh 视频帧")
+        self._status.configure(text=f"Episode：{progress.episode_id}    正在准备四路 RGB 与 Pico Ego MANO 投影视图")
         self._tree.delete(*self._tree.get_children())
         self._rows = {}
-        for camera in progress.payload.get("cameras") or []:
+        available = [str(camera) for camera in progress.payload.get("cameras") or []]
+        cameras = [camera for camera in ("00", "02", "03", "05") if camera in available]
+        if not cameras:
+            cameras = available[:4]
+        cameras.append("ego")
+        for camera in cameras:
             cam = str(camera)
             self._rows[cam] = cam
             self._tree.insert("", "end", iid=cam, values=(cam, "等待", "0 / 0", ""))
@@ -765,16 +780,20 @@ class DecodePage(ttk.Frame):
 
 
 class FrameTimeline(tk.Canvas):
-    def __init__(self, master, *, on_seek: Callable[[int], None]):
-        super().__init__(master, height=34, bg=Theme.PANEL, highlightthickness=0, cursor="hand2")
+    def __init__(self, master, *, on_seek: Callable[[int, bool], None]):
+        super().__init__(master, height=42, bg=Theme.PANEL, highlightthickness=0, cursor="hand2")
         self._frames: List[int] = []
         self._current = 0
         self._bad_ranges: List[Tuple[int, int]] = []
+        self._ego_bad_ranges: List[Tuple[int, int]] = []
         self._preview: Optional[Tuple[int, int]] = None
         self._seek_enabled = True
         self._on_seek = on_seek
+        self._last_drag_position: Optional[int] = None
         self.bind("<Configure>", lambda _event: self._draw())
-        self.bind("<Button-1>", self._handle_click)
+        self.bind("<Button-1>", self._begin_drag)
+        self.bind("<B1-Motion>", self._drag)
+        self.bind("<ButtonRelease-1>", self._end_drag)
 
     def set_data(
         self,
@@ -782,12 +801,14 @@ class FrameTimeline(tk.Canvas):
         frames: List[int],
         current: int,
         bad_ranges: List[Tuple[int, int]],
+        ego_bad_ranges: List[Tuple[int, int]],
         preview: Optional[Tuple[int, int]] = None,
         seek_enabled: bool = True,
     ) -> None:
         self._frames = list(frames)
         self._current = int(current)
         self._bad_ranges = list(bad_ranges)
+        self._ego_bad_ranges = list(ego_bad_ranges)
         self._preview = preview
         self._seek_enabled = bool(seek_enabled)
         self.configure(cursor="hand2" if self._seek_enabled else "arrow")
@@ -829,6 +850,20 @@ class FrameTimeline(tk.Canvas):
                 fill="#e5484d",
                 outline="",
             )
+        for start, end in self._ego_bad_ranges:
+            start_pos = self._position_for_frame(start)
+            end_pos = self._position_for_frame(end)
+            range_x1 = self._x_for_position(min(start_pos, end_pos))
+            range_x2 = max(range_x1 + 2.0, self._x_for_position(max(start_pos, end_pos)))
+            self.create_line(
+                range_x1,
+                28,
+                range_x2,
+                28,
+                fill="#ff202b",
+                width=5,
+                capstyle=tk.ROUND,
+            )
         if self._preview is not None:
             start_pos = self._position_for_frame(self._preview[0])
             end_pos = self._position_for_frame(self._preview[1])
@@ -842,15 +877,35 @@ class FrameTimeline(tk.Canvas):
                 fill="#f59e0b",
                 outline="",
             )
-        self.create_line(current_x, 8, current_x, 28, fill="#ffffff", width=2)
+        self.create_line(current_x, 8, current_x, 34, fill="#ffffff", width=2)
 
-    def _handle_click(self, event: tk.Event) -> None:
-        if not self._seek_enabled or not self._frames:
-            return
+    def _position_from_event(self, event: tk.Event) -> int:
         width = max(1, int(self.winfo_width()))
         ratio = max(0.0, min(1.0, (float(event.x) - 8.0) / max(1.0, float(width) - 16.0)))
-        position = int(round(ratio * max(0, len(self._frames) - 1)))
-        self._on_seek(position)
+        return int(round(ratio * max(0, len(self._frames) - 1)))
+
+    def _begin_drag(self, event: tk.Event) -> None:
+        if not self._seek_enabled or not self._frames:
+            return
+        position = self._position_from_event(event)
+        self._last_drag_position = position
+        self._on_seek(position, False)
+
+    def _drag(self, event: tk.Event) -> None:
+        if not self._seek_enabled or not self._frames or self._last_drag_position is None:
+            return
+        position = self._position_from_event(event)
+        if position == self._last_drag_position:
+            return
+        self._last_drag_position = position
+        self._on_seek(position, False)
+
+    def _end_drag(self, event: tk.Event) -> None:
+        if not self._seek_enabled or not self._frames or self._last_drag_position is None:
+            return
+        position = self._position_from_event(event)
+        self._last_drag_position = None
+        self._on_seek(position, True)
 
 
 class QcPage(ttk.Frame):
@@ -927,7 +982,18 @@ class QcPage(ttk.Frame):
         ttk.Button(self._bad_bar, text="设为坏帧终点", style="Secondary.TButton", command=self.set_bad_end).pack(side="left", padx=(0, 6))
         ttk.Button(self._bad_bar, text="下一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(1)).pack(side="left", padx=(0, 6))
         ttk.Button(self._bad_bar, text="下十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(self.FRAME_STEP)).pack(side="left", padx=(0, 10))
-        ttk.Button(self._bad_bar, text="确认坏帧区间", style="Primary.TButton", command=self.confirm_bad_range).pack(side="right")
+        ttk.Button(
+            self._bad_bar,
+            text="确认为 EgoPose 外参不准",
+            style="Primary.TButton",
+            command=lambda: self.confirm_bad_range("egopose"),
+        ).pack(side="right")
+        ttk.Button(
+            self._bad_bar,
+            text="确认为手部 Pose 不准",
+            style="Primary.TButton",
+            command=lambda: self.confirm_bad_range("hand_pose"),
+        ).pack(side="right", padx=(0, 8))
         ttk.Button(self._bad_bar, text="撤销", style="Secondary.TButton", command=self.cancel_bad_range).pack(side="right", padx=(0, 8))
 
     def set_session(self, progress: QcProgress, media: QcEpisodeMedia) -> None:
@@ -940,7 +1006,7 @@ class QcPage(ttk.Frame):
         self._preparation_error_shown = False
         if progress.frames and progress.current_frame not in progress.frames:
             progress.current_frame = progress.frames[0]
-        self._build_camera_grid(media.task.cameras)
+        self._build_camera_grid(media.display_cameras)
         self._refresh()
         self._monitor_preparation()
 
@@ -996,7 +1062,8 @@ class QcPage(ttk.Frame):
         for idx, cam in enumerate(cameras[:6]):
             host = ttk.Frame(self._grid, style="Panel.TFrame")
             host.grid(row=idx // 3, column=idx % 3, sticky="nsew", padx=5, pady=5)
-            label = ttk.Label(host, text=f"Camera {cam}", style="Muted.TLabel")
+            label_text = "Pico Ego · MANO 外参投影" if cam == "ego" else f"Camera {cam}"
+            label = ttk.Label(host, text=label_text, style="Muted.TLabel")
             label.pack(anchor="w", padx=8, pady=(6, 4))
             canvas = ImageAnnotatorCanvas(host, bg=Theme.PANEL_2)
             canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -1012,8 +1079,12 @@ class QcPage(ttk.Frame):
             return
         frame = self._display_frame()
         ranges = ", ".join(f"{a}-{b}" for a, b in progress.bad_frame_ranges) or "无"
+        ego_ranges = ", ".join(f"{a}-{b}" for a, b in progress.ego_bad_frame_ranges) or "无"
         self._info.configure(
-            text=f"Task：{progress.task_name}    Episode：{progress.episode_id}    当前帧：{frame} / {progress.last_frame}    坏帧区间：{ranges}"
+            text=(
+                f"Task：{progress.task_name}    Episode：{progress.episode_id}    "
+                f"当前帧：{frame} / {progress.last_frame}    手部 Pose：{ranges}    EgoPose：{ego_ranges}"
+            )
         )
         for cam, canvas in self._canvases.items():
             path = media.frame_path(cam, frame)
@@ -1024,9 +1095,12 @@ class QcPage(ttk.Frame):
             canvas.set_skeleton_overlay(None)
             canvas.set_mano_overlay(None)
             if path is None or not path.is_file():
-                self._labels[cam].configure(text=f"Camera {cam}    mesh 帧缺失")
+                camera_label = "Pico Ego" if cam == "ego" else f"Camera {cam}"
+                self._labels[cam].configure(text=f"{camera_label}    mesh 帧缺失")
             else:
-                self._labels[cam].configure(text=f"Camera {cam}")
+                self._labels[cam].configure(
+                    text="Pico Ego · MANO 外参投影" if cam == "ego" else f"Camera {cam}"
+                )
         frame_ready = media.frame_ready(frame)
         self._buffering = not frame_ready
         if not frame_ready and not media.preparation_done and self._frame_refresh_after_id is None:
@@ -1038,6 +1112,7 @@ class QcPage(ttk.Frame):
             frames=progress.frames,
             current=frame,
             bad_ranges=progress.bad_frame_ranges,
+            ego_bad_ranges=progress.ego_bad_frame_ranges,
             preview=preview,
             seek_enabled=self.mode == "playback" and not self._playing and not self._busy_text,
         )
@@ -1183,13 +1258,16 @@ class QcPage(ttk.Frame):
         progress.current_frame = progress.frames[position]
         self._persist_and_refresh()
 
-    def seek_position(self, position: int) -> None:
+    def seek_position(self, position: int, commit: bool = True) -> None:
         progress = self.progress
         if progress is None or not progress.frames or self._playing or self.mode != "playback":
             return
         index = max(0, min(len(progress.frames) - 1, int(position)))
         progress.current_frame = progress.frames[index]
-        self._persist_and_refresh()
+        if commit:
+            self._persist_and_refresh()
+        else:
+            self._refresh()
 
     def enter_bad_range(self) -> None:
         progress = self.progress
@@ -1221,7 +1299,7 @@ class QcPage(ttk.Frame):
         self.bad_end = int(self.bad_cursor)
         self._refresh()
 
-    def confirm_bad_range(self) -> None:
+    def confirm_bad_range(self, kind: str) -> None:
         progress = self.progress
         if progress is None:
             return
@@ -1231,11 +1309,19 @@ class QcPage(ttk.Frame):
         if self.bad_start > self.bad_end:
             messagebox.showwarning("坏帧区间", "坏帧起点不能大于终点。")
             return
-        progress.bad_frame_ranges.append((int(self.bad_start), int(self.bad_end)))
-        progress.bad_frame_ranges = normalize_ranges(
-            progress.bad_frame_ranges,
-            max_gap_frames=self.app.config.range_merge_gap_frames,
+        target = (
+            progress.ego_bad_frame_ranges
+            if kind == "egopose"
+            else progress.bad_frame_ranges
         )
+        target.append((int(self.bad_start), int(self.bad_end)))
+        normalized = normalize_ranges(
+            target, max_gap_frames=self.app.config.range_merge_gap_frames
+        )
+        if kind == "egopose":
+            progress.ego_bad_frame_ranges = normalized
+        else:
+            progress.bad_frame_ranges = normalized
         progress.current_frame = int(self.bad_end)
         self.mode = "playback"
         self.bad_start = None

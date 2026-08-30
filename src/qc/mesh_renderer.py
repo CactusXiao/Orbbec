@@ -20,6 +20,7 @@ HAND_COLORS_RGB = {0: (0.85, 0.45, 0.45), 1: (0.65, 0.74, 0.86)}
 
 _WORKER_STATE: Dict[str, Any] = {}
 _WORKER_RENDERERS: Dict[str, "CameraMeshRenderer"] = {}
+EGO_CAMERA = "ego"
 
 
 def _emit(**fields: Any) -> None:
@@ -64,6 +65,76 @@ def _load_shape_scale(episode_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     if not np.isfinite(scale_value) or scale_value <= 0.0:
         raise ValueError(f"invalid MANO scale {scale_value}: {scale_path}")
     return shape, np.asarray([[scale_value], [scale_value]], dtype=np.float32)
+
+
+def _intrinsic_matrix(entry: Mapping[str, Any]) -> np.ndarray:
+    matrix = np.eye(3, dtype=np.float32)
+    matrix[0, 0] = float(entry["fx"])
+    matrix[1, 1] = float(entry["fy"])
+    matrix[0, 2] = float(entry["cx"])
+    matrix[1, 2] = float(entry["cy"])
+    return matrix
+
+
+def load_ego_camera(episode_dir: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """Load the original Pico fisheye calibration used by the raw RGB frames."""
+    camera_path = episode_dir / "ego" / "camera_params.json"
+    data = json.loads(camera_path.read_text(encoding="utf-8"))
+    try:
+        rgb = data["ego"]["RGB"]
+        intrinsic = rgb["intrinsic"]
+        distortion = rgb["distortion"]
+    except (KeyError, TypeError) as exc:
+        raise KeyError(f"missing ego RGB calibration in {camera_path}") from exc
+    if distortion.get("modelName") != "opencv_fisheye":
+        raise ValueError(f"ego distortion model must be opencv_fisheye: {camera_path}")
+    matrix = _intrinsic_matrix(intrinsic)
+    coefficients = np.asarray(
+        [distortion[f"k{index}"] for index in range(1, 5)], dtype=np.float32
+    ).reshape(4, 1)
+    image_size = (int(intrinsic["width"]), int(intrinsic["height"]))
+    return matrix, coefficients, image_size
+
+
+def load_ego_extrinsics(episode_dir: Path) -> Dict[int, np.ndarray]:
+    """Load p_ego = T_ego_from_reference * p_reference for every QC frame."""
+    candidates = (episode_dir / "ego_pose.json", episode_dir / "ego_extrinsic.json")
+    path = next((candidate for candidate in candidates if candidate.is_file()), candidates[0])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    transforms: Dict[int, np.ndarray] = {}
+    if isinstance(data, Mapping) and isinstance(data.get("frames"), list):
+        convention = data.get("coordinate_convention")
+        if isinstance(convention, Mapping):
+            reference_view = str(convention.get("reference_view") or "00")
+            if reference_view != "00":
+                raise ValueError(f"ego pose reference_view must be 00, got {reference_view}: {path}")
+        entries = data["frames"]
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                continue
+            raw_frame = entry.get("frame_index")
+            frame_text = "" if raw_frame is None else str(raw_frame).strip()
+            value = entry.get("T_ego_from_reference")
+            if not frame_text or value is None:
+                continue
+            frame = int(frame_text)
+            transform = np.asarray(value, dtype=np.float32)
+            if transform.shape != (4, 4):
+                raise ValueError(f"ego extrinsic must have shape (4, 4), got {transform.shape} for frame {frame}")
+            if not np.isfinite(transform).all():
+                raise ValueError(f"non-finite ego extrinsic for frame {frame}: {path}")
+            transforms[frame] = transform
+    elif isinstance(data, Mapping):
+        for frame_text, value in data.items():
+            if not str(frame_text).isdigit():
+                raise ValueError(f"invalid ego extrinsic frame key: {frame_text}")
+            transform = np.asarray(value, dtype=np.float32)
+            if transform.shape != (4, 4):
+                raise ValueError(f"ego extrinsic must have shape (4, 4), got {transform.shape} for frame {frame_text}")
+            transforms[int(frame_text)] = transform
+    if not transforms:
+        raise ValueError(f"no Pico ego extrinsics found in {path}")
+    return transforms
 
 
 def _source_frame(
@@ -111,13 +182,55 @@ def _add_lights(scene: Any, pyrender: Any) -> None:
         )
 
 
+def build_fisheye_render_map(
+    image_size: Tuple[int, int],
+    intrinsic: np.ndarray,
+    distortion: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Match mano/ego_pose.py: map raw fisheye pixels into the pinhole mesh layer."""
+    width, height = image_size
+    grid_x, grid_y = np.meshgrid(
+        np.arange(width, dtype=np.float32),
+        np.arange(height, dtype=np.float32),
+    )
+    fisheye_pixels = np.stack((grid_x, grid_y), axis=-1).reshape(-1, 1, 2)
+    pinhole_pixels = cv2.fisheye.undistortPoints(
+        fisheye_pixels,
+        np.asarray(intrinsic, dtype=np.float32),
+        np.asarray(distortion, dtype=np.float32).reshape(4, 1),
+        P=np.asarray(intrinsic, dtype=np.float32),
+    ).reshape(height, width, 2)
+    return pinhole_pixels[..., 0], pinhole_pixels[..., 1]
+
+
 class CameraMeshRenderer:
-    def __init__(self, *, camera: str, width: int, height: int, intrinsics: np.ndarray, render_factor: float):
+    def __init__(
+        self,
+        *,
+        camera: str,
+        width: int,
+        height: int,
+        intrinsics: np.ndarray,
+        render_factor: float,
+        fisheye_distortion: np.ndarray | None = None,
+    ):
         self.camera = str(camera)
         self.width = int(width)
         self.height = int(height)
         self.factor = float(render_factor)
         self.intrinsics = np.asarray(intrinsics, dtype=np.float32)
+        self.fisheye_distortion = (
+            None
+            if fisheye_distortion is None
+            else np.asarray(fisheye_distortion, dtype=np.float32).reshape(4, 1)
+        )
+        self.fisheye_map = (
+            None
+            if self.fisheye_distortion is None
+            else build_fisheye_render_map(
+                (self.width, self.height), self.intrinsics, self.fisheye_distortion
+            )
+        )
         self.pyrender = None
         self.trimesh = None
         self.renderer = None
@@ -222,6 +335,17 @@ class CameraMeshRenderer:
         layer = rgba.astype(np.float32) / 255.0
         if self.factor != 1.0:
             layer = cv2.resize(layer, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        if self.fisheye_map is not None:
+            # Keep the raw Pico RGB unchanged and distort only the transparent
+            # MANO layer, exactly as mano/ego_pose.py does.
+            layer = cv2.remap(
+                layer,
+                self.fisheye_map[0],
+                self.fisheye_map[1],
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
         image_rgb = image.astype(np.float32)[:, :, ::-1] / 255.0
         alpha = layer[:, :, 3:]
         composite_rgb = image_rgb * (1.0 - alpha) + layer[:, :, :3] * alpha
@@ -241,8 +365,18 @@ class CameraMeshRenderer:
             z = vertices[:, 2]
             valid = np.isfinite(vertices).all(axis=1) & (z > 1e-6)
             uv = np.full((len(vertices), 2), np.nan, dtype=np.float32)
-            uv[valid, 0] = vertices[valid, 0] / z[valid] * k[0, 0] + k[0, 2]
-            uv[valid, 1] = vertices[valid, 1] / z[valid] * k[1, 1] + k[1, 2]
+            if self.fisheye_distortion is not None and valid.any():
+                projected, _ = cv2.fisheye.projectPoints(
+                    vertices[valid].reshape(-1, 1, 3),
+                    np.zeros((3, 1), dtype=np.float32),
+                    np.zeros((3, 1), dtype=np.float32),
+                    k,
+                    self.fisheye_distortion,
+                )
+                uv[valid] = projected.reshape(-1, 2)
+            else:
+                uv[valid, 0] = vertices[valid, 0] / z[valid] * k[0, 0] + k[0, 2]
+                uv[valid, 1] = vertices[valid, 1] / z[valid] * k[1, 1] + k[1, 2]
             base_rgb = np.asarray(HAND_COLORS_RGB[hand], dtype=np.float32) * 255.0
             base_bgr = base_rgb[::-1]
             for face in np.asarray(faces[hand], dtype=np.int32):
@@ -313,19 +447,34 @@ def _render_frame_worker(frame: int, vertices_world: Mapping[int, np.ndarray]) -
         if image is None:
             raise RuntimeError(f"failed to read RGB frame: {source_path}")
         height, width = image.shape[:2]
+        if camera == EGO_CAMERA:
+            expected_size = tuple(int(value) for value in camera_params[camera]["image_size"])
+            if (width, height) != expected_size:
+                raise ValueError(
+                    f"Pico RGB size mismatch for frame {frame}: expected {expected_size}, got {(width, height)}"
+                )
         renderer = _WORKER_RENDERERS.get(camera)
         if renderer is None:
+            distortion = camera_params[camera].get("distortion")
             renderer = CameraMeshRenderer(
                 camera=camera,
                 width=width,
                 height=height,
                 intrinsics=np.asarray(camera_params[camera]["k"], dtype=np.float32),
                 render_factor=factor,
+                fisheye_distortion=(
+                    None if distortion is None else np.asarray(distortion, dtype=np.float32)
+                ),
             )
             _WORKER_RENDERERS[camera] = renderer
 
-        r = np.asarray(camera_params[camera]["r"], dtype=np.float32)
-        t = np.asarray(camera_params[camera]["t"], dtype=np.float32)
+        if camera == EGO_CAMERA:
+            transform = np.asarray(_WORKER_STATE["ego_transforms"][int(frame)], dtype=np.float32)
+            r = transform[:3, :3]
+            t = transform[:3, 3]
+        else:
+            r = np.asarray(camera_params[camera]["r"], dtype=np.float32)
+            t = np.asarray(camera_params[camera]["t"], dtype=np.float32)
         vertices_by_hand = {
             hand: np.matmul(np.asarray(vertices_world[hand], dtype=np.float32), r.T) + t
             for hand in (0, 1)
@@ -366,7 +515,7 @@ def render_request(request: Mapping[str, Any]) -> None:
     output_dir = Path(str(request["output_dir"])).expanduser().resolve()
     toolkit_root = Path(str(request["mano_toolkit_root"])).expanduser().resolve()
     model_dir = Path(str(request["mano_model_dir"])).expanduser().resolve()
-    cameras = [str(value) for value in request.get("cameras") or []][:6]
+    cameras = [str(value) for value in request.get("cameras") or []][:5]
     frames = sorted({int(value) for value in request.get("frames") or []})
     factor = float(request.get("render_factor") or 1.0)
     requested_workers = max(1, min(32, int(request.get("workers") or 1)))
@@ -380,7 +529,19 @@ def render_request(request: Mapping[str, Any]) -> None:
     layers = mano.build_mano_layers(model_dir)
     faces = {hand: mano.mano_faces(layers[hand]) for hand in (0, 1)}
     betas, scales = _load_shape_scale(episode_dir)
-    camera_params = load_episode_cameras(episode_dir, cameras)
+    rgb_cameras = [camera for camera in cameras if camera != EGO_CAMERA]
+    camera_params = load_episode_cameras(episode_dir, rgb_cameras)
+    ego_transforms: Dict[int, np.ndarray] = {}
+    ego_intrinsic: np.ndarray | None = None
+    ego_distortion: np.ndarray | None = None
+    ego_image_size: Tuple[int, int] | None = None
+    if EGO_CAMERA in cameras:
+        ego_transforms = load_ego_extrinsics(episode_dir)
+        missing_ego_frames = [frame for frame in frames if frame not in ego_transforms]
+        if missing_ego_frames:
+            preview = ", ".join(str(frame) for frame in missing_ego_frames[:5])
+            raise ValueError(f"Pico ego extrinsics missing {len(missing_ego_frames)} QC frame(s): {preview}")
+        ego_intrinsic, ego_distortion, ego_image_size = load_ego_camera(episode_dir)
     completed = {camera: 0 for camera in cameras}
     total = len(frames)
     progress_step = max(1, total // 100)
@@ -395,20 +556,28 @@ def render_request(request: Mapping[str, Any]) -> None:
         if any(not (output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
     ]
     worker_count = min(requested_workers, max(1, len(pending_frames)))
-    camera_state = {
+    camera_state: Dict[str, Dict[str, Any]] = {
         camera: {
             "k": np.asarray(camera_params[camera].k, dtype=np.float32),
             "r": np.asarray(camera_params[camera].r, dtype=np.float32),
             "t": np.asarray(camera_params[camera].t, dtype=np.float32),
         }
-        for camera in cameras
+        for camera in rgb_cameras
     }
+    if EGO_CAMERA in cameras:
+        assert ego_intrinsic is not None and ego_distortion is not None and ego_image_size is not None
+        camera_state[EGO_CAMERA] = {
+            "k": ego_intrinsic,
+            "distortion": ego_distortion,
+            "image_size": ego_image_size,
+        }
     worker_state = {
         "episode_dir": str(episode_dir),
         "rgb_cache_dir": str(rgb_cache_dir),
         "output_dir": str(output_dir),
         "cameras": cameras,
         "camera_params": camera_state,
+        "ego_transforms": ego_transforms,
         "faces": faces,
         "render_factor": factor,
         "prefer_integrated_gpu": bool(request.get("prefer_integrated_gpu", False)),

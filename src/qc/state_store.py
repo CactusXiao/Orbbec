@@ -106,6 +106,7 @@ class QcProgress:
     frames: List[int] = field(default_factory=list)
     result_type: str = "in_progress"
     bad_frame_ranges: List[Range] = field(default_factory=list)
+    ego_bad_frame_ranges: List[Range] = field(default_factory=list)
     checked_sample_frames: List[int] = field(default_factory=list)
     playback_complete: bool = False
     payload: Dict[str, Any] = field(default_factory=dict)
@@ -153,6 +154,7 @@ class QcProgress:
             "frames": [int(frame) for frame in self.frames],
             "result_type": self.result_type,
             "bad_frame_ranges": [[int(a), int(b)] for a, b in self.bad_frame_ranges],
+            "ego_bad_frame_ranges": [[int(a), int(b)] for a, b in self.ego_bad_frame_ranges],
             "checked_sample_frames": [int(frame) for frame in self.checked_sample_frames],
             "playback_complete": bool(self.playback_complete),
             "payload": self.payload,
@@ -165,6 +167,7 @@ class QcProgress:
     @classmethod
     def from_dict(cls, obj: Dict[str, Any]) -> "QcProgress":
         ranges = normalize_ranges(obj.get("bad_frame_ranges") or [], max_gap_frames=0)
+        ego_ranges = normalize_ranges(obj.get("ego_bad_frame_ranges") or [], max_gap_frames=0)
         frames = []
         for frame in obj.get("frames") or []:
             if isinstance(frame, bool):
@@ -197,6 +200,7 @@ class QcProgress:
             frames=sorted(set(frames)),
             result_type=str(obj.get("result_type") or "in_progress"),
             bad_frame_ranges=ranges,
+            ego_bad_frame_ranges=ego_ranges,
             checked_sample_frames=sorted(set(checked)),
             playback_complete=playback_complete,
             payload=dict(obj.get("payload") or {}),

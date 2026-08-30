@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import signal
@@ -24,6 +25,8 @@ except Exception:
 
 
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
+QC_RGB_CAMERAS = ("00", "02", "03", "05")
+EGO_CAMERA = "ego"
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class QcEpisodeMedia:
     task: CorrectionTask
     cache_dir: Path
     requires_mesh: bool = False
+    view_cameras: tuple[str, ...] = ()
     preparation: Optional["_QcMediaPreparation"] = field(default=None, compare=False, repr=False)
 
     @property
@@ -40,6 +44,10 @@ class QcEpisodeMedia:
     @property
     def mano_dir(self) -> Path:
         return self.episode_dir / self.task.mano_episode_dir
+
+    @property
+    def display_cameras(self) -> List[str]:
+        return list(self.view_cameras or tuple(str(camera) for camera in self.task.cameras[:6]))
 
     def frame_path(self, camera: str, frame_idx: int) -> Optional[Path]:
         rendered = self.cache_dir / "mesh" / str(camera) / f"{int(frame_idx):05d}.jpg"
@@ -56,7 +64,7 @@ class QcEpisodeMedia:
         return find_frame_path(self.episode_dir, camera, int(frame_idx), self.task.rgb_path_template)
 
     def frame_ready(self, frame_idx: int) -> bool:
-        return all(self.frame_path(str(camera), int(frame_idx)) is not None for camera in self.task.cameras[:6])
+        return all(self.frame_path(camera, int(frame_idx)) is not None for camera in self.display_cameras)
 
     @property
     def preparation_error(self) -> Optional[str]:
@@ -93,12 +101,14 @@ class _QcMediaPreparation:
         cache_dir: Path,
         settings: MeshRendererSettings,
         on_progress: Optional[ProgressCallback],
+        cameras: List[str],
     ) -> None:
         self.task = task
         self.payload = payload
         self.cache_dir = cache_dir
         self.settings = settings
         self.on_progress = on_progress
+        self.cameras = list(cameras)
         self.stop_event = threading.Event()
         self.done_event = threading.Event()
         self._error: Optional[str] = None
@@ -214,11 +224,98 @@ class _QcMediaPreparation:
             _emit(self.on_progress, camera, status="failed", decoded=decoded, total=total, error=str(exc))
             raise
 
+    def _prepare_ego_camera(self) -> None:
+        camera = EGO_CAMERA
+        total = len(self.task.frames)
+        decoded = _count_cached(self.cache_dir, camera, self.task.frames)
+        if decoded >= total and total > 0:
+            _emit(self.on_progress, camera, status="done", decoded=decoded, total=total, error="")
+            return
+        try:
+            mapping = _load_reference_to_ego_frames(self.task.episode_dir())
+            requested = [int(frame) for frame in self.task.frames]
+            missing = [frame for frame in requested if frame not in mapping]
+            if missing:
+                preview = ", ".join(str(frame) for frame in missing[:5])
+                raise ValueError(f"Pico timestamp mapping missing {len(missing)} reference frame(s): {preview}")
+            video_path = _locate_ego_rgb_video(self.task.episode_dir())
+            reverse: Dict[int, List[int]] = {}
+            for reference_frame in requested:
+                reverse.setdefault(mapping[reference_frame], []).append(reference_frame)
+            raw_dir = self.cache_dir / "ego_raw"
+            output_dir = self.cache_dir / camera
+            output_dir.mkdir(parents=True, exist_ok=True)
+            published_references = decoded
+
+            def publish(ego_frame: int, _published: int) -> None:
+                nonlocal published_references
+                source = raw_dir / f"{int(ego_frame):05d}.jpg"
+                if not source.is_file():
+                    return
+                for reference_frame in reverse.get(int(ego_frame), []):
+                    target = output_dir / f"{reference_frame:05d}.jpg"
+                    if target.is_file():
+                        continue
+                    temporary = output_dir / f".{target.name}.{os.getpid()}.tmp"
+                    try:
+                        os.link(source, temporary)
+                    except OSError:
+                        shutil.copyfile(source, temporary)
+                    os.replace(temporary, target)
+                    published_references += 1
+                try:
+                    source.unlink()
+                except OSError:
+                    pass
+                current = published_references
+                if current == total or current % max(1, total // 100) == 0:
+                    _emit(self.on_progress, camera, status="decoding", decoded=current, total=total, error="")
+
+            _emit(self.on_progress, camera, status="decoding", decoded=decoded, total=total, error="", video=str(video_path))
+            pending_ego_frames = [
+                ego_frame
+                for ego_frame, reference_frames in sorted(reverse.items())
+                if any(
+                    not (output_dir / f"{reference_frame:05d}.jpg").is_file()
+                    for reference_frame in reference_frames
+                )
+            ]
+            _decode_camera_frames_streaming(
+                video_path=video_path,
+                timestamp_path=None,
+                frame_map={},
+                camera=camera,
+                frames=pending_ego_frames,
+                out_dir=raw_dir,
+                image_extension="jpg",
+                jpeg_quality=2,
+                ffmpeg_threads=4,
+                stop_event=self.stop_event,
+                on_frame=publish,
+            )
+            # Cached raw frames do not trigger the streaming callback on a resumed run.
+            for ego_frame in sorted(reverse):
+                publish(ego_frame, 0)
+            decoded = _count_cached(self.cache_dir, camera, requested)
+            if decoded != total:
+                raise RuntimeError(f"decoded {decoded}/{total} synchronized Pico RGB frames")
+            _emit(self.on_progress, camera, status="done", decoded=decoded, total=total, error="")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            _emit(self.on_progress, camera, status="failed", decoded=decoded, total=total, error=str(exc))
+            raise
+
     def _run(self) -> None:
-        cameras = [str(camera) for camera in self.task.cameras]
+        cameras = list(self.cameras)
         executor = ThreadPoolExecutor(max_workers=max(2, min(7, len(cameras) + 1)))
         try:
-            futures = [executor.submit(self._prepare_camera, camera) for camera in cameras]
+            futures = []
+            for camera in cameras:
+                if camera == EGO_CAMERA:
+                    futures.append(executor.submit(self._prepare_ego_camera))
+                else:
+                    futures.append(executor.submit(self._prepare_camera, camera))
             futures.append(
                 executor.submit(
                     _prepare_mesh_frames,
@@ -228,6 +325,7 @@ class _QcMediaPreparation:
                     on_progress=self.on_progress,
                     stop_event=self.stop_event,
                     process_callback=self.register_renderer,
+                    cameras=cameras,
                 )
             )
             for future in as_completed(futures):
@@ -273,12 +371,14 @@ def prepare_qc_media(
     total = len(task.frames)
     if total <= 0:
         raise ValueError("QC episode has no frames to prepare")
-    for camera in task.cameras:
+    view_cameras = _qc_view_cameras(task, include_ego=mesh_renderer is not None)
+    for camera in view_cameras:
         _emit(on_progress, camera, status="pending", decoded=_count_cached(cache_dir, camera, task.frames), total=total, error="")
 
     if mesh_renderer is not None:
-        media = QcEpisodeMedia(task=task, cache_dir=cache_dir, requires_mesh=True)
-        cameras = [str(camera) for camera in task.cameras[:6]]
+        _validate_ego_assets(task.episode_dir())
+        cameras = list(view_cameras)
+        media = QcEpisodeMedia(task=task, cache_dir=cache_dir, requires_mesh=True, view_cameras=tuple(cameras))
         if all(
             (cache_dir / "mesh" / camera / f"{int(frame):05d}.jpg").is_file()
             for camera in cameras
@@ -291,11 +391,13 @@ def prepare_qc_media(
             cache_dir=cache_dir,
             settings=mesh_renderer,
             on_progress=on_progress,
+            cameras=cameras,
         )
         media = QcEpisodeMedia(
             task=task,
             cache_dir=cache_dir,
             requires_mesh=True,
+            view_cameras=tuple(cameras),
             preparation=preparation,
         )
         preparation.start()
@@ -358,6 +460,105 @@ def _validate_qc_episode(task: CorrectionTask) -> None:
     require_mano_episode_artifact(episode_dir / task.mano_episode_dir)
 
 
+def _qc_view_cameras(task: CorrectionTask, *, include_ego: bool) -> List[str]:
+    available = [str(camera) for camera in task.cameras]
+    selected = [camera for camera in QC_RGB_CAMERAS if camera in available]
+    if not selected:
+        selected = available[:4]
+    if include_ego:
+        selected.append(EGO_CAMERA)
+    return selected
+
+
+def _ego_camera_params_path(episode_dir: Path) -> Path:
+    path = Path(episode_dir) / "ego" / "camera_params.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"Pico camera calibration not found: {path}")
+    return path
+
+
+def _ego_pose_path(episode_dir: Path) -> Path:
+    for name in ("ego_pose.json", "ego_extrinsic.json"):
+        path = Path(episode_dir) / name
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"Pico per-frame extrinsics not found: {Path(episode_dir) / 'ego_pose.json'}")
+
+
+def _ego_timestamp_path(episode_dir: Path) -> Path:
+    candidates = (
+        Path(episode_dir) / "timestamps.csv",
+        Path(episode_dir) / "ego" / "RGB" / "rgb.h265.timestamps.csv",
+        Path(episode_dir) / "ego" / "timestamps.csv",
+    )
+    existing: List[Path] = []
+    for path in candidates:
+        if not path.is_file():
+            continue
+        existing.append(path)
+        try:
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                fields = set(csv.DictReader(handle).fieldnames or [])
+            if {"frame_index", "ego_frame_index"}.issubset(fields):
+                return path
+        except OSError:
+            continue
+    if existing:
+        joined = ", ".join(str(path) for path in existing)
+        raise ValueError(f"Pico timestamps are missing frame_index/ego_frame_index columns: {joined}")
+    raise FileNotFoundError(f"Pico synchronized timestamps not found under {Path(episode_dir) / 'ego'}")
+
+
+def _load_reference_to_ego_frames(episode_dir: Path) -> Dict[int, int]:
+    path = _ego_timestamp_path(episode_dir)
+    mapping: Dict[int, int] = {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        for row in csv.DictReader(handle):
+            reference_text = str(row.get("frame_index") or "").strip()
+            ego_text = str(row.get("ego_frame_index") or "").strip()
+            if not reference_text or not ego_text:
+                continue
+            reference_frame = int(reference_text)
+            ego_frame = int(ego_text)
+            previous = mapping.get(reference_frame)
+            if previous is not None and previous != ego_frame:
+                raise ValueError(
+                    f"conflicting Pico frame mapping for reference frame {reference_frame}: "
+                    f"{previous} and {ego_frame}"
+                )
+            mapping[reference_frame] = ego_frame
+    if not mapping:
+        raise ValueError(f"no frame_index -> ego_frame_index mappings found: {path}")
+    return mapping
+
+
+def _locate_ego_rgb_video(episode_dir: Path) -> Path:
+    params_path = _ego_camera_params_path(episode_dir)
+    data = json.loads(params_path.read_text(encoding="utf-8"))
+    try:
+        storage_file = str(data["ego"]["RGB"]["storageFile"]).strip()
+    except (KeyError, TypeError) as exc:
+        raise KeyError(f"missing ego.RGB.storageFile in {params_path}") from exc
+    relative = Path(storage_file)
+    if not storage_file or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"invalid Pico RGB storageFile in {params_path}: {storage_file}")
+    candidates = (
+        Path(episode_dir) / "ego" / relative,
+        Path(episode_dir) / "ego" / "RGB" / relative.name,
+    )
+    for path in candidates:
+        if path.is_file():
+            return path.resolve()
+    raise FileNotFoundError(f"Pico RGB video not found for storageFile={storage_file}: {params_path}")
+
+
+def _validate_ego_assets(episode_dir: Path) -> None:
+    _ego_camera_params_path(episode_dir)
+    _ego_pose_path(episode_dir)
+    _ego_timestamp_path(episode_dir)
+    _locate_ego_rgb_video(episode_dir)
+
+
 def cleanup_qc_cache(cache_dir: Path) -> None:
     try:
         path = Path(cache_dir)
@@ -394,8 +595,9 @@ def _prepare_mesh_frames(
     on_progress: Optional[ProgressCallback],
     stop_event: Optional[threading.Event] = None,
     process_callback: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
+    cameras: Optional[List[str]] = None,
 ) -> None:
-    cameras = [str(camera) for camera in task.cameras[:6]]
+    cameras = list(cameras or [str(camera) for camera in task.cameras[:6]])
     frames = [int(frame) for frame in task.frames]
     output_dir = cache_dir / "mesh"
     total = len(frames)

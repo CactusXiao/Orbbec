@@ -86,3 +86,41 @@ def write_qc_report(
         except OSError:
             pass
     return path
+
+
+def write_ego_pose_qc_report(
+    *,
+    episode_dir: Path,
+    episode_id: str,
+    worker_id: str,
+    operator_id: str,
+    bad_ranges: List[Range],
+) -> Path:
+    """Record Pico extrinsic QC without feeding ranges into the MANO repair flow."""
+    ego_dir = Path(episode_dir) / "ego"
+    ego_dir.mkdir(parents=True, exist_ok=True)
+    path = ego_dir / "ego_pose_qc.json"
+    report = {
+        "schema_version": 1,
+        "kind": "orbbec_ego_pose_qc",
+        "episode_id": str(episode_id),
+        "segments": [
+            {"start_frame": int(start), "end_frame": int(end)}
+            for start, end in bad_ranges
+        ],
+        "worker_id": str(worker_id),
+        "operator_id": str(operator_id),
+        "created_at": now_iso(),
+    }
+    fd, tmp_name = tempfile.mkstemp(prefix="ego_pose_qc_", suffix=".json", dir=str(ego_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except OSError:
+            pass
+    return path
