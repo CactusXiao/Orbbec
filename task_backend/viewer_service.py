@@ -215,6 +215,7 @@ class ViewerSession:
     decode_progress: int = 0
     decode_total: int = 0
     decode_jobs: List[Dict[str, Any]] = field(default_factory=list)
+    mano_context: Dict[str, Any] = field(default_factory=dict)
     modes: Dict[str, ModeState] = field(default_factory=lambda: {name: ModeState() for name in VIEWER_MODES})
     closed: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -244,6 +245,7 @@ class ViewerSession:
                     {"id": s.source_id, "label": s.label, "kind": s.kind, "camera": s.camera}
                     for s in self.sources
                 ],
+                "mano": dict(self.mano_context),
                 "modes": {name: state.payload() for name, state in self.modes.items()},
             }
 
@@ -397,10 +399,12 @@ class ViewerSessionManager:
     def _prepare_initial(self, session: ViewerSession) -> None:
         try:
             sources, frames, fps = self._discover_episode(session.episode_dir, session.temp_dir)
+            mano_context = self._mano_context(session.episode_dir, frames)
             with session.lock:
                 session.sources = sources
                 session.frame_indices = frames
                 session.fps = fps
+                session.mano_context = mano_context
             jobs = self._decode_jobs(session)
             with session.lock:
                 session.decode_total = len(jobs)
@@ -450,6 +454,66 @@ class ViewerSessionManager:
                 if not session.closed:
                     session.state = "failed"
                     session.error = str(exc)
+
+    @staticmethod
+    def _mano_context(episode_dir: Path, frames: Sequence[int]) -> Dict[str, Any]:
+        report_path = episode_dir / "qc" / "qc_report.json"
+        report = _json_file(report_path)
+        qc_completed = bool(report) and str(report.get("kind") or "") == "orbbec_qc_report"
+        raw_segments = report.get("segments") if isinstance(report.get("segments"), list) else []
+        segments: List[Dict[str, int]] = []
+        for value in raw_segments:
+            if not isinstance(value, Mapping):
+                continue
+            start = _integer(value.get("start_frame"), -1)
+            end = _integer(value.get("end_frame"), -1)
+            if start < 0 or end < start:
+                continue
+            segments.append({"start_frame": start, "end_frame": end})
+        segments.sort(key=lambda item: (item["start_frame"], item["end_frame"]))
+
+        frame_set = {int(frame) for frame in frames}
+        bad_frames = sorted(
+            frame
+            for segment in segments
+            for frame in range(segment["start_frame"], segment["end_frame"] + 1)
+            if frame in frame_set
+        )
+        manual_mtime: Dict[int, float] = {}
+        manual_root = episode_dir / "manual_2d"
+        if manual_root.is_dir():
+            for path in manual_root.rglob("*.npy"):
+                frame = _frame_number(path)
+                if frame is None or frame not in frame_set:
+                    continue
+                try:
+                    manual_mtime[frame] = max(manual_mtime.get(frame, 0.0), path.stat().st_mtime)
+                except OSError:
+                    continue
+        pose_mtime: Dict[int, float] = {}
+        pose_root = episode_dir / "optimized_pose"
+        if pose_root.is_dir():
+            for path in pose_root.glob("*.npy"):
+                frame = _frame_number(path)
+                if frame is None or frame not in frame_set:
+                    continue
+                try:
+                    pose_mtime[frame] = path.stat().st_mtime
+                except OSError:
+                    continue
+        corrected = bool(bad_frames) and all(
+            frame in manual_mtime
+            and frame in pose_mtime
+            and pose_mtime[frame] > manual_mtime[frame]
+            for frame in bad_frames
+        )
+        return {
+            "qc_completed": qc_completed,
+            "qc_passed": bool(report.get("passed")) if qc_completed else False,
+            "bad_ranges": segments,
+            "source": "corrected_3d" if corrected else "auto_label",
+            "source_label": "纠偏后 3D 优化" if corrected else "初始 AutoLabel 结果",
+        }
 
     def _discover_episode(self, episode_dir: Path, temp_dir: Path) -> Tuple[List[ViewerSource], List[int], float]:
         params = _json_file(episode_dir / "camera_params.json")
@@ -1238,19 +1302,19 @@ h1{{font-size:18px;margin:0 8px 18px}}.sub{{color:var(--muted);font:12px ui-mono
 .mode{{appearance:none;text-align:left;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--muted);padding:12px;cursor:pointer;font-size:14px}}
 .mode:hover:not(:disabled){{background:#17232c;color:var(--text)}}.mode.active{{background:#173a34;border-color:#245d50;color:#bff4e3}}.mode:disabled{{opacity:.35;cursor:not-allowed}}
 .spacer{{flex:1}}#sessionState{{color:var(--muted);font-size:12px;line-height:1.5;padding:10px}}main{{min-width:0;min-height:0;height:100%;overflow:hidden;display:grid;grid-template-rows:58px minmax(0,1fr) 74px}}
-header{{display:flex;align-items:center;gap:14px;padding:0 20px;border-bottom:1px solid var(--line);background:#0e151b}}header strong{{font-size:15px}}#modeStatus{{color:var(--muted);font-size:13px}}
+header{{display:flex;align-items:center;gap:14px;padding:0 20px;border-bottom:1px solid var(--line);background:#0e151b}}header strong{{font-size:15px}}#modeStatus{{color:var(--muted);font-size:13px}}#manoSource{{display:none;margin-left:auto;padding:6px 10px;border:1px solid #405563;border-radius:999px;background:#17232c;color:#cbd9df;font-size:12px}}#manoSource.corrected{{border-color:#28745e;background:#173a34;color:#bff4e3}}
 #stage{{position:relative;min-height:0;padding:14px;background:#080c10;overflow:hidden}}#grid{{height:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px}}
 .tile{{position:relative;min-width:0;min-height:0;background:#101820;border:1px solid #1e2a34;border-radius:7px;overflow:hidden;display:flex;align-items:center;justify-content:center}}.tile img.frame{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;visibility:hidden}}.tile img.frame.active{{opacity:1;visibility:visible}}.tile label{{position:absolute;z-index:2;left:8px;top:7px;background:#0009;padding:3px 7px;border-radius:4px;font:12px ui-monospace}}
 #single{{position:relative;width:100%;height:100%;display:none;align-items:center;justify-content:center}}#single img{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;visibility:hidden}}#single img.active{{opacity:1;visibility:visible}}#cloud{{width:100%;height:100%;display:none;cursor:grab}}#cloud.panning{{cursor:move}}#cloud:active{{cursor:grabbing}}#cloudTools{{position:absolute;right:26px;top:50%;transform:translateY(-50%);display:none;z-index:3;flex-direction:column;gap:8px}}#cloudTools button{{width:42px;height:42px;border:1px solid #45606e;border-radius:8px;background:#15232cdd;color:#fff;font-size:22px;cursor:pointer}}#cloudHint{{position:absolute;left:26px;top:24px;display:none;z-index:3;background:#0009;padding:6px 10px;border-radius:5px;color:#d9e5eb;font-size:12px}}
 #loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#080c10e8;z-index:4}}.card{{width:min(520px,80%);text-align:center}}.track{{height:7px;background:#202b34;border-radius:10px;overflow:hidden;margin:18px 0}}#bar{{height:100%;width:0;background:var(--accent);transition:width .2s}}#loadError{{color:var(--danger);white-space:pre-wrap}}
-footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 20px;background:#0e151b}}button.control{{border:1px solid var(--line);background:#17212a;color:var(--text);padding:8px 14px;border-radius:6px;cursor:pointer}}input[type=range]{{width:100%;accent-color:var(--accent)}}#counter{{font:12px ui-monospace;color:var(--muted);min-width:110px;text-align:right}}
+footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 20px;background:#0e151b}}button.control{{border:1px solid var(--line);background:#17212a;color:var(--text);padding:8px 14px;border-radius:6px;cursor:pointer}}#timelineWrap{{position:relative;height:30px;display:flex;align-items:center}}#timeline{{position:relative;z-index:2;width:100%;accent-color:var(--accent);margin:0}}#badRanges{{position:absolute;z-index:3;pointer-events:none;left:0;right:0;top:1px;height:6px;display:none}}#badRanges span{{position:absolute;height:100%;min-width:3px;border-radius:3px;background:#ff5365;box-shadow:0 0 5px #ff536599}}#counter{{font:12px ui-monospace;color:var(--muted);min-width:110px;text-align:right}}
 @media(max-width:850px){{.app{{grid-template-columns:190px 1fr}}#grid{{grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(3,1fr)}}}}
 </style></head><body><div class="app"><aside><h1>Episode Viewer</h1><div class="sub" id="episodeLabel"></div>
 <button class="mode active" data-mode="rgb" disabled>6 路 RGB</button><button class="mode" data-mode="pico" disabled>Pico + 眼动</button>
 <button class="mode" data-mode="pointcloud" disabled>彩色融合点云</button><button class="mode" data-mode="manomesh" disabled>MANO mesh 视频</button>
-<div class="spacer"></div><div id="sessionState">正在创建临时会话…</div></aside><main><header><strong id="title">6 路 RGB</strong><span id="modeStatus"></span></header>
+<div class="spacer"></div><div id="sessionState">正在创建临时会话…</div></aside><main><header><strong id="title">6 路 RGB</strong><span id="modeStatus"></span><span id="manoSource"></span></header>
 <div id="stage"><div id="grid"></div><div id="single"><img class="active" alt=""><img alt=""></div><canvas id="cloud"></canvas><div id="cloudHint">左键拖动旋转 · 右键拖动平移</div><div id="cloudTools"><button id="zoomIn" title="放大">＋</button><button id="zoomOut" title="缩小">－</button><button id="resetView" title="重置视角" style="font-size:13px">重置</button></div><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
-<footer><button class="control" id="play">播放</button><input id="timeline" type="range" min="0" max="0" value="0"><span id="counter">0 / 0</span></footer></main></div>
+<footer><button class="control" id="play">播放</button><div id="timelineWrap"><div id="badRanges"></div><input id="timeline" type="range" min="0" max="0" value="0"></div><span id="counter">0 / 0</span></footer></main></div>
 <script>
 const episodeId={encoded_id};let sessionId=null,info=null,mode='rgb',framePos=0,playing=false,timer=null,closed=false,gridRenderToken=0,lastGridKey='',pendingGridKey='',gridSignature='',imageCacheEpoch=0,prefetchDesired=-1,prefetchRunning=false;const frameCache=new Map();
 const $=s=>document.querySelector(s), buttons=[...document.querySelectorAll('.mode')];$('#episodeLabel').textContent=episodeId;
@@ -1261,7 +1325,8 @@ async function start(){{try{{const data=await api(`/api/v1/viewer/episodes/${{en
 async function poll(){{if(!sessionId||closed)return;try{{info=await api(`/api/v1/viewer/sessions/${{sessionId}}`);renderState();const active=info.modes[mode];if(info.state==='preparing'||active&&(!active.complete&&(active.status==='preparing'||active.playable)))setTimeout(poll,250)}}catch(e){{showLoading('Viewer 会话错误',0,e.message)}}}}
 function renderState(){{const d=info.decode||{{completed:0,total:0}};$('#sessionState').textContent=`临时解码：${{d.completed}} / ${{d.total}}\n离开页面后自动清理`;if(info.state==='failed')return showLoading('基础视频解码失败',0,info.error);if(info.state!=='ready')return showLoading(`正在并发解码全部视频 ${{d.completed}} / ${{d.total}}`,d.total?100*d.completed/d.total:5);
 buttons.forEach(b=>b.disabled=false);const m=info.modes[mode];if(m.status==='failed')return showLoading('模态准备失败',0,m.error);if((m.status==='preparing'&&!m.playable)||(m.status==='idle'&&mode!=='rgb')){{const pct=m.total?100*m.progress/m.total:8;showLoading(m.message||'正在准备模态数据',pct);return}}hideLoading();$('#modeStatus').textContent=m.complete?'':m.message;setupFrames();renderFrame()}}
-function setupFrames(){{const frames=info.frames||[];$('#timeline').max=Math.max(0,frames.length-1);framePos=Math.min(framePos,Math.max(0,frames.length-1));$('#timeline').value=framePos;$('#counter').textContent=frames.length?`${{frames[framePos]}} · ${{framePos+1}} / ${{frames.length}}`:'0 / 0'}}
+function setupFrames(){{const frames=info.frames||[];$('#timeline').max=Math.max(0,frames.length-1);framePos=Math.min(framePos,Math.max(0,frames.length-1));$('#timeline').value=framePos;$('#counter').textContent=frames.length?`${{frames[framePos]}} · ${{framePos+1}} / ${{frames.length}}`:'0 / 0';renderManoMeta()}}
+function renderManoMeta(){{const meta=info&&info.mano||{{}},badge=$('#manoSource'),ranges=$('#badRanges'),show=mode==='manomesh';badge.style.display=show?'inline-block':'none';if(show){{badge.textContent=meta.source_label||'初始 AutoLabel 结果';badge.classList.toggle('corrected',meta.source==='corrected_3d')}}const values=info&&info.frames||[],bad=meta.qc_completed&&Array.isArray(meta.bad_ranges)?meta.bad_ranges:[];ranges.style.display=show&&bad.length?'block':'none';const signature=show?JSON.stringify([values.length,bad]):'';if(ranges.dataset.signature===signature)return;ranges.dataset.signature=signature;ranges.innerHTML='';const denominator=Math.max(1,values.length-1);for(const segment of bad){{let first=values.findIndex(frame=>frame>=segment.start_frame),last=-1;for(let i=values.length-1;i>=0;i--)if(values[i]<=segment.end_frame){{last=i;break}}if(first<0||last<first)continue;const mark=document.createElement('span');mark.style.left=`${{100*first/denominator}}%`;mark.style.width=`${{Math.max(.35,100*(last-first)/denominator)}}%`;mark.title=`QC 坏帧 ${{segment.start_frame}}–${{segment.end_frame}}`;ranges.appendChild(mark)}}}}
 async function choose(next){{if(!info||info.state!=='ready')return;mode=next;playing=false;clearTimeout(timer);gridRenderToken++;imageCacheEpoch++;frameCache.clear();prefetchDesired=-1;lastGridKey='';pendingGridKey='';$('#play').textContent='播放';buttons.forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));$('#title').textContent={{rgb:'6 路 RGB',pico:'Pico + 眼动',pointcloud:'彩色融合点云',manomesh:'MANO mesh 视频'}}[mode];const m=info.modes[mode];if(m.status==='idle'){{await api(`/api/v1/viewer/sessions/${{sessionId}}/modes/${{mode}}`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});poll()}}else renderState()}}
 buttons.forEach(b=>b.onclick=()=>choose(b.dataset.mode));
 function mediaUrl(source,frame){{return `/api/v1/viewer/sessions/${{sessionId}}/media/${{mode}}/${{encodeURIComponent(source)}}/${{frame}}`}}

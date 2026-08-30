@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -105,6 +106,8 @@ class ViewerSessionManagerTest(unittest.TestCase):
         self.assertIn("sendBeacon", page)
         self.assertIn("renderSix", page)
         self.assertIn("img.frame:not(.active)", page)
+        self.assertIn('id="badRanges"', page)
+        self.assertIn('id="manoSource"', page)
         self.assertNotIn("$('#grid').innerHTML=sources.map(s=>`<div class=\"tile\"><img src=", page)
         self.assertNotIn("episode<script></div>", page)
 
@@ -142,6 +145,41 @@ class ViewerSessionManagerTest(unittest.TestCase):
         self.assertIsNotNone(pixel)
         self.assertAlmostEqual(pixel[0], 640.0)  # type: ignore[index]
         self.assertAlmostEqual(pixel[1], 480.0)  # type: ignore[index]
+
+    def test_mano_context_marks_qc_ranges_and_detects_corrected_pose_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode = Path(tmp)
+            (episode / "qc").mkdir()
+            (episode / "qc" / "qc_report.json").write_text(
+                json.dumps(
+                    {
+                        "kind": "orbbec_qc_report",
+                        "passed": False,
+                        "segments": [{"start_frame": 1, "end_frame": 2}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manual = episode / "manual_2d" / "segments" / "job" / "00"
+            poses = episode / "optimized_pose"
+            manual.mkdir(parents=True)
+            poses.mkdir()
+            for frame in (1, 2):
+                manual_path = manual / f"{frame:05d}.npy"
+                pose_path = poses / f"{frame:05d}.npy"
+                manual_path.write_bytes(b"manual")
+                pose_path.write_bytes(b"pose")
+                os.utime(manual_path, (20, 20))
+                os.utime(pose_path, (10, 10))
+
+            initial = ViewerSessionManager._mano_context(episode, [0, 1, 2])
+            self.assertEqual(initial["bad_ranges"], [{"start_frame": 1, "end_frame": 2}])
+            self.assertEqual(initial["source"], "auto_label")
+
+            for frame in (1, 2):
+                os.utime(poses / f"{frame:05d}.npy", (30, 30))
+            corrected = ViewerSessionManager._mano_context(episode, [0, 1, 2])
+            self.assertEqual(corrected["source"], "corrected_3d")
 
 
 if __name__ == "__main__":
