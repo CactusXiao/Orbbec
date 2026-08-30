@@ -1113,8 +1113,6 @@ class LabelPage(ttk.Frame):
         return self._bundles.get("pred") or self._active_bundle
 
     def _cache_current_source_state(self) -> None:
-        if self._mode == "mano":
-            return
         cam_id = self._active_cam_id()
         if cam_id is None:
             return

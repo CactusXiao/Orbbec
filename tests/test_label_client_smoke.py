@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from label.app import LabelPage
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.env_config import load_label_config
 from label.mano_view import ManoViewRuntime, describe_mano_projection_issue, mano_joints_to_annotation_order
@@ -23,6 +24,47 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
+    def test_mano_source_caches_canvas_edits_before_switching_views(self) -> None:
+        original = (
+            [[(10.0, 20.0) for _ in range(21)] for _ in range(2)],
+            [[True for _ in range(21)] for _ in range(2)],
+        )
+        edited = (
+            [[(30.0, 40.0) for _ in range(21)] for _ in range(2)],
+            [[False for _ in range(21)] for _ in range(2)],
+        )
+
+        class CanvasStub:
+            def get_hand_state(self):
+                return edited
+
+        class PageStub:
+            _mode = "mano"
+            _view_states = {"00": original}
+            _source_state_cache = {}
+            _canvas = CanvasStub()
+
+            @staticmethod
+            def _active_cam_id():
+                return "00"
+
+            def _source_cache_key(self, cam_id, source=None):
+                return ("task", 0, cam_id, source or self._mode)
+
+            @staticmethod
+            def _copy_view_state(state):
+                points, visible = state
+                return (
+                    [[(float(x), float(y)) for x, y in hand] for hand in points],
+                    [[bool(value) for value in hand] for hand in visible],
+                )
+
+        page = PageStub()
+        LabelPage._cache_current_source_state(page)
+
+        self.assertEqual(page._view_states["00"], edited)
+        self.assertEqual(page._source_state_cache[("task", 0, "00", "mano")], edited)
+
     def test_label_app_loads_mount_from_launch_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
