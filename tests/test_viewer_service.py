@@ -101,6 +101,9 @@ class ViewerSessionManagerTest(unittest.TestCase):
         self.assertIn("彩色融合点云", page)
         self.assertIn("MANO mesh 视频", page)
         self.assertIn("sendBeacon", page)
+        self.assertIn("renderSix", page)
+        self.assertIn("img.frame:not(.active)", page)
+        self.assertNotIn("$('#grid').innerHTML=sources.map(s=>`<div class=\"tile\"><img src=", page)
         self.assertNotIn("episode<script></div>", page)
 
     def test_pico_world_gaze_projection_matches_native_center_projection(self) -> None:
