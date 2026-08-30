@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import signal
+import shutil
 import socket
 import sys
 import tempfile
@@ -44,6 +45,7 @@ try:
     )
     from .workflow_models import WorkflowError
     from .workflow_store import WorkflowStore
+    from .viewer_service import ViewerError, ViewerSessionManager, render_viewer_page
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
     from nas_status_sync import NasStatusSync, NasStatusSyncConfig  # type: ignore
@@ -56,6 +58,7 @@ except ImportError:  # pragma: no cover - script execution fallback
     )
     from workflow_models import WorkflowError  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
+    from viewer_service import ViewerError, ViewerSessionManager, render_viewer_page  # type: ignore
 
 try:
     import fcntl  # type: ignore
@@ -514,11 +517,13 @@ class BackendRuntime:
         registry: TaskInstanceRegistry,
         workflow_service: JobService,
         publisher_bridge: Optional[PublisherBridge] = None,
+        viewer_manager: Optional[ViewerSessionManager] = None,
     ):
         self.registry = registry
         self.accounts = AccountStore(registry.data_root)
         self.workflow_service = workflow_service
         self.publisher_bridge = publisher_bridge
+        self.viewer_manager = viewer_manager or ViewerSessionManager()
         self.lock = threading.RLock()
         self.backend: Optional[TaskBackend] = None
         self.active_selection: Optional[Dict[str, Any]] = None
@@ -1871,9 +1876,10 @@ def render_task_detail(model: Dict[str, Any]) -> str:
             f"<td class=\"mono\">{html_escape(item.get('client_id', '-'))}</td>"
             f"<td class=\"muted mono\">{html_escape(item.get('updated_at') or item.get('created_at') or '-')}</td>"
             f"<td class=\"mono\">{html_escape(item.get('collection_path') or '-')}</td>"
+            f"<td><a class=\"button\" target=\"_blank\" rel=\"noopener\" href=\"/episodes/{url_part(reservation_id)}/viewer\">查看</a></td>"
             "</tr>"
         )
-    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"11\" class=\"empty\">No episodes reserved yet.</td></tr>"
+    episode_rows = "\n".join(rows) if rows else "<tr><td colspan=\"12\" class=\"empty\">No episodes reserved yet.</td></tr>"
     meta_rows = []
     for key, value in metadata_pairs(task):
         meta_rows.append(f"<div>{html_escape(key)}</div><div>{html_escape(value)}</div>")
@@ -1900,7 +1906,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         "<section><h2>Episodes</h2><div class=\"wide\"><table>"
         "<thead><tr><th>Episode</th><th>Subject</th><th class=\"num\">No.</th><th>Status</th><th>Workflow</th>"
         "<th class=\"num\">Duration</th><th class=\"num\">Frames</th><th class=\"num\">Storage</th>"
-        "<th>Client</th><th>Updated</th><th>Local Path</th></tr></thead><tbody>"
+        "<th>Client</th><th>Updated</th><th>Local Path</th><th>查看</th></tr></thead><tbody>"
         + episode_rows
         + "</tbody></table></div></section>"
     )
@@ -2419,6 +2425,8 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / "
         f"<a href=\"/tasks/{url_part(task_name)}\">{html_escape(task_name)}</a> / "
         f"{html_escape(reservation_id[:8])}</div>"
+        f"<div class=\"actions\" style=\"padding-left:0\"><a class=\"button\" target=\"_blank\" rel=\"noopener\" "
+        f"href=\"/episodes/{url_part(reservation_id)}/viewer\">查看 Episode</a></div>"
         "<div class=\"summary\">"
         + render_metric("Episode", item.get("episode_number", "-"), str(item.get("subject_id", "")))
         + render_metric("采集状态", status)
@@ -2524,6 +2532,42 @@ class RequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _file_response(self, path: Path, content_type: str) -> None:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise BackendError(HTTPStatus.NOT_FOUND, f"viewer media not found: {exc}") from exc
+        self.send_response(int(HTTPStatus.OK))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "private, max-age=3600, immutable")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+
+    def _viewer_episode_dir(self, episode_id: str) -> Path:
+        model = self.backend.episode_detail_model(episode_id)
+        reservation = model.get("reservation") if isinstance(model.get("reservation"), dict) else {}
+        workflow = model.get("workflow") if isinstance(model.get("workflow"), dict) else {}
+        workflow_episode = workflow.get("episode") if isinstance(workflow.get("episode"), dict) else {}
+        upload = workflow.get("upload") if isinstance(workflow.get("upload"), dict) else {}
+        local_values = [
+            reservation.get("collection_path"),
+            upload.get("collection_path"),
+        ]
+        for value in local_values:
+            text = str(value or "").strip()
+            if text:
+                path = Path(text).expanduser().resolve()
+                if path.is_dir():
+                    return path
+        for uri in (workflow_episode.get("episode_uri"), upload.get("nas_uri"), reservation.get("episode_uri")):
+            path = self.workflow.nas_root_dir_from_uri(str(uri or ""))
+            if path is not None and path.is_dir():
+                return path
+        raise BackendError(HTTPStatus.NOT_FOUND, "Episode 数据目录在本机或已配置 NAS 挂载中不可见")
+
     def _redirect(self, location: str) -> None:
         self.send_response(int(HTTPStatus.SEE_OTHER))
         self.send_header("Location", location)
@@ -2576,6 +2620,27 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            viewer_session_prefix = "/api/v1/viewer/sessions/"
+            if parsed.path.startswith(viewer_session_prefix):
+                rest = parsed.path[len(viewer_session_prefix):].strip("/")
+                parts = rest.split("/") if rest else []
+                if len(parts) == 1 and parts[0]:
+                    session = self.runtime.viewer_manager.get(unquote(parts[0]))
+                    self._json_response(HTTPStatus.OK, session.payload())
+                    return
+                if len(parts) == 5 and parts[1] == "media":
+                    session_id, _media, mode, source_id, frame_text = parts
+                    try:
+                        frame = int(unquote(frame_text))
+                    except ValueError as exc:
+                        raise BackendError(HTTPStatus.BAD_REQUEST, "invalid viewer frame") from exc
+                    media_path, media_type = self.runtime.viewer_manager.media_path(
+                        unquote(session_id), unquote(mode), unquote(source_id), frame
+                    )
+                    self._file_response(media_path, media_type)
+                    return
+                raise BackendError(HTTPStatus.NOT_FOUND, "viewer endpoint not found")
+
             workflow_stage_api_prefix = "/api/v1/workflow/stages/"
             if parsed.path.startswith(workflow_stage_api_prefix):
                 job_type = unquote(parsed.path[len(workflow_stage_api_prefix):].strip("/")).strip()
@@ -2666,6 +2731,15 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if not task_name:
                     raise BackendError(HTTPStatus.NOT_FOUND, "task not found")
                 self._html_response(HTTPStatus.OK, render_task_detail(self.backend.task_detail_model(task_name)))
+            elif parsed.path.startswith("/episodes/") and parsed.path.endswith("/viewer"):
+                raw_id = parsed.path[len("/episodes/"):-len("/viewer")]
+                reservation_id = unquote(raw_id.strip("/")).strip()
+                if not reservation_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                # Resolve now so an invalid/local-unavailable episode fails before the
+                # browser opens a viewer shell.  The actual temp session starts via API.
+                self._viewer_episode_dir(reservation_id)
+                self._html_response(HTTPStatus.OK, render_viewer_page(reservation_id))
             elif parsed.path.startswith("/episodes/"):
                 reservation_id = unquote(parsed.path[len("/episodes/"):]).strip()
                 if not reservation_id:
@@ -2683,6 +2757,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._json_response(exc.status, {"error": exc.message})
             else:
                 self._html_response(exc.status, render_error_page(exc.status, exc.message))
+        except ViewerError as exc:
+            if is_api:
+                self._json_response(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            else:
+                self._html_response(HTTPStatus.BAD_REQUEST, render_error_page(HTTPStatus.BAD_REQUEST, str(exc)))
         except Exception as exc:  # pragma: no cover - defensive server boundary
             if is_api:
                 self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
@@ -2699,6 +2778,39 @@ class RequestHandler(BaseHTTPRequestHandler):
             parsed.path.startswith("/workflow/") or parsed.path.startswith("/tasks/")
         )
         try:
+            viewer_episode_prefix = "/api/v1/viewer/episodes/"
+            if parsed.path.startswith(viewer_episode_prefix) and parsed.path.endswith("/sessions"):
+                raw_id = parsed.path[len(viewer_episode_prefix):-len("/sessions")]
+                episode_id = unquote(raw_id.strip("/")).strip()
+                if not episode_id:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "episode not found")
+                self._read_json()
+                session = self.runtime.viewer_manager.create(episode_id, self._viewer_episode_dir(episode_id))
+                self._json_response(HTTPStatus.ACCEPTED, session.payload())
+                return
+
+            viewer_session_prefix = "/api/v1/viewer/sessions/"
+            if parsed.path.startswith(viewer_session_prefix):
+                rest = parsed.path[len(viewer_session_prefix):].strip("/")
+                parts = rest.split("/") if rest else []
+                if len(parts) == 3 and parts[1] == "modes":
+                    self._read_json()
+                    session = self.runtime.viewer_manager.prepare_mode(unquote(parts[0]), unquote(parts[2]))
+                    self._json_response(HTTPStatus.ACCEPTED, session.payload())
+                    return
+                if len(parts) == 2 and parts[1] == "close":
+                    # navigator.sendBeacon uses POST and may send a text/plain body.
+                    try:
+                        length = int(self.headers.get("Content-Length", "0"))
+                    except ValueError:
+                        length = 0
+                    if length > 0:
+                        self.rfile.read(length)
+                    closed = self.runtime.viewer_manager.close(unquote(parts[0]))
+                    self._json_response(HTTPStatus.OK, {"closed": closed})
+                    return
+                raise BackendError(HTTPStatus.NOT_FOUND, "viewer endpoint not found")
+
             if parsed.path == "/api/v1/auth/register":
                 self._json_response(HTTPStatus.OK, self.runtime.accounts.register(self._read_json()))
                 return
@@ -2868,6 +2980,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._html_response(exc.status, render_error_page(exc.status, exc.message))
             else:
                 self._json_response(exc.status, {"error": exc.message})
+        except ViewerError as exc:
+            self._json_response(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except Exception as exc:  # pragma: no cover - defensive server boundary
             if parsed.path.startswith("/setup/"):
                 self._html_response(
@@ -2881,6 +2995,22 @@ class RequestHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        prefix = "/api/v1/viewer/sessions/"
+        try:
+            if not parsed.path.startswith(prefix):
+                raise BackendError(HTTPStatus.NOT_FOUND, "not found")
+            session_id = unquote(parsed.path[len(prefix):].strip("/"))
+            if not session_id or "/" in session_id:
+                raise BackendError(HTTPStatus.NOT_FOUND, "viewer session not found")
+            closed = self.runtime.viewer_manager.close(session_id)
+            self._json_response(HTTPStatus.OK, {"closed": closed})
+        except BackendError as exc:
+            self._json_response(exc.status, {"error": exc.message})
+        except Exception as exc:  # pragma: no cover
+            self._json_response(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
 
 class TaskHTTPServer(ThreadingHTTPServer):
@@ -3087,7 +3217,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     registry = TaskInstanceRegistry(data_root=data_root, seed_task_files=seed_task_files)
-    runtime = BackendRuntime(registry, workflow_service, publisher_bridge)
+    viewer_manager = ViewerSessionManager(
+        temp_root=env_path(env, "ORBBEC_VIEWER_TMP_DIR", "TASK_BACKEND_VIEWER_TMP_DIR"),
+        ffmpeg=env_get(env, "ORBBEC_VIEWER_FFMPEG", "TASK_BACKEND_VIEWER_FFMPEG") or "ffmpeg",
+        max_decode_workers=env_int(env, 8, "ORBBEC_VIEWER_DECODE_WORKERS"),
+        session_ttl_seconds=env_int(env, 120, "ORBBEC_VIEWER_SESSION_TTL_SECONDS"),
+        mano_toolkit_root=mano_toolkit_root,
+        mano_model_dir=mano_model_dir,
+        mesh_python=str(mano_python or "python3"),
+        mesh_prebuffer_frames=env_int(env, 30, "ORBBEC_VIEWER_MESH_PREBUFFER_FRAMES"),
+    )
+    runtime = BackendRuntime(registry, workflow_service, publisher_bridge, viewer_manager)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
     if args.env_file.exists():
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
@@ -3138,6 +3278,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         manual_publisher_bridge.stop()
         publisher_bridge.stop()
         nas_uploader.stop()
+        runtime.viewer_manager.shutdown()
         server.server_close()
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)

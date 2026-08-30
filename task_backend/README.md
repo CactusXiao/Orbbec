@@ -83,8 +83,15 @@ ORBBEC_NAS_STATUS_SYNC_COMMAND_TIMEOUT_SECONDS=60
 ORBBEC_MANO_PYTHON=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/.venv/bin/python
 ORBBEC_MANO_TOOLKIT_ROOT=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits
 ORBBEC_MANO_MODEL_DIR=/home/ubuntu/WorkSpace/zhenghao/opt_toolkits/ckpt/mano
+ORBBEC_VIEWER_MESH_PREBUFFER_FRAMES=30
 # Optional shared shape fallback. Subject-level /mnt/nas/<subject>/shape.npy wins.
 # ORBBEC_MANO_DEFAULT_SHAPE_PATH=/path/to/shape.npy
+
+# Episode web viewer. Defaults use the system temp directory and ffmpeg on PATH.
+# ORBBEC_VIEWER_TMP_DIR=/tmp/orbbec_web_viewer
+# ORBBEC_VIEWER_FFMPEG=ffmpeg
+ORBBEC_VIEWER_DECODE_WORKERS=8
+ORBBEC_VIEWER_SESSION_TTL_SECONDS=120
 
 # Upload success always queues auto_label jobs; the old
 # ORBBEC_AUTO_LABEL_AFTER_UPLOAD switch is ignored.
@@ -160,6 +167,20 @@ The same service exposes a lightweight browser dashboard:
   and episode summary for the locked instance.
 - `http://127.0.0.1:8765/tasks/<task_name>` shows one task and its episodes.
 - `http://127.0.0.1:8765/episodes/<reservation_id>` shows one episode detail page.
+
+Each episode row and detail page has a **查看** action. It opens a separate tab,
+decodes all H265/MKV video containers concurrently into an isolated temporary
+session, and unlocks the four viewer modes only after that initial decode is
+complete. Six-view RGB is the default. Pico + gaze, fused color point cloud,
+and QC-style MANO mesh data are prepared lazily when selected. The color cloud
+is reconstructed on demand from the six decoded RGB + 16-bit Depth streams and
+episode calibration; it does not require PLY files. MANO mesh uses the QC
+producer/consumer flow: playback opens after the synchronized prebuffer is
+ready while the remaining frames keep rendering, and pauses briefly only when
+the next six-camera frame has not been published yet. Closing the tab
+removes its temporary directory; a heartbeat plus the short session TTL cleans
+up sessions left behind by a crashed browser. The backend process also removes
+all remaining viewer sessions during shutdown.
 
 The current detail pages show backend-owned metadata plus workflow state:
 task definitions, subject IDs, reservation IDs, episode numbers, status,
