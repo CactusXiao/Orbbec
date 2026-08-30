@@ -2552,6 +2552,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         workflow = model.get("workflow") if isinstance(model.get("workflow"), dict) else {}
         workflow_episode = workflow.get("episode") if isinstance(workflow.get("episode"), dict) else {}
         upload = workflow.get("upload") if isinstance(workflow.get("upload"), dict) else {}
+        # Uploaded/finalized episodes must be viewed from their canonical NAS
+        # directory.  The capture collection_path may still exist under an old
+        # episode_1 name and does not receive later optimized_pose/MANO outputs.
+        for uri in (workflow_episode.get("episode_uri"), upload.get("nas_uri"), reservation.get("episode_uri")):
+            path = self.workflow.nas_root_dir_from_uri(str(uri or ""))
+            if path is not None and path.is_dir():
+                return path
         local_values = [
             reservation.get("collection_path"),
             upload.get("collection_path"),
@@ -2562,10 +2569,6 @@ class RequestHandler(BaseHTTPRequestHandler):
                 path = Path(text).expanduser().resolve()
                 if path.is_dir():
                     return path
-        for uri in (workflow_episode.get("episode_uri"), upload.get("nas_uri"), reservation.get("episode_uri")):
-            path = self.workflow.nas_root_dir_from_uri(str(uri or ""))
-            if path is not None and path.is_dir():
-                return path
         raise BackendError(HTTPStatus.NOT_FOUND, "Episode 数据目录在本机或已配置 NAS 挂载中不可见")
 
     def _redirect(self, location: str) -> None:
