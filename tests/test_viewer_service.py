@@ -102,7 +102,8 @@ class ViewerSessionManagerTest(unittest.TestCase):
         self.assertIn("MANO mesh 视频", page)
         self.assertIn("sendBeacon", page)
         self.assertIn("renderSix", page)
-        self.assertIn("img.frame:not(.active)", page)
+        self.assertIn("canvas class=\"frame\"", page)
+        self.assertIn("context.drawImage", page)
         self.assertNotIn("$('#grid').innerHTML=sources.map(s=>`<div class=\"tile\"><img src=", page)
         self.assertNotIn("episode<script></div>", page)
 
