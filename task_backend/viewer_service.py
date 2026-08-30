@@ -360,14 +360,7 @@ class ViewerSessionManager:
         elif mode == "pico":
             path = session.temp_dir / "modes" / "pico" / f"{frame:05d}.jpg"
         elif mode == "pointcloud":
-            path = session.temp_dir / "modes" / "pointcloud" / f"{frame:05d}.json"
-            if not path.is_file():
-                with session.lock:
-                    if not path.is_file():
-                        self._write_pointcloud_frame(session, frame, path)
-                        state = session.modes["pointcloud"]
-                        state.available_frames = sorted(set(state.available_frames + [frame]))
-                        state.progress = len(state.available_frames)
+            path = session.temp_dir / "modes" / "pointcloud" / f"{frame:05d}.bin"
         else:
             camera = str(source_id)
             path = session.temp_dir / "modes" / "manomesh" / camera / f"{frame:05d}.jpg"
@@ -838,12 +831,7 @@ class ViewerSessionManager:
             raise ViewerError(f"无法写入 Pico 帧：{destination.name}")
 
     def _prepare_pointcloud(self, session: ViewerSession, state: ModeState) -> None:
-        """Validate RGB-D reconstruction and publish the first frame.
-
-        The native viewer reconstructs a fused world-space cloud from each camera's
-        decoded 16-bit depth and RGB frame when a frame is requested.  Keeping that
-        lazy contract avoids materialising gigabytes of JSON for long episodes.
-        """
+        """Reconstruct and preload rendered cloud canvases like the native viewer."""
         frames = list(session.frame_indices)
         if not frames:
             raise ViewerError("Episode 没有可重建的帧")
@@ -853,18 +841,47 @@ class ViewerSessionManager:
         if not (session.episode_dir / "camera_params.json").is_file() or not (session.episode_dir / "extrinsics.json").is_file():
             raise ViewerError("彩色融合点云缺少 camera_params.json 或 extrinsics.json")
         state.total = len(frames)
-        state.message = "正在从六路 RGB-D 重建首帧"
+        prebuffer_count = min(len(frames), 60)
+        state.message = f"正在准备点云播放缓冲 0/{prebuffer_count}"
         out_dir = session.temp_dir / "modes" / "pointcloud"
         out_dir.mkdir(parents=True, exist_ok=True)
-        first = frames[0]
-        self._write_pointcloud_frame(session, first, out_dir / f"{first:05d}.json")
-        state.progress = 1
-        state.available_frames = [first]
+
+        def render(frame: int) -> int:
+            if session.cancel.is_set():
+                raise ViewerError("点云准备已取消")
+            self._write_pointcloud_frame(session, frame, out_dir / f"{frame:05d}.bin")
+            return frame
+
+        # The native viewer renders cloud canvases on a preload worker and only
+        # swaps already-rendered frames during playback.  Do the same here instead
+        # of sending 180k JSON points to the browser on every tick.
+        workers = min(self.max_decode_workers, 6, max(1, len(frames)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="viewer-cloud") as executor:
+            for completed, frame in enumerate(executor.map(render, frames), start=1):
+                with session.lock:
+                    state.available_frames.append(frame)
+                    state.progress = completed
+                    if not state.playable and completed >= prebuffer_count:
+                        state.playable = True
+                        state.status = "ready"
+                    state.message = (
+                        f"可播放，后台继续准备 {completed}/{state.total}"
+                        if state.playable
+                        else f"正在准备点云播放缓冲 {completed}/{prebuffer_count}"
+                    )
 
     def _write_pointcloud_frame(self, session: ViewerSession, frame: int, destination: Path) -> None:
-        payload = self._build_rgbd_color_cloud(session, int(frame), max_points=180_000)
-        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        try:
+            import numpy as np  # type: ignore
+        except ImportError as exc:
+            raise ViewerError("彩色融合点云需要 OpenCV 与 NumPy") from exc
+        points = self._build_rgbd_color_cloud(session, int(frame), max_points=180_000)
+        records = np.empty(len(points), dtype=np.dtype([("xyz", "<f4", (3,)), ("rgba", "u1", (4,))]))
+        records["xyz"] = points[:, :3]
+        records["rgba"][:, :3] = np.clip(np.rint(points[:, 3:6]), 0, 255).astype(np.uint8)
+        records["rgba"][:, 3] = 255
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        temporary.write_bytes(struct.pack("<II", int(frame), len(records)) + records.tobytes())
         os.replace(temporary, destination)
 
     @staticmethod
@@ -878,7 +895,7 @@ class ViewerSessionManager:
             return None
         return fx, fy, _float(intrinsic.get("cx")), _float(intrinsic.get("cy"))
 
-    def _build_rgbd_color_cloud(self, session: ViewerSession, frame: int, *, max_points: int) -> Dict[str, Any]:
+    def _build_rgbd_color_cloud(self, session: ViewerSession, frame: int, *, max_points: int) -> Any:
         try:
             import cv2  # type: ignore
             import numpy as np  # type: ignore
@@ -888,7 +905,6 @@ class ViewerSessionManager:
         params = _json_file(session.episode_dir / "camera_params.json")
         extrinsics = _json_file(session.episode_dir / "extrinsics.json")
         clouds = []
-        cameras: List[str] = []
         step = 2
         max_depth_m = 6.0
         for source in [item for item in session.sources if item.kind == "multiview"][:6]:
@@ -911,10 +927,15 @@ class ViewerSessionManager:
                 raise ViewerError(f"相机 {source.camera} 的点云内参无效")
             fx, fy, cx, cy = intrinsic
 
-            rotation = np.asarray(camera_extrinsic.get("rotation"), dtype=np.float32)
-            translation = np.asarray(camera_extrinsic.get("translation"), dtype=np.float32).reshape(-1)
-            if rotation.shape != (3, 3) or translation.size != 3:
+            # extrinsics.json stores world -> camera (Rcw, tcw).  The native
+            # viewer explicitly inverts it before fusing camera points:
+            # Rwc = Rcw^T, twc = -(Rwc * tcw).
+            rotation_cw = np.asarray(camera_extrinsic.get("rotation"), dtype=np.float32)
+            translation_cw = np.asarray(camera_extrinsic.get("translation"), dtype=np.float32).reshape(-1)
+            if rotation_cw.shape != (3, 3) or translation_cw.size != 3:
                 raise ViewerError(f"相机 {source.camera} 的世界外参无效")
+            rotation_wc = rotation_cw.T
+            translation_wc = -(rotation_wc @ translation_cw)
 
             yy, xx = np.mgrid[0 : depth.shape[0] : step, 0 : depth.shape[1] : step]
             depth_mm = depth[::step, ::step].astype(np.float32, copy=False)
@@ -926,7 +947,7 @@ class ViewerSessionManager:
             ys = yy[valid].astype(np.float32, copy=False)
             zs = z[valid]
             camera_points = np.column_stack(((xs - cx) * zs / fx, (ys - cy) * zs / fy, zs))
-            world = camera_points @ rotation.T + translation.reshape(1, 3)
+            world = camera_points @ rotation_wc.T + translation_wc.reshape(1, 3)
 
             if aligned:
                 bgr = rgb[::step, ::step][valid]
@@ -945,26 +966,14 @@ class ViewerSessionManager:
             if not np.any(finite):
                 continue
             clouds.append(np.column_stack((world[finite], colors[finite].astype(np.float32))))
-            cameras.append(source.camera)
 
         if not clouds:
             raise ViewerError(f"第 {frame} 帧没有有效 RGB-D 点")
         fused = np.concatenate(clouds, axis=0)
-        raw_count = int(fused.shape[0])
-        if raw_count > max_points:
-            keep = np.linspace(0, raw_count - 1, max_points, dtype=np.int64)
+        if fused.shape[0] > max_points:
+            keep = np.linspace(0, fused.shape[0] - 1, max_points, dtype=np.int64)
             fused = fused[keep]
-        xyz = np.round(fused[:, :3], 5)
-        rgb_values = np.clip(np.rint(fused[:, 3:]), 0, 255).astype(np.uint8)
-        compact = np.column_stack((xyz, rgb_values)).tolist()
-        return {
-            "frame": int(frame),
-            "source": "decoded_rgb_depth",
-            "cameras": cameras,
-            "raw_point_count": raw_count,
-            "point_count": len(compact),
-            "points": compact,
-        }
+        return fused.astype(np.float32, copy=False)
 
     @staticmethod
     def _map_depth_colors(cv2: Any, np: Any, xs: Any, ys: Any, depth_mm: Any, rgb: Any, camera_params: Mapping[str, Any]) -> Any:
@@ -1187,7 +1196,7 @@ h1{{font-size:18px;margin:0 8px 18px}}.sub{{color:var(--muted);font:12px ui-mono
 header{{display:flex;align-items:center;gap:14px;padding:0 20px;border-bottom:1px solid var(--line);background:#0e151b}}header strong{{font-size:15px}}#modeStatus{{color:var(--muted);font-size:13px}}
 #stage{{position:relative;min-height:0;padding:14px;background:#080c10;overflow:hidden}}#grid{{height:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:8px}}
 .tile{{position:relative;min-width:0;min-height:0;background:#101820;border:1px solid #1e2a34;border-radius:7px;overflow:hidden;display:flex;align-items:center;justify-content:center}}.tile img.frame{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;visibility:hidden}}.tile img.frame.active{{opacity:1;visibility:visible}}.tile label{{position:absolute;z-index:2;left:8px;top:7px;background:#0009;padding:3px 7px;border-radius:4px;font:12px ui-monospace}}
-#single{{width:100%;height:100%;display:none;align-items:center;justify-content:center}}#single img{{max-width:100%;max-height:100%;object-fit:contain}}#cloud{{width:100%;height:100%;display:none;cursor:grab}}#cloud:active{{cursor:grabbing}}
+#single{{position:relative;width:100%;height:100%;display:none;align-items:center;justify-content:center}}#single img{{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;opacity:0;visibility:hidden}}#single img.active{{opacity:1;visibility:visible}}#cloud{{width:100%;height:100%;display:none;cursor:grab}}#cloud.panning{{cursor:move}}#cloud:active{{cursor:grabbing}}#cloudTools{{position:absolute;right:26px;top:50%;transform:translateY(-50%);display:none;z-index:3;flex-direction:column;gap:8px}}#cloudTools button{{width:42px;height:42px;border:1px solid #45606e;border-radius:8px;background:#15232cdd;color:#fff;font-size:22px;cursor:pointer}}#cloudHint{{position:absolute;left:26px;top:24px;display:none;z-index:3;background:#0009;padding:6px 10px;border-radius:5px;color:#d9e5eb;font-size:12px}}
 #loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#080c10e8;z-index:4}}.card{{width:min(520px,80%);text-align:center}}.track{{height:7px;background:#202b34;border-radius:10px;overflow:hidden;margin:18px 0}}#bar{{height:100%;width:0;background:var(--accent);transition:width .2s}}#loadError{{color:var(--danger);white-space:pre-wrap}}
 footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 20px;background:#0e151b}}button.control{{border:1px solid var(--line);background:#17212a;color:var(--text);padding:8px 14px;border-radius:6px;cursor:pointer}}input[type=range]{{width:100%;accent-color:var(--accent)}}#counter{{font:12px ui-monospace;color:var(--muted);min-width:110px;text-align:right}}
 @media(max-width:850px){{.app{{grid-template-columns:190px 1fr}}#grid{{grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(3,1fr)}}}}
@@ -1195,10 +1204,10 @@ footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto
 <button class="mode active" data-mode="rgb" disabled>6 路 RGB</button><button class="mode" data-mode="pico" disabled>Pico + 眼动</button>
 <button class="mode" data-mode="pointcloud" disabled>彩色融合点云</button><button class="mode" data-mode="manomesh" disabled>MANO mesh 视频</button>
 <div class="spacer"></div><div id="sessionState">正在创建临时会话…</div></aside><main><header><strong id="title">6 路 RGB</strong><span id="modeStatus"></span></header>
-<div id="stage"><div id="grid"></div><div id="single"><img id="singleImage"></div><canvas id="cloud"></canvas><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
+<div id="stage"><div id="grid"></div><div id="single"><img class="active" alt=""><img alt=""></div><canvas id="cloud"></canvas><div id="cloudHint">左键拖动旋转 · 右键拖动平移</div><div id="cloudTools"><button id="zoomIn" title="放大">＋</button><button id="zoomOut" title="缩小">－</button><button id="resetView" title="重置视角" style="font-size:13px">重置</button></div><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
 <footer><button class="control" id="play">播放</button><input id="timeline" type="range" min="0" max="0" value="0"><span id="counter">0 / 0</span></footer></main></div>
 <script>
-const episodeId={encoded_id};let sessionId=null,info=null,mode='rgb',framePos=0,playing=false,timer=null,closed=false,gridRenderToken=0,lastGridKey='',pendingGridKey='',gridSignature='';
+const episodeId={encoded_id};let sessionId=null,info=null,mode='rgb',framePos=0,playing=false,timer=null,closed=false,gridRenderToken=0,lastGridKey='',pendingGridKey='',gridSignature='',imageCacheEpoch=0,prefetchDesired=-1,prefetchRunning=false;const frameCache=new Map();
 const $=s=>document.querySelector(s), buttons=[...document.querySelectorAll('.mode')];$('#episodeLabel').textContent=episodeId;
 async function api(url,options={{}}){{const r=await fetch(url,options);const data=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(data.error||r.statusText);return data}}
 function showLoading(text,pct=0,error=''){{$('#loading').style.display='flex';$('#loadText').textContent=text;$('#bar').style.width=`${{Math.max(0,Math.min(100,pct))}}%`;$('#loadError').textContent=error}}
@@ -1208,26 +1217,36 @@ async function poll(){{if(!sessionId||closed)return;try{{info=await api(`/api/v1
 function renderState(){{const d=info.decode||{{completed:0,total:0}};$('#sessionState').textContent=`临时解码：${{d.completed}} / ${{d.total}}\n离开页面后自动清理`;if(info.state==='failed')return showLoading('基础视频解码失败',0,info.error);if(info.state!=='ready')return showLoading(`正在并发解码全部视频 ${{d.completed}} / ${{d.total}}`,d.total?100*d.completed/d.total:5);
 buttons.forEach(b=>b.disabled=false);const m=info.modes[mode];if(m.status==='failed')return showLoading('模态准备失败',0,m.error);if((m.status==='preparing'&&!m.playable)||(m.status==='idle'&&mode!=='rgb')){{const pct=m.total?100*m.progress/m.total:8;showLoading(m.message||'正在准备模态数据',pct);return}}hideLoading();$('#modeStatus').textContent=m.complete?'':m.message;setupFrames();renderFrame()}}
 function setupFrames(){{const frames=info.frames||[];$('#timeline').max=Math.max(0,frames.length-1);framePos=Math.min(framePos,Math.max(0,frames.length-1));$('#timeline').value=framePos;$('#counter').textContent=frames.length?`${{frames[framePos]}} · ${{framePos+1}} / ${{frames.length}}`:'0 / 0'}}
-async function choose(next){{if(!info||info.state!=='ready')return;mode=next;playing=false;clearTimeout(timer);gridRenderToken++;lastGridKey='';pendingGridKey='';$('#play').textContent='播放';buttons.forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));$('#title').textContent={{rgb:'6 路 RGB',pico:'Pico + 眼动',pointcloud:'彩色融合点云',manomesh:'MANO mesh 视频'}}[mode];const m=info.modes[mode];if(m.status==='idle'){{await api(`/api/v1/viewer/sessions/${{sessionId}}/modes/${{mode}}`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});poll()}}else renderState()}}
+async function choose(next){{if(!info||info.state!=='ready')return;mode=next;playing=false;clearTimeout(timer);gridRenderToken++;imageCacheEpoch++;frameCache.clear();prefetchDesired=-1;lastGridKey='';pendingGridKey='';$('#play').textContent='播放';buttons.forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));$('#title').textContent={{rgb:'6 路 RGB',pico:'Pico + 眼动',pointcloud:'彩色融合点云',manomesh:'MANO mesh 视频'}}[mode];const m=info.modes[mode];if(m.status==='idle'){{await api(`/api/v1/viewer/sessions/${{sessionId}}/modes/${{mode}}`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});poll()}}else renderState()}}
 buttons.forEach(b=>b.onclick=()=>choose(b.dataset.mode));
 function mediaUrl(source,frame){{return `/api/v1/viewer/sessions/${{sessionId}}/media/${{mode}}/${{encodeURIComponent(source)}}/${{frame}}`}}
-function frameAvailable(frame){{if(mode!=='manomesh')return true;const m=info&&info.modes&&info.modes.manomesh;return !!m&&Array.isArray(m.available_frames)&&m.available_frames.includes(frame)}}
+function frameAvailable(frame){{if(mode!=='manomesh'&&mode!=='pointcloud')return true;const m=info&&info.modes&&info.modes[mode];return !!m&&(m.complete||Array.isArray(m.available_frames)&&m.available_frames.includes(frame))}}
 function ensureSixGrid(sources){{const signature=sources.map(s=>s.id).join('|');if(signature===gridSignature)return;gridSignature=signature;lastGridKey='';pendingGridKey='';$('#grid').innerHTML=sources.map(s=>`<div class="tile"><img class="frame active" alt=""><img class="frame" alt=""><label>${{s.label}}</label></div>`).join('')}}
-function preloadImage(url){{return new Promise((resolve,reject)=>{{const image=new Image();image.onload=async()=>{{try{{if(image.decode)await image.decode()}}catch(_e){{}}resolve()}};image.onerror=()=>reject(new Error('画面加载失败'));image.src=url}})}}
-async function renderSix(frame){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);ensureSixGrid(sources);const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey)return true;pendingGridKey=key;const token=++gridRenderToken;const urls=sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame));try{{await Promise.all(urls.map(preloadImage));if(token!==gridRenderToken)return false;const tiles=[...document.querySelectorAll('#grid .tile')],backs=tiles.map(tile=>tile.querySelector('img.frame:not(.active)'));backs.forEach((img,i)=>img.src=urls[i]);await Promise.all(backs.map(async img=>{{try{{if(img.decode)await img.decode()}}catch(_e){{}}}}));if(token!==gridRenderToken)return false;tiles.forEach((tile,i)=>{{tile.querySelectorAll('img.frame').forEach(img=>img.classList.remove('active'));backs[i].classList.add('active')}});lastGridKey=key;return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
-async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';
-if(mode==='manomesh'&&!frameAvailable(frame)){{$('#modeStatus').textContent='正在缓冲该同步帧…';return false}}
+function preloadImage(url){{return new Promise((resolve,reject)=>{{const image=new Image();image.onload=async()=>{{try{{if(image.decode)await image.decode()}}catch(_e){{}}resolve(image)}};image.onerror=()=>reject(new Error('画面加载失败'));image.src=url}})}}
+function cachedImage(url){{let promise=frameCache.get(url);if(!promise){{promise=preloadImage(url).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
+function cachedCloud(url){{let promise=frameCache.get(url);if(!promise){{promise=fetch(url).then(r=>{{if(!r.ok)throw new Error('点云帧加载失败');return r.arrayBuffer()}}).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
+function frameUrlsAt(position){{const frames=info.frames||[],frame=frames[(position+frames.length)%frames.length];if(mode==='rgb'||mode==='manomesh'){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);return sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame))}}return [mediaUrl(mode==='pointcloud'?'cloud':'ego',frame)]}}
+async function requestFramePrefetch(){{if(!['rgb','manomesh','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
+async function renderSix(frame){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);ensureSixGrid(sources);const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,urls=sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame));try{{await Promise.all(urls.map(cachedImage));if(token!==gridRenderToken)return false;const tiles=[...document.querySelectorAll('#grid .tile')],backs=tiles.map(tile=>tile.querySelector('img.frame:not(.active)'));backs.forEach((img,i)=>img.src=urls[i]);await Promise.all(backs.map(async img=>{{try{{if(img.decode)await img.decode()}}catch(_e){{}}}}));if(token!==gridRenderToken)return false;tiles.forEach((tile,i)=>{{tile.querySelectorAll('img.frame').forEach(img=>img.classList.remove('active'));backs[i].classList.add('active')}});lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
+async function renderSingle(frame,source){{const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,url=mediaUrl(source,frame);try{{await cachedImage(url);if(token!==gridRenderToken)return false;const images=[...document.querySelectorAll('#single img')],back=images.find(img=>!img.classList.contains('active'));back.src=url;try{{if(back.decode)await back.decode()}}catch(_e){{}}if(token!==gridRenderToken)return false;images.forEach(img=>img.classList.remove('active'));back.classList.add('active');lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
+async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';
+if(!frameAvailable(frame)){{$('#modeStatus').textContent='后台渲染中，正在缓冲该同步帧…';return false}}
 if(mode==='rgb'||mode==='manomesh'){{try{{return await renderSix(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}
-else if(mode==='pico'){{$('#singleImage').src=mediaUrl('ego',frame);return true}}else{{try{{const r=await fetch(mediaUrl('cloud',frame));const cloud=await r.json();drawCloud(cloud.points||[]);return true}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}}}
+else if(mode==='pico'){{try{{return await renderSingle(frame,'ego')}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}else{{try{{return await renderCloudFrame(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}}}
 $('#timeline').oninput=e=>{{framePos=Number(e.target.value);renderFrame()}};
 function schedulePlay(delay){{clearTimeout(timer);if(playing)timer=setTimeout(playTick,delay)}}
 async function playTick(){{if(!playing||!info||!info.frames.length)return;const started=performance.now(),previous=framePos,next=(framePos+1)%info.frames.length,frame=info.frames[next];if(!frameAvailable(frame)){{$('#modeStatus').textContent='后台渲染中，正在缓冲下一同步帧…';schedulePlay(30);return}}framePos=next;const shown=await renderFrame();if(!shown){{framePos=previous;setupFrames();schedulePlay(30);return}}schedulePlay(Math.max(0,1000/(info.fps||30)-(performance.now()-started)))}}
 $('#play').onclick=()=>{{playing=!playing;$('#play').textContent=playing?'暂停':'播放';clearTimeout(timer);if(playing)schedulePlay(0)}};
-const canvas=$('#cloud'),ctx=canvas.getContext('2d');let yaw=.72,pitch=.48,zoom=2.6,drag=false,lastX=0,lastY=0,cloudPoints=[];
-function drawCloud(points){{cloudPoints=points;const r=canvas.getBoundingClientRect(),d=devicePixelRatio||1;canvas.width=Math.max(1,r.width*d);canvas.height=Math.max(1,r.height*d);ctx.setTransform(d,0,0,d,0,0);ctx.fillStyle='#080c10';ctx.fillRect(0,0,r.width,r.height);const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),scale=Math.min(r.width,r.height)*.72/zoom;const projected=[];for(const p of points){{let x=p[0],y=p[1],z=p[2]-.8;const x1=cy*x+sy*z,z1=-sy*x+cy*z,y1=cp*y-sp*z1,z2=sp*y+cp*z1+zoom;if(z2<=.05)continue;projected.push([r.width/2+x1*scale/z2,r.height/2+y1*scale/z2,z2,p[3],p[4],p[5]])}}projected.sort((a,b)=>b[2]-a[2]);for(const p of projected){{ctx.fillStyle=`rgb(${{p[3]}},${{p[4]}},${{p[5]}})`;ctx.fillRect(p[0],p[1],1.5,1.5)}}}}
-canvas.onpointerdown=e=>{{drag=true;lastX=e.clientX;lastY=e.clientY;canvas.setPointerCapture(e.pointerId)}};canvas.onpointermove=e=>{{if(!drag)return;yaw+=(e.clientX-lastX)*.008;pitch=Math.max(-1.45,Math.min(1.45,pitch+(e.clientY-lastY)*.008));lastX=e.clientX;lastY=e.clientY;drawCloud(cloudPoints)}};canvas.onpointerup=()=>drag=false;canvas.onwheel=e=>{{e.preventDefault();zoom=Math.max(.3,Math.min(12,zoom*Math.exp(e.deltaY*.001)));drawCloud(cloudPoints)}};
+const canvas=$('#cloud'),gl=canvas.getContext('webgl',{{antialias:false,alpha:false}});let cloudProgram=null,cloudBuffer=null,cloudCount=0,yaw=0,pitch=0,distance=1.5,target=[0,0,1],dragMode='',lastX=0,lastY=0;
+function makeShader(type,source){{const shader=gl.createShader(type);gl.shaderSource(shader,source);gl.compileShader(shader);if(!gl.getShaderParameter(shader,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(shader));return shader}}
+function initCloudGL(){{if(!gl)throw new Error('浏览器不支持 WebGL 点云显示');if(cloudProgram)return;const vs=makeShader(gl.VERTEX_SHADER,`attribute vec3 aPosition;attribute vec4 aColor;uniform vec3 uRight,uUp,uForward,uCamera;uniform vec2 uViewport;uniform float uPointSize;varying vec4 vColor;void main(){{vec3 v=aPosition-uCamera;float x=dot(v,uRight),y=dot(v,uUp),z=dot(v,uForward);float n=.05,f=20.;gl_Position=vec4(1800.*x/uViewport.x,1800.*y/uViewport.y,((f+n)/(f-n))*z-(2.*f*n/(f-n)),z);gl_PointSize=uPointSize;vColor=aColor;}}`),fs=makeShader(gl.FRAGMENT_SHADER,`precision mediump float;varying vec4 vColor;void main(){{gl_FragColor=vColor;}}`);cloudProgram=gl.createProgram();gl.attachShader(cloudProgram,vs);gl.attachShader(cloudProgram,fs);gl.linkProgram(cloudProgram);if(!gl.getProgramParameter(cloudProgram,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(cloudProgram));cloudBuffer=gl.createBuffer();gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LESS);gl.clearColor(0,0,0,1)}}
+function cloudBasis(){{const cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),forward=[sy*cp,-sp,cy*cp],right=[-forward[2],0,forward[0]],rn=Math.hypot(...right);right[0]/=rn;right[2]/=rn;const up=[forward[1]*right[2]-forward[2]*right[1],forward[2]*right[0]-forward[0]*right[2],forward[0]*right[1]-forward[1]*right[0]],camera=target.map((v,i)=>v-forward[i]*distance);return{{right,up,forward,camera}}}}
+function drawCloudGL(){{if(!gl||!cloudProgram||!cloudCount)return;const rect=canvas.getBoundingClientRect(),d=window.devicePixelRatio||1,w=Math.max(1,Math.round(rect.width*d)),h=Math.max(1,Math.round(rect.height*d));if(canvas.width!==w||canvas.height!==h){{canvas.width=w;canvas.height=h}}gl.viewport(0,0,w,h);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);gl.useProgram(cloudProgram);gl.bindBuffer(gl.ARRAY_BUFFER,cloudBuffer);const pos=gl.getAttribLocation(cloudProgram,'aPosition'),color=gl.getAttribLocation(cloudProgram,'aColor');gl.enableVertexAttribArray(pos);gl.vertexAttribPointer(pos,3,gl.FLOAT,false,16,0);gl.enableVertexAttribArray(color);gl.vertexAttribPointer(color,4,gl.UNSIGNED_BYTE,true,16,12);const b=cloudBasis();gl.uniform3fv(gl.getUniformLocation(cloudProgram,'uRight'),b.right);gl.uniform3fv(gl.getUniformLocation(cloudProgram,'uUp'),b.up);gl.uniform3fv(gl.getUniformLocation(cloudProgram,'uForward'),b.forward);gl.uniform3fv(gl.getUniformLocation(cloudProgram,'uCamera'),b.camera);gl.uniform2f(gl.getUniformLocation(cloudProgram,'uViewport'),rect.width,rect.height);gl.uniform1f(gl.getUniformLocation(cloudProgram,'uPointSize'),Math.max(1,d));gl.drawArrays(gl.POINTS,0,cloudCount)}}
+async function renderCloudFrame(frame){{initCloudGL();const data=await cachedCloud(mediaUrl('cloud',frame)),view=new DataView(data);if(data.byteLength<8)throw new Error('点云帧数据损坏');const count=view.getUint32(4,true);if(data.byteLength<8+count*16)throw new Error('点云帧长度错误');gl.bindBuffer(gl.ARRAY_BUFFER,cloudBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Uint8Array(data,8,count*16),gl.DYNAMIC_DRAW);cloudCount=count;drawCloudGL();requestFramePrefetch();return true}}
+canvas.oncontextmenu=e=>e.preventDefault();canvas.onpointerdown=e=>{{if(e.button!==0&&e.button!==2)return;e.preventDefault();dragMode=e.button===0?'rotate':'pan';canvas.classList.toggle('panning',dragMode==='pan');lastX=e.clientX;lastY=e.clientY;canvas.setPointerCapture(e.pointerId)}};canvas.onpointermove=e=>{{if(!dragMode)return;const dx=e.clientX-lastX,dy=e.clientY-lastY;lastX=e.clientX;lastY=e.clientY;if(dragMode==='rotate'){{yaw+=dx*.005;pitch=Math.max(-1.55,Math.min(1.55,pitch+dy*.005))}}else{{const b=cloudBasis(),scale=distance*.001;for(let i=0;i<3;i++)target[i]+=-b.right[i]*dx*scale+b.up[i]*dy*scale}}drawCloudGL()}};function stopDrag(){{dragMode='';canvas.classList.remove('panning')}}canvas.onpointerup=stopDrag;canvas.onpointercancel=stopDrag;
+function zoomCloud(factor){{distance=Math.max(.2,Math.min(20,distance*factor));drawCloudGL()}}$('#zoomIn').onclick=()=>zoomCloud(.9);$('#zoomOut').onclick=()=>zoomCloud(1.1);$('#resetView').onclick=()=>{{yaw=0;pitch=0;distance=1.5;target=[0,0,1];drawCloudGL()}};canvas.onwheel=e=>{{e.preventDefault();zoomCloud(e.deltaY<0?.9:1.1)}};window.addEventListener('keydown',e=>{{if(mode==='pointcloud'&&e.ctrlKey&&(e.key==='+'||e.key==='='||e.key==='-')){{e.preventDefault();zoomCloud(e.key==='-'?1.1:.9)}}}});window.addEventListener('resize',()=>{{if(mode==='pointcloud')drawCloudGL()}});
 async function closeSession(){{if(closed||!sessionId)return;closed=true;const url=`/api/v1/viewer/sessions/${{sessionId}}`;if(navigator.sendBeacon)navigator.sendBeacon(url+'/close');else fetch(url,{{method:'DELETE',keepalive:true}})}}
 window.addEventListener('pagehide',closeSession);window.addEventListener('beforeunload',closeSession);window.addEventListener('unload',closeSession);
 setInterval(()=>{{if(sessionId&&!closed)fetch(`/api/v1/viewer/sessions/${{sessionId}}`,{{cache:'no-store'}}).catch(()=>{{}})}},20000);
-window.addEventListener('resize',()=>{{if(mode==='pointcloud')drawCloud(cloudPoints)}});start();
+start();
 </script></body></html>"""

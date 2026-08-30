@@ -88,10 +88,12 @@ class ViewerSessionManagerTest(unittest.TestCase):
             self._wait(session, "pointcloud")
             self.assertEqual(session.payload()["modes"]["pointcloud"]["status"], "ready")
             path, content_type = manager.media_path(session.session_id, "pointcloud", "cloud", 0)
-            self.assertEqual(content_type, "application/json")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["source"], "decoded_rgb_depth")
-            self.assertEqual(payload["raw_point_count"], 6)
+            self.assertEqual(content_type, "application/octet-stream")
+            data = path.read_bytes()
+            frame, count = __import__("struct").unpack("<II", data[:8])
+            self.assertEqual(frame, 0)
+            self.assertEqual(count, 6)
+            self.assertEqual(len(data), 8 + count * 16)
             manager.close_all()
 
     def test_viewer_page_contains_four_modes_and_cleanup_beacon(self) -> None:
