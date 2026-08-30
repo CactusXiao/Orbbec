@@ -69,6 +69,31 @@ def _csv_rows(path: Path) -> List[Dict[str, str]]:
         return []
 
 
+def _ego_metadata_rows(path: Path) -> List[Dict[str, str]]:
+    """Parse Pico metadata with the same legacy column repair as viewer.cpp."""
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            header = next(reader, [])
+            if not header:
+                return []
+            gaze_index = header.index("gaze_valid") if "gaze_valid" in header else -1
+            rows: List[Dict[str, str]] = []
+            bool_values = {"0", "1", "true", "false", "yes", "no"}
+            for columns in reader:
+                if len(columns) == len(header) + 1 and gaze_index >= 0 and gaze_index + 1 < len(columns):
+                    left = columns[gaze_index].strip().lower()
+                    right = columns[gaze_index + 1].strip().lower()
+                    if left in bool_values and right in bool_values:
+                        del columns[gaze_index + 1]
+                rows.append(dict(zip(header, columns)))
+            return rows
+    except (OSError, csv.Error, UnicodeError):
+        return []
+
+
 def _integer(value: Any, default: int = -1) -> int:
     try:
         return int(str(value).strip())
@@ -675,7 +700,7 @@ class ViewerSessionManager:
             raise ViewerError("该 Episode 没有 Pico RGB 数据")
         out_dir = session.temp_dir / "modes" / "pico"
         out_dir.mkdir(parents=True, exist_ok=True)
-        metadata = _csv_rows(session.episode_dir / "ego" / "metadata.csv")
+        metadata = _ego_metadata_rows(session.episode_dir / "ego" / "metadata.csv")
         by_frame = {_integer(row.get("frame_index"), index): row for index, row in enumerate(metadata)}
         ego_params = self._ego_rgb_params(session.episode_dir / "ego")
         local_pose = self._ego_rgb_local_pose(session.episode_dir / "ego" / "camera.json")
@@ -704,6 +729,18 @@ class ViewerSessionManager:
             rgb = candidate.get("RGB") or candidate.get("rgb")
             if isinstance(rgb, dict):
                 return rgb
+        return {}
+
+    @staticmethod
+    def _ego_undistort_intrinsic(rgb_params: Mapping[str, Any]) -> Mapping[str, Any]:
+        direct = rgb_params.get("undistortIntrinsic") or rgb_params.get("undistort_intrinsic")
+        if isinstance(direct, Mapping):
+            return direct
+        undistort = rgb_params.get("undistort")
+        if isinstance(undistort, Mapping):
+            nested = undistort.get("new_intrinsic")
+            if isinstance(nested, Mapping):
+                return nested
         return {}
 
     @classmethod
@@ -778,9 +815,7 @@ class ViewerSessionManager:
         point = tuple(origin[i] + direction[i] * t for i in range(3))
         if point[2] <= 1e-9:
             return None
-        und = rgb_params.get("undistortIntrinsic") or rgb_params.get("undistort_intrinsic") or {}
-        if not isinstance(und, dict):
-            return None
+        und = cls._ego_undistort_intrinsic(rgb_params)
         fx, fy, cx, cy = (_float(und.get(key)) for key in ("fx", "fy", "cx", "cy"))
         if fx <= 0 or fy <= 0:
             return None
@@ -810,7 +845,7 @@ class ViewerSessionManager:
         if image is None:
             raise ViewerError(f"无法读取 Pico 帧：{source.name}")
         intr = rgb_params.get("intrinsic") or {}
-        und = rgb_params.get("undistortIntrinsic") or rgb_params.get("undistort_intrinsic") or {}
+        und = cls._ego_undistort_intrinsic(rgb_params)
         dist = rgb_params.get("distortion") or {}
         if isinstance(intr, dict) and isinstance(und, dict) and _float(intr.get("fx")) > 0 and _float(und.get("fx")) > 0:
             k = np.asarray([[intr.get("fx"), 0, intr.get("cx")], [0, intr.get("fy"), intr.get("cy")], [0, 0, 1]], dtype=np.float64)
@@ -823,10 +858,14 @@ class ViewerSessionManager:
             image = image[y0:y0 + crop_h, x0:x0 + crop_w].copy()
         pixel = cls._project_gaze(row, rgb_params, local_pose, (image.shape[1], image.shape[0]))
         if pixel is not None:
-            x, y = int(round(pixel[0])), int(round(pixel[1]))
-            if 0 <= x < image.shape[1] and 0 <= y < image.shape[0]:
-                cv2.circle(image, (x, y), 18, (80, 240, 120), 3, cv2.LINE_AA)
-                cv2.circle(image, (x, y), 4, (80, 80, 255), -1, cv2.LINE_AA)
+            inside = 0 <= pixel[0] < image.shape[1] and 0 <= pixel[1] < image.shape[0]
+            x = max(0, min(image.shape[1] - 1, int(round(pixel[0]))))
+            y = max(0, min(image.shape[0] - 1, int(round(pixel[1]))))
+            color = (80, 240, 120) if inside else (0, 190, 255)
+            radius = max(8, image.shape[1] // 120)
+            cv2.circle(image, (x, y), radius, color, 2, cv2.LINE_AA)
+            cv2.line(image, (max(0, x - 16), y), (min(image.shape[1] - 1, x + 16), y), color, 2, cv2.LINE_AA)
+            cv2.line(image, (x, max(0, y - 16)), (x, min(image.shape[0] - 1, y + 16)), color, 2, cv2.LINE_AA)
         if not cv2.imwrite(str(destination), image, [cv2.IMWRITE_JPEG_QUALITY, 95]):
             raise ViewerError(f"无法写入 Pico 帧：{destination.name}")
 
@@ -1226,7 +1265,7 @@ function preloadImage(url){{return new Promise((resolve,reject)=>{{const image=n
 function cachedImage(url){{let promise=frameCache.get(url);if(!promise){{promise=preloadImage(url).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
 function cachedCloud(url){{let promise=frameCache.get(url);if(!promise){{promise=fetch(url).then(r=>{{if(!r.ok)throw new Error('点云帧加载失败');return r.arrayBuffer()}}).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
 function frameUrlsAt(position){{const frames=info.frames||[],frame=frames[(position+frames.length)%frames.length];if(mode==='rgb'||mode==='manomesh'){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);return sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame))}}return [mediaUrl(mode==='pointcloud'?'cloud':'ego',frame)]}}
-async function requestFramePrefetch(){{if(!['rgb','manomesh','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
+async function requestFramePrefetch(){{if(!['rgb','pico','manomesh','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
 async function renderSix(frame){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);ensureSixGrid(sources);const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,urls=sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame));try{{await Promise.all(urls.map(cachedImage));if(token!==gridRenderToken)return false;const tiles=[...document.querySelectorAll('#grid .tile')],backs=tiles.map(tile=>tile.querySelector('img.frame:not(.active)'));backs.forEach((img,i)=>img.src=urls[i]);await Promise.all(backs.map(async img=>{{try{{if(img.decode)await img.decode()}}catch(_e){{}}}}));if(token!==gridRenderToken)return false;tiles.forEach((tile,i)=>{{tile.querySelectorAll('img.frame').forEach(img=>img.classList.remove('active'));backs[i].classList.add('active')}});lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
 async function renderSingle(frame,source){{const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,url=mediaUrl(source,frame);try{{await cachedImage(url);if(token!==gridRenderToken)return false;const images=[...document.querySelectorAll('#single img')],back=images.find(img=>!img.classList.contains('active'));back.src=url;try{{if(back.decode)await back.decode()}}catch(_e){{}}if(token!==gridRenderToken)return false;images.forEach(img=>img.classList.remove('active'));back.classList.add('active');lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
 async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';

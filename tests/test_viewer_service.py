@@ -128,7 +128,11 @@ class ViewerSessionManagerTest(unittest.TestCase):
             "width": "1280",
             "height": "960",
         }
-        params = {"undistort_intrinsic": {"fx": 600, "fy": 600, "cx": 640, "cy": 480}}
+        params = {
+            "width": 1280,
+            "height": 960,
+            "undistort": {"new_intrinsic": {"fx": 600, "fy": 600, "cx": 640, "cy": 480}},
+        }
         pixel = ViewerSessionManager._project_gaze(
             row,
             params,
