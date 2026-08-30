@@ -515,7 +515,7 @@ def render_request(request: Mapping[str, Any]) -> None:
     output_dir = Path(str(request["output_dir"])).expanduser().resolve()
     toolkit_root = Path(str(request["mano_toolkit_root"])).expanduser().resolve()
     model_dir = Path(str(request["mano_model_dir"])).expanduser().resolve()
-    cameras = [str(value) for value in request.get("cameras") or []][:5]
+    cameras = [str(value) for value in request.get("cameras") or []][:6]
     frames = sorted({int(value) for value in request.get("frames") or []})
     factor = float(request.get("render_factor") or 1.0)
     requested_workers = max(1, min(32, int(request.get("workers") or 1)))
