@@ -43,6 +43,15 @@ class ImageAnnotatorCanvas(tk.Canvas):
         (0, 0), (0, 1), (0, 2), (0, 3),
         (1, 3), (2, 3), (3, 3), (4, 3),
     )
+    _SMPLX_SCHEMATIC_POINTS = (
+        (0.0, 0.95),
+        (-0.35, 0.25), (-0.44, -0.20), (-0.48, -0.60),
+        (0.00, 0.20), (-0.02, -0.30), (-0.02, -0.75),
+        (0.65, 0.35), (0.78, 0.00), (0.86, -0.30),
+        (0.35, 0.25), (0.42, -0.20), (0.45, -0.60),
+        (-0.55, 0.35), (-0.82, 0.05), (-1.00, -0.22),
+        (-1.12, -0.48), (-0.50, -0.95), (-0.02, -1.15), (0.48, -0.95), (0.92, -0.58),
+    )
 
     def __init__(self, master, *, bg: str, **kwargs):
         super().__init__(master, bg=bg, highlightthickness=0, **kwargs)
@@ -932,30 +941,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self._overlay_items.append(item)
 
     def _schematic_point(self, hand: int, joint: int, cx: float, cy: float, scale: float) -> Tuple[float, float]:
-        points = (
-            (0.0, 0.95),
-            (-0.55, 0.35),
-            (-0.82, 0.05),
-            (-1.00, -0.22),
-            (-1.12, -0.48),
-            (-0.35, 0.25),
-            (-0.44, -0.20),
-            (-0.48, -0.60),
-            (-0.50, -0.95),
-            (0.00, 0.20),
-            (-0.02, -0.30),
-            (-0.02, -0.75),
-            (-0.02, -1.15),
-            (0.35, 0.25),
-            (0.42, -0.20),
-            (0.45, -0.60),
-            (0.48, -0.95),
-            (0.65, 0.35),
-            (0.78, 0.00),
-            (0.86, -0.30),
-            (0.92, -0.58),
-        )
-        x, y = points[joint]
+        x, y = self._SMPLX_SCHEMATIC_POINTS[joint]
         # The base shape is a right hand back view. Mirror hand 0 to show the left hand.
         if hand == 0:
             x = -x
