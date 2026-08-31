@@ -30,7 +30,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 VIDEO_SUFFIXES = {".h265", ".hevc", ".mkv", ".mp4", ".mov", ".avi"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
-VIEWER_MODES = ("rgb", "pico", "pointcloud", "manomesh")
+VIEWER_MODES = ("rgb", "pico", "pointcloud", "manomesh", "picohand")
 
 
 class ViewerError(Exception):
@@ -388,9 +388,13 @@ class ViewerSessionManager:
             path = session.temp_dir / "modes" / "pico" / f"{frame:05d}.jpg"
         elif mode == "pointcloud":
             path = session.temp_dir / "modes" / "pointcloud" / f"{frame:05d}.bin"
-        else:
+        elif mode == "manomesh":
             camera = str(source_id)
             path = session.temp_dir / "modes" / "manomesh" / camera / f"{frame:05d}.jpg"
+        else:
+            if str(source_id) != "ego":
+                raise ViewerError("Pico 手部 Pose 数据源不存在")
+            path = session.temp_dir / "modes" / "picohand" / "ego" / f"{frame:05d}.jpg"
         if not path.is_file():
             raise ViewerError(f"帧不存在：{frame}")
         mime = mimetypes.guess_type(path.name)[0] or ("application/json" if path.suffix == ".json" else "application/octet-stream")
@@ -749,6 +753,8 @@ class ViewerSessionManager:
                 self._prepare_pointcloud(session, state)
             elif mode == "manomesh":
                 self._prepare_manomesh(session, state)
+            elif mode == "picohand":
+                self._prepare_picohand(session, state)
             if session.cancel.is_set():
                 return
             with session.lock:
@@ -1208,12 +1214,77 @@ class ViewerSessionManager:
                         target.symlink_to(rgb_path)
                     except OSError:
                         shutil.copyfile(rgb_path, target)
+        self._run_mesh_renderer(
+            session,
+            state,
+            label="MANO mesh",
+            cameras=cameras,
+            frames=frames,
+            rgb_cache_dir=rgb_cache_dir,
+            output_dir=output_dir,
+            available_dir=output_dir,
+            request_name="manomesh_request.json",
+        )
+
+    def _prepare_picohand(self, session: ViewerSession, state: ModeState) -> None:
+        if not self.mano_toolkit_root or not self.mano_model_dir:
+            raise ViewerError("后端未配置 MANO toolkit/model 路径")
+        source = next((item for item in session.sources if item.kind == "ego"), None)
+        frames = list(session.frame_indices)
+        if source is None or not frames or not self._source_has_rgb(source, frames):
+            raise ViewerError("该 Episode 没有完整的 Pico RGB 数据")
+        if not (session.episode_dir / "optimized_pose").is_dir():
+            raise ViewerError("Episode 缺少 optimized_pose")
+        if not any((session.episode_dir / name).is_file() for name in ("ego_pose.json", "ego_extrinsic.json")):
+            raise ViewerError("Episode 缺少 ego_pose.json/ego_extrinsic.json，无法投影 Pico 手部 Pose")
+
+        state.total = len(frames)
+        rgb_cache_dir = session.temp_dir / "picohand_rgb"
+        camera_cache = rgb_cache_dir / "ego"
+        camera_cache.mkdir(parents=True, exist_ok=True)
+        for frame in frames:
+            rgb_path = self._rgb_frame_path(source, frame)
+            target = camera_cache / f"{frame:05d}{rgb_path.suffix.lower()}"
+            if not target.exists():
+                try:
+                    target.symlink_to(rgb_path)
+                except OSError:
+                    shutil.copyfile(rgb_path, target)
+
+        preview_dir = session.temp_dir / "modes" / "picohand"
+        self._run_mesh_renderer(
+            session,
+            state,
+            label="Pico 手部 Pose",
+            cameras=["ego"],
+            frames=frames,
+            rgb_cache_dir=rgb_cache_dir,
+            output_dir=session.temp_dir / "modes" / "picohand_full",
+            available_dir=preview_dir,
+            request_name="picohand_request.json",
+            preview_output_dir=preview_dir,
+        )
+
+    def _run_mesh_renderer(
+        self,
+        session: ViewerSession,
+        state: ModeState,
+        *,
+        label: str,
+        cameras: Sequence[str],
+        frames: Sequence[int],
+        rgb_cache_dir: Path,
+        output_dir: Path,
+        available_dir: Path,
+        request_name: str,
+        preview_output_dir: Optional[Path] = None,
+    ) -> None:
         request = {
             "episode_dir": str(session.episode_dir),
             "rgb_cache_dir": str(rgb_cache_dir),
             "output_dir": str(output_dir),
-            "cameras": cameras,
-            "frames": frames,
+            "cameras": list(cameras),
+            "frames": list(frames),
             "mano_toolkit_root": str(self.mano_toolkit_root),
             "mano_model_dir": str(self.mano_model_dir),
             "render_factor": 0.5,
@@ -1223,7 +1294,10 @@ class ViewerSessionManager:
             # every source frame is published and waits for the decoder output.
             "source_wait_seconds": 300.0,
         }
-        request_path = session.temp_dir / "manomesh_request.json"
+        if preview_output_dir is not None:
+            request["preview_output_dir"] = str(preview_output_dir)
+            request["ego_preview_max_width"] = 960
+        request_path = session.temp_dir / request_name
         request_path.write_text(json.dumps(request, ensure_ascii=False), encoding="utf-8")
         project_root = Path(__file__).resolve().parents[1]
         process = subprocess.Popen(
@@ -1246,11 +1320,11 @@ class ViewerSessionManager:
                         os.killpg(process.pid, signal.SIGTERM)
                     else:
                         process.terminate()
-                    raise ViewerError("MANO mesh 准备已取消")
+                    raise ViewerError(f"{label} 准备已取消")
                 available = [
                     frame
                     for frame in frames
-                    if all((output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
+                    if all((available_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
                 ]
                 with session.lock:
                     state.available_frames = available
@@ -1265,14 +1339,14 @@ class ViewerSessionManager:
                     )
             stderr = (process.stderr.read() if process.stderr else b"").decode("utf-8", errors="replace").strip()
             if process.returncode != 0:
-                raise ViewerError(f"MANO mesh 渲染失败：{stderr[-1200:] or 'renderer error'}")
+                raise ViewerError(f"{label} 渲染失败：{stderr[-1200:] or 'renderer error'}")
             available = [
                 frame
                 for frame in frames
-                if all((output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
+                if all((available_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
             ]
             if len(available) != len(frames):
-                raise ViewerError(f"MANO mesh 渲染结束但缺少 {len(frames) - len(available)} 个同步帧")
+                raise ViewerError(f"{label} 渲染结束但缺少 {len(frames) - len(available)} 个同步帧")
             with session.lock:
                 state.available_frames = available
                 state.progress = len(available)
@@ -1312,6 +1386,7 @@ footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto
 </style></head><body><div class="app"><aside><h1>Episode Viewer</h1><div class="sub" id="episodeLabel"></div>
 <button class="mode active" data-mode="rgb" disabled>6 路 RGB</button><button class="mode" data-mode="pico" disabled>Pico + 眼动</button>
 <button class="mode" data-mode="pointcloud" disabled>彩色融合点云</button><button class="mode" data-mode="manomesh" disabled>MANO mesh 视频</button>
+<button class="mode" data-mode="picohand" disabled>Pico 手部 Pose</button>
 <div class="spacer"></div><div id="sessionState">正在创建临时会话…</div></aside><main><header><strong id="title">6 路 RGB</strong><span id="modeStatus"></span><span id="manoSource"></span></header>
 <div id="stage"><div id="grid"></div><div id="single"><img class="active" alt=""><img alt=""></div><canvas id="cloud"></canvas><div id="cloudHint">左键拖动旋转 · 右键拖动平移</div><div id="cloudTools"><button id="zoomIn" title="放大">＋</button><button id="zoomOut" title="缩小">－</button><button id="resetView" title="重置视角" style="font-size:13px">重置</button></div><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
 <footer><button class="control" id="play">播放</button><div id="timelineWrap"><div id="badRanges"></div><input id="timeline" type="range" min="0" max="0" value="0"></div><span id="counter">0 / 0</span></footer></main></div>
@@ -1326,23 +1401,23 @@ async function poll(){{if(!sessionId||closed)return;try{{info=await api(`/api/v1
 function renderState(){{const d=info.decode||{{completed:0,total:0}};$('#sessionState').textContent=`临时解码：${{d.completed}} / ${{d.total}}\n离开页面后自动清理`;if(info.state==='failed')return showLoading('基础视频解码失败',0,info.error);if(info.state!=='ready')return showLoading(`正在并发解码全部视频 ${{d.completed}} / ${{d.total}}`,d.total?100*d.completed/d.total:5);
 buttons.forEach(b=>b.disabled=false);const m=info.modes[mode];if(m.status==='failed')return showLoading('模态准备失败',0,m.error);if((m.status==='preparing'&&!m.playable)||(m.status==='idle'&&mode!=='rgb')){{const pct=m.total?100*m.progress/m.total:8;showLoading(m.message||'正在准备模态数据',pct);return}}hideLoading();$('#modeStatus').textContent=m.complete?'':m.message;setupFrames();renderFrame()}}
 function setupFrames(){{const frames=info.frames||[];$('#timeline').max=Math.max(0,frames.length-1);framePos=Math.min(framePos,Math.max(0,frames.length-1));$('#timeline').value=framePos;$('#counter').textContent=frames.length?`${{frames[framePos]}} · ${{framePos+1}} / ${{frames.length}}`:'0 / 0';renderManoMeta()}}
-function renderManoMeta(){{const meta=info&&info.mano||{{}},badge=$('#manoSource'),ranges=$('#badRanges'),show=mode==='manomesh';badge.style.display=show?'inline-block':'none';if(show){{badge.textContent=meta.source_label||'初始 AutoLabel 结果';badge.classList.toggle('corrected',meta.source==='corrected_3d')}}const values=info&&info.frames||[],bad=meta.qc_completed&&Array.isArray(meta.bad_ranges)?meta.bad_ranges:[];ranges.style.display=show&&bad.length?'block':'none';const signature=show?JSON.stringify([values.length,bad]):'';if(ranges.dataset.signature===signature)return;ranges.dataset.signature=signature;ranges.innerHTML='';const denominator=Math.max(1,values.length-1);for(const segment of bad){{let first=values.findIndex(frame=>frame>=segment.start_frame),last=-1;for(let i=values.length-1;i>=0;i--)if(values[i]<=segment.end_frame){{last=i;break}}if(first<0||last<first)continue;const mark=document.createElement('span');mark.style.left=`${{100*first/denominator}}%`;mark.style.width=`${{Math.max(.35,100*(last-first)/denominator)}}%`;mark.title=`QC 坏帧 ${{segment.start_frame}}–${{segment.end_frame}}`;ranges.appendChild(mark)}}}}
-async function choose(next){{if(!info||info.state!=='ready')return;mode=next;playing=false;clearTimeout(timer);gridRenderToken++;imageCacheEpoch++;frameCache.clear();prefetchDesired=-1;lastGridKey='';pendingGridKey='';$('#play').textContent='播放';buttons.forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));$('#title').textContent={{rgb:'6 路 RGB',pico:'Pico + 眼动',pointcloud:'彩色融合点云',manomesh:'MANO mesh 视频'}}[mode];const m=info.modes[mode];if(m.status==='idle'){{await api(`/api/v1/viewer/sessions/${{sessionId}}/modes/${{mode}}`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});poll()}}else renderState()}}
+function renderManoMeta(){{const meta=info&&info.mano||{{}},badge=$('#manoSource'),ranges=$('#badRanges'),show=mode==='manomesh'||mode==='picohand';badge.style.display=show?'inline-block':'none';if(show){{badge.textContent=meta.source_label||'初始 AutoLabel 结果';badge.classList.toggle('corrected',meta.source==='corrected_3d')}}const values=info&&info.frames||[],bad=meta.qc_completed&&Array.isArray(meta.bad_ranges)?meta.bad_ranges:[];ranges.style.display=show&&bad.length?'block':'none';const signature=show?JSON.stringify([mode,values.length,bad]):'';if(ranges.dataset.signature===signature)return;ranges.dataset.signature=signature;ranges.innerHTML='';const denominator=Math.max(1,values.length-1);for(const segment of bad){{let first=values.findIndex(frame=>frame>=segment.start_frame),last=-1;for(let i=values.length-1;i>=0;i--)if(values[i]<=segment.end_frame){{last=i;break}}if(first<0||last<first)continue;const mark=document.createElement('span');mark.style.left=`${{100*first/denominator}}%`;mark.style.width=`${{Math.max(.35,100*(last-first)/denominator)}}%`;mark.title=`QC 坏帧 ${{segment.start_frame}}–${{segment.end_frame}}`;ranges.appendChild(mark)}}}}
+async function choose(next){{if(!info||info.state!=='ready')return;mode=next;playing=false;clearTimeout(timer);gridRenderToken++;imageCacheEpoch++;frameCache.clear();prefetchDesired=-1;lastGridKey='';pendingGridKey='';$('#play').textContent='播放';buttons.forEach(b=>b.classList.toggle('active',b.dataset.mode===mode));$('#title').textContent={{rgb:'6 路 RGB',pico:'Pico + 眼动',pointcloud:'彩色融合点云',manomesh:'MANO mesh 视频',picohand:'Pico 手部 Pose'}}[mode];const m=info.modes[mode];if(m.status==='idle'){{await api(`/api/v1/viewer/sessions/${{sessionId}}/modes/${{mode}}`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:'{{}}'}});poll()}}else renderState()}}
 buttons.forEach(b=>b.onclick=()=>choose(b.dataset.mode));
 function mediaUrl(source,frame){{return `/api/v1/viewer/sessions/${{sessionId}}/media/${{mode}}/${{encodeURIComponent(source)}}/${{frame}}`}}
-function frameAvailable(frame){{if(mode!=='manomesh'&&mode!=='pointcloud')return true;const m=info&&info.modes&&info.modes[mode];return !!m&&(m.complete||Array.isArray(m.available_frames)&&m.available_frames.includes(frame))}}
+function frameAvailable(frame){{if(mode!=='manomesh'&&mode!=='picohand'&&mode!=='pointcloud')return true;const m=info&&info.modes&&info.modes[mode];return !!m&&(m.complete||Array.isArray(m.available_frames)&&m.available_frames.includes(frame))}}
 function ensureSixGrid(sources){{const signature=sources.map(s=>s.id).join('|');if(signature===gridSignature)return;gridSignature=signature;lastGridKey='';pendingGridKey='';$('#grid').innerHTML=sources.map(s=>`<div class="tile"><img class="frame active" alt=""><img class="frame" alt=""><label>${{s.label}}</label></div>`).join('')}}
 function preloadImage(url){{return new Promise((resolve,reject)=>{{const image=new Image();image.onload=async()=>{{try{{if(image.decode)await image.decode()}}catch(_e){{}}resolve(image)}};image.onerror=()=>reject(new Error('画面加载失败'));image.src=url}})}}
 function cachedImage(url){{let promise=frameCache.get(url);if(!promise){{promise=preloadImage(url).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
 function cachedCloud(url){{let promise=frameCache.get(url);if(!promise){{promise=fetch(url).then(r=>{{if(!r.ok)throw new Error('点云帧加载失败');return r.arrayBuffer()}}).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
 function frameUrlsAt(position){{const frames=info.frames||[],frame=frames[(position+frames.length)%frames.length];if(mode==='rgb'||mode==='manomesh'){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);return sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame))}}return [mediaUrl(mode==='pointcloud'?'cloud':'ego',frame)]}}
-async function requestFramePrefetch(){{if(!['rgb','pico','manomesh','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
+async function requestFramePrefetch(){{if(!['rgb','pico','manomesh','picohand','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
 async function renderSix(frame){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);ensureSixGrid(sources);const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,urls=sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame));try{{await Promise.all(urls.map(cachedImage));if(token!==gridRenderToken)return false;const tiles=[...document.querySelectorAll('#grid .tile')],backs=tiles.map(tile=>tile.querySelector('img.frame:not(.active)'));backs.forEach((img,i)=>img.src=urls[i]);await Promise.all(backs.map(async img=>{{try{{if(img.decode)await img.decode()}}catch(_e){{}}}}));if(token!==gridRenderToken)return false;tiles.forEach((tile,i)=>{{tile.querySelectorAll('img.frame').forEach(img=>img.classList.remove('active'));backs[i].classList.add('active')}});lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
 async function renderSingle(frame,source){{const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,url=mediaUrl(source,frame);try{{await cachedImage(url);if(token!==gridRenderToken)return false;const images=[...document.querySelectorAll('#single img')],back=images.find(img=>!img.classList.contains('active'));back.src=url;try{{if(back.decode)await back.decode()}}catch(_e){{}}if(token!==gridRenderToken)return false;images.forEach(img=>img.classList.remove('active'));back.classList.add('active');lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
-async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';
+async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'||mode==='picohand'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';
 if(!frameAvailable(frame)){{$('#modeStatus').textContent='后台渲染中，正在缓冲该同步帧…';return false}}
 if(mode==='rgb'||mode==='manomesh'){{try{{return await renderSix(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}
-else if(mode==='pico'){{try{{return await renderSingle(frame,'ego')}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}else{{try{{return await renderCloudFrame(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}}}
+else if(mode==='pico'||mode==='picohand'){{try{{return await renderSingle(frame,'ego')}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}else{{try{{return await renderCloudFrame(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}}}
 $('#timeline').oninput=e=>{{framePos=Number(e.target.value);renderFrame()}};
 function schedulePlay(delay){{clearTimeout(timer);if(playing)timer=setTimeout(playTick,delay)}}
 async function playTick(){{if(!playing||!info||!info.frames.length)return;const started=performance.now(),previous=framePos,next=(framePos+1)%info.frames.length,frame=info.frames[next];if(!frameAvailable(frame)){{$('#modeStatus').textContent='后台渲染中，正在缓冲下一同步帧…';schedulePlay(30);return}}framePos=next;const shown=await renderFrame();if(!shown){{framePos=previous;setupFrames();schedulePlay(30);return}}schedulePlay(Math.max(0,1000/(info.fps||30)-(performance.now()-started)))}}
