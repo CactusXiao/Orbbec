@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from mano.joint_order import MANO_HAND_ORDER, SMPLX_MANO_JOINT_NAMES
+
 
 Point = Tuple[float, float]
 HandPoints = List[List[Point]]
@@ -381,6 +383,20 @@ def require_mano_episode_artifact(mano_dir: Path) -> Path:
     if not meta_path.is_file() or not joints_path.is_file():
         raise FileNotFoundError(
             f"MANO episode output missing at {root}: expected {meta_path} and {joints_path}"
+        )
+    try:
+        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"Failed to read MANO episode metadata: {meta_path}") from exc
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"MANO episode metadata must be an object: {meta_path}")
+    hand_order = metadata.get("hand_order")
+    if hand_order is not None and list(hand_order) != list(MANO_HAND_ORDER):
+        raise ValueError(f"MANO hand_order must be {list(MANO_HAND_ORDER)}, got {hand_order}: {meta_path}")
+    joint_order = metadata.get("joint_order")
+    if joint_order is not None and list(joint_order) != list(SMPLX_MANO_JOINT_NAMES):
+        raise ValueError(
+            f"MANO joint_order must match SMPL-X MANO, got {joint_order}: {meta_path}"
         )
     return meta_path
 

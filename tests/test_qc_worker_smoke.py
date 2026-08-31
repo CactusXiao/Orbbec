@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from label.video_frames import _run_ffmpeg_select
+from mano.joint_order import MANO_HAND_ORDER, SMPLX_MANO_JOINT_NAMES
 from src.qc.config import load_qc_config
 from src.qc.media import (
     QcEpisodeMedia,
@@ -22,6 +23,41 @@ from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, nor
 
 
 class QcWorkerSmokeTest(unittest.TestCase):
+    def test_qc_rejects_non_smplx_mano_joint_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            episode_dir = Path(tmp) / "S001" / "task" / "episode_001"
+            mano_dir = episode_dir / "mano" / "episode"
+            (episode_dir / "00" / "RGB").mkdir(parents=True)
+            mano_dir.mkdir(parents=True)
+            (episode_dir / "camera_params.json").write_text("{}", encoding="utf-8")
+            (episode_dir / "extrinsics.json").write_text("{}", encoding="utf-8")
+            np.save(mano_dir / "joints_3d.npy", np.zeros((1, 2, 21, 3), dtype=np.float32))
+            (mano_dir / "mano_episode.json").write_text(
+                json.dumps(
+                    {
+                        "frames": [0],
+                        "joints_3d_file": "joints_3d.npy",
+                        "hand_order": list(MANO_HAND_ORDER),
+                        "joint_order": list(reversed(SMPLX_MANO_JOINT_NAMES)),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "joint_order must match SMPL-X MANO"):
+                prepare_qc_media(
+                    {
+                        "episode_id": "episode_001",
+                        "subject_id": "S001",
+                        "task_name": "task",
+                        "episode_uri": "nas://ego/S001/task/episode_001",
+                        "cameras": ["00"],
+                        "frames": [0],
+                    },
+                    mounts={"nas://ego": str(Path(tmp))},
+                    tmp_dir=Path(tmp) / "qc_tmp",
+                )
+
     def test_wall_clock_playback_skips_display_frames_instead_of_slowing_time(self) -> None:
         self.assertEqual(
             playback_target_position(

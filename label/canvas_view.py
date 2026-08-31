@@ -10,6 +10,7 @@ import tkinter.font as tkfont
 
 from PIL import Image, ImageTk
 
+from mano.joint_order import SMPLX_MANO_SKELETON_EDGES
 from src.qc.crop import Box, expand_region_to_aspect
 
 
@@ -30,28 +31,7 @@ class ViewState:
 class ImageAnnotatorCanvas(tk.Canvas):
     _HAND_COUNT = 2
     _JOINT_COUNT = 21
-    _SKELETON_EDGES = (
-        (0, 1),
-        (1, 2),
-        (2, 3),
-        (3, 17),
-        (0, 4),
-        (4, 5),
-        (5, 6),
-        (6, 18),
-        (0, 7),
-        (7, 8),
-        (8, 9),
-        (9, 20),
-        (0, 10),
-        (10, 11),
-        (11, 12),
-        (12, 19),
-        (0, 13),
-        (13, 14),
-        (14, 15),
-        (15, 16),
-    )
+    _SKELETON_EDGES = SMPLX_MANO_SKELETON_EDGES
     _LEFT_BASES = ("#0078ff", "#28b4ff", "#50dcff", "#78ffdc", "#b4ffb4")
     _RIGHT_BASES = ("#ff4600", "#ff7800", "#ffb400", "#ffdc3c", "#ffff78")
     _SMPLX_JOINT_STYLE = (
