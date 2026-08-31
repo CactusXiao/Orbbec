@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from label.app import SOURCE_LABELS, SOURCE_ORDER, LabelPage
 from label.backend_client import LabelBackendClient, NasEpisodeResolver, grouped_label_tasks
 from label.env_config import load_label_config
-from label.mano_view import ManoViewRuntime, describe_mano_projection_issue, mano_joints_to_annotation_order
+from label.mano_view import ManoViewRuntime, describe_mano_projection_issue
 from label.storage import (
     PredictionBundle,
     apply_view_state_to_corrected,
@@ -166,9 +166,9 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             points, visible = LabelPage._build_mano_3d_view_state(PageStub(), 5, "00")
 
         self.assertEqual(points, projected[0])
-        self.assertTrue(visible[0][1])   # thumb MCP in the canvas order
-        self.assertTrue(visible[1][5])   # index MCP in the canvas order
-        self.assertFalse(visible[0][13])
+        self.assertTrue(visible[0][13])  # canonical MANO thumb MCP
+        self.assertTrue(visible[1][1])   # canonical MANO index MCP
+        self.assertFalse(visible[0][1])
 
     def test_joint_visibility_loader_accepts_bool_or_numeric_masks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -391,18 +391,31 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertTrue(np.isnan(points[1][0][0]))
             self.assertTrue(np.isnan(points[1][0][1]))
 
-    def test_mano_source_adapts_canonical_smplx_order_only_for_annotation_display(self) -> None:
-        canonical = np.zeros((2, 21, 3), dtype=np.float32)
-        canonical[:, :, 0] = np.arange(21, dtype=np.float32)
+    def test_manual_2d_is_saved_in_canonical_smplx_mano_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = PredictionBundle(
+                mode="correct",
+                episode_dir=root,
+                prediction_dir=root / "pred_2d",
+                pred_dir=root / "manual_2d",
+                corrected_dir=root / "manual_2d",
+                samples={},
+            )
+            points = [
+                [(float(hand * 100 + joint), float(hand * 100 + joint) + 0.5) for joint in range(21)]
+                for hand in range(2)
+            ]
+            visible = [[True] * 21 for _ in range(2)]
 
-        annotation = mano_joints_to_annotation_order(canonical)
+            apply_view_state_to_corrected(bundle, 5, "00", points, visible)
+            save_corrected_array(bundle)
+            stored = np.load(root / "manual_2d" / "00" / "00005.npy")
 
-        self.assertEqual(annotation[0, 1, 0], 13.0)  # thumb MCP
-        self.assertEqual(annotation[0, 4, 0], 16.0)  # thumb tip
-        self.assertEqual(annotation[0, 5, 0], 1.0)   # index MCP
-        self.assertEqual(annotation[0, 9, 0], 4.0)   # middle MCP
-        self.assertEqual(annotation[0, 13, 0], 10.0)  # ring MCP
-        self.assertEqual(annotation[0, 17, 0], 7.0)   # pinky MCP
+        canonical = np.asarray(points, dtype=np.float32)
+        np.testing.assert_array_equal(stored, canonical)
+        self.assertEqual(stored[0, 13, 0], 13.0)  # canonical thumb MCP
+        self.assertEqual(stored[0, 1, 0], 1.0)    # canonical index MCP
 
     def test_mano_source_reloads_when_npy_changes(self) -> None:
         try:

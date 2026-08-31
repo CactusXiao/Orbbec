@@ -36,7 +36,6 @@ try:
         ManoMeshResult,
         ManoViewRuntime,
         describe_mano_projection_issue,
-        mano_visibility_to_annotation_order,
     )
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
@@ -67,7 +66,6 @@ except Exception:
         ManoMeshResult,
         ManoViewRuntime,
         describe_mano_projection_issue,
-        mano_visibility_to_annotation_order,
     )
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
@@ -1041,9 +1039,8 @@ class LabelPage(ttk.Frame):
         if original_visible is None:
             return points, projected_visible
 
-        ordered_visible = mano_visibility_to_annotation_order(original_visible).tolist()
         visible = [
-            [bool(projected_visible[hand][joint] and ordered_visible[hand][joint]) for joint in range(21)]
+            [bool(projected_visible[hand][joint] and original_visible[hand][joint]) for joint in range(21)]
             for hand in range(2)
         ]
         return points, visible

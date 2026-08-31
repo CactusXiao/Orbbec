@@ -217,6 +217,8 @@ QC 失败时，`segments` 使用：
 
 - dtype：`float32`
 - shape：`(2, 21, 2)`
+- hand order：`left, right`
+- joint order：`mano/mano(1).py` 中的 `SMPLX_MANO_JOINT_NAMES`
 - 不可见点：`[-1.0, -1.0]`
 
 对应后端 artifact：

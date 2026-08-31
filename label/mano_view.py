@@ -17,53 +17,6 @@ _HAND_COUNT = 2
 _JOINT_COUNT = 21
 _MANO_MODEL_DIR = "/home/ubuntu/orbbec/mano"
 _HAND_COLORS = ("#37c7ff", "#ff8a3d")
-_SMPLX_MANO_TO_APP_ORDER = (
-    0,
-    13,
-    14,
-    15,
-    16,
-    1,
-    2,
-    3,
-    17,
-    4,
-    5,
-    6,
-    18,
-    10,
-    11,
-    12,
-    19,
-    7,
-    8,
-    9,
-    20,
-)
-
-
-def mano_joints_to_annotation_order(joints_3d: np.ndarray) -> np.ndarray:
-    """Adapt canonical SMPL-X MANO joints for the annotation canvas only."""
-    joints = np.asarray(joints_3d)
-    if joints.shape != (_HAND_COUNT, _JOINT_COUNT, 3):
-        raise ValueError(
-            "canonical MANO joints must have shape "
-            f"({_HAND_COUNT}, {_JOINT_COUNT}, 3), got {joints.shape}"
-        )
-    return joints[:, list(_SMPLX_MANO_TO_APP_ORDER), :]
-
-
-def mano_visibility_to_annotation_order(visibility: np.ndarray) -> np.ndarray:
-    """Apply the same canonical-MANO to canvas order used for joint coordinates."""
-    values = np.asarray(visibility, dtype=bool)
-    if values.shape != (_HAND_COUNT, _JOINT_COUNT):
-        raise ValueError(
-            "canonical MANO visibility must have shape "
-            f"({_HAND_COUNT}, {_JOINT_COUNT}), got {values.shape}"
-        )
-    return values[:, list(_SMPLX_MANO_TO_APP_ORDER)]
-
-
 @dataclass(frozen=True)
 class CameraParams:
     k: np.ndarray
@@ -100,11 +53,7 @@ class ManoViewRuntime:
         joints_3d = self._load_mano_frame_joints(mano_dir, int(frame_idx))
         if joints_3d is None:
             return None
-        # Stored MANO artifacts remain in the canonical smplx order used by
-        # mano/mano(1).py. The annotation canvas uses contiguous finger chains,
-        # so adapt only at this UI boundary instead of changing the artifact.
-        annotation_joints = mano_joints_to_annotation_order(joints_3d)
-        return self.project_skeleton(episode_dir=episode_dir, cam_id=cam_id, joints_3d=annotation_joints)
+        return self.project_skeleton(episode_dir=episode_dir, cam_id=cam_id, joints_3d=joints_3d)
 
     def has_mano_frame(
         self,
@@ -319,7 +268,7 @@ class ManoViewRuntime:
                 f"MANO model must output at least 21 joints, got {int(joints.shape[1])}. "
                 "Please update the local smplx MANO implementation to return 21 joints."
             )
-        return joints[:, list(_SMPLX_MANO_TO_APP_ORDER)]
+        return joints
 
 
 def _ensure_mano_pickle_compat() -> None:

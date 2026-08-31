@@ -31,6 +31,7 @@ from tools.virtual_workflow.orbbec_virtual_workflow import (
     BackendClient,
     LabelTask,
     NasSimulator,
+    annotation_hand_values_to_mano_order,
     handle_auto_label_once,
     handle_qc_once,
     handle_upload_once,
@@ -75,6 +76,17 @@ class NoHandDetector(FakeHandGtDetector):
 
 
 class VirtualWorkflowToolSmokeTest(unittest.TestCase):
+    def test_virtual_prediction_persistence_uses_smplx_mano_joint_order(self) -> None:
+        annotation = []
+        for hand in range(2):
+            for joint in range(21):
+                annotation.extend((float(hand * 100 + joint), 0.0))
+
+        stored = np.asarray(annotation_hand_values_to_mano_order(annotation), dtype=np.float32).reshape(2, 21, 2)
+
+        self.assertEqual(stored[0, 13, 0], 1.0)  # canonical thumb MCP
+        self.assertEqual(stored[0, 1, 0], 5.0)   # canonical index MCP
+
     def test_run_workers_defaults_load_from_env_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

@@ -34,29 +34,35 @@ class ImageAnnotatorCanvas(tk.Canvas):
         (0, 1),
         (1, 2),
         (2, 3),
-        (3, 4),
-        (0, 5),
+        (3, 17),
+        (0, 4),
+        (4, 5),
         (5, 6),
-        (6, 7),
+        (6, 18),
+        (0, 7),
         (7, 8),
-        (0, 9),
-        (9, 10),
+        (8, 9),
+        (9, 20),
+        (0, 10),
         (10, 11),
         (11, 12),
+        (12, 19),
         (0, 13),
         (13, 14),
         (14, 15),
         (15, 16),
-        (0, 17),
-        (17, 18),
-        (18, 19),
-        (19, 20),
-        (5, 9),
-        (9, 13),
-        (13, 17),
     )
     _LEFT_BASES = ("#0078ff", "#28b4ff", "#50dcff", "#78ffdc", "#b4ffb4")
     _RIGHT_BASES = ("#ff4600", "#ff7800", "#ffb400", "#ffdc3c", "#ffff78")
+    _SMPLX_JOINT_STYLE = (
+        (0, 0),
+        (1, 0), (1, 1), (1, 2),
+        (2, 0), (2, 1), (2, 2),
+        (4, 0), (4, 1), (4, 2),
+        (3, 0), (3, 1), (3, 2),
+        (0, 0), (0, 1), (0, 2), (0, 3),
+        (1, 3), (2, 3), (3, 3), (4, 3),
+    )
 
     def __init__(self, master, *, bg: str, **kwargs):
         super().__init__(master, bg=bg, highlightthickness=0, **kwargs)
@@ -1013,8 +1019,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
             color = "#f2f2f2" if hand == 0 else "#d2d2ff"
         else:
             bases = self._LEFT_BASES if hand == 0 else self._RIGHT_BASES
-            finger = min(4, max(0, (joint - 1) // 4))
-            step = min(3, max(0, (joint - 1) % 4))
+            finger, step = self._SMPLX_JOINT_STYLE[joint]
             color = self._brighten(bases[finger], 0.10 * step)
         if faded:
             color = self._mix_hex(color, "#ffffff", 0.45)

@@ -70,6 +70,26 @@ _HAND_TEMPLATE = (
     (0.54, -0.64),
     (0.64, -0.80),
 )
+# The virtual detector/template uses the annotation convention internally
+# (wrist, thumb, index, middle, ring, pinky). Persisted 2D artifacts use the
+# canonical SMPL-X MANO order from mano/mano(1).py.
+_ANNOTATION_TO_SMPLX_MANO = (
+    0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20,
+)
+
+
+def annotation_hand_values_to_mano_order(values: Sequence[float]) -> List[float]:
+    expected = _HAND_COUNT * _JOINT_COUNT * 2
+    if len(values) != expected:
+        raise ValueError(f"hand value count mismatch: expected {expected}, got {len(values)}")
+    out = [-1.0] * expected
+    for hand in range(_HAND_COUNT):
+        hand_offset = hand * _JOINT_COUNT * 2
+        for annotation_joint, mano_joint in enumerate(_ANNOTATION_TO_SMPLX_MANO):
+            source = hand_offset + annotation_joint * 2
+            target = hand_offset + mano_joint * 2
+            out[target:target + 2] = [float(values[source]), float(values[source + 1])]
+    return out
 
 
 def strip_env_comment(value: str) -> str:
@@ -747,7 +767,7 @@ def virtual_hand_values(cam: str, frame: int, width: int, height: int, variant: 
             x = round(max(0.0, min(float(width - 1), x)) / quant) * quant
             y = round(max(0.0, min(float(height - 1), y)) / quant) * quant
             values.extend((x, y))
-    return values
+    return annotation_hand_values_to_mano_order(values)
 
 
 def invisible_hand_values() -> List[float]:
@@ -1109,7 +1129,7 @@ class InteractionHandGtDetector:
                 x, y = point
                 values[base_index + joint_idx * 2] = max(0.0, min(width - 1.0, float(x)))
                 values[base_index + joint_idx * 2 + 1] = max(0.0, min(height - 1.0, float(y)))
-        return values if used_slots else invisible_hand_values()
+        return annotation_hand_values_to_mano_order(values) if used_slots else invisible_hand_values()
 
 
 def hand_gt_detector_for_args(args: argparse.Namespace) -> InteractionHandGtDetector:
