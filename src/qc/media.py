@@ -50,6 +50,12 @@ class QcEpisodeMedia:
         return list(self.view_cameras or tuple(str(camera) for camera in self.task.cameras[:6]))
 
     def frame_path(self, camera: str, frame_idx: int) -> Optional[Path]:
+        if str(camera) == EGO_CAMERA:
+            preview = self.cache_dir / "mesh_preview" / EGO_CAMERA / f"{int(frame_idx):05d}.jpg"
+            if preview.exists() and preview.is_file():
+                return preview
+            if self.requires_mesh:
+                return None
         rendered = self.cache_dir / "mesh" / str(camera) / f"{int(frame_idx):05d}.jpg"
         if rendered.exists() and rendered.is_file():
             return rendered
@@ -380,7 +386,12 @@ def prepare_qc_media(
         cameras = list(view_cameras)
         media = QcEpisodeMedia(task=task, cache_dir=cache_dir, requires_mesh=True, view_cameras=tuple(cameras))
         if all(
-            (cache_dir / "mesh" / camera / f"{int(frame):05d}.jpg").is_file()
+            (
+                cache_dir
+                / ("mesh_preview" if camera == EGO_CAMERA else "mesh")
+                / camera
+                / f"{int(frame):05d}.jpg"
+            ).is_file()
             for camera in cameras
             for frame in task.frames
         ):
@@ -600,10 +611,15 @@ def _prepare_mesh_frames(
     cameras = list(cameras or [str(camera) for camera in task.cameras[:6]])
     frames = [int(frame) for frame in task.frames]
     output_dir = cache_dir / "mesh"
+    preview_output_dir = cache_dir / "mesh_preview"
     total = len(frames)
     if total <= 0:
         raise ValueError("QC episode has no frames to render")
-    if all((output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras for frame in frames):
+    def rendered_path(camera: str, frame: int) -> Path:
+        root = preview_output_dir if camera == EGO_CAMERA else output_dir
+        return root / camera / f"{frame:05d}.jpg"
+
+    if all(rendered_path(camera, frame).is_file() for camera in cameras for frame in frames):
         for camera in cameras:
             _emit(on_progress, camera, status="mesh_done", decoded=total, rendered=total, total=total, error="")
         return
@@ -612,6 +628,8 @@ def _prepare_mesh_frames(
         "episode_dir": str(task.episode_dir()),
         "rgb_cache_dir": str(cache_dir),
         "output_dir": str(output_dir),
+        "preview_output_dir": str(preview_output_dir),
+        "ego_preview_max_width": 960,
         "cameras": cameras,
         "frames": frames,
         "mano_toolkit_root": str(settings.mano_toolkit_root),
@@ -692,7 +710,7 @@ def _prepare_mesh_frames(
         f"{camera}/{frame:05d}.jpg"
         for camera in cameras
         for frame in frames
-        if not (output_dir / camera / f"{frame:05d}.jpg").is_file()
+        if not rendered_path(camera, frame).is_file()
     ]
     if missing:
         preview = ", ".join(missing[:5])

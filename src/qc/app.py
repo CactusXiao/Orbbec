@@ -3,6 +3,7 @@ from __future__ import annotations
 import queue
 import signal
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -18,6 +19,7 @@ except Exception:
 from .backend import QcBackendClient, QcBackendError
 from .config import QcConfig
 from .media import MeshRendererSettings, QcEpisodeMedia, prepare_qc_media
+from .playback import playback_target_position
 from .report import build_qc_result, write_ego_pose_qc_report, write_qc_report
 from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges
 
@@ -878,6 +880,15 @@ class FrameTimeline(tk.Canvas):
                 outline="",
             )
         self.create_line(current_x, 8, current_x, 34, fill="#ffffff", width=2)
+        self.create_oval(
+            current_x - 5,
+            13,
+            current_x + 5,
+            23,
+            fill="#ffffff",
+            outline=Theme.ACCENT,
+            width=2,
+        )
 
     def _position_from_event(self, event: tk.Event) -> int:
         width = max(1, int(self.winfo_width()))
@@ -923,8 +934,12 @@ class QcPage(ttk.Frame):
         self.bad_end: Optional[int] = None
         self._canvases: Dict[str, ImageAnnotatorCanvas] = {}
         self._labels: Dict[str, ttk.Label] = {}
+        self._rendering_overlays: Dict[str, tk.Label] = {}
         self._playing = False
         self._play_after_id: Optional[str] = None
+        self._play_clock_started_at: Optional[float] = None
+        self._play_clock_start_position = 0
+        self._timeline_dragging = False
         self._ticks_since_save = 0
         self._busy_text = ""
         self._buffering = False
@@ -1055,6 +1070,7 @@ class QcPage(ttk.Frame):
             child.destroy()
         self._canvases = {}
         self._labels = {}
+        self._rendering_overlays = {}
         for row in range(2):
             self._grid.rowconfigure(row, weight=1, uniform="qc_rows")
         for col in range(3):
@@ -1069,8 +1085,17 @@ class QcPage(ttk.Frame):
             canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
             canvas.set_read_only(True)
             canvas.set_annotation_visible(False)
+            rendering_overlay = tk.Label(
+                host,
+                text="渲染中…",
+                bg="#b45309",
+                fg="#ffffff",
+                padx=18,
+                pady=10,
+            )
             self._canvases[cam] = canvas
             self._labels[cam] = label
+            self._rendering_overlays[cam] = rendering_overlay
 
     def _refresh(self) -> None:
         progress = self.progress
@@ -1086,22 +1111,32 @@ class QcPage(ttk.Frame):
                 f"当前帧：{frame} / {progress.last_frame}    手部 Pose：{ranges}    EgoPose：{ego_ranges}"
             )
         )
-        for cam, canvas in self._canvases.items():
-            path = media.frame_path(cam, frame)
-            canvas.set_image(path)
-            canvas.set_read_only(True)
-            canvas.set_annotation_visible(False)
-            canvas.set_focus_region(None)
-            canvas.set_skeleton_overlay(None)
-            canvas.set_mano_overlay(None)
-            if path is None or not path.is_file():
-                camera_label = "Pico Ego" if cam == "ego" else f"Camera {cam}"
-                self._labels[cam].configure(text=f"{camera_label}    mesh 帧缺失")
-            else:
+        frame_ready = media.frame_ready(frame)
+        if frame_ready:
+            for cam, canvas in self._canvases.items():
+                path = media.frame_path(cam, frame)
+                canvas.set_image(path)
+                canvas.set_read_only(True)
+                canvas.set_annotation_visible(False)
+                canvas.set_focus_region(None)
+                canvas.set_skeleton_overlay(None)
+                canvas.set_mano_overlay(None)
                 self._labels[cam].configure(
                     text="Pico Ego · MANO 外参投影" if cam == "ego" else f"Camera {cam}"
                 )
-        frame_ready = media.frame_ready(frame)
+                self._rendering_overlays[cam].place_forget()
+            if not self._busy_text:
+                self._busy.configure(text="")
+        else:
+            for cam in self._canvases:
+                camera_label = "Pico Ego" if cam == "ego" else f"Camera {cam}"
+                self._labels[cam].configure(text=f"{camera_label}    目标帧 {frame} 渲染中")
+                overlay = self._rendering_overlays[cam]
+                overlay.configure(text=f"目标帧 {frame}\n渲染中…")
+                overlay.place(relx=0.5, rely=0.55, anchor="center")
+                overlay.lift()
+            if not self._busy_text:
+                self._busy.configure(text=f"目标帧 {frame} 正在后台渲染…")
         self._buffering = not frame_ready
         if not frame_ready and not media.preparation_done and self._frame_refresh_after_id is None:
             self._frame_refresh_after_id = self.after(30, self._retry_frame_refresh)
@@ -1114,7 +1149,7 @@ class QcPage(ttk.Frame):
             bad_ranges=progress.bad_frame_ranges,
             ego_bad_ranges=progress.ego_bad_frame_ranges,
             preview=preview,
-            seek_enabled=self.mode == "playback" and not self._playing and not self._busy_text,
+            seek_enabled=self.mode == "playback" and not self._busy_text,
         )
         self._update_controls()
 
@@ -1127,7 +1162,18 @@ class QcPage(ttk.Frame):
             self._monitor_preparation()
             return
         if media.frame_ready(self._display_frame()):
+            was_buffering = self._buffering
             self._refresh()
+            if was_buffering and self._playing and not self._timeline_dragging:
+                if self._play_after_id is not None:
+                    try:
+                        self.after_cancel(self._play_after_id)
+                    except Exception:
+                        pass
+                    self._play_after_id = None
+                self._play_clock_started_at = time.monotonic()
+                self._play_clock_start_position = self._current_position()
+                self._schedule_play_tick()
             return
         if not media.preparation_done:
             self._frame_refresh_after_id = self.after(30, self._retry_frame_refresh)
@@ -1180,7 +1226,9 @@ class QcPage(ttk.Frame):
         elif progress.playback_complete:
             status = "已播放至末尾，可提交"
         elif self._buffering:
-            status = "缓冲中 · 后台正在准备 mesh 帧"
+            status = f"目标帧 {self._display_frame()} 渲染中 · 可继续拖动进度条"
+        elif self._timeline_dragging:
+            status = f"正在拖动定位 · 目标帧 {self._display_frame()}"
         elif self._playing:
             status = f"播放中 · 目标 {self.app.config.playback_fps:g} FPS"
         else:
@@ -1199,6 +1247,8 @@ class QcPage(ttk.Frame):
             return
         if progress.playback_complete and self._current_position() >= len(progress.frames) - 1:
             progress.current_frame = progress.frames[0]
+        self._play_clock_start_position = self._current_position()
+        self._play_clock_started_at = time.monotonic()
         self._playing = True
         self._update_controls()
         self._schedule_play_tick()
@@ -1212,6 +1262,8 @@ class QcPage(ttk.Frame):
             self._play_after_id = None
         was_playing = self._playing
         self._playing = False
+        self._play_clock_started_at = None
+        self._timeline_dragging = False
         if self.media is not None and self.progress is not None:
             self._buffering = not self.media.frame_ready(self.progress.current_frame)
         if persist and was_playing:
@@ -1219,7 +1271,16 @@ class QcPage(ttk.Frame):
         self._update_controls()
 
     def _schedule_play_tick(self) -> None:
-        delay_ms = max(1, int(round(1000.0 / self.app.config.playback_fps)))
+        now = time.monotonic()
+        fps = self.app.config.playback_fps
+        if self._play_clock_started_at is None:
+            self._play_clock_started_at = now
+            self._play_clock_start_position = self._current_position()
+        elapsed = max(0.0, now - self._play_clock_started_at)
+        current_offset = max(0, self._current_position() - self._play_clock_start_position)
+        next_offset = max(current_offset + 1, int(elapsed * fps) + 1)
+        deadline = self._play_clock_started_at + (float(next_offset) / fps)
+        delay_ms = max(1, int(max(0.0, deadline - now) * 1000.0) + 1)
         self._play_after_id = self.after(delay_ms, self._play_tick)
 
     def _play_tick(self) -> None:
@@ -1228,25 +1289,70 @@ class QcPage(ttk.Frame):
         if not self._playing or progress is None or not progress.frames:
             return
         position = self._current_position()
+        now = time.monotonic()
+        media = self.media
+        current_frame = progress.frames[position]
+        if media is not None and not media.frame_ready(current_frame):
+            self._buffering = True
+            self._play_clock_started_at = now
+            self._play_clock_start_position = position
+            self._update_controls()
+            self._play_after_id = self.after(30, self._play_tick)
+            return
+        if self._buffering:
+            self._buffering = False
+            self._play_clock_started_at = now
+            self._play_clock_start_position = position
+            self._refresh()
+            if position >= len(progress.frames) - 1:
+                progress.playback_complete = True
+                self.pause_playback(persist=False)
+                self.app.save_current_progress()
+                self._refresh()
+                return
+            self._schedule_play_tick()
+            return
         if position >= len(progress.frames) - 1:
             progress.playback_complete = True
             self.pause_playback(persist=False)
             self.app.save_current_progress()
             self._refresh()
             return
-        next_frame = progress.frames[position + 1]
-        media = self.media
+        if self._play_clock_started_at is None:
+            self._play_clock_started_at = now
+            self._play_clock_start_position = position
+        target_position = playback_target_position(
+            start_position=self._play_clock_start_position,
+            elapsed_seconds=now - self._play_clock_started_at,
+            fps=self.app.config.playback_fps,
+            last_position=len(progress.frames) - 1,
+        )
+        if target_position <= position:
+            self._schedule_play_tick()
+            return
+        next_frame = progress.frames[target_position]
         if media is not None and not media.frame_ready(next_frame):
+            progress.current_frame = next_frame
             self._buffering = True
-            self._update_controls()
+            # Buffering pauses the playback clock instead of creating a large
+            # catch-up jump when the next complete five-view frame arrives.
+            self._play_clock_started_at = now
+            self._play_clock_start_position = position
+            self._refresh()
             self._play_after_id = self.after(30, self._play_tick)
             return
         self._buffering = False
         progress.current_frame = next_frame
-        self._ticks_since_save += 1
+        self._ticks_since_save += max(1, target_position - position)
         if self._ticks_since_save >= max(1, int(round(self.app.config.playback_fps))):
             self._ticks_since_save = 0
             self.app.save_current_progress()
+        if target_position >= len(progress.frames) - 1:
+            progress.playback_complete = True
+            self.pause_playback(persist=False)
+            self.app.save_current_progress()
+            self._refresh()
+            return
         self._refresh()
         self._schedule_play_tick()
 
@@ -1260,12 +1366,32 @@ class QcPage(ttk.Frame):
 
     def seek_position(self, position: int, commit: bool = True) -> None:
         progress = self.progress
-        if progress is None or not progress.frames or self._playing or self.mode != "playback":
+        if progress is None or not progress.frames or self.mode != "playback" or self._busy_text:
             return
+        if not self._timeline_dragging:
+            self._timeline_dragging = True
+            if self._play_after_id is not None:
+                try:
+                    self.after_cancel(self._play_after_id)
+                except Exception:
+                    pass
+                self._play_after_id = None
         index = max(0, min(len(progress.frames) - 1, int(position)))
         progress.current_frame = progress.frames[index]
+        if index < len(progress.frames) - 1:
+            progress.playback_complete = False
         if commit:
-            self._persist_and_refresh()
+            self._timeline_dragging = False
+            self.app.save_current_progress()
+            self._refresh()
+            if self._playing:
+                self._play_clock_started_at = time.monotonic()
+                self._play_clock_start_position = index
+                media = self.media
+                if media is not None and not media.frame_ready(progress.current_frame):
+                    self._play_after_id = self.after(30, self._play_tick)
+                else:
+                    self._schedule_play_tick()
         else:
             self._refresh()
 

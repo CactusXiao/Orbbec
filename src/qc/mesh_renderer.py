@@ -407,6 +407,24 @@ def _close_worker_renderers() -> None:
     _WORKER_RENDERERS.clear()
 
 
+def _write_display_preview(image: np.ndarray, target: Path, *, max_width: int) -> None:
+    """Write a smaller QC-only image after full-resolution fisheye compositing."""
+    height, width = image.shape[:2]
+    limit = max(320, int(max_width))
+    if width > limit:
+        scale = float(limit) / float(width)
+        image = cv2.resize(
+            image,
+            (limit, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp.jpg")
+    if not cv2.imwrite(str(temporary), image, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+        raise RuntimeError(f"failed to write mesh preview frame: {temporary}")
+    os.replace(temporary, target)
+
+
 def _initialize_render_worker(state: Mapping[str, Any]) -> None:
     """Initialize one process that renders complete six-view frame groups."""
     global _WORKER_STATE
@@ -425,16 +443,30 @@ def _render_frame_worker(frame: int, vertices_world: Mapping[int, np.ndarray]) -
     episode_dir = Path(str(_WORKER_STATE["episode_dir"]))
     rgb_cache_dir = Path(str(_WORKER_STATE["rgb_cache_dir"]))
     output_dir = Path(str(_WORKER_STATE["output_dir"]))
+    preview_output_dir = Path(str(_WORKER_STATE["preview_output_dir"]))
     cameras = [str(value) for value in _WORKER_STATE["cameras"]]
     camera_params = _WORKER_STATE["camera_params"]
     faces = _WORKER_STATE["faces"]
     factor = float(_WORKER_STATE["render_factor"])
     source_wait_seconds = float(_WORKER_STATE.get("source_wait_seconds") or 0.0)
+    ego_preview_max_width = int(_WORKER_STATE.get("ego_preview_max_width") or 960)
     rendered_cameras: List[str] = []
 
     for camera in cameras:
         target = output_dir / camera / f"{int(frame):05d}.jpg"
-        if target.is_file():
+        display_target = (
+            preview_output_dir / camera / f"{int(frame):05d}.jpg"
+            if camera == EGO_CAMERA
+            else target
+        )
+        if display_target.is_file():
+            continue
+        if camera == EGO_CAMERA and target.is_file():
+            existing = cv2.imread(str(target), cv2.IMREAD_COLOR)
+            if existing is None:
+                raise RuntimeError(f"failed to read existing Pico mesh frame: {target}")
+            _write_display_preview(existing, display_target, max_width=ego_preview_max_width)
+            rendered_cameras.append(camera)
             continue
         source_path = _source_frame(
             episode_dir,
@@ -484,6 +516,8 @@ def _render_frame_worker(frame: int, vertices_world: Mapping[int, np.ndarray]) -
         if not cv2.imwrite(str(temporary), rendered, [cv2.IMWRITE_JPEG_QUALITY, 92]):
             raise RuntimeError(f"failed to write mesh frame: {temporary}")
         os.replace(temporary, target)
+        if camera == EGO_CAMERA:
+            _write_display_preview(rendered, display_target, max_width=ego_preview_max_width)
         rendered_cameras.append(camera)
     return int(frame), rendered_cameras
 
@@ -513,12 +547,16 @@ def render_request(request: Mapping[str, Any]) -> None:
     episode_dir = Path(str(request["episode_dir"])).expanduser().resolve()
     rgb_cache_dir = Path(str(request["rgb_cache_dir"])).expanduser().resolve()
     output_dir = Path(str(request["output_dir"])).expanduser().resolve()
+    preview_output_dir = Path(
+        str(request.get("preview_output_dir") or (output_dir.parent / "mesh_preview"))
+    ).expanduser().resolve()
     toolkit_root = Path(str(request["mano_toolkit_root"])).expanduser().resolve()
     model_dir = Path(str(request["mano_model_dir"])).expanduser().resolve()
     cameras = [str(value) for value in request.get("cameras") or []][:6]
     frames = sorted({int(value) for value in request.get("frames") or []})
     factor = float(request.get("render_factor") or 1.0)
     requested_workers = max(1, min(32, int(request.get("workers") or 1)))
+    ego_preview_max_width = max(320, int(request.get("ego_preview_max_width") or 960))
     if not cameras or not frames:
         raise ValueError("mesh render request requires cameras and frames")
     pose_dir = episode_dir / "optimized_pose"
@@ -545,15 +583,31 @@ def render_request(request: Mapping[str, Any]) -> None:
     completed = {camera: 0 for camera in cameras}
     total = len(frames)
     progress_step = max(1, total // 100)
+    if EGO_CAMERA in cameras:
+        (preview_output_dir / EGO_CAMERA).mkdir(parents=True, exist_ok=True)
+        for frame in frames:
+            full_path = output_dir / EGO_CAMERA / f"{frame:05d}.jpg"
+            preview_path = preview_output_dir / EGO_CAMERA / f"{frame:05d}.jpg"
+            if preview_path.is_file() or not full_path.is_file():
+                continue
+            existing = cv2.imread(str(full_path), cv2.IMREAD_COLOR)
+            if existing is None:
+                raise RuntimeError(f"failed to read existing Pico mesh frame: {full_path}")
+            _write_display_preview(existing, preview_path, max_width=ego_preview_max_width)
+
+    def rendered_path(camera: str, frame: int) -> Path:
+        root = preview_output_dir if camera == EGO_CAMERA else output_dir
+        return root / camera / f"{frame:05d}.jpg"
+
     for camera in cameras:
         (output_dir / camera).mkdir(parents=True, exist_ok=True)
-        completed[camera] = sum(1 for frame in frames if (output_dir / camera / f"{frame:05d}.jpg").is_file())
+        completed[camera] = sum(1 for frame in frames if rendered_path(camera, frame).is_file())
         _emit(camera=camera, status="mesh_pending", rendered=completed[camera], total=total)
 
     pending_frames = [
         frame
         for frame in frames
-        if any(not (output_dir / camera / f"{frame:05d}.jpg").is_file() for camera in cameras)
+        if any(not rendered_path(camera, frame).is_file() for camera in cameras)
     ]
     worker_count = min(requested_workers, max(1, len(pending_frames)))
     camera_state: Dict[str, Dict[str, Any]] = {
@@ -575,6 +629,8 @@ def render_request(request: Mapping[str, Any]) -> None:
         "episode_dir": str(episode_dir),
         "rgb_cache_dir": str(rgb_cache_dir),
         "output_dir": str(output_dir),
+        "preview_output_dir": str(preview_output_dir),
+        "ego_preview_max_width": ego_preview_max_width,
         "cameras": cameras,
         "camera_params": camera_state,
         "ego_transforms": ego_transforms,

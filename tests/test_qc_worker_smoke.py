@@ -10,16 +10,38 @@ from unittest.mock import patch
 from label.video_frames import _run_ffmpeg_select
 from src.qc.config import load_qc_config
 from src.qc.media import (
+    QcEpisodeMedia,
     _count_cached,
     _load_reference_to_ego_frames,
     _qc_view_cameras,
     prepare_qc_media,
 )
 from src.qc.report import build_qc_result, write_ego_pose_qc_report
+from src.qc.playback import playback_target_position
 from src.qc.state_store import QcProgress, QcStateStore, first_sample_after, normalize_ranges
 
 
 class QcWorkerSmokeTest(unittest.TestCase):
+    def test_wall_clock_playback_skips_display_frames_instead_of_slowing_time(self) -> None:
+        self.assertEqual(
+            playback_target_position(
+                start_position=10,
+                elapsed_seconds=0.1,
+                fps=30.0,
+                last_position=100,
+            ),
+            13,
+        )
+        self.assertEqual(
+            playback_target_position(
+                start_position=98,
+                elapsed_seconds=0.2,
+                fps=30.0,
+                last_position=100,
+            ),
+            100,
+        )
+
     def test_qc_jpeg_decode_uses_compact_contiguous_select(self) -> None:
         with patch("label.video_frames.subprocess.run") as run:
             run.return_value.returncode = 0
@@ -154,6 +176,39 @@ class QcWorkerSmokeTest(unittest.TestCase):
         )
 
         self.assertEqual(_qc_view_cameras(task, include_ego=True), ["00", "02", "03", "05", "ego"])
+
+    def test_qc_media_prefers_small_pico_playback_preview(self) -> None:
+        from label.storage import CorrectionTask
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            episode_dir = root / "episode"
+            cache_dir = root / "cache"
+            task = CorrectionTask(
+                line_no=1,
+                root=str(root),
+                subject="",
+                task="",
+                episode="episode",
+                cameras=["00"],
+                frames=[0],
+                nas_root_path=str(episode_dir),
+            )
+            full = cache_dir / "mesh" / "ego" / "00000.jpg"
+            preview = cache_dir / "mesh_preview" / "ego" / "00000.jpg"
+            full.parent.mkdir(parents=True)
+            preview.parent.mkdir(parents=True)
+            full.write_bytes(b"full-resolution")
+            preview.write_bytes(b"display-preview")
+            media = QcEpisodeMedia(
+                task=task,
+                cache_dir=cache_dir,
+                requires_mesh=True,
+                view_cameras=("ego",),
+            )
+
+            self.assertEqual(media.frame_path("ego", 0), preview)
+            self.assertTrue(media.frame_ready(0))
 
     def test_loads_new_ego_pose_frame_structure_and_fisheye_calibration(self) -> None:
         try:
