@@ -14,7 +14,7 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class WorkflowStoreSmokeTest(unittest.TestCase):
-    def test_episode_storage_name_is_human_readable_and_never_reuses_released_number(self) -> None:
+    def test_episode_storage_name_is_human_readable_and_reuses_released_number(self) -> None:
         self.assertEqual(
             episode_storage_name("xiaojiazhou", "task-clean-the-bowl", 12),
             "episode12",
@@ -28,7 +28,7 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                 }
             }
         }
-        self.assertEqual(next_episode_number(subject, "task-clean-the-bowl"), 2)
+        self.assertEqual(next_episode_number(subject, "task-clean-the-bowl"), 1)
 
     def test_collection_reservation_persists_uuid_to_storage_name_mapping(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -71,6 +71,54 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             )
             mapped = store.get_episode(episode_uuid)
             self.assertEqual(mapped["episode_uri"], episode_uri)  # type: ignore[index]
+
+    def test_releasing_unsubmitted_reservation_removes_it_and_reuses_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            task_file = tmp_path / "tasks.json"
+            task_file.write_text(
+                json.dumps({"tasks": [{"task_name": "task-clean-the-bowl", "total": 20}]}),
+                encoding="utf-8",
+            )
+            store = WorkflowStore(tmp_path / "workflow.sqlite3")
+            service = JobService(store, nas_mounts={"nas://ego": str(tmp_path / "nas")})
+            backend = TaskBackend(tmp_path / "state", task_file, workflow_service=service)
+            request = {
+                "client_id": "capture-01",
+                "subject_id": "xiaojiazhou",
+                "task_name": "task-clean-the-bowl",
+            }
+
+            first = backend.reserve(request)
+            first_uuid = first["reservation_id"]
+            self.assertEqual(first["episode_number"], 1)
+            self.assertIsNotNone(store.get_episode(first_uuid))
+
+            released = backend.release(
+                {
+                    "reservation_id": first_uuid,
+                    "subject_id": "xiaojiazhou",
+                    "task_name": "task-clean-the-bowl",
+                }
+            )
+            self.assertTrue(released["released"])
+            self.assertIsNone(store.get_episode(first_uuid))
+
+            second = backend.reserve(request)
+            self.assertNotEqual(second["reservation_id"], first_uuid)
+            self.assertEqual(second["episode_number"], 1)
+            self.assertEqual(second["storage_name"], "episode1")
+            self.assertIsNotNone(store.get_episode(second["reservation_id"]))
+
+    def test_next_episode_number_fills_a_released_gap(self) -> None:
+        subject = {
+            "reservations": {
+                "confirmed-1": {"task_name": "task", "episode_number": 1, "status": "confirmed"},
+                "released-2": {"task_name": "task", "episode_number": 2, "status": "released"},
+                "confirmed-3": {"task_name": "task", "episode_number": 3, "status": "confirmed"},
+            }
+        }
+        self.assertEqual(next_episode_number(subject, "task"), 2)
 
     def test_workflow_stage_leases_are_open_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

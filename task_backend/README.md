@@ -294,11 +294,14 @@ have to match any path on the backend machine.
    `backend-sync-pending`; retry Confirm uses the same reservation and
    idempotency key. Background upload or confirmation failures retain local data
    and are reported in the collection log.
-13. Reset/Delete deletes local episode data and releases the reservation; it does
-   not increase `completed`.
-14. The capture page has a `Tasks` button for returning to the standalone task
+13. Reset/Delete deletes only the local episode data and keeps the current
+   reservation, so Start retries the same episode number without a backend call.
+14. Explicit abandon/exit releases the unsubmitted reservation. The backend
+   removes that reservation and its workflow placeholder, so the episode number
+   becomes available again as if the attempt never happened.
+15. The capture page has a `Tasks` button for returning to the standalone task
    selection page; task selection is not mixed into the capture view.
-15. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
+16. ESC, Menu, Tasks, Config, and camera-error Exit paths show a confirmation
     dialog before stopping cameras or leaving collection when applicable.
 
 The backend confirm endpoint is idempotent: repeating the same

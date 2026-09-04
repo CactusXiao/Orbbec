@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -9,6 +9,19 @@ from urllib.request import Request, urlopen
 
 class QcBackendError(Exception):
     pass
+
+
+def episode_display_id(*sources: Mapping[str, Any]) -> str:
+    """Return the human-facing episode number without exposing the backend UUID."""
+    for source in sources:
+        value = source.get("episode_index")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    for source in sources:
+        storage_name = str(source.get("storage_name") or "").strip()
+        if storage_name:
+            return storage_name
+    return "-"
 
 
 class QcBackendClient:

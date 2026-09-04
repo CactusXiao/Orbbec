@@ -824,6 +824,11 @@ class JobService:
         storage_name = str(reservation.get("storage_name") or "").strip() or _episode_storage_name(
             reservation.get("subject_id"), reservation.get("task_name"), reservation.get("episode_number")
         )
+        self.store.delete_released_collection_slot(
+            str(reservation.get("subject_id") or ""),
+            str(reservation.get("task_name") or ""),
+            storage_name,
+        )
         self.store.create_or_update_episode(
             episode_id=str(reservation.get("reservation_id") or ""),
             subject_id=str(reservation.get("subject_id") or ""),
@@ -917,9 +922,7 @@ class JobService:
         episode_id = str(reservation.get("reservation_id") or "")
         if not episode_id:
             return
-        episode = self.store.get_episode(episode_id)
-        if episode is not None:
-            self.store.update_episode_status(episode_id, "planned", {"released_from_collection": True})
+        self.store.delete_collection_reservation(episode_id)
 
     def enrich_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
         episode = self.store.get_episode(str(job.get("episode_id") or "")) if job.get("episode_id") else None

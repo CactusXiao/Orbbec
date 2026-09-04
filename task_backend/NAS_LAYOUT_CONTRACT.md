@@ -12,8 +12,9 @@ storage_name: episode<episode_index>
 ```
 
 后端 `episodes` 表用 `(subject_id, task_name, storage_name)` 唯一定位 NAS 目录，并维护
-`episode_id -> subject_id/task_name/storage_name -> episode_uri` 映射。`episode_index` 一旦分配就不复用
-（包括预约释放后），避免旧 NAS 数据被新 episode 覆盖。
+`episode_id -> subject_id/task_name/storage_name -> episode_uri` 映射。只有确认提交的 episode
+才永久占用 `episode_index`；未提交预约 Release 后视为未发生，该编号可以重新分配。采集端
+Reset 不调用后端 Release，而是保留原预约并用同一编号重采。
 
 后端记录 episode 根 URI：
 

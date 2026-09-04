@@ -6,12 +6,13 @@ import shutil
 import tempfile
 import threading
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
-    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
+    from .backend_client import BackendClientError, LabelBackendClient, LabelJobSession, episode_display_id, session_from_lease
     from .canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from .storage import (
         CorrectionProgress,
@@ -41,7 +42,7 @@ try:
     from .video_frames import ensure_decoded_rgb_frames
     from .env_config import LabelConfig, load_label_config
 except Exception:
-    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, session_from_lease
+    from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, episode_display_id, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
     from storage import (
         CorrectionProgress,
@@ -272,12 +273,12 @@ class HomePage(ttk.Frame):
         episode_host.pack(fill="both", pady=(4, 8))
         episode_cols = ("episode", "subject", "segments", "frames", "first")
         self._episode_tree = ttk.Treeview(episode_host, columns=episode_cols, show="headings", height=7)
-        self._episode_tree.heading("episode", text="Episode")
+        self._episode_tree.heading("episode", text="Episode ID")
         self._episode_tree.heading("subject", text="Subject")
         self._episode_tree.heading("segments", text="Segments")
         self._episode_tree.heading("frames", text="Frames")
         self._episode_tree.heading("first", text="First Frame")
-        self._episode_tree.column("episode", width=180, anchor="w")
+        self._episode_tree.column("episode", width=100, anchor="center")
         self._episode_tree.column("subject", width=120, anchor="w")
         self._episode_tree.column("segments", width=76, anchor="center")
         self._episode_tree.column("frames", width=70, anchor="center")
@@ -373,7 +374,7 @@ class HomePage(ttk.Frame):
             item_id = f"episode_{index}"
             episode_id = str(episode.get("episode_id") or "")
             values = (
-                episode_id,
+                episode_display_id(episode),
                 str(episode.get("subject_id") or ""),
                 str(episode.get("segments") or episode.get("pending_segments") or 0),
                 str(episode.get("frames") or 0),
@@ -609,6 +610,7 @@ class LabelPage(ttk.Frame):
     def _set_backend_session(self, session: LabelJobSession) -> bool:
         try:
             task = correction_task_from_backend_payload(session.payload, mounts=session.mounts)
+            task = replace(task, episode=episode_display_id(session.payload, session.job))
         except Exception as exc:
             messagebox.showerror("Backend Task", str(exc))
             return False
@@ -626,7 +628,8 @@ class LabelPage(ttk.Frame):
         self._backend_session = session
         self._backend_completed = False
         self._jsonl_path = None
-        self._apply_session_tasks([], {}, f"Backend job: {session.job_id}    Decoding RGB frames...", initial_source="correct")
+        display_id = episode_display_id(session.payload, session.job)
+        self._apply_session_tasks([], {}, f"Episode ID: {display_id}    Decoding RGB frames...", initial_source="correct")
         if self._frame_status is not None:
             self._frame_status.configure(text="正在解码 RGB 帧...", fg=STATUS_TODO_COLOR)
         self._schedule_backend_heartbeat()
@@ -693,7 +696,7 @@ class LabelPage(ttk.Frame):
         self._apply_session_tasks(
             [task],
             progress,
-            f"Backend job: {self._backend_session.job_id if self._backend_session else task.key}",
+            f"Episode ID: {episode_display_id(self._backend_session.payload, self._backend_session.job) if self._backend_session else task.episode}",
             auto_open_first=True,
             initial_source="correct",
         )

@@ -11806,7 +11806,7 @@ int run_collection(const AppConfig &cfg,
             const bool modalFault = !modalExit && cameraFaultActive;
             const bool modalDelete = !modalExit && !modalFault && (captureState == CaptureState::DELETE_CONFIRM);
             const bool allowStart  = !modalFault && !modalDelete && (captureState == CaptureState::IDLE)
-                                     && !modalExit && !currentReservation.active
+                                     && !modalExit
                                      && !manualExtrinsicRecheckPending && readyForStart;
             const bool allowStop   = !modalFault && !modalDelete && !modalExit && (captureState == CaptureState::RECORDING);
             const bool allowSave   = !modalFault && !modalDelete && !modalExit
@@ -12043,10 +12043,6 @@ int run_collection(const AppConfig &cfg,
                         pushUiLog("Delete failed before camera restart: " + error);
                         announce("delete_failed", "delete failed");
                     }
-                    if(okToRestart && currentReservation.active && !currentReservation.localFinalized) {
-                        okToRestart = releaseCurrentReservation("camera restart");
-                    }
-
                     if(okToRestart) {
                         if(hadSession) {
                             pushUiLog("Faulted episode deleted.");
@@ -12107,33 +12103,58 @@ int run_collection(const AppConfig &cfg,
                 const fs::path root = cfg.collection.savePath;
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
-                TaskEpisodeReservation reservation;
-                std::string backendError;
-                bool ok = backendClient.reserveEpisode(collectionClientId, subject, taskName, collectionOperatorId, reservation, &backendError);
-                if(!ok) {
-                    capUi.msg = "Backend reserve failed: " + backendError;
+                bool ok = true;
+                if(!currentReservation.active) {
+                    TaskEpisodeReservation reservation;
+                    std::string backendError;
+                    ok = backendClient.reserveEpisode(
+                        collectionClientId,
+                        subject,
+                        taskName,
+                        collectionOperatorId,
+                        reservation,
+                        &backendError);
+                    if(!ok) {
+                        capUi.msg = "Backend reserve failed: " + backendError;
+                        pushUiLog(capUi.msg);
+                        announce("start_failed", "start failed");
+                    }
+                    else {
+                        currentReservation.clear();
+                        currentReservation.active = true;
+                        currentReservation.reservationId = reservation.reservationId;
+                        currentReservation.taskName = reservation.taskName;
+                        currentReservation.storageName = reservation.storageName;
+                        currentReservation.episodeNumber = reservation.episodeNumber;
+                        currentReservation.collectionPath = root / subject / reservation.taskName
+                                                            / ("episode_" + std::to_string(reservation.episodeNumber));
+                        currentReservation.idempotencyKey = makeIdempotencyKey(
+                            collectionClientId,
+                            reservation.reservationId,
+                            reservation.episodeNumber);
+                        capUi.currentEpisode = reservation.episodeNumber;
+                        pushUiLog("Backend reserved: " + reservation.taskName
+                                  + " ep" + std::to_string(reservation.episodeNumber));
+                    }
+                }
+                else if(currentReservation.taskName != taskName) {
+                    ok = false;
+                    capUi.msg = "Active reservation belongs to another task";
                     pushUiLog(capUi.msg);
-                    announce("start_failed", "start failed");
+                }
+                else {
+                    capUi.currentEpisode = currentReservation.episodeNumber;
+                    pushUiLog("Retrying existing reservation: " + currentReservation.taskName
+                              + " ep" + std::to_string(currentReservation.episodeNumber));
                 }
                 if(ok) {
-                    currentReservation.clear();
-                    currentReservation.active = true;
-                    currentReservation.reservationId = reservation.reservationId;
-                    currentReservation.taskName = reservation.taskName;
-                    currentReservation.storageName = reservation.storageName;
-                    currentReservation.episodeNumber = reservation.episodeNumber;
-                    currentReservation.collectionPath = root / subject / reservation.taskName
-                                                        / ("episode_" + std::to_string(reservation.episodeNumber));
-                    currentReservation.idempotencyKey = makeIdempotencyKey(collectionClientId,
-                                                                           reservation.reservationId,
-                                                                           reservation.episodeNumber);
-                    capUi.currentEpisode = reservation.episodeNumber;
-                    pushUiLog("Backend reserved: " + reservation.taskName
-                              + " ep" + std::to_string(reservation.episodeNumber));
-
                     ok = recorder.start(cfgUi);
                     if(ok) {
-                        ok = recorder.beginRecord(root, subject, reservation.taskName, reservation.episodeNumber);
+                        ok = recorder.beginRecord(
+                            root,
+                            subject,
+                            currentReservation.taskName,
+                            currentReservation.episodeNumber);
                     }
                 }
                 if(!ok) {
@@ -12147,9 +12168,6 @@ int run_collection(const AppConfig &cfg,
                         if(!line.empty()) {
                             pushUiLog(line);
                         }
-                    }
-                    if(currentReservation.active && !currentReservation.localFinalized) {
-                        (void)releaseCurrentReservation("start failed");
                     }
                 }
                 else {
@@ -12286,19 +12304,13 @@ int run_collection(const AppConfig &cfg,
                 std::string error;
                 if(recorder.discardCurrentSession(&error)) {
                     recorder.clearStatus();
-                    const bool releaseOk = releaseCurrentReservation("reset");
                     captureState = CaptureState::IDLE;
                     pendingResetAfterDrain = false;
                     resetDrainStatusTracking();
                     resetCameraReadyAnnouncement();
-                    if(releaseOk) {
-                        capUi.msg = "Capture discarded";
-                        pushUiLog("Reset OK. Current episode discarded.");
-                        announce("reset_confirm", "reset confirmed");
-                    }
-                    else {
-                        announce("delete_failed", "delete failed");
-                    }
+                    capUi.msg = "Capture discarded. Press Start to retry the same episode.";
+                    pushUiLog("Reset OK. Current episode discarded; reservation retained for retry.");
+                    announce("reset_confirm", "reset confirmed");
                 }
                 else {
                     capUi.msg = "Delete failed";

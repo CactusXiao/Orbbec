@@ -549,6 +549,62 @@ class WorkflowStore:
             )
             return self._get_episode_unlocked(conn, episode_id) or episode
 
+    def delete_collection_reservation(self, episode_id: str) -> bool:
+        episode_id = str(episode_id or "").strip()
+        if not episode_id:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "episode_id is required")
+        with self.connect() as conn:
+            episode = self._get_episode_unlocked(conn, episode_id)
+            if episode is None:
+                return True
+            released_legacy_slot = (
+                episode.get("status") == "planned"
+                and bool((episode.get("metadata") or {}).get("released_from_collection"))
+            )
+            if episode.get("status") != "reserved_for_collection" and not released_legacy_slot:
+                raise WorkflowError(
+                    HTTPStatus.CONFLICT,
+                    f"cannot release collection reservation in status {episode.get('status')}: {episode_id}",
+                )
+            if self._episode_has_dependencies_unlocked(conn, episode_id):
+                raise WorkflowError(
+                    HTTPStatus.CONFLICT,
+                    f"cannot release collection reservation with downstream data: {episode_id}",
+                )
+            deleted = conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,)).rowcount
+            return deleted == 1
+
+    def delete_released_collection_slot(self, subject_id: str, task_name: str, storage_name: str) -> bool:
+        subject_id = str(subject_id or "").strip()
+        task_name = str(task_name or "").strip()
+        storage_name = str(storage_name or "").strip()
+        if not subject_id or not task_name or not storage_name:
+            return False
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM episodes
+                WHERE subject_id = ? AND task_name = ? AND storage_name = ?
+                """,
+                (subject_id, task_name, storage_name),
+            ).fetchall()
+            deleted = False
+            for row in rows:
+                episode = self._row_to_episode(row)
+                metadata = episode.get("metadata") or {}
+                if episode.get("status") != "planned" or not metadata.get("released_from_collection"):
+                    continue
+                episode_id = str(episode.get("episode_id") or "")
+                if self._episode_has_dependencies_unlocked(conn, episode_id):
+                    raise WorkflowError(
+                        HTTPStatus.CONFLICT,
+                        f"released collection slot has downstream data: {episode_id}",
+                    )
+                deleted = bool(
+                    conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,)).rowcount
+                ) or deleted
+            return deleted
+
     def update_episode_storage(
         self,
         episode_id: str,
@@ -1267,6 +1323,17 @@ class WorkflowStore:
     def _get_episode_unlocked(self, conn: sqlite3.Connection, episode_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()
         return self._row_to_episode(row) if row is not None else None
+
+    @staticmethod
+    def _episode_has_dependencies_unlocked(conn: sqlite3.Connection, episode_id: str) -> bool:
+        for table in ("artifacts", "jobs", "segments", "nas_sync_outbox"):
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE episode_id = ? LIMIT 1",
+                (episode_id,),
+            ).fetchone()
+            if row is not None:
+                return True
+        return False
 
     def _get_job_unlocked(self, conn: sqlite3.Connection, job_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()

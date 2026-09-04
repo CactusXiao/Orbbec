@@ -16,7 +16,7 @@ except Exception:
     from ...label.canvas_view import ImageAnnotatorCanvas  # type: ignore
     from ...label.theme import Theme, apply_theme  # type: ignore
 
-from .backend import QcBackendClient, QcBackendError
+from .backend import QcBackendClient, QcBackendError, episode_display_id
 from .config import QcConfig
 from .media import MeshRendererSettings, QcEpisodeMedia, prepare_qc_media
 from .playback import playback_target_position
@@ -632,20 +632,19 @@ class EpisodeSelectionPage(ttk.Frame):
         ttk.Button(top, text="刷新", style="Secondary.TButton", command=lambda: self.app.refresh_episodes(self._task_name)).pack(side="right")
         self._status = ttk.Label(outer, text="", style="Muted.TLabel")
         self._status.pack(fill="x", pady=(8, 10))
-        cols = ("status", "episode", "subject", "index", "frames", "lease")
+        cols = ("status", "episode", "subject", "frames", "lease")
         self._tree = ttk.Treeview(outer, columns=cols, show="headings")
         headings = {
             "status": "状态",
-            "episode": "Episode",
+            "episode": "Episode ID",
             "subject": "Subject",
-            "index": "Index",
             "frames": "帧数",
             "lease": "租期剩余",
         }
-        widths = {"status": 120, "episode": 360, "subject": 150, "index": 80, "frames": 100, "lease": 160}
+        widths = {"status": 120, "episode": 110, "subject": 180, "frames": 100, "lease": 160}
         for col in cols:
             self._tree.heading(col, text=headings[col])
-            self._tree.column(col, width=widths[col], anchor="center" if col != "episode" else "w")
+            self._tree.column(col, width=widths[col], anchor="center")
         self._tree.pack(fill="both", expand=True)
         self._tree.bind("<Double-1>", self._open_selected)
         self._tree.bind("<Return>", self._open_selected)
@@ -671,23 +670,21 @@ class EpisodeSelectionPage(ttk.Frame):
             self._tree.insert("", "end", iid=iid, values=self._values(kind, entry))
         self._schedule_countdown()
 
-    def _values(self, kind: str, entry: Any) -> Tuple[str, str, str, str, str, str]:
+    def _values(self, kind: str, entry: Any) -> Tuple[str, str, str, str, str]:
         if kind == "local":
             progress: QcProgress = entry
             return (
                 "进行中",
-                progress.episode_id,
+                episode_display_id(progress.episode, progress.payload),
                 str(progress.episode.get("subject_id") or progress.payload.get("subject_id") or ""),
-                str(progress.episode.get("episode_index") or ""),
                 str(len(progress.frames)),
                 format_seconds(progress.lease_seconds_remaining),
             )
         item = dict(entry or {})
         return (
             "可领取",
-            str(item.get("episode_id") or ""),
+            episode_display_id(item),
             str(item.get("subject_id") or ""),
-            str(item.get("episode_index") or ""),
             str(item.get("frames_count") or len(item.get("frames") or [])),
             "",
         )
@@ -742,7 +739,8 @@ class DecodePage(ttk.Frame):
         self._tree.pack(fill="x")
 
     def reset(self, progress: QcProgress) -> None:
-        self._status.configure(text=f"Episode：{progress.episode_id}    正在准备四路 RGB 与 Pico Ego MANO 投影视图")
+        display_id = episode_display_id(progress.episode, progress.payload)
+        self._status.configure(text=f"Episode ID：{display_id}    正在准备四路 RGB 与 Pico Ego MANO 投影视图")
         self._tree.delete(*self._tree.get_children())
         self._rows = {}
         available = [str(camera) for camera in progress.payload.get("cameras") or []]
@@ -1107,7 +1105,7 @@ class QcPage(ttk.Frame):
         ego_ranges = ", ".join(f"{a}-{b}" for a, b in progress.ego_bad_frame_ranges) or "无"
         self._info.configure(
             text=(
-                f"Task：{progress.task_name}    Episode：{progress.episode_id}    "
+                f"Task：{progress.task_name}    Episode ID：{episode_display_id(progress.episode, progress.payload)}    "
                 f"当前帧：{frame} / {progress.last_frame}    手部 Pose：{ranges}    EgoPose：{ego_ranges}"
             )
         )

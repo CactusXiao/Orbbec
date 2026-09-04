@@ -624,6 +624,8 @@ def next_episode_number(subject: Dict[str, Any], task_name: str) -> int:
     for item in subject.get("reservations", {}).values():
         if item.get("task_name") != task_name:
             continue
+        if item.get("status") == "released":
+            continue
         try:
             episode = int(item.get("episode_number", 0))
         except (TypeError, ValueError):
@@ -1126,13 +1128,18 @@ class TaskBackend:
         self.workflow_service = workflow_service
         self.data_root.mkdir(parents=True, exist_ok=True)
 
-    def _workflow_hook(self, method_name: str, payload: Dict[str, Any]) -> None:
+    def _workflow_hook(self, method_name: str, payload: Dict[str, Any], *, required: bool = False) -> None:
         if self.workflow_service is None:
             return
         try:
             method = getattr(self.workflow_service, method_name)
             method(dict(payload))
         except Exception as exc:
+            if required:
+                raise BackendError(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    f"workflow hook {method_name} failed: {exc}",
+                ) from exc
             print(f"[task-backend] workflow hook {method_name} failed: {exc}", file=sys.stderr)
 
     @contextmanager
@@ -1384,7 +1391,7 @@ class TaskBackend:
                 "updated_at": now_iso(),
             }
             subject["reservations"][reservation_id] = reservation
-            self._workflow_hook("record_collection_reservation", reservation)
+            self._workflow_hook("record_collection_reservation", reservation, required=True)
             return {
                 "reservation_id": reservation_id,
                 "task_name": task_name,
@@ -1492,12 +1499,20 @@ class TaskBackend:
             if task_name and reservation.get("task_name") != task_name:
                 raise BackendError(HTTPStatus.CONFLICT, "reservation does not match task")
             if reservation.get("status") == "reserved":
-                reservation["status"] = "released"
-                reservation["released_at"] = now_iso()
-                reservation["updated_at"] = now_iso()
-                reservation["released_by"] = operator_id
+                released_reservation = {
+                    **reservation,
+                    "status": "released",
+                    "released_at": now_iso(),
+                    "released_by": operator_id,
+                }
+                self._workflow_hook("record_collection_release", released_reservation, required=True)
+                del subject["reservations"][reservation_id]
+                idempotency = subject.get("idempotency", {})
+                if isinstance(idempotency, dict):
+                    for key, value in list(idempotency.items()):
+                        if value == reservation_id:
+                            del idempotency[key]
                 released = True
-                self._workflow_hook("record_collection_release", reservation)
             else:
                 released = False
             return {"released": released, **progress_payload(subject_id, subject, self.tasks, state)}

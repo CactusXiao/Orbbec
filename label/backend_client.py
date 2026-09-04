@@ -13,6 +13,19 @@ class BackendClientError(Exception):
     pass
 
 
+def episode_display_id(*sources: Mapping[str, Any]) -> str:
+    """Return the human-facing episode number without exposing the backend UUID."""
+    for source in sources:
+        value = source.get("episode_index")
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    for source in sources:
+        storage_name = str(source.get("storage_name") or "").strip()
+        if storage_name:
+            return storage_name
+    return "-"
+
+
 @dataclass(frozen=True)
 class LabelJobSession:
     client: "LabelBackendClient"
