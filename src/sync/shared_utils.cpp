@@ -552,6 +552,19 @@ AppConfig loadConfig(const fs::path &configPath) {
         cfg.colorfulCloudPoints = *v;
     }
 
+    if(auto *collectionObj = cJSON_GetObjectItemCaseSensitive(root, "collection")) {
+        if(cJSON_IsObject(collectionObj)) {
+            if(auto v = getString(collectionObj, "savePath")) {
+                const std::string value = trimString(*v);
+                cfg.collection.savePath = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+            }
+            else if(auto v = getString(collectionObj, "save_path")) {
+                const std::string value = trimString(*v);
+                cfg.collection.savePath = value.empty() ? fs::path() : resolveConfigRelativePath(value);
+            }
+        }
+    }
+
     if(auto *filtersObj = cJSON_GetObjectItemCaseSensitive(root, "filters")) {
         if(cJSON_IsObject(filtersObj)) {
             if(auto v = getString(filtersObj, "preset")) {

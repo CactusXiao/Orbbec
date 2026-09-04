@@ -838,7 +838,6 @@ struct CollectionConfigUi {
     bool enableFisheyes  = false;
     bool enableEgo       = false;
     bool enableTouch     = false;
-    std::string saveRoot;
     std::string subjectId = "test";
     std::string exposureMs;
     std::string brightness;
@@ -849,7 +848,7 @@ struct CollectionConfigUi {
     void enforceRules() {}
 
     bool hasRequiredFields() const {
-        return !trimString(saveRoot).empty() && !trimString(subjectId).empty();
+        return !trimString(subjectId).empty();
     }
 
     bool hasSelectedCaptureType() const {
@@ -10975,9 +10974,12 @@ int run_collection(const AppConfig &cfg,
             }
 
             const int fieldsTop = top + 2 * rowH;
-            if(uiTextField(ui, cv::Rect(left, fieldsTop, 520, 36), "save_path (required)", cfgUi.saveRoot, cfgUi.activeField == "save", fm)) {
-                cfgUi.activeField = "save";
-            }
+            cv::putText(ui, "save_path (config)", cv::Point(left, fieldsTop - 6),
+                        cv::FONT_HERSHEY_DUPLEX, 0.55, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            cv::rectangle(ui, cv::Rect(left, fieldsTop, 520, 36), cv::Scalar(30, 30, 30), cv::FILLED);
+            cv::rectangle(ui, cv::Rect(left, fieldsTop, 520, 36), cv::Scalar(100, 140, 160), 1);
+            cv::putText(ui, cfg.collection.savePath.string(), cv::Point(left + 8, fieldsTop + 26),
+                        cv::FONT_HERSHEY_DUPLEX, 0.65, cv::Scalar(220, 245, 255), 1, cv::LINE_AA);
             const cv::Rect subjectRect(left + 560, fieldsTop, 260, 36);
             if(subjectBoundToLogin) {
                 cv::rectangle(ui, subjectRect, cv::Scalar(30, 30, 30), cv::FILLED);
@@ -11022,15 +11024,27 @@ int run_collection(const AppConfig &cfg,
                     announce("enter_failed", "enter failed");
                 }
                 else if(!cfgUi.hasRequiredFields()) {
-                    cfgUi.error = "save_path and login account are required";
+                    cfgUi.error = "login account is required";
                     announce("enter_failed", "enter failed");
                 }
                 else {
-                    const fs::path saveRoot = fs::path(trimString(cfgUi.saveRoot));
-                    const std::string subject = trimString(cfgUi.subjectId);
-                    (void)saveRoot;
-                    (void)subject;
-                    if(!cfg.taskBackend.enabled) {
+                    const fs::path saveRoot = cfg.collection.savePath;
+                    std::error_code pathEc;
+                    const fs::path resolvedSaveRoot = fs::weakly_canonical(saveRoot, pathEc);
+                    std::error_code nasEc;
+                    const fs::path resolvedNasRoot = cfg.taskBackend.nas.mountPath.empty()
+                        ? fs::path()
+                        : fs::weakly_canonical(cfg.taskBackend.nas.mountPath, nasEc);
+                    if(saveRoot.empty()) {
+                        cfgUi.error = "collection.savePath is empty in config.json";
+                        announce("enter_failed", "enter failed");
+                    }
+                    else if(!pathEc && !nasEc && !resolvedNasRoot.empty()
+                            && pathIsSameOrBelow(resolvedSaveRoot, resolvedNasRoot)) {
+                        cfgUi.error = "collection.savePath must not be inside the NAS mount";
+                        announce("enter_failed", "enter failed");
+                    }
+                    else if(!cfg.taskBackend.enabled) {
                         cfgUi.error = "Task backend is disabled in config";
                         announce("enter_failed", "enter failed");
                     }
@@ -11063,10 +11077,7 @@ int run_collection(const AppConfig &cfg,
             if(!exitConfirmActive && !cfgUi.activeField.empty() && key > 0) {
                 const bool ctrlFromMask = ((key & 0x20000) != 0) || ((key & 0x04000000) != 0);
                 const bool ctrlHeld = g_ctrlShortcutListening || ctrlFromMask;
-                if(cfgUi.activeField == "save") {
-                    handleTextInputShortcut(cfgUi.saveRoot, key, ctrlHeld);
-                }
-                else if(!subjectBoundToLogin && cfgUi.activeField == "sub") {
+                if(!subjectBoundToLogin && cfgUi.activeField == "sub") {
                     handleTextInputShortcut(cfgUi.subjectId, key, ctrlHeld);
                 }
                 else if(cfgUi.activeField == "exp") {
@@ -11415,7 +11426,7 @@ int run_collection(const AppConfig &cfg,
                 pushUiLog(isManualRecheck ? "Resampling camera extrinsics..."
                                           : "Checking camera extrinsics before READY...");
 
-                const fs::path root = fs::path(trimString(cfgUi.saveRoot));
+                const fs::path root = cfg.collection.savePath;
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 const int episodeN = capUi.currentEpisode;
@@ -12093,7 +12104,7 @@ int run_collection(const AppConfig &cfg,
                 collectionSetStage("ui_capture_start");
                 cfgUi.enforceRules();
                 resetDrainStatusTracking();
-                const fs::path root = fs::path(trimString(cfgUi.saveRoot));
+                const fs::path root = cfg.collection.savePath;
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 TaskEpisodeReservation reservation;

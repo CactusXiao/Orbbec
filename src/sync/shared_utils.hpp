@@ -212,6 +212,10 @@ struct TaskBackendConfig {
     NasConfig   nas;
 };
 
+struct CollectionConfig {
+    fs::path savePath = "/data/local";
+};
+
 struct FrontendLaunchConfig {
     ManualLabelFrontendConfig label;
     QcFrontendConfig          qc;
@@ -244,6 +248,7 @@ struct AppConfig {
     int                       colorCloudRgbFrameOffset = 0;
     SaveOptions               save;
     VoiceFeedbackConfig       voiceFeedback;
+    CollectionConfig          collection;
     TaskBackendConfig         taskBackend;
     FrontendLaunchConfig      frontends;
     EgoModuleConfig           ego;

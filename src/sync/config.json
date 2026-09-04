@@ -70,6 +70,10 @@
     "enableSync": true,
     "colorBrightness": -1,
     "colorCloudRgbFrameOffset": 0,
+    "collection": {
+        "_comment": "Local temporary capture root. Completed episodes are uploaded to taskBackend.nas.mountPath.",
+        "savePath": "/data/local"
+    },
     "queueCapacity": 1024,
     "writerThreads": 0,
     "recordQueueCapacity": 1024,
