@@ -41,6 +41,7 @@ try:
     from .tracking import CoTrackerRuntime
     from .video_frames import ensure_decoded_rgb_frames
     from .env_config import LabelConfig, load_label_config
+    from .mesh_cache import OriginalMeshCache
 except Exception:
     from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, episode_display_id, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
@@ -71,6 +72,7 @@ except Exception:
     from tracking import CoTrackerRuntime
     from video_frames import ensure_decoded_rgb_frames
     from env_config import LabelConfig, load_label_config
+    from label.mesh_cache import OriginalMeshCache
 
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
@@ -466,7 +468,13 @@ class LabelPage(ttk.Frame):
         self._mano_btn: Optional[ttk.Button] = None
         self._frame_status: Optional[tk.Label] = None
 
+        self._original_mesh_cache = None
+        self._mesh_poll_id = None
         self._build_ui()
+        for number in range(1, 7):
+            self.winfo_toplevel().bind(
+                f"<KeyPress-{number}>", lambda event, index=number - 1: self._camera_shortcut(event, index), add="+"
+            )
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, style="TFrame")
@@ -508,7 +516,7 @@ class LabelPage(ttk.Frame):
         btn_row.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
         btn_row.add(ttk.Button(btn_row, text="上一帧", style="Small.TButton", command=self._back_frame))
         btn_row.add(ttk.Button(btn_row, text="下一帧", style="Small.TButton", command=self._skip_frame))
-        btn_row.add(ttk.Button(btn_row, text="上一机位", style="Small.TButton", command=self._prev_cam))
+        btn_row.add(ttk.Button(btn_row, text="上一机位（1–6 切换）", style="Small.TButton", command=self._prev_cam))
         btn_row.add(ttk.Button(btn_row, text="下一机位", style="Small.TButton", command=self._next_cam))
         btn_row.add(ttk.Button(btn_row, text="撤销", style="Small.TButton", command=self._undo))
         btn_row.add(ttk.Button(btn_row, text="忽略视角", style="Small.TButton", command=self._ignore_view))
@@ -542,8 +550,10 @@ class LabelPage(ttk.Frame):
 
         self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
         self._canvas.pack(fill="both", expand=True)
+        self._mesh_notice = ttk.Label(canvas_host, text="", style="PanelMuted.TLabel", padding=8)
 
     def on_hide(self) -> None:
+        self._stop_original_mesh_cache()
         self._decode_generation += 1
         self._cancel_backend_heartbeat()
         self._cleanup_decode_cache()
@@ -571,6 +581,7 @@ class LabelPage(ttk.Frame):
             self._frame_status.configure(text="")
 
     def release_on_exit(self) -> None:
+        self._stop_original_mesh_cache()
         self._release_backend_job("operator_exit")
 
     def set_session(self, *, session: Any = None, jsonl_path: str = "") -> bool:
@@ -687,6 +698,7 @@ class LabelPage(ttk.Frame):
         )
 
     def _cleanup_decode_cache(self) -> None:
+        self._stop_original_mesh_cache()
         cache_dir = self._decode_cache_dir
         self._decode_cache_dir = None
         if cache_dir is None:
@@ -853,6 +865,7 @@ class LabelPage(ttk.Frame):
             messagebox.showerror("Error", str(exc))
             return
 
+        self._stop_original_mesh_cache()
         self._active_key = task.key
         self._active_task = task
         self._active_bundle = bundle
@@ -867,6 +880,7 @@ class LabelPage(ttk.Frame):
         if self._frame_pos < 0:
             self._frame_pos = 0
         self._load_current_sample()
+        self._start_original_mesh_cache()
 
     def _next_unconfirmed_position(self, task: CorrectionTask, start: int) -> int:
         total = task.total_frames
@@ -970,7 +984,7 @@ class LabelPage(ttk.Frame):
 
     def _build_modified_view_state(self, frame_idx: int, cam_id: str) -> Tuple[HandPoints, HandVisible]:
         bundle = self._ensure_bundle("correct")
-        original = self._build_mano_3d_view_state(frame_idx, cam_id)
+        original = self._build_visible_mano_view_state(frame_idx, cam_id)
         if source_frame_path(bundle, frame_idx, cam_id) is not None:
             saved_points, saved_visible = view_state_from_bundle(bundle, frame_idx, cam_id)
             if original is None:
@@ -1014,6 +1028,14 @@ class LabelPage(ttk.Frame):
             )
             return None
 
+        return state
+
+    def _build_visible_mano_view_state(self, frame_idx: int, cam_id: str) -> Optional[Tuple[HandPoints, HandVisible]]:
+        state = self._build_mano_3d_view_state(frame_idx, cam_id)
+        if state is None:
+            return None
+        task = self._active_task
+        err_key = (task.key, int(frame_idx), str(cam_id))
         points, projected_visible = state
         try:
             original_visible = load_joint_visibility(
@@ -1025,7 +1047,8 @@ class LabelPage(ttk.Frame):
             self._mano_projection_errors[err_key] = str(exc)
             return None
         if original_visible is None:
-            return points, projected_visible
+            self._mano_projection_errors[err_key] = f"Missing joints_vis for camera {cam_id}, frame {frame_idx}"
+            return None
 
         visible = [
             [bool(projected_visible[hand][joint] and original_visible[hand][joint]) for joint in range(21)]
@@ -1245,6 +1268,7 @@ class LabelPage(ttk.Frame):
             self._mano_btn.master._schedule()
 
     def _reset_mano(self) -> None:
+        self._clear_original_mesh_preview()
         self._show_mano = False
         self._mano_mesh = None
         self._update_mano_button()
@@ -1265,6 +1289,7 @@ class LabelPage(ttk.Frame):
         self._sync_visualization_canvas_state()
 
     def _reset_visualizations(self) -> None:
+        self._clear_original_mesh_preview()
         self._show_mano = False
         self._mano_mesh = None
         self._show_skeleton = False
@@ -1349,6 +1374,49 @@ class LabelPage(ttk.Frame):
             return
         self._canvas.set_skeleton_overlay(points, visible)
 
+    def _start_original_mesh_cache(self) -> None:
+        if self._active_task is None or self._original_mesh_cache is not None:
+            return
+        try:
+            self._original_mesh_cache = OriginalMeshCache(self._active_task)
+        except Exception as exc:
+            self._mesh_notice.configure(text=f"MANO 渲染失败：{exc}")
+
+    def _stop_original_mesh_cache(self) -> None:
+        self._clear_original_mesh_preview()
+        cache = self._original_mesh_cache
+        self._original_mesh_cache = None
+        if cache is not None:
+            cache.close()
+
+    def _clear_original_mesh_preview(self) -> None:
+        if self._mesh_poll_id is not None:
+            self.after_cancel(self._mesh_poll_id)
+            self._mesh_poll_id = None
+        self._canvas.set_rendered_image(None)
+        self._mesh_notice.place_forget()
+
+    def _refresh_original_mesh_preview(self) -> None:
+        if self._mesh_poll_id is not None:
+            self.after_cancel(self._mesh_poll_id)
+            self._mesh_poll_id = None
+        if not self._show_mano or self._mode != "mano" or self._active_task is None:
+            return
+        cache = self._original_mesh_cache
+        camera = self._active_cam_id()
+        frame = self._active_task.frames[self._frame_pos]
+        path = cache.path(camera, frame) if cache is not None else None
+        self._canvas.set_rendered_image(path)
+        if path is not None:
+            self._mesh_notice.place_forget()
+            return
+        if cache is not None:
+            text = f"MANO 渲染失败：{cache.error}" if cache.error else f"MANO 后台渲染中 · 机位 {camera} · 帧 {frame}"
+            self._mesh_notice.configure(text=text)
+            if not cache.done_event.is_set():
+                self._mesh_poll_id = self.after(200, self._refresh_original_mesh_preview)
+        self._mesh_notice.place(relx=0.5, y=12, anchor="n")
+
     def _toggle_mano(self) -> None:
         if self._show_mano:
             self._reset_mano()
@@ -1358,6 +1426,13 @@ class LabelPage(ttk.Frame):
         if task is None:
             return
         self._reset_skeleton()
+        if self._mode == "mano":
+            self._show_mano = True
+            self._start_original_mesh_cache()
+            self._update_mano_button()
+            self._refresh_original_mesh_preview()
+            self._sync_visualization_canvas_state()
+            return
         self._cache_current_source_state()
         frame_idx = task.frames[self._frame_pos]
         self._ensure_all_view_states_loaded(frame_idx)
@@ -1385,6 +1460,9 @@ class LabelPage(ttk.Frame):
         self._sync_visualization_canvas_state()
 
     def _refresh_mano_overlay(self) -> None:
+        if self._show_mano and self._mode == "mano":
+            self._refresh_original_mesh_preview()
+            return
         if not self._show_mano or self._mano_mesh is None or self._active_task is None:
             self._canvas.set_mano_overlay([])
             return
@@ -1502,6 +1580,20 @@ class LabelPage(ttk.Frame):
                     missing += 1
         return missing
 
+    def _camera_shortcut(self, event, index: int):
+        if not self.winfo_ismapped() or self._active_task is None:
+            return None
+        if event.widget.winfo_class() in {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"}:
+            return None
+        if event.state & (0x4 | 0x8 | 0x20000):
+            return None
+        if index >= len(self._camera_ids):
+            return None
+        self._cache_current_source_state()
+        self._cam_idx = index
+        self._refresh_view()
+        return "break"
+
     def _prev_cam(self) -> None:
         if not self._camera_ids:
             return
@@ -1517,12 +1609,12 @@ class LabelPage(ttk.Frame):
         self._refresh_view()
 
     def _undo(self) -> None:
-        if self._visualization_active():
+        if self._mode == "mano" or self._visualization_active():
             return
         self._canvas.undo()
 
     def _ignore_view(self) -> None:
-        if self._visualization_active():
+        if self._mode == "mano" or self._visualization_active():
             return
         self._canvas.ignore_view()
 
@@ -1535,7 +1627,10 @@ class LabelPage(ttk.Frame):
             return
         self._source_state_cache.clear()
         self._view_states = {}
+        keep_mano = self._mode == "mano" and self._show_mano
         self._reset_visualizations()
+        self._show_mano = keep_mano
+        self._update_mano_button()
         self._frame_pos = next_pos
         self._load_current_sample()
 
@@ -1548,7 +1643,10 @@ class LabelPage(ttk.Frame):
             return
         self._source_state_cache.clear()
         self._view_states = {}
+        keep_mano = self._mode == "mano" and self._show_mano
         self._reset_visualizations()
+        self._show_mano = keep_mano
+        self._update_mano_button()
         self._frame_pos = prev_pos
         self._load_current_sample()
 

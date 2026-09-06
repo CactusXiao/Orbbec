@@ -58,6 +58,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
         self._img_path: Optional[Path] = None
         self._base_image: Optional[Image.Image] = None
+        self._rendered_image: Optional[Image.Image] = None
+        self._rendered_path: Optional[Path] = None
         self._imgtk: Optional[ImageTk.PhotoImage] = None
         self._img_item: Optional[int] = None
 
@@ -106,6 +108,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._cancel_pending_fit()
         self._img_path = None
         self._base_image = None
+        self._rendered_image = None
+        self._rendered_path = None
         self._imgtk = None
         if self._img_item is not None:
             self.delete(self._img_item)
@@ -138,6 +142,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._panning = False
         self._img_path = path
         self._base_image = None
+        self._rendered_image = None
+        self._rendered_path = None
         self._imgtk = None
         self._view_user_adjusted = False
         self._focus_region = None
@@ -162,6 +168,18 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
         self._hide_message()
         self._fit_and_render_image()
+
+    def set_rendered_image(self, path: Optional[Path]) -> None:
+        """Swap QC's composited preview without changing annotations, pan or zoom."""
+        if path == self._rendered_path:
+            return
+        self._rendered_path = path
+        self._rendered_image = None
+        if path is not None:
+            with Image.open(path) as image:
+                self._rendered_image = image.convert("RGB")
+        self._render_image()
+        self._render_overlay()
 
     def set_hand_state(self, points: HandPoints, visible: HandVisible) -> None:
         self._locate_joint = None
@@ -640,7 +658,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
                 self.delete(self._img_item)
                 self._img_item = None
             return
-        img = self._base_image.crop((source_x1, source_y1, source_x2, source_y2))
+        display_image = self._rendered_image if self._rendered_image is not None else self._base_image
+        img = display_image.crop((source_x1, source_y1, source_x2, source_y2))
         tw = max(1, int(round((source_x2 - source_x1) * scale)))
         th = max(1, int(round((source_y2 - source_y1) * scale)))
         img = img.resize((tw, th), Image.BILINEAR)

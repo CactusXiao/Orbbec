@@ -58,7 +58,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                     return bundle
 
                 @staticmethod
-                def _build_mano_3d_view_state(_frame_idx, _cam_id):
+                def _build_visible_mano_view_state(_frame_idx, _cam_id):
                     return original
 
                 @staticmethod
@@ -107,7 +107,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                     return bundle
 
                 @staticmethod
-                def _build_mano_3d_view_state(_frame_idx, _cam_id):
+                def _build_visible_mano_view_state(_frame_idx, _cam_id):
                     return (
                         [[(100.0 + joint, 200.0 + joint) for joint in range(21)] for _ in range(2)],
                         [[True for _ in range(21)] for _ in range(2)],
@@ -127,7 +127,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         self.assertEqual(reloaded_points[1][4], (104.0, 204.0))
         self.assertTrue(reloaded_visible[1][4])
 
-    def test_original_view_uses_joints_vis_in_canvas_joint_order(self) -> None:
+    def test_modified_initial_view_uses_joints_vis_in_canvas_joint_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             episode_dir = Path(tmp)
             visibility_dir = episode_dir / "joints_vis" / "00"
@@ -163,7 +163,8 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 def _mano_runtime_instance():
                     return RuntimeStub()
 
-            points, visible = LabelPage._build_mano_3d_view_state(PageStub(), 5, "00")
+            PageStub._build_mano_3d_view_state = LabelPage._build_mano_3d_view_state
+            points, visible = LabelPage._build_visible_mano_view_state(PageStub(), 5, "00")
 
         self.assertEqual(points, projected[0])
         self.assertTrue(visible[0][13])  # canonical MANO thumb MCP

@@ -56,7 +56,7 @@ class LabelVisibilitySequenceTest(unittest.TestCase):
         visible = load_joint_visibility(self.root, "00", 0)
         self.assertEqual(visible[0][:5], [False, False, False, False, True])
 
-    def test_original_view_applies_packed_mask_to_projected_joints(self):
+    def test_original_is_unmasked_and_modified_initial_view_applies_packed_mask(self):
         values = np.zeros((2, 2, 21), dtype=np.uint8)
         values[1, 0, 13] = 1
         values[1, 1, 4] = 1
@@ -84,7 +84,11 @@ class LabelVisibilitySequenceTest(unittest.TestCase):
             def _mano_runtime_instance(self):
                 return Runtime()
 
-        result_points, visible = LabelPage._build_mano_3d_view_state(Page(), 1, "00")
+        Page._build_mano_3d_view_state = LabelPage._build_mano_3d_view_state
+        original_points, original_visible = LabelPage._build_mano_3d_view_state(Page(), 1, "00")
+        self.assertEqual(original_points, points)
+        self.assertEqual(original_visible, projected_visible)
+        result_points, visible = LabelPage._build_visible_mano_view_state(Page(), 1, "00")
         self.assertEqual(result_points, points)
         self.assertTrue(visible[0][13])
         self.assertEqual(np.count_nonzero(visible), 1)
