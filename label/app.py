@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import locale
 import os
+import queue
+import signal
 import shutil
 import tempfile
 import threading
 import tkinter as tk
+from frontend_runtime import cancel_tk_callbacks
 from dataclasses import replace
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -89,6 +92,10 @@ STATUS_TODO_COLOR = "#ff5c5c"
 
 
 class LabelToolApp(tk.Tk):
+    def destroy(self) -> None:
+        cancel_tk_callbacks(self)
+        super().destroy()
+
     def __init__(self, config: Optional[LabelConfig] = None):
         self._ensure_utf8_env()
         super().__init__()
@@ -123,6 +130,9 @@ class LabelToolApp(tk.Tk):
         self._home.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._label.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._go_home()
+        self.protocol("WM_DELETE_WINDOW", self._on_exit)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: self.after_idle(self._on_exit))
 
     @staticmethod
     def _ensure_utf8_env() -> None:
@@ -198,11 +208,8 @@ class LabelToolApp(tk.Tk):
             self._is_maximized = False
 
     def _on_exit(self) -> None:
-        try:
-            self._label.release_on_exit()
-        except Exception:
-            pass
-        self.destroy()
+        if self._label.release_on_exit():
+            self.destroy()
 
     def _go_home(self) -> None:
         self._label.on_hide()
@@ -443,6 +450,9 @@ class LabelPage(ttk.Frame):
         self._heartbeat_after_id: Optional[str] = None
         self._decode_generation: int = 0
         self._decode_thread: Optional[threading.Thread] = None
+        self._decode_stop = threading.Event()
+        self._decode_results = queue.Queue()
+        self._decode_poll_id = None
         self._decode_cache_dir: Optional[Path] = None
         self._mode: str = "correct"
         self._tasks: List[CorrectionTask] = []
@@ -598,9 +608,18 @@ class LabelPage(ttk.Frame):
         if self._frame_status is not None:
             self._frame_status.configure(text="")
 
-    def release_on_exit(self) -> None:
-        self._stop_original_mesh_cache()
-        self._release_backend_job("operator_exit")
+    def release_on_exit(self) -> bool:
+        self._cancel_backend_heartbeat()
+        self._decode_generation += 1
+        cleanup_error = None
+        try:
+            self._cleanup_decode_cache()
+        except Exception as exc:
+            cleanup_error = exc
+        released = self._release_backend_job("operator_exit")
+        if cleanup_error is not None:
+            messagebox.showerror("退出未完成", f"临时缓存清理失败，请重试退出：{cleanup_error}")
+        return released and cleanup_error is None
 
     def set_session(self, *, session: Any = None, jsonl_path: str = "") -> bool:
         if isinstance(session, LabelJobSession):
@@ -622,10 +641,13 @@ class LabelPage(ttk.Frame):
         return self._apply_session_tasks(tasks, progress, f"Tasks: {p}", initial_source="correct")
 
     def _set_backend_session(self, session: LabelJobSession) -> bool:
+        self._backend_session = session
+        self._backend_completed = False
         try:
             task = correction_task_from_backend_payload(session.payload, mounts=session.mounts)
             task = replace(task, episode=episode_display_id(session.payload, session.job))
         except Exception as exc:
+            self._release_backend_job("invalid_label_payload")
             messagebox.showerror("Backend Task", str(exc))
             return False
 
@@ -653,8 +675,10 @@ class LabelPage(ttk.Frame):
             args=(generation, session, task, cache_dir),
             daemon=True,
         )
+        self._decode_stop = threading.Event()
         self._decode_thread = thread
         thread.start()
+        self._decode_poll_id = self.after(60, self._poll_backend_decode)
         return True
 
     def _decode_backend_session_worker(
@@ -670,23 +694,26 @@ class LabelPage(ttk.Frame):
                 session.payload,
                 cache_root=cache_dir,
                 ffmpeg_executable=self._config.ffmpeg_executable,
+                stop_event=self._decode_stop,
             )
+            if self._decode_stop.is_set():
+                return
             progress_ref = decoded_task.episode_dir() / f".{session.job_id}.jsonl"
             progress = load_correction_progress(str(progress_ref), [decoded_task])
             save_correction_progress(str(progress_ref), progress)
         except Exception as exc:
-            self.after(0, lambda error=exc: self._finish_backend_decode(generation, None, None, "", error))
+            self._decode_results.put((generation, None, None, "", exc))
             return
-        self.after(
-            0,
-            lambda: self._finish_backend_decode(
-                generation,
-                decoded_task,
-                progress,
-                str(progress_ref),
-                None,
-            ),
-        )
+        self._decode_results.put((generation, decoded_task, progress, str(progress_ref), None))
+
+    def _poll_backend_decode(self) -> None:
+        self._decode_poll_id = None
+        try:
+            result = self._decode_results.get_nowait()
+        except queue.Empty:
+            self._decode_poll_id = self.after(60, self._poll_backend_decode)
+            return
+        self._finish_backend_decode(*result)
 
     def _finish_backend_decode(
         self,
@@ -716,15 +743,20 @@ class LabelPage(ttk.Frame):
         )
 
     def _cleanup_decode_cache(self) -> None:
+        self._decode_stop.set()
+        if self._decode_poll_id is not None:
+            self.after_cancel(self._decode_poll_id)
+            self._decode_poll_id = None
+        if self._decode_thread is not None:
+            self._decode_thread.join()
+            self._decode_thread = None
+        while not self._decode_results.empty():
+            self._decode_results.get_nowait()
         self._stop_original_mesh_cache()
         cache_dir = self._decode_cache_dir
+        if cache_dir is not None and cache_dir.exists():
+            shutil.rmtree(cache_dir)
         self._decode_cache_dir = None
-        if cache_dir is None:
-            return
-        try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        except Exception:
-            pass
 
     def _apply_session_tasks(
         self,
@@ -804,6 +836,8 @@ class LabelPage(ttk.Frame):
             return True
         try:
             session.client.release_label_job(session.job_id, reason=reason)
+            self._backend_session = None
+            self._cancel_backend_heartbeat()
             return True
         except Exception as exc:
             messagebox.showerror("Backend", f"Failed to release label job: {exc}")
@@ -811,7 +845,7 @@ class LabelPage(ttk.Frame):
 
     def _back_home(self) -> None:
         if self._ask_yes_no("Notice", "Going back will discard unsaved corrections. Continue?"):
-            if self._release_backend_job("operator_returned_home"):
+            if self.release_on_exit():
                 self._on_back()
 
     def _ask_yes_no(self, title: str, message: str) -> bool:
@@ -1405,9 +1439,9 @@ class LabelPage(ttk.Frame):
     def _stop_original_mesh_cache(self) -> None:
         self._clear_original_mesh_preview()
         cache = self._original_mesh_cache
-        self._original_mesh_cache = None
         if cache is not None:
             cache.close()
+        self._original_mesh_cache = None
 
     def _clear_original_mesh_preview(self) -> None:
         if self._mesh_poll_id is not None:

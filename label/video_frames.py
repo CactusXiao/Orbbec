@@ -26,6 +26,7 @@ def ensure_decoded_rgb_frames(
     *,
     cache_root: Optional[Path] = None,
     ffmpeg_executable: str = "ffmpeg",
+    stop_event: Optional[threading.Event] = None,
 ) -> CorrectionTask:
     """Decode the RGB H265 episode videos needed by a backend label segment."""
     payload = payload or {}
@@ -42,10 +43,15 @@ def ensure_decoded_rgb_frames(
     decoded_any = False
     failures: List[str] = []
     for cam in cameras_to_decode:
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("label decoding stopped")
         try:
             video_path, timestamp_path = _locate_rgb_video(episode_dir, cam, payload)
             frame_map = _load_frame_map(timestamp_path)
-            _decode_camera_frames(
+            decode = _decode_camera_frames if stop_event is None else _decode_camera_frames_streaming
+            cancellation = {} if stop_event is None else {"stop_event": stop_event, "image_extension": "png"}
+            decode(
+                **cancellation,
                 video_path=video_path,
                 timestamp_path=timestamp_path,
                 frame_map=frame_map,
@@ -55,6 +61,8 @@ def ensure_decoded_rgb_frames(
                 ffmpeg_executable=ffmpeg_executable,
             )
             decoded_any = True
+        except InterruptedError:
+            raise
         except Exception as exc:
             failures.append(f"{cam}: {exc}")
 

@@ -47,7 +47,7 @@ Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json`
 
 - Task / Episode 列表来自后端 `qc` stage 的可租 job。
 - 双击 Episode 后才会正式租借。
-- 本机保留的有效进度会合并显示，并显示剩余租期倒计时。
+- 本机未提交进度会合并显示；已退出的任务显示“已释放”，继续时重新向后端领取。
 - 00/02/03/05 和 Pico Ego RGB H.265 会并行解码为高质量 JPEG 缓存，旧 PNG 缓存仍可继续使用。
 - `<episode>/optimized_pose/<frame>.npy` 会生成 MANO 表面，并预渲染到 `tmp_dir/<episode_id>/mesh/<camera>/<frame>.jpg`。
 - 五个视图使用同一个播放帧游标，不裁剪画面；播放中和暂停时都支持点击、拖动进度条。拖到尚未完成的帧时保留上一张完整画面并显示“目标帧渲染中”，后台完成后自动切换，UI 不等待渲染。暂停后也可前后移动 1 帧或 10 帧。
@@ -57,3 +57,9 @@ Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json`
 - 正常结果完成一次播放后即可提交；回退、拖动或再次播放不会清除已完成记录，不要求停留在末帧。再次播放时也可提交，提交时自动暂停；“Episode 异常”仍可直接提交。
 - QC 提交会先写 `<episode>/qc/qc_report.json`，再调用后端 complete。
 - “Episode 异常”提交为 `result_type=bad_episode`，不会创建人工返修 segment。
+
+### 退出与单实例
+
+- 关闭窗口、点击退出或返回任务列表，均停止心跳，等待正在领取/提交的请求完成，停止并等待临时解码与 MANO 渲染进程，然后删除当前 Episode 的 RGB、Ego 和渲染缓存，并向后端释放未完成任务。SIGINT / SIGTERM 使用同一退出流程。
+- 未提交的 QC 进度仍保存在本机 JSON 中，退出不续租；下次继续会重新检查并领取任务。缓存删除或后端释放失败时显示错误，保留窗口供重试。
+- 同一主机、同一运行账号分别最多启动一个 QC 和一个 Label。重复启动会唤起对应的已有窗口；两种页面可以同时运行。锁跨启动配置和仓库目录生效，退出完成后才释放。

@@ -59,7 +59,7 @@ class OriginalMeshCache:
 
     @staticmethod
     def _terminate(process, *, force=False):
-        if process.poll() is not None:
+        if os.name == "nt" and process.poll() is not None:
             return
         try:
             if os.name != "nt":
@@ -98,22 +98,17 @@ class OriginalMeshCache:
             self.done_event.set()
 
     def close(self):
-        """Cancel and clean up off the Tk thread, including renderer children."""
-        if self.stop_event.is_set():
-            return
+        """Stop all writers before removing the cache or letting the app exit."""
         self.stop_event.set()
         with self._lock:
             process = self._process
         if process is not None:
             self._terminate(process)
-
-        def reap():
-            if not self.done_event.wait(3):
-                with self._lock:
-                    process = self._process
-                if process is not None:
-                    self._terminate(process, force=True)
-            self._thread.join()
-            shutil.rmtree(self.cache_dir, ignore_errors=True)
-
-        threading.Thread(target=reap, name="label-mano-cleanup", daemon=True).start()
+        if not self.done_event.wait(3):
+            with self._lock:
+                process = self._process
+            if process is not None:
+                self._terminate(process, force=True)
+        self._thread.join()
+        if self.cache_dir.exists():
+            shutil.rmtree(self.cache_dir)

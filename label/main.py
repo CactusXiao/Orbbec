@@ -29,15 +29,24 @@ def main() -> None:
     parser.add_argument("--config", help="Path to the Label launch config JSON.")
     args = parser.parse_args()
 
-    try:
-        from .app import LabelToolApp
-        from .env_config import load_label_config
-    except Exception:
-        from app import LabelToolApp
-        from env_config import load_label_config
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from frontend_runtime import SingleInstance
 
-    app = LabelToolApp(load_label_config(args.config))
-    app.mainloop()
+    with SingleInstance("label") as instance:
+        if not instance.acquired:
+            return
+        try:
+            from .app import LabelToolApp
+            from .env_config import load_label_config
+        except Exception:
+            from app import LabelToolApp
+            from env_config import load_label_config
+
+        app = LabelToolApp(load_label_config(args.config))
+        instance.attach(app)
+        app.mainloop()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import signal
 import threading
 import time
 import tkinter as tk
+from frontend_runtime import cancel_tk_callbacks
 from pathlib import Path
 from tkinter import messagebox, ttk
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -25,6 +26,10 @@ from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ran
 
 
 class QcWorkerApp(tk.Tk):
+    def destroy(self) -> None:
+        cancel_tk_callbacks(self)
+        super().destroy()
+
     def __init__(self, config: QcConfig):
         super().__init__()
         self.config = config
@@ -40,6 +45,12 @@ class QcWorkerApp(tk.Tk):
         self._current_media: Optional[QcEpisodeMedia] = None
         self._heartbeat_after_id: Optional[str] = None
         self._last_task_name: str = ""
+        self._closing = False
+        self._exit_after_cleanup = False
+        self._pending_work = 0
+        self._opening_episode = False
+        self._media_stop = threading.Event()
+        self._media_updates = queue.Queue()
 
         self._host = ttk.Frame(self, style="TFrame")
         self._host.pack(fill="both", expand=True)
@@ -57,7 +68,7 @@ class QcWorkerApp(tk.Tk):
 
     def _install_signal_handlers(self) -> None:
         def handler(_signum, _frame) -> None:
-            self.preserve_for_crash_and_exit()
+            self.after_idle(self.request_exit)
 
         for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
             if sig is None:
@@ -101,7 +112,7 @@ class QcWorkerApp(tk.Tk):
 
     def _task_models(self) -> List[Dict[str, Any]]:
         items = self.client.available_qc_items()
-        local = [p for p in self.state_store.list_progress(worker_machine_id=self.config.worker_machine_id) if p.lease_valid]
+        local = self.state_store.list_progress(worker_machine_id=self.config.worker_machine_id)
         groups: Dict[str, Dict[str, Any]] = {}
         for item in items:
             task = str(item.get("task_name") or "Unspecified").strip() or "Unspecified"
@@ -123,7 +134,7 @@ class QcWorkerApp(tk.Tk):
         local = [
             progress
             for progress in self.state_store.list_progress(worker_machine_id=self.config.worker_machine_id)
-            if progress.lease_valid and (progress.task_name or "Unspecified") == task_name
+            if (progress.task_name or "Unspecified") == task_name
         ]
         local_keys = {(p.job_id, p.episode_id) for p in local}
         rows: List[Tuple[str, Any]] = [("local", progress) for progress in local]
@@ -135,6 +146,9 @@ class QcWorkerApp(tk.Tk):
         return rows
 
     def open_episode_entry(self, kind: str, entry: Any) -> None:
+        if self._closing or self._opening_episode or self._current_progress is not None:
+            return
+        self._opening_episode = True
         if kind == "local":
             self._restore_progress(entry)
         else:
@@ -215,6 +229,12 @@ class QcWorkerApp(tk.Tk):
         self._run_bg(work, lambda result: self._after_progress_ready(result[0], result[1]))
 
     def _after_progress_ready(self, progress: Optional[QcProgress], error: Optional[str]) -> None:
+        self._opening_episode = False
+        if self._closing:
+            # A lease request can finish after the window's close button is pressed.
+            if progress is not None:
+                self._current_progress = progress
+            return
         if error:
             messagebox.showerror("QC", error)
             if self._last_task_name:
@@ -229,11 +249,23 @@ class QcWorkerApp(tk.Tk):
         self.prepare_episode(progress)
 
     def prepare_episode(self, progress: QcProgress) -> None:
+        self._media_stop = threading.Event()
+        stop = self._media_stop
         self.decode_page.reset(progress)
         self.decode_page.lift()
 
         def progress_callback(_camera: str, status: Dict[str, Any]) -> None:
-            self.after(0, lambda s=status: self.decode_page.update_camera(s))
+            self._media_updates.put(status)
+
+        def poll_updates() -> None:
+            while not self._media_updates.empty():
+                status = self._media_updates.get_nowait()
+                if not self._closing:
+                    self.decode_page.update_camera(status)
+            if not stop.is_set():
+                self.after(100, poll_updates)
+
+        self.after(100, poll_updates)
 
         def work() -> Tuple[Optional[QcEpisodeMedia], Optional[str]]:
             try:
@@ -242,6 +274,8 @@ class QcWorkerApp(tk.Tk):
                     mounts=self.config.nas_mounts,
                     tmp_dir=self.config.tmp_dir,
                     on_progress=progress_callback,
+                    stop_event=stop,
+                    on_media_created=lambda media: setattr(self, "_current_media", media),
                     mesh_renderer=MeshRendererSettings(
                         python_executable=self.config.mesh_renderer_python,
                         mano_toolkit_root=self.config.mano_toolkit_root,
@@ -259,13 +293,14 @@ class QcWorkerApp(tk.Tk):
         self._run_bg(work, lambda result: self._after_media_ready(result[0], result[1]))
 
     def _after_media_ready(self, media: Optional[QcEpisodeMedia], error: Optional[str]) -> None:
+        if self._closing:
+            if media is not None:
+                self._current_media = media
+            return
         if error:
             self._cancel_heartbeat()
             messagebox.showerror("数据准备失败", error)
-            if self._last_task_name:
-                self.show_episodes(self._last_task_name)
-            else:
-                self.show_tasks()
+            self.handle_interrupt(exit_after=False)
             return
         if media is None or self._current_progress is None:
             return
@@ -328,6 +363,7 @@ class QcWorkerApp(tk.Tk):
                     }
                 ]
                 self.client.complete_qc_job(progress.job_id, result=result, artifacts=artifacts, operator_id=self.config.operator_id)
+                self._current_progress = None
                 self.state_store.delete(progress)
                 media.close(cleanup=True)
                 return True, None
@@ -340,138 +376,95 @@ class QcWorkerApp(tk.Tk):
             if not ok:
                 messagebox.showerror("提交失败", error or "后端没有确认提交成功。")
                 return
-            messagebox.showinfo("提交成功", "后端已确认 QC 结果。")
+            if not self._closing:
+                messagebox.showinfo("提交成功", "后端已确认 QC 结果。")
             self.qc_page.clear_session()
             self._current_progress = None
             self._current_media = None
             self._cancel_heartbeat()
-            self.show_episodes(self._last_task_name or progress.task_name)
+            if not self._closing:
+                self.show_episodes(self._last_task_name or progress.task_name)
 
         self._run_bg(work, done)
 
     def handle_interrupt(self, *, exit_after: bool) -> None:
-        self.qc_page.pause_playback()
+        if self._closing:
+            self._exit_after_cleanup = self._exit_after_cleanup or exit_after
+            return
+        self._closing = True
+        self._exit_after_cleanup = exit_after
+        self._cancel_heartbeat()
+        self._media_stop.set()
+        self.qc_page.set_busy("正在停止解码和渲染、清理缓存并释放任务...")
+        self.decode_page._status.configure(text="正在停止解码和渲染、清理缓存并释放任务...")
+        self.decode_page.lift()
+        self._wait_for_cleanup()
+
+    def _wait_for_cleanup(self) -> None:
+        # Let every in-flight lease/heartbeat/submission deliver its result first.
+        # No worker calls Tk, so stopping and joining media workers cannot deadlock.
+        if self._pending_work:
+            self.after(60, self._wait_for_cleanup)
+            return
         progress = self._current_progress
-        if progress is None:
-            if exit_after:
+        media = self._current_media
+
+        def work() -> Optional[str]:
+            errors = []
+            if media is not None:
+                try:
+                    media.close(cleanup=True)
+                except Exception as exc:
+                    errors.append(f"临时缓存清理失败：{exc}")
+            if progress is not None:
+                try:
+                    self.state_store.save(progress)
+                except Exception as exc:
+                    errors.append(f"进度保存失败：{exc}")
+                try:
+                    self.client.release_qc_job(progress.job_id, reason="operator_left_qc")
+                    self._current_progress = None
+                    progress.lease_until = ""
+                    progress.job.update(status="queued", lease_owner="", lease_until="")
+                    self.state_store.save(progress)
+                except Exception as exc:
+                    errors.append(f"任务释放失败：{exc}")
+            return "\n".join(errors) or None
+
+        def done(error: Optional[str]) -> None:
+            self.qc_page.clear_session()
+            self.qc_page.set_busy("")
+            if error:
+                self._closing = False
+                self.decode_page._status.configure(text="退出未完成，请重试关闭窗口。")
+                messagebox.showerror("退出未完成", error + "\n请重试退出。")
+                return
+            self._current_media = None
+            if self._exit_after_cleanup:
                 self.destroy()
             else:
+                self._closing = False
                 self.show_episodes(self._last_task_name)
-            return
-        choice = InterruptDialog.ask(self)
-        if choice == "stay":
-            return
-        if choice == "abandon":
-            self.abandon_current_progress(exit_after=exit_after)
-            return
-        if choice == "preserve":
-            seconds = PreserveDialog.ask(self, default_minutes=self.config.default_lease_minutes)
-            if seconds is None:
-                return
-            self.preserve_current_progress(lease_seconds=seconds, exit_after=exit_after)
+
+        self._run_bg(work, done, during_close=True)
 
     def abandon_current_progress(self, *, exit_after: bool) -> None:
-        progress = self._current_progress
-        media = self._current_media
-        if progress is None:
-            return
-
-        def work() -> Tuple[bool, Optional[str]]:
-            try:
-                self.client.release_qc_job(progress.job_id, reason="operator_abandoned_qc")
-                return True, None
-            except Exception as exc:
-                return False, str(exc)
-
-        def done(result: Tuple[bool, Optional[str]]) -> None:
-            ok, error = result
-            if not ok:
-                messagebox.showerror("放弃失败", error or "后端没有确认释放租约。")
-                return
-            self.state_store.delete(progress)
-            if media is not None:
-                media.close(cleanup=True)
-            self.qc_page.clear_session()
-            self._current_progress = None
-            self._current_media = None
-            self._cancel_heartbeat()
-            if exit_after:
-                self.destroy()
-            else:
-                self.show_episodes(self._last_task_name or progress.task_name)
-
-        self._run_bg(work, done)
+        self.handle_interrupt(exit_after=exit_after)
 
     def preserve_current_progress(self, *, lease_seconds: int, exit_after: bool) -> None:
-        progress = self._current_progress
-        media = self._current_media
-        if progress is None:
-            return
-
-        def work() -> Tuple[bool, Optional[str]]:
-            try:
-                response = self.client.heartbeat_qc_job(
-                    progress.job_id,
-                    worker_id=self.config.worker_machine_id,
-                    lease_seconds=max(1, int(lease_seconds)),
-                    status="running",
-                )
-                job = dict(response.get("job") or {})
-                if job.get("lease_until"):
-                    progress.lease_until = str(job.get("lease_until"))
-                    progress.job = job
-                self.state_store.save(progress)
-                if media is not None:
-                    media.close(cleanup=True)
-                return True, None
-            except Exception as exc:
-                self.state_store.save(progress)
-                return False, str(exc)
-
-        def done(result: Tuple[bool, Optional[str]]) -> None:
-            ok, error = result
-            if not ok:
-                messagebox.showerror("保留失败", error or "后端没有确认续租。")
-                return
-            self._cancel_heartbeat()
-            self.qc_page.clear_session()
-            self._current_progress = None
-            self._current_media = None
-            if exit_after:
-                self.destroy()
-            else:
-                self.show_episodes(self._last_task_name or progress.task_name)
-
-        self._run_bg(work, done)
+        # Progress is retained locally; leaving the page always releases the lease.
+        self.handle_interrupt(exit_after=exit_after)
 
     def preserve_for_crash_and_exit(self) -> None:
-        progress = self._current_progress
-        if progress is not None:
-            try:
-                self.client.heartbeat_qc_job(
-                    progress.job_id,
-                    worker_id=self.config.worker_machine_id,
-                    lease_seconds=self.config.crash_lease_extension_seconds,
-                    status="running",
-                )
-            except Exception:
-                pass
-            try:
-                self.state_store.save(progress)
-            except Exception:
-                pass
-        if self._current_media is not None:
-            self._current_media.close(cleanup=True)
-        self.destroy()
+        self.request_exit()
 
     def request_exit(self) -> None:
-        if self._current_progress is None:
-            self.destroy()
-        else:
-            self.handle_interrupt(exit_after=True)
+        self.handle_interrupt(exit_after=True)
 
     def _schedule_heartbeat(self) -> None:
         self._cancel_heartbeat()
+        if self._closing or self._current_progress is None:
+            return
         seconds = max(30, self.config.default_lease_seconds // 3)
         self._heartbeat_after_id = self.after(seconds * 1000, self._heartbeat_active)
 
@@ -504,11 +497,17 @@ class QcWorkerApp(tk.Tk):
             pass
         self._heartbeat_after_id = None
 
-    def _run_bg(self, work: Callable[[], Any], done: Callable[[Any], None]) -> None:
+    def _run_bg(self, work: Callable[[], Any], done: Callable[[Any], None], *, during_close: bool = False) -> None:
+        if self._closing and not during_close:
+            return
+        self._pending_work += 1
         q: "queue.Queue[Any]" = queue.Queue(maxsize=1)
 
         def runner() -> None:
-            q.put(work())
+            try:
+                q.put((work(), None))
+            except Exception as exc:
+                q.put((None, exc))
 
         threading.Thread(target=runner, daemon=True).start()
 
@@ -518,7 +517,12 @@ class QcWorkerApp(tk.Tk):
             except queue.Empty:
                 self.after(60, poll)
                 return
-            done(result)
+            self._pending_work -= 1
+            value, error = result
+            if error is not None:
+                messagebox.showerror("后台操作失败", str(error))
+            else:
+                done(value)
 
         self.after(60, poll)
 
@@ -592,8 +596,10 @@ class TaskSelectionPage(ttk.Frame):
     def _expire_text(self, local: List[QcProgress]) -> str:
         if not local:
             return ""
-        seconds = min(progress.lease_seconds_remaining for progress in local)
-        return format_seconds(seconds)
+        active = [progress for progress in local if progress.lease_valid]
+        if not active:
+            return "已释放"
+        return format_seconds(min(progress.lease_seconds_remaining for progress in active))
 
     def _schedule_countdown(self) -> None:
         if self._countdown_after is not None:
@@ -683,11 +689,11 @@ class EpisodeSelectionPage(ttk.Frame):
         if kind == "local":
             progress: QcProgress = entry
             return (
-                "进行中",
+                "进行中" if progress.lease_valid else "已释放 · 有本地进度",
                 episode_display_id(progress.episode, progress.payload),
                 str(progress.episode.get("subject_id") or progress.payload.get("subject_id") or ""),
                 str(len(progress.frames)),
-                format_seconds(progress.lease_seconds_remaining),
+                format_seconds(progress.lease_seconds_remaining) if progress.lease_valid else "已释放",
             )
         item = dict(entry or {})
         return (
@@ -709,7 +715,7 @@ class EpisodeSelectionPage(ttk.Frame):
     def _tick_countdown(self) -> None:
         for iid, (kind, entry) in self._entries.items():
             if kind == "local" and self._tree.exists(iid):
-                self._tree.set(iid, "lease", format_seconds(entry.lease_seconds_remaining))
+                self._tree.set(iid, "lease", format_seconds(entry.lease_seconds_remaining) if entry.lease_valid else "已释放")
         self._countdown_after = self.after(1000, self._tick_countdown)
 
     def _open_selected(self, _evt=None) -> None:
@@ -1496,90 +1502,6 @@ class ConfirmDialog:
     @staticmethod
     def ask(parent: tk.Misc, title: str, message: str) -> bool:
         return bool(messagebox.askyesno(title, message, parent=parent))
-
-
-class InterruptDialog:
-    @staticmethod
-    def ask(parent: tk.Misc) -> str:
-        dialog = tk.Toplevel(parent)
-        dialog.title("当前 Episode 尚未完成")
-        dialog.configure(bg=Theme.BG)
-        dialog.resizable(False, False)
-        result = {"choice": "stay"}
-        outer = ttk.Frame(dialog, style="Panel.TFrame", padding=(18, 14))
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="当前 Episode 尚未完成。\n是否保留当前质检进度？", style="TLabel", justify="left").pack(anchor="w")
-        btns = ttk.Frame(outer, style="Panel.TFrame")
-        btns.pack(fill="x", pady=(14, 0))
-
-        def choose(value: str) -> None:
-            result["choice"] = value
-            try:
-                dialog.grab_release()
-            except Exception:
-                pass
-            dialog.destroy()
-
-        ttk.Button(btns, text="放弃任务", style="Secondary.TButton", command=lambda: choose("abandon")).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="保留进度", style="Primary.TButton", command=lambda: choose("preserve")).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="回到任务", style="Secondary.TButton", command=lambda: choose("stay")).pack(side="left")
-        _center_modal(parent, dialog)
-        dialog.wait_window(dialog)
-        return str(result["choice"])
-
-
-class PreserveDialog:
-    @staticmethod
-    def ask(parent: tk.Misc, *, default_minutes: int) -> Optional[int]:
-        dialog = tk.Toplevel(parent)
-        dialog.title("保留当前任务")
-        dialog.configure(bg=Theme.BG)
-        dialog.resizable(False, False)
-        result: Dict[str, Optional[int]] = {"seconds": None}
-        hours = tk.StringVar(value="0")
-        minutes = tk.StringVar(value=str(int(default_minutes)))
-        outer = ttk.Frame(dialog, style="Panel.TFrame", padding=(18, 14))
-        outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="保留当前任务", style="TLabel").pack(anchor="w")
-        form = ttk.Frame(outer, style="Panel.TFrame")
-        form.pack(fill="x", pady=(12, 0))
-        ttk.Label(form, text="小时", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(form, textvariable=hours, width=8).grid(row=0, column=1, padx=(0, 16))
-        ttk.Label(form, text="分钟", style="Muted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 8))
-        ttk.Entry(form, textvariable=minutes, width=8).grid(row=0, column=3)
-        btns = ttk.Frame(outer, style="Panel.TFrame")
-        btns.pack(fill="x", pady=(14, 0))
-
-        def confirm() -> None:
-            try:
-                h = max(0, int(hours.get() or "0"))
-                m = max(0, int(minutes.get() or "0"))
-            except ValueError:
-                messagebox.showwarning("保留当前任务", "请输入有效的小时和分钟。", parent=dialog)
-                return
-            seconds = h * 3600 + m * 60
-            if seconds <= 0:
-                messagebox.showwarning("保留当前任务", "保留时间必须大于 0。", parent=dialog)
-                return
-            result["seconds"] = seconds
-            try:
-                dialog.grab_release()
-            except Exception:
-                pass
-            dialog.destroy()
-
-        def cancel() -> None:
-            try:
-                dialog.grab_release()
-            except Exception:
-                pass
-            dialog.destroy()
-
-        ttk.Button(btns, text="取消", style="Secondary.TButton", command=cancel).pack(side="right", padx=(8, 0))
-        ttk.Button(btns, text="确认", style="Primary.TButton", command=confirm).pack(side="right")
-        _center_modal(parent, dialog)
-        dialog.wait_window(dialog)
-        return result["seconds"]
 
 
 def _center_modal(parent: tk.Misc, dialog: tk.Toplevel) -> None:

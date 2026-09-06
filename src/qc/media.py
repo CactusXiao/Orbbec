@@ -108,6 +108,7 @@ class _QcMediaPreparation:
         settings: MeshRendererSettings,
         on_progress: Optional[ProgressCallback],
         cameras: List[str],
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
         self.task = task
         self.payload = payload
@@ -115,7 +116,7 @@ class _QcMediaPreparation:
         self.settings = settings
         self.on_progress = on_progress
         self.cameras = list(cameras)
-        self.stop_event = threading.Event()
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.done_event = threading.Event()
         self._error: Optional[str] = None
         self._lock = threading.Lock()
@@ -138,7 +139,10 @@ class _QcMediaPreparation:
         self.stop_event.set()
         self._terminate_renderer()
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
-            self._thread.join(timeout=15.0)
+            self._thread.join(timeout=3.0)
+            if self._thread.is_alive():
+                self._terminate_renderer(force=True)
+                self._thread.join()
 
     def register_renderer(self, process: Optional[subprocess.Popen[str]]) -> None:
         with self._lock:
@@ -146,19 +150,21 @@ class _QcMediaPreparation:
         if process is not None and self.stop_event.is_set():
             self._terminate_process(process)
 
-    def _terminate_renderer(self) -> None:
+    def _terminate_renderer(self, *, force: bool = False) -> None:
         with self._lock:
             process = self._renderer_process
         if process is not None:
-            self._terminate_process(process)
+            self._terminate_process(process, force=force)
 
     @staticmethod
-    def _terminate_process(process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
+    def _terminate_process(process: subprocess.Popen[str], *, force: bool = False) -> None:
+        if os.name == "nt" and process.poll() is not None:
             return
         try:
             if os.name != "nt":
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif force:
+                process.kill()
             else:
                 process.terminate()
         except (OSError, ProcessLookupError):
@@ -368,21 +374,26 @@ def prepare_qc_media(
     tmp_dir: Path,
     on_progress: Optional[ProgressCallback] = None,
     mesh_renderer: Optional[MeshRendererSettings] = None,
+    stop_event: Optional[threading.Event] = None,
+    on_media_created: Optional[Callable[[QcEpisodeMedia], None]] = None,
 ) -> QcEpisodeMedia:
     task = correction_task_from_backend_payload(dict(payload), mounts=dict(mounts or {}))
     _validate_qc_episode(task)
     episode_id = str(payload.get("episode_id") or task.episode or task.episode_dir().name)
     cache_dir = Path(tmp_dir).expanduser().resolve() / episode_id
-    cache_dir.mkdir(parents=True, exist_ok=True)
     total = len(task.frames)
     if total <= 0:
         raise ValueError("QC episode has no frames to prepare")
     view_cameras = _qc_view_cameras(task, include_ego=mesh_renderer is not None)
+    if mesh_renderer is not None:
+        _validate_ego_assets(task.episode_dir())
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("QC preparation stopped")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     for camera in view_cameras:
         _emit(on_progress, camera, status="pending", decoded=_count_cached(cache_dir, camera, task.frames), total=total, error="")
 
     if mesh_renderer is not None:
-        _validate_ego_assets(task.episode_dir())
         cameras = list(view_cameras)
         media = QcEpisodeMedia(task=task, cache_dir=cache_dir, requires_mesh=True, view_cameras=tuple(cameras))
         if all(
@@ -403,6 +414,7 @@ def prepare_qc_media(
             settings=mesh_renderer,
             on_progress=on_progress,
             cameras=cameras,
+            stop_event=stop_event,
         )
         media = QcEpisodeMedia(
             task=task,
@@ -411,11 +423,15 @@ def prepare_qc_media(
             view_cameras=tuple(cameras),
             preparation=preparation,
         )
+        if on_media_created is not None:
+            on_media_created(media)
         preparation.start()
         prebuffer_count = min(total, max(1, int(mesh_renderer.prebuffer_frames)))
         prebuffer_frames = [int(frame) for frame in task.frames[:prebuffer_count]]
         try:
             while not all(media.frame_ready(frame) for frame in prebuffer_frames):
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("QC preparation stopped")
                 error = preparation.error
                 if error:
                     raise RuntimeError(error)
@@ -423,7 +439,7 @@ def prepare_qc_media(
                     raise RuntimeError("mesh preparation stopped before the playback buffer was ready")
                 time.sleep(0.02)
         except Exception:
-            preparation.stop()
+            media.close(cleanup=True)
             raise
         return media
 
@@ -436,7 +452,10 @@ def prepare_qc_media(
             video_path, timestamp_path = _locate_rgb_video(task.episode_dir(), camera, payload)
             frame_map = _load_frame_map(timestamp_path)
             _emit(on_progress, camera, status="decoding", decoded=decoded, total=total, error="", video=str(video_path))
-            _decode_camera_frames(
+            decode = _decode_camera_frames if stop_event is None else _decode_camera_frames_streaming
+            cancellation = {} if stop_event is None else {"stop_event": stop_event}
+            decode(
+                **cancellation,
                 video_path=video_path,
                 timestamp_path=timestamp_path,
                 frame_map=frame_map,
@@ -449,6 +468,8 @@ def prepare_qc_media(
             )
             decoded = _count_cached(cache_dir, camera, task.frames)
             _emit(on_progress, camera, status="done", decoded=decoded, total=total, error="")
+        except InterruptedError:
+            raise
         except Exception as exc:
             has_original_frames = all(find_frame_path(task.episode_dir(), camera, frame, task.rgb_path_template) is not None for frame in task.frames)
             if has_original_frames:
@@ -458,10 +479,14 @@ def prepare_qc_media(
             raise
 
     cameras = [str(camera) for camera in task.cameras]
-    with ThreadPoolExecutor(max_workers=max(1, min(6, len(cameras)))) as executor:
-        futures = [executor.submit(prepare_camera, camera) for camera in cameras]
-        for future in as_completed(futures):
-            future.result()
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, min(6, len(cameras)))) as executor:
+            futures = [executor.submit(prepare_camera, camera) for camera in cameras]
+            for future in as_completed(futures):
+                future.result()
+    except Exception:
+        cleanup_qc_cache(cache_dir)
+        raise
     return QcEpisodeMedia(task=task, cache_dir=cache_dir)
 
 
@@ -571,12 +596,9 @@ def _validate_ego_assets(episode_dir: Path) -> None:
 
 
 def cleanup_qc_cache(cache_dir: Path) -> None:
-    try:
-        path = Path(cache_dir)
-        if path.exists() and path.is_dir():
-            shutil.rmtree(path)
-    except OSError:
-        pass
+    path = Path(cache_dir)
+    if path.exists() and path.is_dir():
+        shutil.rmtree(path)
 
 
 def _count_cached(cache_dir: Path, camera: str, frames: List[int]) -> int:
@@ -693,6 +715,18 @@ def _prepare_mesh_frames(
                     )
             return_code = process.wait()
         finally:
+            if process.poll() is None or (stop_event is not None and stop_event.is_set()):
+                _QcMediaPreparation._terminate_process(process)
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    _QcMediaPreparation._terminate_process(process, force=True)
+                    process.wait()
+                # The parent may already be gone while a worker still owns a
+                # cache file. Kill the entire group before releasing its handle.
+                _QcMediaPreparation._terminate_process(process, force=True)
+            if process.stdout is not None:
+                process.stdout.close()
             if process_callback is not None:
                 process_callback(None)
         if stop_event is not None and stop_event.is_set():

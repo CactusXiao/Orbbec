@@ -30,15 +30,24 @@ def main() -> None:
     parser.add_argument("--config", help="Path to the QC launch config JSON.")
     args = parser.parse_args()
 
-    try:
-        from .app import QcWorkerApp
-        from .config import load_qc_config
-    except Exception:
-        from app import QcWorkerApp  # type: ignore
-        from config import load_qc_config  # type: ignore
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from frontend_runtime import SingleInstance
 
-    app = QcWorkerApp(load_qc_config(config_path=args.config))
-    app.mainloop()
+    with SingleInstance("qc") as instance:
+        if not instance.acquired:
+            return
+        try:
+            from .app import QcWorkerApp
+            from .config import load_qc_config
+        except Exception:
+            from app import QcWorkerApp  # type: ignore
+            from config import load_qc_config  # type: ignore
+
+        app = QcWorkerApp(load_qc_config(config_path=args.config))
+        instance.attach(app)
+        app.mainloop()
 
 
 if __name__ == "__main__":
