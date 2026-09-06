@@ -462,14 +462,29 @@ def load_frame_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Option
 
 
 def load_joint_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Optional[List[List[bool]]]:
-    """Load the automatic-label visibility mask for one camera frame."""
+    """Load a per-frame mask or a frame from the publisher's camera sequence."""
     path = find_optional_prediction_frame_path(base_dir, cam_id, frame_idx)
+    sequence = path is None
     if path is None:
-        return None
+        path = base_dir / str(cam_id) / "joints_vis.npy"
+        if not path.is_file():
+            return None
     try:
-        arr = np.load(path)
+        arr = np.load(path, mmap_mode="r" if sequence else None, allow_pickle=False)
     except Exception as exc:
         raise ValueError(f"Failed to load joint visibility npy: {path}") from exc
+
+    if sequence:
+        if arr.ndim not in (3, 4) or arr.shape[1:] not in (
+            (_HAND_COUNT, _JOINT_COUNT), (_HAND_COUNT, _JOINT_COUNT, 1)
+        ):
+            raise ValueError(
+                "Joint visibility sequence must have shape (frames,2,21) or (frames,2,21,1), "
+                f"got {arr.shape}: {path}"
+            )
+        if not 0 <= int(frame_idx) < arr.shape[0]:
+            raise ValueError(f"Joint visibility frame {frame_idx} outside sequence of {arr.shape[0]} frames: {path}")
+        arr = arr[int(frame_idx)]
 
     values = np.asarray(arr)
     if values.shape == (_HAND_COUNT, _JOINT_COUNT, 1):
