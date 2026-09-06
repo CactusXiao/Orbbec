@@ -8,6 +8,7 @@
 #include "utils/utils.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1265,12 +1266,14 @@ class VoiceAnnouncer {
     struct VoiceMessage {
         std::string key;
         std::string text;
+        uint64_t    generation = 0;
     };
 
 public:
     explicit VoiceAnnouncer(VoiceFeedbackConfig cfg)
         : cfg_(std::move(cfg)) {
         if(cfg_.enabled) {
+            initializeNaturalVoiceCache();
             worker_ = std::thread([this]() { workerLoop(); });
         }
     }
@@ -1303,23 +1306,19 @@ public:
                 const bool beepPending = std::any_of(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
                     return isBeepMessage(message.key);
                 });
-                if(voicePendingOrPlaying || beepPending) {
+                if(voicePendingOrPlaying || beepPending || activePlaybackPid_ > 0) {
                     return;
                 }
             }
             else {
-                queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
-                                 return isBeepMessage(message.key);
-                             }),
-                             queue_.end());
-                if(messageKey == "record_elapsed") {
-                    queue_.erase(std::remove_if(queue_.begin(), queue_.end(), [](const VoiceMessage &message) {
-                                     return message.key == "record_elapsed";
-                                 }),
-                                 queue_.end());
-                }
+                // Operation feedback is state-based: only the newest state is useful.
+                // Drop queued messages and stop the currently playing command so the
+                // new prompt starts immediately instead of waiting behind stale audio.
+                queue_.clear();
+                ++voiceGeneration_;
+                interruptPlaybackLocked();
             }
-            queue_.push_back(VoiceMessage{ messageKey, std::move(text) });
+            queue_.push_back(VoiceMessage{ messageKey, std::move(text), voiceGeneration_ });
         }
         cv_.notify_one();
     }
@@ -1332,12 +1331,19 @@ public:
         queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
                                     [&](const VoiceMessage &message) { return message.key == messageKey; }),
                      queue_.end());
+        if(activePlaybackKey_ == messageKey) {
+            ++voiceGeneration_;
+            interruptPlaybackLocked();
+        }
     }
 
     void stop() {
         {
             std::lock_guard<std::mutex> lock(mtx_);
             stopping_ = true;
+            queue_.clear();
+            ++voiceGeneration_;
+            interruptPlaybackLocked();
         }
         cv_.notify_all();
         if(worker_.joinable()) {
@@ -1360,28 +1366,42 @@ private:
         return "printf '%s\\n' " + shellQuote("[collection][voice] " + message) + " >&2";
     }
 
-    std::string buildMechanicalChineseFallback(const std::string &qText) const {
-        return "if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- " + qText + "; "
-               "elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin " + qText + "; "
-               "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 " + qText + "; "
-               "elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 " + qText + "; "
-               "else false; fi";
+    static fs::path defaultVoiceCacheDir() {
+        return fs::current_path() / "voice";
     }
 
-    std::string buildNaturalChineseCommand(const std::string &qText) const {
+    static uint64_t stableVoiceHash(const std::string &value) {
+        uint64_t hash = 1469598103934665603ULL;
+        for(unsigned char c: value) {
+            hash ^= static_cast<uint64_t>(c);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    fs::path cachePathFor(const std::string &messageKey, const std::string &text) const {
+        const std::string identity = cfg_.voice + "\n" + cfg_.rate + "\n" + cfg_.pitch + "\n" + text;
+        std::ostringstream name;
+        name << sanitizePathComponent(messageKey) << '-' << std::hex << stableVoiceHash(identity) << ".mp3";
+        return cacheDir_ / name.str();
+    }
+
+    static bool cacheFileReady(const fs::path &path) {
+        std::error_code ec;
+        return fs::is_regular_file(path, ec) && !ec && fs::file_size(path, ec) > 0 && !ec;
+    }
+
+    std::string buildNaturalCacheCommand(const std::string &text, const fs::path &cachePath) const {
         const std::string voice = trimString(cfg_.voice).empty() ? "zh-CN-XiaoxiaoNeural" : trimString(cfg_.voice);
         const std::string rate = trimString(cfg_.rate);
         const std::string pitch = trimString(cfg_.pitch);
+        const std::string qText = shellQuote(text);
+        const std::string qCache = shellQuote(cachePath.string());
 
         std::ostringstream cmd;
-        cmd << "(tmp=$(mktemp /tmp/orbbec-voice.XXXXXX.mp3); rm -f \"$tmp\"; "
-            << "cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; "
-            << "play_voice(){ "
-            << "if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet \"$1\"; "
-            << "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video \"$1\"; "
-            << "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q \"$1\"; "
-            << "else return 1; fi; "
-            << "}; "
+        cmd << "(cache=" << qCache << "; "
+            << "if [ -s \"$cache\" ]; then exit 0; fi; "
+            << "tmp=\"${cache}.tmp.$$\"; cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; "
             << "run_edge_tts(){ "
             << "if command -v edge-tts >/dev/null 2>&1; then edge-tts \"$@\"; "
             << "elif command -v python3 >/dev/null 2>&1 && python3 -c 'import edge_tts' >/dev/null 2>&1; then python3 -m edge_tts \"$@\"; "
@@ -1394,15 +1414,195 @@ private:
         if(!pitch.empty()) {
             cmd << " --pitch " << shellQuote(pitch);
         }
-        cmd << " --text " << qText << " --write-media \"$tmp\" >/dev/null 2>&1 && play_voice \"$tmp\"; then exit 0; fi; ";
-        if(cfg_.naturalOnly) {
-            cmd << commandMessage("natural Chinese TTS failed. Install edge-tts and ffmpeg: python3 -m pip install --user edge-tts; sudo apt install ffmpeg")
-                << "; exit 1)";
-        }
-        else {
-            cmd << "rm -f \"$tmp\"; " << buildMechanicalChineseFallback(qText) << ")";
-        }
+        cmd << " --text " << qText << " --write-media \"$tmp\" >/dev/null 2>&1 && [ -s \"$tmp\" ]; "
+            << "then mv -f \"$tmp\" \"$cache\"; else exit 1; fi)";
         return cmd.str();
+    }
+
+    std::string buildCachedVoicePlaybackCommand(const fs::path &cachePath) const {
+        const std::string qCache = shellQuote(cachePath.string());
+#if defined(__APPLE__)
+        return "(if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet " + qCache + "; "
+               "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video " + qCache + "; "
+               "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q " + qCache + "; "
+               "elif command -v afplay >/dev/null 2>&1; then afplay " + qCache + "; else false; fi)";
+#else
+        const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
+        return "(if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet " + qCache + "; "
+               "elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video " + qCache + "; "
+               "elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q " + qCache + "; "
+               "elif command -v ffmpeg >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
+               "ffmpeg -loglevel quiet -i " + qCache + " -f wav - | aplay -q -D " + shellQuote(device) + "; else false; fi)";
+#endif
+    }
+
+    void initializeNaturalVoiceCache() {
+        cacheDir_ = defaultVoiceCacheDir();
+        std::error_code ec;
+        fs::create_directories(cacheDir_, ec);
+        if(ec || !cfg_.command.empty()) {
+            return;
+        }
+
+        struct CacheTask {
+            std::string text;
+            fs::path path;
+        };
+        std::vector<CacheTask> tasks;
+        tasks.reserve(cfg_.messages.size());
+        std::unordered_set<std::string> scheduledPaths;
+        for(const auto &[key, configuredText]: cfg_.messages) {
+            const std::string text = trimString(configuredText);
+            if(text.empty() || !containsNonAscii(text)) {
+                continue;
+            }
+            const fs::path path = cachePathFor(key, text);
+            if(cacheFileReady(path) || !scheduledPaths.insert(path.string()).second) {
+                continue;
+            }
+            tasks.push_back(CacheTask{ text, path });
+        }
+        if(tasks.empty()) {
+            return;
+        }
+
+        std::cerr << "[collection][voice] preparing " << tasks.size()
+                  << " natural voice prompts (one-time cache)..." << std::endl;
+        std::atomic<size_t> nextTask{ 0 };
+        std::atomic<int> failures{ 0 };
+        const size_t workerCount = std::min<size_t>(6, tasks.size());
+        std::vector<std::future<void>> workers;
+        workers.reserve(workerCount);
+        for(size_t i = 0; i < workerCount; ++i) {
+            workers.emplace_back(std::async(std::launch::async, [&]() {
+                while(true) {
+                    const size_t index = nextTask.fetch_add(1);
+                    if(index >= tasks.size()) {
+                        return;
+                    }
+                    if(std::system(buildNaturalCacheCommand(tasks[index].text, tasks[index].path).c_str()) != 0) {
+                        failures.fetch_add(1);
+                    }
+                }
+            }));
+        }
+        for(auto &worker: workers) {
+            worker.get();
+        }
+        if(failures.load() > 0) {
+            std::cerr << "[collection][voice] " << failures.load()
+                      << " prompt(s) were not cached; natural TTS will retry when needed." << std::endl;
+        }
+    }
+
+    void interruptPlaybackLocked() {
+#if defined(__unix__) || defined(__APPLE__)
+        if(activePlaybackPid_ > 0) {
+            // The shell is placed in its own process group, so this also stops
+            // any speech or audio child process launched by the command.
+            (void)::kill(-activePlaybackPid_, SIGKILL);
+            (void)::kill(activePlaybackPid_, SIGKILL);
+        }
+#endif
+    }
+
+    int runPlaybackCommand(const std::string &cmd,
+                           const std::string &key,
+                           uint64_t generation,
+                           bool nonBeepMessage) {
+#if defined(__unix__) || defined(__APPLE__)
+        pid_t pid = -1;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if(stopping_ || generation != voiceGeneration_) {
+                if(nonBeepMessage) {
+                    speakingNonBeep_ = false;
+                }
+                return 0;
+            }
+            pid = ::fork();
+            if(pid == 0) {
+                (void)::setpgid(0, 0);
+                ::execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char *>(nullptr));
+                ::_exit(127);
+            }
+            if(pid > 0) {
+                (void)::setpgid(pid, pid);
+                activePlaybackPid_ = pid;
+                activePlaybackKey_ = key;
+            }
+        }
+        if(pid < 0) {
+            if(nonBeepMessage) {
+                std::lock_guard<std::mutex> lock(mtx_);
+                speakingNonBeep_ = false;
+            }
+            return -1;
+        }
+
+        int status = 0;
+        while(::waitpid(pid, &status, 0) < 0) {
+            if(errno != EINTR) {
+                status = -1;
+                break;
+            }
+        }
+
+        bool superseded = false;
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            if(activePlaybackPid_ == pid) {
+                activePlaybackPid_ = -1;
+                activePlaybackKey_.clear();
+            }
+            superseded = stopping_ || generation != voiceGeneration_;
+            if(nonBeepMessage) {
+                speakingNonBeep_ = false;
+            }
+        }
+        if(superseded) {
+            return 0;
+        }
+        if(status < 0) {
+            return -1;
+        }
+        if(WIFEXITED(status)) {
+            return WEXITSTATUS(status);
+        }
+        return WIFSIGNALED(status) ? 128 + WTERMSIG(status) : -1;
+#else
+        const int rc = std::system(cmd.c_str());
+        if(nonBeepMessage) {
+            std::lock_guard<std::mutex> lock(mtx_);
+            speakingNonBeep_ = false;
+        }
+        return rc;
+#endif
+    }
+
+    std::string buildMechanicalChineseFallback(const std::string &qText) const {
+        return "if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- " + qText + "; "
+               "elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin " + qText + "; "
+               "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 " + qText + "; "
+               "elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 " + qText + "; "
+               "else false; fi";
+    }
+
+    std::string buildNaturalChineseCommand(const std::string &messageKey, const std::string &text) const {
+        const fs::path cachePath = cachePathFor(messageKey, text);
+        const std::string playback = buildCachedVoicePlaybackCommand(cachePath);
+        if(cacheFileReady(cachePath)) {
+            return playback;
+        }
+
+        const std::string generation = buildNaturalCacheCommand(text, cachePath);
+        if(cfg_.naturalOnly) {
+            return "(" + generation + " && " + playback + ") || (" +
+                   commandMessage("natural Chinese TTS failed. Install edge-tts and ffmpeg: python3 -m pip install --user edge-tts; sudo apt install ffmpeg") +
+                   "; false)";
+        }
+        return "(" + generation + " && " + playback + ") || (" +
+               buildMechanicalChineseFallback(shellQuote(text)) + ")";
     }
 
     std::string buildBeepCommand() const {
@@ -1440,7 +1640,7 @@ private:
         return tone.str();
     }
 
-    std::string buildCommand(const std::string &text) const {
+    std::string buildCommand(const std::string &messageKey, const std::string &text) const {
         const std::string device = cfg_.speakerDevice.empty() ? "default" : cfg_.speakerDevice;
         const std::string qText = shellQuote(text);
         const std::string qDevice = shellQuote(device);
@@ -1455,21 +1655,19 @@ private:
             return cmd;
         }
 
+        if(containsNonAscii(text)) {
+            return buildNaturalChineseCommand(messageKey, text);
+        }
+
 #if defined(__APPLE__)
         std::ostringstream cmd;
         cmd << "if command -v say >/dev/null 2>&1; then say ";
-        if(containsNonAscii(text)) {
-            cmd << "-v Tingting ";
-        }
         if(!device.empty() && device != "default") {
             cmd << "-a " << qDevice << " ";
         }
         cmd << qText << "; fi";
         return cmd.str();
 #else
-        if(containsNonAscii(text)) {
-            return buildNaturalChineseCommand(qText);
-        }
         return "(if command -v spd-say >/dev/null 2>&1 && spd-say -w -- " + qText + "; then :; "
                "elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -s 155 " + qText + "; "
                "elif command -v espeak >/dev/null 2>&1 && command -v aplay >/dev/null 2>&1; then "
@@ -1482,6 +1680,7 @@ private:
         while(true) {
             std::string key;
             std::string text;
+            uint64_t generation = 0;
             bool nonBeepMessage = false;
             {
                 std::unique_lock<std::mutex> lock(mtx_);
@@ -1492,13 +1691,14 @@ private:
                 key = std::move(queue_.front().key);
                 nonBeepMessage = !isBeepMessage(key);
                 text = std::move(queue_.front().text);
+                generation = queue_.front().generation;
                 queue_.pop_front();
                 if(nonBeepMessage) {
                     speakingNonBeep_ = true;
                 }
             }
 
-            const std::string cmd = isBeepMessage(key) ? buildBeepCommand() : buildCommand(text);
+            const std::string cmd = isBeepMessage(key) ? buildBeepCommand() : buildCommand(key, text);
             if(cmd.empty()) {
                 if(nonBeepMessage) {
                     std::lock_guard<std::mutex> lock(mtx_);
@@ -1506,11 +1706,7 @@ private:
                 }
                 continue;
             }
-            const int rc = std::system(cmd.c_str());
-            if(nonBeepMessage) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                speakingNonBeep_ = false;
-            }
+            const int rc = runPlaybackCommand(cmd, key, generation, nonBeepMessage);
             if(rc != 0 && !warnedFailure_) {
                 warnedFailure_ = true;
                 std::cerr << "[collection][voice] playback command failed once. key=" << key << " text=" << text << std::endl;
@@ -1526,6 +1722,14 @@ private:
     bool                      stopping_ = false;
     bool                      speakingNonBeep_ = false;
     bool                      warnedFailure_ = false;
+    fs::path                  cacheDir_;
+    uint64_t                  voiceGeneration_ = 0;
+#if defined(__unix__) || defined(__APPLE__)
+    pid_t                     activePlaybackPid_ = -1;
+#else
+    int                       activePlaybackPid_ = -1;
+#endif
+    std::string               activePlaybackKey_;
 };
 
 static std::string toLowerAscii(std::string s) {
@@ -10868,6 +11072,9 @@ int run_collection(const AppConfig &cfg,
         if(recorder.hasData()) {
             capUi.msg = "Data saved to disk. Confirm or reset this episode.";
             pushUiLog("Background save finished. Ready to confirm.");
+            if(!pendingResetAfterDrain) {
+                announce("ready_to_confirm", "已停止采集，可以确认");
+            }
         }
         else {
             capUi.msg = "No valid frames captured. Reset to discard this episode.";

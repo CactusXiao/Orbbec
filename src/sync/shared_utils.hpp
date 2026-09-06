@@ -153,7 +153,7 @@ struct VoiceFeedbackConfig {
     std::string speakerDevice = "default";
     std::string command;
     std::string voice         = "zh-CN-XiaoxiaoNeural";
-    std::string rate          = "-8%";
+    std::string rate          = "+10%";
     std::string pitch         = "+0Hz";
     bool        naturalOnly   = true;
     double      recordTickIntervalSeconds = 5.0;

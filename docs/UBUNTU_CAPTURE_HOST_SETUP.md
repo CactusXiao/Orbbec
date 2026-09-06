@@ -91,13 +91,11 @@ sudo apt install -y \
 | `xclip`, `zenity`, `yad` | Viewer/Collection 中的剪贴板和目录选择辅助 |
 | `alsa-utils`, `espeak`, `speech-dispatcher` | 采集语音提示回退和声卡检查 |
 
-中文采集播报默认使用更自然的 neural TTS。安装系统包后再安装一次 Python 命令行工具：
+中文采集播报使用 `zh-CN-XiaoxiaoNeural` 自然 neural TTS，默认语速为 `+10%`、音调为 `+0Hz`。仓库随附默认提示的 MP3，并把语音文件持久化在程序工作目录的 `voice/`；已有文件会直接播放，只有提示文案或音色参数变化、对应文件不存在时才会重新生成。因此重启程序不会重复生成，实际操作也不再承担在线生成带来的约 2 秒延迟。新的操作提示会取消并覆盖正在播放的旧提示，因此状态切换时不会积压过期语音。
 
 ```bash
 python3 -m pip install --user edge-tts
 ```
-
-如果终端找不到 `edge-tts`，确认 `~/.local/bin` 已在 `PATH` 中。默认中文音色在配置里是 `voiceFeedback.voice: "zh-CN-XiaoxiaoNeural"`，可换成 `zh-CN-XiaoyiNeural` 或 `zh-CN-YunxiNeural`；`voiceFeedback.rate` 可以调语速，例如 `-12%` 更慢。
 
 如果 CMake 版本仍然低于 3.22，可用 snap 安装新版：
 
@@ -1021,7 +1019,7 @@ aplay: main:831: 音乐打开错误： 没有那个文件或目录
 
 这是采集语音提示播放失败，通常不影响相机取流。没有扬声器、默认声卡不存在、root/sudo 环境没有音频权限时都会出现。
 
-中文播报如果听起来很机械，通常是没有装 `edge-tts` 或播放器不可用，程序退到了系统本地语音。当前默认配置会启用 `voiceFeedback.naturalOnly`，避免中文静默降级到机械音；缺依赖时会打印安装提示。修复方式：
+自然语音会持久化在程序工作目录的 `voice/`。若完全没有播报或首次生成失败，安装 neural TTS 和播放器：
 
 ```bash
 sudo apt install ffmpeg
@@ -1044,8 +1042,6 @@ speaker-test -t wav -c 2
 ```
 
 再把 `voiceFeedback.speakerDevice` 改成可用设备，例如 `default`、`plughw:0,0` 或 `hw:1,0`。
-
-如果确实希望在 neural TTS 失败时仍然用系统本地语音兜底，可把 `voiceFeedback.naturalOnly` 改成 `false`。
 
 ## 16. 批量部署建议
 

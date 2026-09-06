@@ -132,14 +132,17 @@
         }
     },
     "voiceFeedback": {
-        "_comment": "Ubuntu collection voice prompts. Chinese prompts prefer edge-tts zh-CN-XiaoxiaoNeural when installed (python3 -m pip install edge-tts; ffplay from ffmpeg), then fall back to spd-say, ekho, or espeak-ng. During recording, record_tick plays a short, low-volume tone at the configured interval.",
+        "_comment": "Ubuntu collection prompts use natural neural TTS stored persistently in the working directory's voice folder. Existing files play immediately; only missing or changed prompts are generated. Every new prompt cancels the previous one.",
         "enabled": true,
         "speakerDevice": "default",
         "recordTickIntervalSeconds": 5.0,
         "recordTickFrequencyHz": 700,
         "recordTickDurationMs": 60,
         "recordTickVolume": 0.08,
-        "command": "(tmp=$(mktemp /tmp/orbbec-voice.XXXXXX.mp3); rm -f \"$tmp\"; play_voice(){ if command -v ffplay >/dev/null 2>&1; then ffplay -nodisp -autoexit -loglevel quiet \"$1\"; elif command -v mpv >/dev/null 2>&1; then mpv --really-quiet --no-video \"$1\"; elif command -v mpg123 >/dev/null 2>&1; then mpg123 -q \"$1\"; else return 1; fi; }; if command -v edge-tts >/dev/null 2>&1 && edge-tts --voice zh-CN-XiaoxiaoNeural --text {text} --write-media \"$tmp\" >/dev/null 2>&1 && play_voice \"$tmp\"; then rm -f \"$tmp\"; exit 0; fi; rm -f \"$tmp\"; if command -v spd-say >/dev/null 2>&1; then spd-say -w -l zh-cn -- {text}; elif command -v ekho >/dev/null 2>&1; then ekho -v Mandarin {text}; elif command -v espeak-ng >/dev/null 2>&1; then espeak-ng -v cmn -s 155 {text}; elif command -v espeak >/dev/null 2>&1; then espeak -v zh -s 155 {text}; fi)",
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "rate": "+10%",
+        "pitch": "+0Hz",
+        "command": "",
         "messages": {
             "ready": "设备已就绪",
             "enter": "已进入采集",
@@ -148,6 +151,7 @@
             "record_tick": "",
             "start_failed": "启动失败，请检查设备",
             "stop": "已停止采集",
+            "ready_to_confirm": "已停止采集，可以确认",
             "confirm": "采集已保存",
             "task_complete": "当前任务已全部完成，请更换任务",
             "confirm_failed": "保存失败，请稍后重试",

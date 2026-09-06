@@ -79,4 +79,5 @@ install(FILES
     ${CMAKE_CURRENT_LIST_DIR}/estimate_pico_ego_extrinsics.py
     DESTINATION bin
 )
+install(DIRECTORY voice DESTINATION bin)
 install(TARGETS orbbec RUNTIME DESTINATION bin)
