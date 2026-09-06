@@ -178,7 +178,8 @@ class LabelViewUiTest(unittest.TestCase):
                     p._mode = mode
                     p._show_mano = show_mano
                     p._progress = {}
-                    p._source_state_cache = {("test", 0, "00", "correct"): edited}
+                    p._source_state_cache = {("test", 0, "00", "correct"): edited,
+                                             ("test", 1, "01", "correct"): edited}
                     p._canvas.set_hand_state(*(original if mode == "mano" else edited))
                     p._view_states = {"00": original if mode == "mano" else edited}
                     with patch.object(p, "_save_bundle", return_value=object()), \
@@ -198,7 +199,52 @@ class LabelViewUiTest(unittest.TestCase):
                         self.assertEqual(p._frame_pos, 1)
                         self.assertEqual(p._mode, mode)
                         self.assertEqual(p._show_mano, show_mano)
+                        self.assertEqual(p._source_state_cache[("test", 1, "01", "correct")], edited)
                         next_frame.assert_called_once()
+
+    def test_unconfirmed_positions_and_visibility_survive_frame_camera_and_source_switches(self):
+        p = self.page
+
+        def state(value):
+            return (
+                [[(float(value + j), 20.0) for j in range(21)] for _ in range(2)],
+                [[(j + value) % 3 == 0 for j in range(21)] for _ in range(2)],
+            )
+
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "frame.png"
+            Image.new("RGB", (100, 80)).save(image)
+            p._active_task = SimpleNamespace(key="drafts", frames=[5, 12], total_frames=2,
+                display_name="Draft test", episode_dir=lambda: Path(temp), rgb_path_template="unused")
+            p._active_key = "drafts"
+            p._camera_ids = ["00", "01"]
+            p._bundles = {"pred": object()}
+            with patch("label.app.find_frame_path", return_value=image), \
+                 patch.object(p, "_build_modified_view_state", side_effect=lambda *_: state(0)), \
+                 patch.object(p, "_build_mano_3d_view_state", side_effect=lambda *_: state(90)), \
+                 patch.object(p, "_view_source_status", return_value="test"), \
+                 patch("label.app.save_corrected_array") as save:
+                p._refresh_view()
+                p._canvas.set_hand_state(*state(1))
+                p._next_cam()
+                p._canvas.set_hand_state(*state(2))
+                p._skip_frame()
+                p._canvas.set_hand_state(*state(3))
+                p._prev_cam()
+                p._canvas.set_hand_state(*state(4))
+                p._toggle_source()
+                self.assertEqual(p._canvas.get_hand_state(), state(90))
+                p._back_frame()
+                p._toggle_source()
+                self.assertEqual(p._canvas.get_hand_state(), state(1))
+                p._next_cam()
+                self.assertEqual(p._canvas.get_hand_state(), state(2))
+                p._skip_frame()
+                self.assertEqual(p._canvas.get_hand_state(), state(3))
+                p._prev_cam()
+                self.assertEqual(p._canvas.get_hand_state(), state(4))
+                self.assertEqual(p._progress, {})
+                save.assert_not_called()
 
     def test_preview_swap_preserves_coordinates_visibility_and_zoom(self):
         canvas = self.page._canvas

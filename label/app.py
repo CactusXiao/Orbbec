@@ -1193,7 +1193,7 @@ class LabelPage(ttk.Frame):
         stale = [
             key
             for key in self._source_state_cache
-            if key[0] == self._active_key and key[3] in {"correct", "last"}
+            if key[0] == self._active_key and key[1] == int(self._frame_pos) and key[3] in {"correct", "last"}
         ]
         for key in stale:
             self._source_state_cache.pop(key, None)
@@ -1580,7 +1580,7 @@ class LabelPage(ttk.Frame):
         next_pos = min(task.total_frames - 1, self._frame_pos + 1)
         if next_pos == self._frame_pos:
             return
-        self._source_state_cache.clear()
+        self._cache_current_source_state()
         self._view_states = {}
         keep_mano = self._show_mano
         self._reset_visualizations()
@@ -1596,7 +1596,7 @@ class LabelPage(ttk.Frame):
         prev_pos = max(0, self._frame_pos - 1)
         if prev_pos == self._frame_pos:
             return
-        self._source_state_cache.clear()
+        self._cache_current_source_state()
         self._view_states = {}
         keep_mano = self._show_mano
         self._reset_visualizations()
@@ -1657,7 +1657,6 @@ class LabelPage(ttk.Frame):
             return
 
         self._frame_pos = next_pos
-        self._source_state_cache.clear()
         self._view_states = {}
         self._load_current_sample()
 
