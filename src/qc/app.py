@@ -11,10 +11,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from label.canvas_view import ImageAnnotatorCanvas
-    from label.theme import Theme, apply_theme
+    from label.theme import Theme, apply_theme, fit_window, WrapToolbar
 except Exception:
     from ...label.canvas_view import ImageAnnotatorCanvas  # type: ignore
-    from ...label.theme import Theme, apply_theme  # type: ignore
+    from ...label.theme import Theme, apply_theme, fit_window, WrapToolbar  # type: ignore
 
 from .backend import QcBackendClient, QcBackendError, episode_display_id
 from .config import QcConfig
@@ -32,10 +32,9 @@ class QcWorkerApp(tk.Tk):
         self.state_store = QcStateStore(config.state_dir)
 
         self.title("Orbbec 人工 QC Worker")
-        self.geometry("1320x860")
-        self.minsize(1100, 720)
         self.configure(bg=Theme.BG)
         apply_theme(self)
+        fit_window(self)
 
         self._current_progress: Optional[QcProgress] = None
         self._current_media: Optional[QcEpisodeMedia] = None
@@ -540,17 +539,19 @@ class TaskSelectionPage(ttk.Frame):
         self._build()
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, style="TFrame", padding=(18, 16))
+        outer = ttk.Frame(self, style="TFrame", padding=(24, 20))
         outer.pack(fill="both", expand=True)
         top = ttk.Frame(outer, style="TFrame")
         top.pack(fill="x")
-        ttk.Label(top, text="人工 QC - Task 选择", style="TLabel").pack(side="left")
+        ttk.Label(top, text="人工质检", style="Title.TLabel").pack(side="left")
         ttk.Button(top, text="刷新", style="Secondary.TButton", command=self.app.refresh_tasks).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="退出", style="Secondary.TButton", command=self.app.request_exit).pack(side="right")
         self._status = ttk.Label(outer, text="", style="Muted.TLabel")
         self._status.pack(fill="x", pady=(8, 10))
         cols = ("task", "queued", "local", "expire")
-        self._tree = ttk.Treeview(outer, columns=cols, show="headings")
+        table = ttk.Frame(outer, style="Panel.TFrame")
+        table.pack(fill="both", expand=True)
+        self._tree = ttk.Treeview(table, columns=cols, show="headings")
         self._tree.heading("task", text="Task")
         self._tree.heading("queued", text="待质检 Episode")
         self._tree.heading("local", text="本机进行中")
@@ -559,7 +560,10 @@ class TaskSelectionPage(ttk.Frame):
         self._tree.column("queued", width=140, anchor="center")
         self._tree.column("local", width=160, anchor="center")
         self._tree.column("expire", width=160, anchor="center")
-        self._tree.pack(fill="both", expand=True)
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self._tree.yview)
+        scroll.pack(side="right", fill="y")
+        self._tree.configure(yscrollcommand=scroll.set)
+        self._tree.pack(side="left", fill="both", expand=True)
         self._tree.bind("<Double-1>", self._open_selected)
         self._tree.bind("<Return>", self._open_selected)
 
@@ -622,18 +626,20 @@ class EpisodeSelectionPage(ttk.Frame):
         self._build()
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, style="TFrame", padding=(18, 16))
+        outer = ttk.Frame(self, style="TFrame", padding=(24, 20))
         outer.pack(fill="both", expand=True)
         top = ttk.Frame(outer, style="TFrame")
         top.pack(fill="x")
-        self._title = ttk.Label(top, text="Episode 选择", style="TLabel")
+        self._title = ttk.Label(top, text="Episode 选择", style="Title.TLabel")
         self._title.pack(side="left")
         ttk.Button(top, text="返回 Task", style="Secondary.TButton", command=self.app.show_tasks).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="刷新", style="Secondary.TButton", command=lambda: self.app.refresh_episodes(self._task_name)).pack(side="right")
         self._status = ttk.Label(outer, text="", style="Muted.TLabel")
         self._status.pack(fill="x", pady=(8, 10))
         cols = ("status", "episode", "subject", "frames", "lease")
-        self._tree = ttk.Treeview(outer, columns=cols, show="headings")
+        table = ttk.Frame(outer, style="Panel.TFrame")
+        table.pack(fill="both", expand=True)
+        self._tree = ttk.Treeview(table, columns=cols, show="headings")
         headings = {
             "status": "状态",
             "episode": "Episode ID",
@@ -645,7 +651,10 @@ class EpisodeSelectionPage(ttk.Frame):
         for col in cols:
             self._tree.heading(col, text=headings[col])
             self._tree.column(col, width=widths[col], anchor="center")
-        self._tree.pack(fill="both", expand=True)
+        scroll = ttk.Scrollbar(table, orient="vertical", command=self._tree.yview)
+        scroll.pack(side="right", fill="y")
+        self._tree.configure(yscrollcommand=scroll.set)
+        self._tree.pack(side="left", fill="both", expand=True)
         self._tree.bind("<Double-1>", self._open_selected)
         self._tree.bind("<Return>", self._open_selected)
 
@@ -663,7 +672,7 @@ class EpisodeSelectionPage(ttk.Frame):
         if error:
             self._status.configure(text=f"刷新失败：{error}")
             return
-        self._status.configure(text="双击 Episode 后才会正式租借。")
+        self._status.configure(text="双击 Episode 开始质检；进行中的任务可继续上次进度。")
         for idx, (kind, entry) in enumerate(entries):
             iid = f"{kind}:{idx}"
             self._entries[iid] = (kind, entry)
@@ -721,9 +730,9 @@ class DecodePage(ttk.Frame):
         self._build()
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, style="TFrame", padding=(18, 16))
+        outer = ttk.Frame(self, style="TFrame", padding=(24, 20))
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="正在准备质检数据", style="TLabel").pack(anchor="w")
+        ttk.Label(outer, text="正在准备质检数据", style="Title.TLabel").pack(anchor="w")
         self._status = ttk.Label(outer, text="正在解码 RGB 视频...", style="Muted.TLabel")
         self._status.pack(anchor="w", pady=(8, 12))
         cols = ("camera", "status", "progress", "error")
@@ -951,63 +960,67 @@ class QcPage(ttk.Frame):
         root.pack(fill="both", expand=True)
         self._top = ttk.Frame(root, style="Panel.TFrame", padding=(12, 8))
         self._top.pack(fill="x")
-        self._info = ttk.Label(self._top, text="", style="TLabel")
-        self._info.pack(side="left")
-        self._busy = ttk.Label(self._top, text="", style="Muted.TLabel")
-        self._busy.pack(side="right")
+        self._info = ttk.Label(self._top, text="", style="Panel.TLabel")
+        self._info.pack(fill="x")
+        self._top.bind("<Configure>", lambda e: self._info.configure(wraplength=max(300, e.width - 24)))
+        self._busy = ttk.Label(self._top, text="", style="PanelMuted.TLabel")
+        self._busy.pack(anchor="w")
         self._grid = ttk.Frame(root, style="TFrame")
-        self._grid.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
-        timeline_host = ttk.Frame(root, style="Panel.TFrame", padding=(10, 2))
+        footer = ttk.Frame(root, style="Panel.TFrame", padding=(14, 10))
+        footer.pack(side="bottom", fill="x")
+        timeline_host = ttk.Frame(footer, style="Panel.TFrame", padding=(10, 2))
         timeline_host.pack(fill="x")
         self._timeline = FrameTimeline(timeline_host, on_seek=self.seek_position)
         self._timeline.pack(fill="x")
 
-        self._playback_bar = ttk.Frame(root, style="Panel.TFrame", padding=(10, 8))
+        self._playback_bar = WrapToolbar(footer)
         self._playback_bar.pack(fill="x")
         self._prev_ten = ttk.Button(self._playback_bar, text="上十帧", style="Small.TButton", command=lambda: self.step_frames(-self.FRAME_STEP))
-        self._prev_ten.pack(side="left", padx=(0, 6))
+        self._playback_bar.add(self._prev_ten)
         self._prev_one = ttk.Button(self._playback_bar, text="上一帧", style="Small.TButton", command=lambda: self.step_frames(-1))
-        self._prev_one.pack(side="left", padx=(0, 6))
+        self._playback_bar.add(self._prev_one)
         self._play_button = ttk.Button(self._playback_bar, text="播放", style="Primary.TButton", command=self.toggle_playback)
-        self._play_button.pack(side="left", padx=(0, 6))
+        self._playback_bar.add(self._play_button)
         self._next_one = ttk.Button(self._playback_bar, text="下一帧", style="Small.TButton", command=lambda: self.step_frames(1))
-        self._next_one.pack(side="left", padx=(0, 6))
+        self._playback_bar.add(self._next_one)
         self._next_ten = ttk.Button(self._playback_bar, text="下十帧", style="Small.TButton", command=lambda: self.step_frames(self.FRAME_STEP))
-        self._next_ten.pack(side="left", padx=(0, 12))
-        self._reject_button = ttk.Button(self._playback_bar, text="该帧不通过", style="Secondary.TButton", command=self.enter_bad_range)
-        self._reject_button.pack(side="left", padx=(0, 8))
-        self._bad_episode_button = ttk.Button(self._playback_bar, text="Episode 异常", style="Secondary.TButton", command=self.mark_bad_episode)
-        self._bad_episode_button.pack(side="left", padx=(0, 12))
-        self._playback_status = ttk.Label(self._playback_bar, text="", style="Muted.TLabel")
-        self._playback_status.pack(side="left")
+        self._playback_bar.add(self._next_ten)
+        self._reject_button = ttk.Button(self._playback_bar, text="该帧不通过", style="Danger.TButton", command=self.enter_bad_range)
+        self._playback_bar.add(self._reject_button)
+        self._bad_episode_button = ttk.Button(self._playback_bar, text="Episode 异常", style="Danger.TButton", command=self.mark_bad_episode)
+        self._playback_bar.add(self._bad_episode_button)
+        self._playback_status = ttk.Label(self._playback_bar, text="", style="PanelMuted.TLabel")
+        self._playback_bar.add(self._playback_status)
         self._submit_button = ttk.Button(self._playback_bar, text="提交", style="Primary.TButton", command=lambda: self.app.submit_current_progress())
-        self._submit_button.pack(side="right")
-        ttk.Button(self._playback_bar, text="退出程序", style="Secondary.TButton", command=self.app.request_exit).pack(side="right", padx=(0, 8))
-        ttk.Button(self._playback_bar, text="返回 Episode 列表", style="Secondary.TButton", command=lambda: self.app.handle_interrupt(exit_after=False)).pack(side="right", padx=(0, 8))
+        self._playback_bar.add(self._submit_button)
+        self._playback_bar.add(ttk.Button(self._playback_bar, text="退出程序", style="Secondary.TButton", command=self.app.request_exit))
+        self._playback_bar.add(ttk.Button(self._playback_bar, text="返回 Episode 列表", style="Secondary.TButton", command=lambda: self.app.handle_interrupt(exit_after=False)))
 
-        self._bad_bar = ttk.Frame(root, style="Panel.TFrame", padding=(10, 8))
-        ttk.Button(self._bad_bar, text="上十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-self.FRAME_STEP)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bad_bar, text="上一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-1)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bad_bar, text="设为坏帧起点", style="Secondary.TButton", command=self.set_bad_start).pack(side="left", padx=(0, 10))
-        self._bad_status = ttk.Label(self._bad_bar, text="", style="Muted.TLabel")
-        self._bad_status.pack(side="left", padx=(0, 10))
-        ttk.Button(self._bad_bar, text="设为坏帧终点", style="Secondary.TButton", command=self.set_bad_end).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bad_bar, text="下一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(1)).pack(side="left", padx=(0, 6))
-        ttk.Button(self._bad_bar, text="下十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(self.FRAME_STEP)).pack(side="left", padx=(0, 10))
-        ttk.Button(
+        self._bad_bar = WrapToolbar(footer)
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="上十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-self.FRAME_STEP)))
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="上一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(-1)))
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="设为坏帧起点", style="Secondary.TButton", command=self.set_bad_start))
+        self._bad_status = ttk.Label(self._bad_bar, text="", style="PanelMuted.TLabel")
+        self._bad_bar.add(self._bad_status)
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="设为坏帧终点", style="Secondary.TButton", command=self.set_bad_end))
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="下一帧", style="Small.TButton", command=lambda: self.move_bad_cursor(1)))
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="下十帧", style="Small.TButton", command=lambda: self.move_bad_cursor(self.FRAME_STEP)))
+        self._bad_bar.add(ttk.Button(
             self._bad_bar,
             text="确认为 EgoPose 外参不准",
             style="Primary.TButton",
             command=lambda: self.confirm_bad_range("egopose"),
-        ).pack(side="right")
-        ttk.Button(
+        ))
+        self._bad_bar.add(ttk.Button(
             self._bad_bar,
             text="确认为手部 Pose 不准",
             style="Primary.TButton",
             command=lambda: self.confirm_bad_range("hand_pose"),
-        ).pack(side="right", padx=(0, 8))
-        ttk.Button(self._bad_bar, text="撤销", style="Secondary.TButton", command=self.cancel_bad_range).pack(side="right", padx=(0, 8))
+        ))
+        self._bad_bar.add(ttk.Button(self._bad_bar, text="撤销", style="Secondary.TButton", command=self.cancel_bad_range))
+
+        self._grid.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
     def set_session(self, progress: QcProgress, media: QcEpisodeMedia) -> None:
         self.pause_playback(persist=False)
@@ -1077,7 +1090,7 @@ class QcPage(ttk.Frame):
             host = ttk.Frame(self._grid, style="Panel.TFrame")
             host.grid(row=idx // 3, column=idx % 3, sticky="nsew", padx=5, pady=5)
             label_text = "Pico Ego · MANO 外参投影" if cam == "ego" else f"Camera {cam}"
-            label = ttk.Label(host, text=label_text, style="Muted.TLabel")
+            label = ttk.Label(host, text=label_text, style="PanelMuted.TLabel")
             label.pack(anchor="w", padx=8, pady=(6, 4))
             canvas = ImageAnnotatorCanvas(host, bg=Theme.PANEL_2)
             canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -1196,6 +1209,8 @@ class QcPage(ttk.Frame):
         widget.state(["!disabled"] if enabled else ["disabled"])
 
     def _update_controls(self) -> None:
+        self._playback_bar._schedule()
+        self._bad_bar._schedule()
         progress = self.progress
         if self.mode == "bad_range":
             if self._playback_bar.winfo_manager():

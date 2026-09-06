@@ -32,7 +32,7 @@ try:
         source_frame_path,
         view_state_from_bundle,
     )
-    from .theme import Theme, apply_theme
+    from .theme import Theme, apply_theme, fit_window, WrapToolbar
     from .mano_view import (
         ManoMeshResult,
         ManoViewRuntime,
@@ -62,7 +62,7 @@ except Exception:
         source_frame_path,
         view_state_from_bundle,
     )
-    from theme import Theme, apply_theme
+    from theme import Theme, apply_theme, fit_window, WrapToolbar
     from mano_view import (
         ManoMeshResult,
         ManoViewRuntime,
@@ -99,11 +99,10 @@ class LabelToolApp(tk.Tk):
         self._restore_geom: Optional[str] = None
 
         self.configure(bg=Theme.BG)
-        self.title("Joint Correction Tool")
-        self.geometry("1200x780")
-        self.minsize(980, 640)
+        self.title("Orbbec · 关节标注")
 
         apply_theme(self)
+        fit_window(self)
 
         self._root_container = ttk.Frame(self, style="TFrame")
         self._root_container.pack(fill="both", expand=True)
@@ -135,7 +134,7 @@ class LabelToolApp(tk.Tk):
             pass
 
     def _build_titlebar(self, bar: ttk.Frame) -> None:
-        bar.configure(height=38)
+        bar.configure(height=52)
         bar.pack_propagate(False)
 
         left = ttk.Frame(bar, style="Panel.TFrame")
@@ -143,7 +142,7 @@ class LabelToolApp(tk.Tk):
         right = ttk.Frame(bar, style="Panel.TFrame")
         right.pack(side="right", fill="y")
 
-        title = ttk.Label(left, text="Joint Correction Tool", foreground=Theme.FG, background=Theme.PANEL)
+        title = ttk.Label(left, text="ORBBEC  /  关节标注", style="Section.TLabel")
         title.pack(side="left", padx=12)
 
         ui_font = (Theme.FONT_FAMILY, Theme.FONT_SIZE) if Theme.FONT_FAMILY else None
@@ -226,84 +225,71 @@ class HomePage(ttk.Frame):
         outer = ttk.Frame(self, style="TFrame")
         outer.pack(fill="both", expand=True)
 
-        center = ttk.Frame(outer, style="Panel.TFrame", padding=(28, 22))
-        center.place(relx=0.5, rely=0.5, anchor="center")
-
-        title = ttk.Label(center, text="Joint Correction", style="TLabel")
-        title.pack(pady=(26, 16))
-
-        form = ttk.Frame(center, style="Panel.TFrame")
-        form.pack(padx=28, fill="x")
+        center = ttk.Frame(outer, style="TFrame", padding=(24, 20))
+        center.pack(fill="both", expand=True)
+        ttk.Label(center, text="关节标注", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(center, text="选择任务与 Episode，检查并修正多视角手部关节。", style="Muted.TLabel").pack(anchor="w", pady=(4, 16))
 
         self._var_backend_url = tk.StringVar(value=config.backend_url)
         self._var_operator = tk.StringVar(value=config.operator_id)
         self._var_jsonl = tk.StringVar()
+        form = ttk.Frame(center, style="Panel.TFrame", padding=16)
+        form.pack(fill="x", pady=(0, 16))
+        form.columnconfigure(0, weight=3)
+        form.columnconfigure(1, weight=2)
+        ttk.Label(form, text="服务地址", style="PanelMuted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(form, text="操作员", style="PanelMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(20, 0))
+        ttk.Entry(form, textvariable=self._var_backend_url).grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        ttk.Entry(form, textvariable=self._var_operator).grid(row=1, column=1, sticky="ew", padx=(20, 0), pady=(6, 0))
 
-        ttk.Label(form, text="Backend URL", style="Muted.TLabel").pack(anchor="w")
-        ttk.Entry(form, textvariable=self._var_backend_url, width=58).pack(fill="x", pady=(6, 10))
+        # Reserve the footer before the expanding queues so actions stay visible.
+        footer = ttk.Frame(center)
+        footer.pack(side="bottom", fill="x", pady=(14, 0))
+        self._queue_notice = ttk.Label(footer, text="点击“刷新任务”加载待标注数据。", style="Muted.TLabel")
+        self._queue_notice.pack(fill="x", pady=(0, 10))
+        footer.bind("<Configure>", lambda e: self._queue_notice.configure(wraplength=max(300, e.width)))
+        btns = ttk.Frame(footer)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="退出", style="Secondary.TButton", command=self._on_exit).pack(side="left")
+        ttk.Button(btns, text="刷新任务", style="Secondary.TButton", command=self._refresh_tasks).pack(side="left", padx=8)
+        ttk.Button(btns, text="开始标注所选 Episode", style="Primary.TButton", command=self._lease_selected_episode).pack(side="right")
+        legacy = ttk.Frame(footer, style="Panel.TFrame", padding=12)
+        def toggle_legacy():
+            if legacy.winfo_manager():
+                legacy.pack_forget()
+            else:
+                legacy.pack(fill="x", pady=(12, 0))
+        ttk.Button(btns, text="本地 JSONL…", style="Secondary.TButton", command=toggle_legacy).pack(side="left")
+        ttk.Label(legacy, text="本地任务文件", style="PanelMuted.TLabel").pack(side="left", padx=(0, 10))
+        ttk.Entry(legacy, textvariable=self._var_jsonl).pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Button(legacy, text="打开", style="Secondary.TButton", command=self._enter_legacy).pack(side="right")
 
-        ttk.Label(form, text="Operator ID", style="Muted.TLabel").pack(anchor="w")
-        ttk.Entry(form, textvariable=self._var_operator, width=58).pack(fill="x", pady=(6, 10))
-
-        queue = ttk.Frame(center, style="Panel.TFrame")
-        queue.pack(padx=28, fill="both", pady=(8, 0))
-        ttk.Label(queue, text="Queued correction episodes", style="Muted.TLabel").pack(anchor="w")
-
-        queue_host = ttk.Frame(queue, style="Panel.TFrame")
-        queue_host.pack(fill="both", pady=(6, 8))
-        cols = ("task", "segments", "episodes", "subjects", "frames")
-        self._queue_tree = ttk.Treeview(queue_host, columns=cols, show="headings", height=8)
-        self._queue_tree.heading("task", text="Task")
-        self._queue_tree.heading("segments", text="Segments")
-        self._queue_tree.heading("episodes", text="Episodes")
-        self._queue_tree.heading("subjects", text="Subjects")
-        self._queue_tree.heading("frames", text="Frames")
-        self._queue_tree.column("task", width=180, anchor="w")
-        self._queue_tree.column("segments", width=76, anchor="center")
-        self._queue_tree.column("episodes", width=76, anchor="center")
-        self._queue_tree.column("subjects", width=150, anchor="w")
-        self._queue_tree.column("frames", width=70, anchor="center")
-        self._queue_tree.pack(side="left", fill="both", expand=True)
-        queue_scroll = ttk.Scrollbar(queue_host, orient="vertical", command=self._queue_tree.yview)
-        queue_scroll.pack(side="left", fill="y", padx=(8, 0))
-        self._queue_tree.configure(yscrollcommand=queue_scroll.set)
-        self._queue_tree.bind("<<TreeviewSelect>>", self._load_selected_task_episodes)
-
-        episode_host = ttk.Frame(queue, style="Panel.TFrame")
-        episode_host.pack(fill="both", pady=(4, 8))
-        episode_cols = ("episode", "subject", "segments", "frames", "first")
-        self._episode_tree = ttk.Treeview(episode_host, columns=episode_cols, show="headings", height=7)
-        self._episode_tree.heading("episode", text="Episode ID")
-        self._episode_tree.heading("subject", text="Subject")
-        self._episode_tree.heading("segments", text="Segments")
-        self._episode_tree.heading("frames", text="Frames")
-        self._episode_tree.heading("first", text="First Frame")
-        self._episode_tree.column("episode", width=100, anchor="center")
-        self._episode_tree.column("subject", width=120, anchor="w")
-        self._episode_tree.column("segments", width=76, anchor="center")
-        self._episode_tree.column("frames", width=70, anchor="center")
-        self._episode_tree.column("first", width=86, anchor="center")
-        self._episode_tree.pack(side="left", fill="both", expand=True)
-        episode_scroll = ttk.Scrollbar(episode_host, orient="vertical", command=self._episode_tree.yview)
-        episode_scroll.pack(side="left", fill="y", padx=(8, 0))
-        self._episode_tree.configure(yscrollcommand=episode_scroll.set)
-        self._episode_tree.bind("<Double-1>", self._lease_selected_episode)
-
-        self._queue_notice = ttk.Label(queue, text="Refresh to load queued tasks.", style="Muted.TLabel")
-        self._queue_notice.pack(anchor="w")
-
-        btns = ttk.Frame(center, style="Panel.TFrame")
-        btns.pack(pady=(22, 8), fill="x")
-
-        ttk.Button(btns, text="Exit", style="Secondary.TButton", command=self._on_exit, width=14).pack(side="left", padx=(0, 12))
-        ttk.Button(btns, text="Refresh Tasks", style="Secondary.TButton", command=self._refresh_tasks, width=16).pack(side="left", padx=(0, 12))
-        ttk.Button(btns, text="Get Selected Episode", style="Primary.TButton", command=self._lease_selected_episode, width=20).pack(side="left")
-
-        legacy = ttk.Frame(center, style="Panel.TFrame")
-        legacy.pack(padx=28, fill="x", pady=(18, 0))
-        ttk.Label(legacy, text="Legacy/debug JSONL", style="Muted.TLabel").pack(anchor="w")
-        ttk.Entry(legacy, textvariable=self._var_jsonl, width=58).pack(fill="x", pady=(6, 8))
-        ttk.Button(legacy, text="Start Legacy JSONL", style="Secondary.TButton", command=self._enter_legacy, width=18).pack(anchor="w")
+        queue = ttk.Frame(center)
+        queue.pack(fill="both", expand=True)
+        queue.columnconfigure(0, weight=1, uniform="queues")
+        queue.columnconfigure(1, weight=1, uniform="queues")
+        queue.rowconfigure(0, weight=1)
+        for column, title, attr, cols, headings, widths, binding, callback in (
+            (0, "01  选择任务", "_queue_tree", ("task", "segments", "episodes", "subjects", "frames"),
+             ("任务", "片段", "批次", "受试者", "帧数"), (180, 62, 90, 100, 65), "<<TreeviewSelect>>", self._load_selected_task_episodes),
+            (1, "02  选择 Episode", "_episode_tree", ("episode", "subject", "segments", "frames", "first"),
+             ("Episode", "受试者", "片段", "帧数", "起始帧"), (100, 110, 62, 65, 75), "<Double-1>", self._lease_selected_episode),
+        ):
+            card = ttk.Frame(queue, style="Panel.TFrame", padding=14)
+            card.grid(row=0, column=column, sticky="nsew", padx=(0, 8) if column == 0 else (8, 0))
+            ttk.Label(card, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 12))
+            host = ttk.Frame(card, style="Panel.TFrame")
+            host.pack(fill="both", expand=True)
+            tree = ttk.Treeview(host, columns=cols, show="headings", height=5)
+            setattr(self, attr, tree)
+            for col, heading, width in zip(cols, headings, widths):
+                tree.heading(col, text=heading)
+                tree.column(col, width=width, minwidth=55, anchor="w" if col in ("task", "subject", "subjects") else "center")
+            scroll = ttk.Scrollbar(host, orient="vertical", command=tree.yview)
+            scroll.pack(side="right", fill="y", padx=(8, 0))
+            tree.pack(side="left", fill="both", expand=True)
+            tree.configure(yscrollcommand=scroll.set)
+            tree.bind(binding, callback)
 
     def _refresh_tasks(self) -> None:
         backend_url = (self._var_backend_url.get() or "").strip()
@@ -346,9 +332,9 @@ class HomePage(ttk.Frame):
             first = "task_1"
             self._queue_tree.selection_set(first)
             self._queue_tree.focus(first)
-            self._queue_notice.configure(text=f"{len(groups)} task group(s) loaded.")
+            self._queue_notice.configure(text=f"已加载 {len(groups)} 个任务，选择右侧 Episode 开始标注。")
         else:
-            self._queue_notice.configure(text="No queued correction episodes.")
+            self._queue_notice.configure(text="暂无待标注任务。")
 
     def _load_selected_task_episodes(self, _event: Any = None) -> None:
         backend_url = (self._var_backend_url.get() or "").strip()
@@ -491,16 +477,16 @@ class LabelPage(ttk.Frame):
         right = ttk.Frame(root, style="Panel.TFrame")
         right.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
-        ttk.Label(left, text="Tasks", style="TLabel").pack(anchor="w", padx=12, pady=(10, 8))
+        ttk.Label(left, text="标注进度", style="Section.TLabel").pack(anchor="w", padx=12, pady=(10, 8))
 
         cols = ("task", "done", "total")
         self._tree = ttk.Treeview(left, columns=cols, show="headings", height=22)
-        self._tree.heading("task", text="Task")
-        self._tree.heading("done", text="Done")
-        self._tree.heading("total", text="Total")
-        self._tree.column("task", width=300, anchor="w")
-        self._tree.column("done", width=70, anchor="center")
-        self._tree.column("total", width=70, anchor="center")
+        self._tree.heading("task", text="任务")
+        self._tree.heading("done", text="完成")
+        self._tree.heading("total", text="总数")
+        self._tree.column("task", width=170, anchor="w")
+        self._tree.column("done", width=55, anchor="center")
+        self._tree.column("total", width=55, anchor="center")
         self._tree["displaycolumns"] = ("task", "done", "total")
         self._tree.pack(side="left", fill="y", padx=(12, 0), pady=(0, 12))
 
@@ -511,52 +497,51 @@ class LabelPage(ttk.Frame):
 
         top = ttk.Frame(right, style="Panel.TFrame")
         top.pack(fill="x", padx=12, pady=(10, 8))
-        self._info = ttk.Label(top, text="", style="Muted.TLabel")
-        self._info.pack(side="left", fill="x", expand=True)
+        self._info = ttk.Label(top, text="", style="PanelMuted.TLabel", wraplength=600)
+        self._info.pack(fill="x", expand=True)
+        top.bind("<Configure>", lambda e: self._info.configure(wraplength=max(200, e.width)))
         ui_font = (Theme.FONT_FAMILY, Theme.FONT_SIZE) if Theme.FONT_FAMILY else None
         self._frame_status = tk.Label(top, text="", fg=STATUS_TODO_COLOR, bg=Theme.PANEL, font=ui_font)
-        self._frame_status.pack(side="right", padx=(12, 0))
+        self._frame_status.pack(anchor="w", pady=(4, 0))
 
-        canvas_host = ttk.Frame(right, style="Panel2.TFrame")
-        canvas_host.pack(fill="both", expand=True, padx=12, pady=(0, 10))
-
-        self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
-        self._canvas.pack(fill="both", expand=True)
-
-        btn_row = ttk.Frame(right, style="Panel.TFrame")
-        btn_row.pack(fill="x", padx=12)
-        ttk.Button(btn_row, text="<<", style="Small.TButton", command=self._back_frame).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text=">>", style="Small.TButton", command=self._skip_frame).pack(side="left", padx=(0, 16))
-        ttk.Button(btn_row, text="←", style="Small.TButton", command=self._prev_cam).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text="→", style="Small.TButton", command=self._next_cam).pack(side="left", padx=(0, 16))
-        ttk.Button(btn_row, text="Undo", style="Small.TButton", command=self._undo).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text="Ignore View", style="Small.TButton", command=self._ignore_view).pack(side="left", padx=(0, 16))
+        btn_row = WrapToolbar(right)
+        btn_row.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
+        btn_row.add(ttk.Button(btn_row, text="上一帧", style="Small.TButton", command=self._back_frame))
+        btn_row.add(ttk.Button(btn_row, text="下一帧", style="Small.TButton", command=self._skip_frame))
+        btn_row.add(ttk.Button(btn_row, text="上一机位", style="Small.TButton", command=self._prev_cam))
+        btn_row.add(ttk.Button(btn_row, text="下一机位", style="Small.TButton", command=self._next_cam))
+        btn_row.add(ttk.Button(btn_row, text="撤销", style="Small.TButton", command=self._undo))
+        btn_row.add(ttk.Button(btn_row, text="忽略视角", style="Small.TButton", command=self._ignore_view))
         self._source_btn = ttk.Button(
             btn_row,
             text=self._source_button_text(),
             style="Small.TButton",
             command=self._toggle_source,
         )
-        self._source_btn.pack(side="left", padx=(0, 16))
+        btn_row.add(self._source_btn)
         self._skeleton_btn = ttk.Button(
             btn_row,
             text=self._skeleton_button_text(),
             style="Small.TButton",
             command=self._toggle_skeleton,
         )
-        self._skeleton_btn.pack(side="left", padx=(0, 8))
+        btn_row.add(self._skeleton_btn)
         self._mano_btn = ttk.Button(
             btn_row,
             text=self._mano_button_text(),
             style="Small.TButton",
             command=self._toggle_mano,
         )
-        self._mano_btn.pack(side="left", padx=(0, 16))
-        ttk.Button(btn_row, text="Confirm", style="Primary.TButton", command=self._confirm).pack(side="left")
+        btn_row.add(self._mano_btn)
+        btn_row.add(ttk.Button(btn_row, text="确认并继续", style="Primary.TButton", command=self._confirm))
 
-        bottom = ttk.Frame(right, style="Panel.TFrame")
-        bottom.pack(fill="x", padx=12, pady=(10, 12))
-        ttk.Button(bottom, text="Back to Home", style="Secondary.TButton", command=self._back_home).pack(side="left")
+        btn_row.add(ttk.Button(btn_row, text="返回任务", style="Secondary.TButton", command=self._back_home))
+
+        canvas_host = ttk.Frame(right, style="Panel2.TFrame")
+        canvas_host.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+
+        self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
+        self._canvas.pack(fill="both", expand=True)
 
     def on_hide(self) -> None:
         self._decode_generation += 1
@@ -1241,6 +1226,7 @@ class LabelPage(ttk.Frame):
     def _update_source_button(self) -> None:
         if self._source_btn is not None:
             self._source_btn.configure(text=self._source_button_text())
+            self._source_btn.master._schedule()
 
     def _skeleton_button_text(self) -> str:
         return "Hide Skeleton" if self._show_skeleton else "Show Skeleton"
@@ -1248,6 +1234,7 @@ class LabelPage(ttk.Frame):
     def _update_skeleton_button(self) -> None:
         if self._skeleton_btn is not None:
             self._skeleton_btn.configure(text=self._skeleton_button_text())
+            self._skeleton_btn.master._schedule()
 
     def _mano_button_text(self) -> str:
         return "Hide MANO" if self._show_mano else "Show MANO"
@@ -1255,6 +1242,7 @@ class LabelPage(ttk.Frame):
     def _update_mano_button(self) -> None:
         if self._mano_btn is not None:
             self._mano_btn.configure(text=self._mano_button_text())
+            self._mano_btn.master._schedule()
 
     def _reset_mano(self) -> None:
         self._show_mano = False

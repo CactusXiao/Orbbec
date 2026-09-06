@@ -18,11 +18,11 @@ from urllib.parse import unquote, urlparse
 try:
     from .job_service import JobService
     from .storage_resolver import uri_join
-    from .workflow_models import WorkflowError
+    from .workflow_models import WorkflowError, is_shape_calibration_episode
 except ImportError:  # pragma: no cover - script execution fallback
     from job_service import JobService  # type: ignore
     from storage_resolver import uri_join  # type: ignore
-    from workflow_models import WorkflowError  # type: ignore
+    from workflow_models import WorkflowError, is_shape_calibration_episode  # type: ignore
 
 
 PUBLISHER_WAITING_STATES = {
@@ -573,6 +573,23 @@ class PublisherBridge:
         while not self.stop_event.is_set():
             try:
                 status = self.publisher.status(publisher_episode_id)
+                if is_shape_calibration_episode(episode):
+                    # Capture already published with --shape-calibration. Only
+                    # observe the result; never republish as a normal episode.
+                    if status.get("state") != "shape_calibrated":
+                        self.stop_event.wait(self.config.poll_seconds)
+                        continue
+                    result_dir = episode_dir.parent.parent / "shape_calibration_result"
+                    if not all((result_dir / name).is_file() and (result_dir / name).stat().st_size > 0
+                               for name in ("shape.npy", "scale.npy", "pose_mesh.png", "pose_2d.png")):
+                        self.stop_event.wait(self.config.poll_seconds)
+                        continue
+                    result_uri = uri_join(episode_uri.rsplit("/", 2)[0], "shape_calibration_result")
+                    self.service.complete_job(job_id, {"result": {
+                        "ok": True, "worker_id": worker_id, "publisher_state": "shape_calibrated",
+                        "shape_calibration": True, "generation": status.get("generation"),
+                    }, "artifacts": [{"kind": "shape_calibration_result", "uri": result_uri}]})
+                    return True
                 if not bool(status.get("found")):
                     self.publisher.publish(publisher_episode_id)
                     _log(f"published job={job_id} episode={publisher_episode_id}")

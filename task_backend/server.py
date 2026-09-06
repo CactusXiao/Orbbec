@@ -43,7 +43,7 @@ try:
         PublisherBridge,
         PublisherBridgeConfig,
     )
-    from .workflow_models import WorkflowError
+    from .workflow_models import WorkflowError, is_shape_calibration_episode
     from .workflow_store import WorkflowStore
     from .viewer_service import ViewerError, ViewerSessionManager, render_viewer_page
 except ImportError:  # pragma: no cover - script execution fallback
@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover - script execution fallback
         PublisherBridge,
         PublisherBridgeConfig,
     )
-    from workflow_models import WorkflowError  # type: ignore
+    from workflow_models import WorkflowError, is_shape_calibration_episode  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
     from viewer_service import ViewerError, ViewerSessionManager, render_viewer_page  # type: ignore
 
@@ -1319,6 +1319,13 @@ class TaskBackend:
                     "metadata_pairs": metadata_pairs(task) if task is not None else [],
                     "workflow": workflow,
                 }
+        if self.workflow_service is not None:
+            episode = self.workflow_service.store.get_episode(reservation_id)
+            if episode and is_shape_calibration_episode(episode):
+                return {"reservation": with_episode_stats({
+                    **episode, "reservation_id": reservation_id, "episode_number": 1,
+                    "status": "confirmed", "confirmed_at": (episode.get("metadata") or {}).get("shape_published_at"),
+                }), "task": None, "metadata_pairs": [], "workflow": self.workflow_service.upload_status(reservation_id)}
         raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
 
     def delete_episode(self, reservation_id: str) -> Dict[str, Any]:
@@ -2363,6 +2370,17 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         ),
     ]
 
+    if is_shape_calibration_episode(workflow_episode) or is_shape_calibration_episode(item):
+        result_artifact = next((a for a in workflow_artifacts if a.get("kind") == "shape_calibration_result"), {})
+        flow_rows = flow_rows[:2] + [flow_row(
+            "3. 自动标注 + Episode 3D", flow_status_from_job("auto_label"),
+            auto_job.get("updated_at") if auto_job else "",
+            "手型标定结果已回传，流程结束" if workflow_metadata.get("tracking_complete") else "等待手型标定结果回传",
+            result_artifact.get("uri", ""),
+        )]
+        flow_rows[1] = flow_row("2. 上传到 NAS", "succeeded", workflow_metadata.get("shape_published_at"),
+                                "手型标定已发布", workflow_episode.get("episode_uri"))
+
     capture_fields = [
         ("任务", task_name),
         ("采集对象", item.get("subject_id", "")),
@@ -2835,6 +2853,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/v1/auth/login":
                 self._json_response(HTTPStatus.OK, self.runtime.accounts.login(self._read_json()))
+                return
+
+            if parsed.path == "/api/v1/shape-calibration/published":
+                self._json_response(HTTPStatus.OK, self.workflow.register_shape_calibration(self._read_json()))
                 return
 
             workflow_stage_api_prefix = "/api/v1/workflow/stages/"

@@ -15,11 +15,11 @@ from urllib.parse import quote, unquote, urlparse
 
 try:
     from .storage_resolver import uri_join
-    from .workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type
+    from .workflow_models import is_shape_calibration_episode, SHAPE_CALIBRATION_TASK, TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
     from storage_resolver import uri_join  # type: ignore
-    from workflow_models import TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type  # type: ignore
+    from workflow_models import is_shape_calibration_episode, SHAPE_CALIBRATION_TASK, TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
 
 
@@ -256,6 +256,37 @@ class JobService:
         self.auto_label_after_upload = True
         self.nas_mounts = _normalize_nas_mounts(nas_mounts)
 
+    def register_shape_calibration(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        subject = str(body.get("subject_id") or "").strip()
+        token = str(body.get("capture_token") or "").strip()
+        uri = str(body.get("episode_uri") or "").strip().rstrip("/")
+        if not subject or subject in {".", ".."} or "/" in subject or "\\" in subject or not token:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "subject_id and capture_token are required")
+        directory = self.nas_root_dir_from_uri(uri)
+        if directory is None or tuple(directory.parts[-3:]) != (subject, SHAPE_CALIBRATION_TASK, "episode1"):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "invalid shape calibration NAS path")
+        episode_id = "handshape_" + uuid.uuid5(uuid.NAMESPACE_URL, subject).hex
+        job_id = "auto_label_" + uuid.uuid5(uuid.NAMESPACE_URL, episode_id + ":" + token).hex
+        existing = self.store.get_job(job_id)
+        if existing is not None:
+            return self.enrich_job(existing)
+        for job in self.store.jobs_for_episode(episode_id):
+            if job["status"] not in TERMINAL_JOB_STATUSES:
+                raise WorkflowError(HTTPStatus.CONFLICT, "previous shape calibration is still running")
+        self.store.create_or_update_episode(
+            episode_id=episode_id, subject_id=subject, task_name=SHAPE_CALIBRATION_TASK,
+            episode_index=1, storage_name="episode1", status="auto_labeling", episode_uri=uri,
+            collection_path=str(body.get("collection_path") or ""),
+            metadata={"shape_calibration": True, "capture_token": token, "stop_after_stage": "auto_label",
+                      "shape_published_at": now_iso(), "tracking_complete": False},
+        )
+        job = self._create_job_once(job_id=job_id, job_type="auto_label", episode_id=episode_id, payload={
+            "episode_uri": uri, "subject_id": subject, "task_name": SHAPE_CALIBRATION_TASK,
+            "shape_calibration": True, "capture_token": token, "publisher_already_submitted": True,
+            "produces": ["shape_calibration_result"], "scope": "episode",
+        })
+        return self.enrich_job(job)
+
     def create_manual_label_job(self, body: Dict[str, Any]) -> Dict[str, Any]:
         payload_in = dict(body or {})
         collection_path = str(payload_in.get("collection_path") or "").strip()
@@ -269,6 +300,9 @@ class JobService:
         task_name = str(payload_in.get("task_name") or inferred_task or "manual_label").strip()
         episode_id = str(payload_in.get("episode_id") or inferred_episode or _new_id("episode")).strip()
         episode_index = _optional_int(payload_in.get("episode_index"))
+
+        if task_name == SHAPE_CALIBRATION_TASK or is_shape_calibration_episode(self.store.get_episode(episode_id) or {}):
+            raise WorkflowError(HTTPStatus.CONFLICT, "handshape calibration does not enter manual labeling")
 
         cameras = _label_camera_ids(payload_in.get("cameras")) or _discover_cameras(nas_root_dir)
         frames = _as_int_list(payload_in.get("frames")) or _discover_frames(nas_root_dir, cameras)
@@ -777,11 +811,25 @@ class JobService:
         before = self.store.get_job(job_id)
         if before is None:
             raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+        episode = self.store.get_episode(str(before.get("episode_id") or "")) or {}
+        shape_calibration = is_shape_calibration_episode(episode)
+        if shape_calibration and str(before.get("type")) not in {"upload", "auto_label"}:
+            raise WorkflowError(HTTPStatus.CONFLICT, "downstream completion is disabled for handshape calibration")
         result = json_object(body.get("result"), "result")
+        if shape_calibration and before.get("type") == "auto_label":
+            if result.get("publisher_state") != "shape_calibrated":
+                raise WorkflowError(HTTPStatus.CONFLICT, "shape calibration results have not returned")
+            if (before.get("payload") or {}).get("capture_token") != (episode.get("metadata") or {}).get("capture_token"):
+                raise WorkflowError(HTTPStatus.CONFLICT, "stale shape calibration completion")
+            directory = self.nas_root_dir_from_uri(str(episode.get("episode_uri") or ""))
+            result_dir = directory.parent.parent / "shape_calibration_result" if directory else None
+            if result_dir is None or not all((result_dir / name).is_file() and (result_dir / name).stat().st_size > 0
+                                             for name in ("shape.npy", "scale.npy", "pose_mesh.png", "pose_2d.png")):
+                raise WorkflowError(HTTPStatus.CONFLICT, "shape calibration result files are incomplete")
         if not result:
             result = {k: v for k, v in body.items() if k not in {"artifacts", "artifact"}}
         artifacts = self._artifacts_from_body(body)
-        if str(before.get("type") or "") == "auto_label" and self._is_publisher_bridge_job(before, result):
+        if not shape_calibration and str(before.get("type") or "") == "auto_label" and self._is_publisher_bridge_job(before, result):
             self._validate_publisher_bridge_completion(before, result, artifacts)
         operator_id = _human_operator_id(body, result)
         if operator_id:
@@ -1181,6 +1229,9 @@ class JobService:
         return _short_summary("; ".join(parts[:5]) + (f"; +{len(parts) - 5} more" if len(parts) > 5 else ""))
 
     def _create_job_once(self, *, job_id: str, job_type: str, episode_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        episode = self.store.get_episode(episode_id) or {}
+        if is_shape_calibration_episode(episode) and job_type not in {"upload", "auto_label"}:
+            raise WorkflowError(HTTPStatus.CONFLICT, "handshape calibration stops after auto_label; downstream jobs are disabled")
         existing = self.store.get_job(job_id)
         if existing is not None:
             return existing
@@ -1242,6 +1293,12 @@ class JobService:
             self.store.update_episode_status(episode_id, "uploaded")
             self._create_auto_label_jobs_from_upload(episode_id, payload, result, nas_uri)
         elif job_type == "auto_label":
+            if is_shape_calibration_episode(self.store.get_episode(episode_id) or {}):
+                self.store.update_episode_status(episode_id, "mano_optimized", metadata={
+                    "shape_calibration": True, "tracking_complete": True,
+                    "shape_calibrated_at": now_iso(), "stop_after_stage": "auto_label",
+                })
+                return
             publisher_bridge_job = self._is_publisher_bridge_job(job, result)
             if (
                 not publisher_bridge_job
@@ -1584,6 +1641,8 @@ class JobService:
         return frames
 
     def _create_qc_job_from_existing_episode(self, episode_id: str, result: Dict[str, Any], *, reason: str = "mano_episode_succeeded") -> None:
+        if is_shape_calibration_episode(self.store.get_episode(episode_id) or {}):
+            return
         existing_qc_jobs = self.store.jobs_for_episode(episode_id, "qc")
         if any(str(job.get("status") or "") != "canceled" for job in existing_qc_jobs):
             return
@@ -2142,6 +2201,8 @@ class JobService:
             return ""
         if kind in {"pred_2d", "auto_2d"}:
             return uri_join(episode_uri, "pred_2d")
+        if kind == "shape_calibration_result":
+            return uri_join(episode_uri.rsplit("/", 2)[0], "shape_calibration_result")
         if kind == "optimized_pose":
             return uri_join(episode_uri, "optimized_pose")
         if kind == "mano_episode":

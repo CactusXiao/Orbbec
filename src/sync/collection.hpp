@@ -7,6 +7,7 @@ namespace sync_app {
 int run_collection(const AppConfig &cfg,
                    const std::atomic_bool *cancel,
                    EgoRecorder *sharedEgoRecorder = nullptr,
-                   const std::string &operatorId = "");
+                   const std::string &operatorId = "",
+                   bool shapeCalibration = false);
 
 }

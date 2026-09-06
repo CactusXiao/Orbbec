@@ -118,3 +118,12 @@ def json_object(value: Any, field_name: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise WorkflowError(HTTPStatus.BAD_REQUEST, f"{field_name} must be an object")
     return value
+
+
+SHAPE_CALIBRATION_TASK = "task_handshapeCalibration"
+
+
+def is_shape_calibration_episode(episode: Dict[str, Any]) -> bool:
+    metadata = episode.get("metadata") or {}
+    return (episode.get("task_name") == SHAPE_CALIBRATION_TASK
+            or metadata.get("shape_calibration") is True)

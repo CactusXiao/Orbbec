@@ -1,4 +1,5 @@
 #include "collection.hpp"
+#include "handshape_calibration.hpp"
 #include "ego.hpp"
 #include "fisheyes.hpp"
 #include "tactile.hpp"
@@ -2943,7 +2944,7 @@ public:
             return "";
         }
         std::ostringstream oss;
-        oss << session_.subjectId << "/" << session_.taskName << "/episode_" << session_.episodeN;
+        oss << session_.subjectId << "/" << session_.taskName << "/" << session_.dest.filename().string();
         return oss.str();
     }
 
@@ -4146,7 +4147,7 @@ public:
         return true;
     }
 
-    bool beginRecord(const fs::path &saveRoot, const std::string &subjectId, const std::string &taskName, int episodeN) {
+    bool beginRecord(const fs::path &saveRoot, const std::string &subjectId, const std::string &taskName, int episodeN, bool shapeCalibration = false) {
         if(!capturing_.load() || recording_.load()) {
             return false;
         }
@@ -4157,7 +4158,8 @@ public:
         local.subjectId = subjectId;
         local.taskName = taskName;
         local.episodeN = episodeN;
-        local.dest = saveRoot / subjectId / taskName / ("episode_" + std::to_string(episodeN));
+        local.dest = shapeCalibration ? handshape::episodePath(saveRoot, subjectId)
+                                      : saveRoot / subjectId / taskName / ("episode_" + std::to_string(episodeN));
         local.stepUs = sessionStepUs();
         local.maxAbsDiffUs = sessionMaxAbsDiffUs(local.stepUs, cfg_.enableSync);
         if(local.stepUs == 0) {
@@ -4461,6 +4463,7 @@ public:
             std::lock_guard<std::mutex> lock(previewTsMtx_);
             lastPreviewTs_.clear();
         }
+        const fs::path recordingDest = local.dest;
         {
             std::lock_guard<std::mutex> lock(coordMtx_);
             closeSessionTimestampsLocked();
@@ -4518,7 +4521,7 @@ public:
                 joinCoordinatorThreadIfPossible();
                 try {
                     if(!egoSessionName.empty()) {
-                        fs::remove_all(saveRoot / subjectId / taskName / ("episode_" + std::to_string(episodeN)));
+                        fs::remove_all(recordingDest);
                     }
                 }
                 catch(...) {
@@ -10244,14 +10247,34 @@ static ExitConfirmModalActions drawExitConfirmModal(cv::Mat &ui,
 int run_collection(const AppConfig &cfg,
                    const std::atomic_bool *cancel,
                    EgoRecorder *sharedEgoRecorder,
-                   const std::string &operatorId) {
+                   const std::string &operatorId,
+                   bool shapeCalibration) {
     (void)cancel;
 
     collectionInstallCrashHandlerOnce();
     collectionSetStage("ui_enter");
     std::cerr << "[collection] run enter" << std::endl;
 
-    const std::string winName = "Collection";
+    handshape::CaptureLock shapeCaptureLock;
+    if(shapeCalibration) {
+        try {
+            if(!cfg.taskBackend.nas.enabled || cfg.taskBackend.nas.mountPath.empty()) {
+                throw std::runtime_error("Handshape calibration requires the NAS upload destination");
+            }
+            const auto localRoot = fs::weakly_canonical(cfg.collection.savePath);
+            const auto nasRoot = fs::weakly_canonical(cfg.taskBackend.nas.mountPath);
+            if(pathIsSameOrBelow(localRoot, nasRoot)) {
+                throw std::runtime_error("Handshape capture root must be outside the NAS mount");
+            }
+            shapeCaptureLock.acquire(cfg.collection.savePath, trimString(operatorId));
+            handshape::prepareEpisode(cfg.collection.savePath, trimString(operatorId), false);
+        }
+        catch(const std::exception &e) {
+            std::cerr << "[handshape] " << e.what() << std::endl;
+            return 1;
+        }
+    }
+    const std::string winName = shapeCalibration ? "Handshape Calibration" : "Collection";
     cv::namedWindow(winName, cv::WINDOW_NORMAL);
     cv::resizeWindow(winName, 1800, 1000);
 
@@ -10270,6 +10293,7 @@ int run_collection(const AppConfig &cfg,
     TaskBackendClient backendClient(cfg.taskBackend.baseUrl, cfg.taskBackend.timeoutMs);
     const std::string collectionClientId = makeCollectionClientId();
     EpisodeReservationUi currentReservation;
+    std::future<std::pair<int, std::string>> shapePublishFuture;
     VoiceAnnouncer voice(cfg.voiceFeedback);
     std::deque<std::string> uiLogs;
     std::deque<TrackedUploadUi> trackedUploads;
@@ -10305,6 +10329,24 @@ int run_collection(const AppConfig &cfg,
     }
     if(cfg.colorBrightness >= 0) {
         cfgUi.brightness = std::to_string(cfg.colorBrightness);
+    }
+
+    if(shapeCalibration) {
+        TaskInfo task;
+        task.name = handshape::taskName;
+        task.description_en = "Subject handshape calibration. One episode per subject; a new capture replaces episode1.";
+        task.description_cn = "手型标定：每位受试者仅保留一个 episode，重复采集覆盖 episode1。";
+        capUi.tasks = {task};
+        capUi.currentTaskIdx = 0;
+        capUi.currentEpisode = 1;
+        if(recorder.start(cfgUi)) {
+            page = CollectionPage::Capture;
+        }
+        else {
+            std::cerr << "[handshape] Camera start failed: " << recorder.lastInfoLine() << std::endl;
+            cv::destroyWindow(winName);
+            return 1;
+        }
     }
 
     auto pushUiLog = [&](std::string s) {
@@ -10581,6 +10623,34 @@ int run_collection(const AppConfig &cfg,
         capUi.msg.clear();
     };
 
+    auto enqueueShapePublish = [&]() {
+        if(shapePublishFuture.valid()) { return false; }
+        if(!currentReservation.active || !currentReservation.localFinalized) { return false; }
+        const fs::path source = currentReservation.collectionPath;
+        const std::string subject = trimString(cfgUi.subjectId);
+        const std::string token = currentReservation.idempotencyKey;
+        const fs::path nasRoot = cfg.taskBackend.nas.mountPath;
+        const std::string backendUrl = cfg.taskBackend.baseUrl;
+        const std::string nasUriPrefix = cfg.taskBackend.nas.uriPrefix;
+        shapePublishFuture = std::async(std::launch::async, [source, subject, token, nasRoot, backendUrl, nasUriPrefix]() {
+            const auto script = fs::absolute("scripts/publish_handshape.py");
+            const std::string command = "python3 " + shellQuote(script.string())
+                + " --source " + shellQuote(source.string())
+                + " --nas-root " + shellQuote(nasRoot.string())
+                + " --subject " + shellQuote(subject)
+                + " --token " + shellQuote(token)
+                + " --backend-url " + shellQuote(backendUrl)
+                + " --nas-uri-prefix " + shellQuote(nasUriPrefix) + " 2>&1";
+            std::string output;
+            const int code = runCommandCapture(command, output);
+            return std::make_pair(code, output);
+        });
+        captureState = CaptureState::BACKEND_SYNC_PENDING;
+        capUi.msg = "Uploading handshape episode and publishing calibration...";
+        pushUiLog(capUi.msg);
+        return false; // Keep the reservation and disable Start until publication succeeds.
+    };
+
     auto releaseCurrentReservation = [&](const std::string &reason) {
         if(!currentReservation.active) {
             return true;
@@ -10590,6 +10660,7 @@ int run_collection(const AppConfig &cfg,
             pushUiLog(capUi.msg);
             return false;
         }
+        if(shapeCalibration) { currentReservation.clear(); return true; }
         std::string error;
         const std::string subject = trimString(cfgUi.subjectId);
         if(!backendClient.releaseEpisode(currentReservation.reservationId,
@@ -10688,6 +10759,7 @@ int run_collection(const AppConfig &cfg,
     };
 
     auto confirmReservationWithBackend = [&]() {
+        if(shapeCalibration) { return enqueueShapePublish(); }
         if(!currentReservation.active) {
             capUi.msg = "Backend confirm failed: no active reservation";
             pushUiLog(capUi.msg);
@@ -10832,6 +10904,14 @@ int run_collection(const AppConfig &cfg,
         pendingExitDeleteFaultEpisode = false;
 
         bool okToLeave = true;
+        if(shapeCalibration && shapePublishFuture.valid()) {
+            capUi.msg = "Wait for handshape publication before exiting.";
+            return;
+        }
+        if(shapeCalibration && currentReservation.localFinalized) {
+            pushUiLog("Unpublished handshape capture retained at " + currentReservation.collectionPath.string());
+            currentReservation.clear();
+        }
         if(currentReservation.active && currentReservation.localFinalized) {
             pushUiLog("Exit requested while backend sync is pending. Retrying backend confirm first.");
             if(!confirmReservationWithBackend()) {
@@ -10917,6 +10997,28 @@ int run_collection(const AppConfig &cfg,
         auto fm = beginFrame(ms);
         pollTrackedUploads(false);
         pollCaptureNasFinalizeJobs();
+        if(shapePublishFuture.valid() && shapePublishFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            std::pair<int, std::string> result;
+            try { result = shapePublishFuture.get(); }
+            catch(const std::exception &e) { result = {1, e.what()}; }
+            pushUiLog(result.second);
+            if(result.first == 0) {
+                currentReservation.clear();
+                capUi.tasks.front().completed = 1;
+                completedThisCollection = 1;
+                recorder.clearStatus();
+                captureState = CaptureState::IDLE;
+                capUi.msg = "Handshape calibration submitted. Results will appear in subject/shape_calibration_result.";
+                pushUiLog(capUi.msg);
+                announce("confirm", "手型标定已提交");
+            }
+            else {
+                captureState = CaptureState::BACKEND_SYNC_PENDING;
+                capUi.msg = "Handshape publish failed. Local data kept; retry Confirm after fixing publisher.";
+                pushUiLog(capUi.msg);
+                announce("confirm_failed", "手型标定发布失败，采集数据已保留");
+            }
+        }
         if(key == 27) {
             collectionSetStage("ui_exit_esc");
             if(exitConfirmActive) {
@@ -11810,6 +11912,7 @@ int run_collection(const AppConfig &cfg,
                                      && !manualExtrinsicRecheckPending && readyForStart;
             const bool allowStop   = !modalFault && !modalDelete && !modalExit && (captureState == CaptureState::RECORDING);
             const bool allowSave   = !modalFault && !modalDelete && !modalExit
+                                     && !shapePublishFuture.valid()
                                      && ((captureState == CaptureState::STOPPED_READY && recorder.hasData())
                                          || (captureState == CaptureState::BACKEND_SYNC_PENDING && currentReservation.active && currentReservation.localFinalized));
             const bool allowReset  = !modalFault && !modalDelete
@@ -11818,6 +11921,7 @@ int run_collection(const AppConfig &cfg,
                                          || captureState == CaptureState::STOPPED_READY
                                          || (captureState == CaptureState::DRAINING && !pendingResetAfterDrain));
             const bool allowNav    = !modalFault && !modalDelete && !modalExit
+                                     && !shapePublishFuture.valid()
                                      && (captureState == CaptureState::IDLE || captureState == CaptureState::BACKEND_SYNC_PENDING);
             const bool allowExtrinsicRecheck = !modalFault && !modalDelete && !modalExit
                                              && captureState == CaptureState::IDLE
@@ -11863,14 +11967,14 @@ int run_collection(const AppConfig &cfg,
             bool doExtrinsicRecheck = uiButtonEx(ui, bExtrinsicRecheck, "Resample Extrinsic Check", fm, allowExtrinsicRecheck);
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
-            std::string saveLabel = "Confirm [Ctrl+3]";
+            std::string saveLabel = shapeCalibration ? "Calibrate [Ctrl+3]" : "Confirm [Ctrl+3]";
             if(captureState == CaptureState::BACKEND_SYNC_PENDING) {
                 saveLabel = "Retry Confirm [Ctrl+3]";
             }
             bool doSave     = uiButtonEx(ui, bSave, saveLabel, fm, allowSave);
             bool doReset    = uiButtonEx(ui, bReset, "Reset  [Ctrl+4]", fm, allowReset);
             bool doBackMenu = uiButtonEx(ui, bMenu,  "Menu",            fm, allowNav);
-            bool doBackTasks = uiButtonEx(ui, bTasks,"Tasks",           fm, allowNav);
+            bool doBackTasks = uiButtonEx(ui, bTasks,"Tasks",           fm, allowNav && !shapeCalibration);
             bool doDeleteConfirm = false;
             bool doDeleteCancel  = false;
             bool doFaultExit = false;
@@ -12104,7 +12208,27 @@ int run_collection(const AppConfig &cfg,
                 const std::string subject = trimString(cfgUi.subjectId);
                 const std::string taskName = capUi.tasks[static_cast<size_t>(capUi.currentTaskIdx)].name;
                 bool ok = true;
-                if(!currentReservation.active) {
+                if(shapeCalibration && !currentReservation.active) {
+                    try {
+                        handshape::prepareEpisode(root, subject, true);
+                        currentReservation.clear();
+                        currentReservation.active = true;
+                        currentReservation.reservationId = makeCollectionClientId();
+                        currentReservation.taskName = handshape::taskName;
+                        currentReservation.storageName = handshape::episodeName;
+                        currentReservation.episodeNumber = 1;
+                        currentReservation.collectionPath = handshape::episodePath(root, subject);
+                        currentReservation.idempotencyKey = currentReservation.reservationId;
+                        capUi.currentEpisode = 1;
+                        pushUiLog("Handshape capture: " + currentReservation.collectionPath.string());
+                    }
+                    catch(const std::exception &e) {
+                        ok = false;
+                        capUi.msg = e.what();
+                        pushUiLog(capUi.msg);
+                    }
+                }
+                else if(!currentReservation.active) {
                     TaskEpisodeReservation reservation;
                     std::string backendError;
                     ok = backendClient.reserveEpisode(
@@ -12154,7 +12278,7 @@ int run_collection(const AppConfig &cfg,
                             root,
                             subject,
                             currentReservation.taskName,
-                            currentReservation.episodeNumber);
+                            currentReservation.episodeNumber, shapeCalibration);
                     }
                 }
                 if(!ok) {
@@ -12256,9 +12380,9 @@ int run_collection(const AppConfig &cfg,
                 }
                 else {
                     const double maxDiff = recorder.lastAlignedMaxDiffMs();
-                    const bool finalizeAccepted = cfg.taskBackend.nas.enabled
-                        ? enqueueCaptureNasFinalizeForCurrentReservation()
-                        : confirmReservationWithBackend();
+                    const bool finalizeAccepted = shapeCalibration ? enqueueShapePublish()
+                        : (cfg.taskBackend.nas.enabled ? enqueueCaptureNasFinalizeForCurrentReservation()
+                                                      : confirmReservationWithBackend());
                     if(finalizeAccepted) {
                         if(maxDiff > 0.0) {
                             std::ostringstream oss;
@@ -12295,7 +12419,7 @@ int run_collection(const AppConfig &cfg,
                     else {
                         captureState = CaptureState::BACKEND_SYNC_PENDING;
                         pendingResetAfterDrain = false;
-                        announce("confirm_failed", "confirm failed");
+                        if(!shapePublishFuture.valid()) { announce("confirm_failed", "confirm failed"); }
                     }
                 }
             }

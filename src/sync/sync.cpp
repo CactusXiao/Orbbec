@@ -688,8 +688,9 @@ int main(int argc, char **argv) {
                 cv::Rect b4(60, 286, 780, 48);
                 cv::Rect b5(60, 342, 780, 48);
                 cv::Rect b6(60, 398, 780, 48);
-                cv::Rect b7(60, 454, 780, 48);
-                cv::Rect b8(60, 510, 780, 48);
+                cv::Rect bShape(60, 454, 780, 48);
+                cv::Rect b7(60, 510, 380, 48);
+                cv::Rect b8(460, 510, 380, 48);
                 if(uiButton(ui, b1, "Interaction", fm)) {
                     menuNotice.clear();
                     menuError.clear();
@@ -759,6 +760,24 @@ int main(int argc, char **argv) {
                         menuNotice.clear();
                         menuError = "QC frontend failed: " + detail;
                     }
+                }
+                if(uiButton(ui, bShape, "Handshape Calibration", fm)) {
+                    menuNotice.clear();
+                    menuError.clear();
+                    stopPlaceholderMode();
+                    menuPico.waitForStartup();
+                    AppConfig cfg = baseCfg;
+                    cfg.mode = "collection";
+                    cv::destroyWindow(winName);
+                    const int result = run_collection(cfg, nullptr, menuPico.recorder(), loggedInUsername, true);
+                    if(result != 0) {
+                        menuError = "Handshape calibration could not start. Check capture path and camera log.";
+                    }
+                    page = AppPage::Menu;
+                    cv::namedWindow(winName, cv::WINDOW_NORMAL);
+                    cv::resizeWindow(winName, 900, 640);
+                    cv::setMouseCallback(winName, mouseThunk, &ms);
+                    continue;
                 }
                 if(uiButton(ui, b7, "Logout", fm)) {
                     logout();
