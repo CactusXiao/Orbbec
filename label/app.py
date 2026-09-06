@@ -42,6 +42,7 @@ try:
     from .video_frames import ensure_decoded_rgb_frames
     from .env_config import LabelConfig, load_label_config
     from .mesh_cache import OriginalMeshCache
+    from .timeline import LabelTimeline
 except Exception:
     from backend_client import BackendClientError, LabelBackendClient, LabelJobSession, episode_display_id, session_from_lease
     from canvas_view import HandPoints, HandVisible, ImageAnnotatorCanvas
@@ -73,6 +74,7 @@ except Exception:
     from video_frames import ensure_decoded_rgb_frames
     from env_config import LabelConfig, load_label_config
     from label.mesh_cache import OriginalMeshCache
+    from label.timeline import LabelTimeline
 
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
@@ -545,6 +547,20 @@ class LabelPage(ttk.Frame):
 
         btn_row.add(ttk.Button(btn_row, text="返回任务", style="Secondary.TButton", command=self._back_home))
 
+        timeline_host = ttk.Frame(right, style="Panel.TFrame")
+        timeline_host.pack(side="bottom", fill="x", padx=12, pady=(0, 2))
+        legend = ttk.Frame(timeline_host, style="Panel.TFrame")
+        legend.pack(fill="x")
+        self._timeline_status = ttk.Label(legend, text="帧进度", style="PanelMuted.TLabel")
+        self._timeline_status.pack(side="left", expand=True, fill="x")
+        legend.bind("<Configure>", lambda e: self._timeline_status.configure(wraplength=max(200, e.width - 180)))
+        ttk.Label(legend, text="● 已确认", foreground=LabelTimeline.DONE,
+                  style="PanelMuted.TLabel").pack(side="left", padx=8)
+        ttk.Label(legend, text="● 未确认", foreground=LabelTimeline.TODO,
+                  style="PanelMuted.TLabel").pack(side="left")
+        self._timeline = LabelTimeline(timeline_host, on_seek=self._seek_timeline)
+        self._timeline.pack(fill="x")
+
         canvas_host = ttk.Frame(right, style="Panel2.TFrame")
         canvas_host.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
@@ -558,6 +574,8 @@ class LabelPage(ttk.Frame):
         self._cancel_backend_heartbeat()
         self._cleanup_decode_cache()
         self._canvas.clear()
+        self._timeline.set_data(frames=[], position=0, done=set())
+        self._timeline_status.configure(text="帧进度")
         self._jsonl_path = None
         self._backend_session = None
         self._backend_completed = False
@@ -731,6 +749,8 @@ class LabelPage(ttk.Frame):
         self._tracking_notice_keys = set()
         self._mano_projection_errors = {}
         self._update_source_button()
+        self._timeline.set_data(frames=[], position=0, done=set())
+        self._timeline_status.configure(text="帧进度")
 
         for item in self._tree.get_children():
             self._tree.delete(item)
@@ -850,7 +870,7 @@ class LabelPage(ttk.Frame):
 
     def _on_task_select(self, _evt) -> None:
         sel = self._tree.selection()
-        if not sel:
+        if not sel or sel[0] == self._active_key:
             return
         self._load_task(sel[0])
 
@@ -1499,6 +1519,7 @@ class LabelPage(ttk.Frame):
         self._update_source_button()
         self._refresh_visual_overlays()
 
+        self._refresh_timeline()
         rec = self._progress.get(task.key)
         done = rec.done_count if rec else 0
         frame_done = self._is_frame_done(task, self._frame_pos)
@@ -1573,12 +1594,37 @@ class LabelPage(ttk.Frame):
             return
         self._canvas.ignore_view()
 
-    def _skip_frame(self) -> None:
+    def _refresh_timeline(self) -> None:
+        task = self._active_task
+        if task is None:
+            return
+        rec = self._progress.get(task.key)
+        self._timeline.set_data(frames=task.frames, position=self._frame_pos,
+                                done=rec.done_positions if rec else set())
+        self._set_timeline_status(self._frame_pos)
+
+    def _set_timeline_status(self, position: int) -> None:
+        task = self._active_task
+        if task is None or not task.frames:
+            return
+        rec = self._progress.get(task.key)
+        done = rec.done_count if rec else 0
+        status = "已确认" if rec and position in rec.done_positions else "未确认"
+        self._timeline_status.configure(
+            text=f"帧 {task.frames[position]} · {position + 1}/{task.total_frames} · {status} · 已确认 {done}/{task.total_frames}"
+        )
+
+    def _seek_timeline(self, position: int, final: bool) -> None:
+        self._set_timeline_status(position)
+        if final:
+            self._jump_to_frame(position)
+
+    def _jump_to_frame(self, position: int) -> None:
         task = self._active_task
         if task is None or task.total_frames <= 0:
             return
-        next_pos = min(task.total_frames - 1, self._frame_pos + 1)
-        if next_pos == self._frame_pos:
+        position = max(0, min(task.total_frames - 1, int(position)))
+        if position == self._frame_pos:
             return
         self._cache_current_source_state()
         self._view_states = {}
@@ -1586,24 +1632,14 @@ class LabelPage(ttk.Frame):
         self._reset_visualizations()
         self._show_mano = keep_mano
         self._update_mano_button()
-        self._frame_pos = next_pos
+        self._frame_pos = position
         self._load_current_sample()
 
+    def _skip_frame(self) -> None:
+        self._jump_to_frame(self._frame_pos + 1)
+
     def _back_frame(self) -> None:
-        task = self._active_task
-        if task is None or task.total_frames <= 0:
-            return
-        prev_pos = max(0, self._frame_pos - 1)
-        if prev_pos == self._frame_pos:
-            return
-        self._cache_current_source_state()
-        self._view_states = {}
-        keep_mano = self._show_mano
-        self._reset_visualizations()
-        self._show_mano = keep_mano
-        self._update_mano_button()
-        self._frame_pos = prev_pos
-        self._load_current_sample()
+        self._jump_to_frame(self._frame_pos - 1)
 
     def _confirm(self) -> None:
         task = self._active_task
@@ -1639,22 +1675,22 @@ class LabelPage(ttk.Frame):
         if rec is None:
             rec = CorrectionProgress(task_key=task.key, total_frames=task.total_frames)
             self._progress[task.key] = rec
+        was_complete = rec.done_count >= task.total_frames
         rec.done_positions.add(self._frame_pos)
         save_correction_progress(self._jsonl_path, self._progress)
         self._update_tree_row(task)
 
-        next_pos = self._next_unconfirmed_position(task, self._frame_pos + 1)
+        next_pos = min(task.total_frames - 1, self._frame_pos + 1)
         keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano
         self._update_mano_button()
-        if next_pos < 0:
+        if rec.done_count >= task.total_frames:
             if not self._complete_backend_job(task):
                 self._refresh_view()
                 return
-            messagebox.showinfo("Done", "This task is fully completed.")
-            self._refresh_view()
-            return
+            if not was_complete:
+                messagebox.showinfo("Done", "This task is fully completed.")
 
         self._frame_pos = next_pos
         self._view_states = {}

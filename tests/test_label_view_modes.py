@@ -14,7 +14,7 @@ from label.app import LabelPage
 from label.canvas_view import ImageAnnotatorCanvas
 from label.env_config import LabelConfig
 from label.mesh_cache import OriginalMeshCache
-from label.storage import CorrectionTask
+from label.storage import CorrectionTask, CorrectionProgress
 
 
 class MeshCacheTest(unittest.TestCase):
@@ -245,6 +245,77 @@ class LabelViewUiTest(unittest.TestCase):
                 self.assertEqual(p._canvas.get_hand_state(), state(4))
                 self.assertEqual(p._progress, {})
                 save.assert_not_called()
+
+    def test_confirm_advances_sequentially_even_when_next_frame_is_already_done(self):
+        p = self.page
+        points = [[(10.0, 20.0)] * 21 for _ in range(2)]
+        visible = [[False] * 21 for _ in range(2)]
+        cases = [(0, {0, 1}, 1), (3, {0, 1}, 3), (0, {0, 1, 2, 3}, 1), (2, {0, 1, 3}, 3)]
+        for current, done, expected in cases:
+            with self.subTest(current=current, done=done):
+                p._active_task = SimpleNamespace(key="review", frames=[5, 12, 20, 30], total_frames=4)
+                p._active_key = "review"
+                p._jsonl_path = "unused"
+                p._camera_ids = ["00"]
+                p._frame_pos = current
+                p._progress = {"review": CorrectionProgress("review", set(done), 4)}
+                p._canvas.set_hand_state(points, visible)
+                with patch.object(p, "_save_bundle", return_value=object()), \
+                     patch.object(p, "_build_initial_view_state", return_value=(points, visible)), \
+                     patch.object(p, "_next_unconfirmed_position", side_effect=AssertionError("must not skip confirmed frames")), \
+                     patch.object(p, "_load_current_sample"), \
+                     patch.object(p, "_update_tree_row"), \
+                     patch.object(p, "_complete_backend_job", return_value=True) as complete, \
+                     patch("label.app.apply_view_state_to_corrected"), \
+                     patch("label.app.save_corrected_array"), \
+                     patch("label.app.save_correction_progress"), \
+                     patch("label.app.messagebox.showinfo") as notice:
+                    p._confirm()
+                    self.assertEqual(p._frame_pos, expected)
+                    self.assertEqual(complete.call_count, int(len(done | {current}) == 4))
+                    self.assertEqual(notice.call_count, int(len(done) < 4 and len(done | {current}) == 4))
+
+    def test_timeline_drag_jumps_on_release_and_preserves_unconfirmed_edits(self):
+        p = self.page
+        initial = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[True] * 21 for _ in range(2)])
+        edited = ([[(42.0, 24.0)] * 21 for _ in range(2)], [[False] * 21 for _ in range(2)])
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "frame.png"
+            Image.new("RGB", (100, 80)).save(image)
+            p._active_task = SimpleNamespace(key="seek", frames=[5, 12, 20, 30], total_frames=4,
+                display_name="Seek test", episode_dir=lambda: Path(temp), rgb_path_template="unused")
+            p._active_key = "seek"
+            p._camera_ids = ["00"]
+            p._bundles = {"pred": object()}
+            p._progress = {"seek": CorrectionProgress("seek", {0, 2}, 4)}
+            with patch("label.app.find_frame_path", return_value=image), \
+                 patch.object(p, "_build_modified_view_state", return_value=initial), \
+                 patch.object(p, "_view_source_status", return_value="test"):
+                p._refresh_view()
+                self.root.update()
+                p._canvas.set_hand_state(*edited)
+                timeline = p._timeline
+                self.assertEqual(len(timeline.find_withtag("done")), 2)
+                self.assertEqual(len(timeline.find_withtag("todo")), 2)
+                x = int(timeline._x_for_position(3))
+                timeline.event_generate("<Button-1>", x=x, y=18)
+                self.root.update()
+                self.assertEqual(p._frame_pos, 0)
+                self.assertIn("帧 30", p._timeline_status.cget("text"))
+                timeline.event_generate("<ButtonRelease-1>", x=x, y=18)
+                self.root.update()
+                self.assertEqual(p._frame_pos, 3)
+                p._jump_to_frame(0)
+                self.assertEqual(p._canvas.get_hand_state(), edited)
+                self.assertEqual(p._progress["seek"].done_positions, {0, 2})
+                with patch.object(p._tree, "selection", return_value=("seek",)), \
+                     patch.object(p, "_load_task") as reload_task:
+                    p._on_task_select(None)
+                    reload_task.assert_not_called()
+                timeline.set_data(frames=[5], position=0, done={0})
+                self.assertEqual(timeline._position_from_event(SimpleNamespace(x=10000)), 0)
+                timeline.set_data(frames=[], position=0, done=set())
+                self.assertFalse(timeline.find_all())
 
     def test_preview_swap_preserves_coordinates_visibility_and_zoom(self):
         canvas = self.page._canvas
