@@ -272,8 +272,60 @@ class LabelViewUiTest(unittest.TestCase):
                      patch("label.app.messagebox.showinfo") as notice:
                     p._confirm()
                     self.assertEqual(p._frame_pos, expected)
-                    self.assertEqual(complete.call_count, int(len(done | {current}) == 4))
-                    self.assertEqual(notice.call_count, int(len(done) < 4 and len(done | {current}) == 4))
+                    complete.assert_not_called()
+                    notice.assert_not_called()
+
+    def _setup_submit_task(self, done):
+        p = self.page
+        p._active_task = SimpleNamespace(key="submit", frames=[5, 12], total_frames=2, cameras=["00"])
+        p._active_key = "submit"
+        p._backend_session = SimpleNamespace(client=Mock(), job_id="job", episode_id="episode",
+                                             operator_id="labeler", payload={})
+        p._progress = {"submit": CorrectionProgress("submit", set(done), 2)}
+        p._on_back = Mock()
+        p._update_submit_button()
+        return p
+
+    def test_submit_requires_all_frames_and_sends_only_on_button_click(self):
+        p = self._setup_submit_task({0})
+        self.assertTrue(p._submit_btn.instate(["disabled"]))
+        with patch("label.app.messagebox.showwarning") as warning:
+            p._submit_task()
+        warning.assert_called_once()
+        p._backend_session.client.complete_label_job.assert_not_called()
+        p._progress["submit"].done_positions.add(1)
+        p._update_submit_button()
+        self.assertFalse(p._submit_btn.instate(["disabled"]))
+        p._backend_session.client.complete_label_job.assert_not_called()
+        # Submission works while reviewing an earlier frame in original + MANO.
+        p._frame_pos = 0
+        p._mode = "mano"
+        p._show_mano = True
+        with patch("label.app.messagebox.showinfo"), patch.object(p, "_cancel_backend_heartbeat") as heartbeat:
+            p._submit_btn.invoke()
+        p._backend_session.client.complete_label_job.assert_called_once()
+        self.assertEqual(p._backend_session.client.complete_label_job.call_args.kwargs["result"]["frames_completed"], [5, 12])
+        heartbeat.assert_called_once()
+        p._on_back.assert_called_once()
+        self.assertTrue(p._backend_completed)
+        self.assertTrue(p._submit_btn.instate(["disabled"]))
+        p._submit_task()
+        p._backend_session.client.complete_label_job.assert_called_once()
+
+    def test_failed_submission_keeps_task_and_can_retry(self):
+        p = self._setup_submit_task({0, 1})
+        p._backend_session.client.complete_label_job.side_effect = [RuntimeError("offline"), None]
+        with patch("label.app.messagebox.showerror") as error:
+            p._submit_btn.invoke()
+        error.assert_called_once()
+        p._on_back.assert_not_called()
+        self.assertFalse(p._backend_completed)
+        self.assertFalse(p._submit_btn.instate(["disabled"]))
+        self.assertEqual(p._progress["submit"].done_positions, {0, 1})
+        with patch("label.app.messagebox.showinfo"):
+            p._submit_btn.invoke()
+        self.assertTrue(p._backend_completed)
+        p._on_back.assert_called_once()
 
     def test_timeline_drag_jumps_on_release_and_preserves_unconfirmed_edits(self):
         p = self.page

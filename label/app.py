@@ -447,6 +447,7 @@ class LabelPage(ttk.Frame):
         self._jsonl_path: Optional[str] = None
         self._backend_session: Optional[LabelJobSession] = None
         self._backend_completed: bool = False
+        self._submitting = False
         self._heartbeat_after_id: Optional[str] = None
         self._decode_generation: int = 0
         self._decode_thread: Optional[threading.Thread] = None
@@ -554,6 +555,11 @@ class LabelPage(ttk.Frame):
         )
         btn_row.add(self._mano_btn)
         btn_row.add(ttk.Button(btn_row, text="确认并继续", style="Primary.TButton", command=self._confirm))
+        self._submit_btn = ttk.Button(
+            btn_row, text="提交任务", style="Primary.TButton",
+            command=self._submit_task, state="disabled",
+        )
+        btn_row.add(self._submit_btn)
 
         btn_row.add(ttk.Button(btn_row, text="返回任务", style="Secondary.TButton", command=self._back_home))
 
@@ -595,6 +601,7 @@ class LabelPage(ttk.Frame):
         self._progress = {}
         self._active_key = None
         self._active_task = None
+        self._update_submit_button()
         self._active_bundle = None
         self._bundles = {}
         self._camera_ids = []
@@ -773,6 +780,7 @@ class LabelPage(ttk.Frame):
         self._progress = progress
         self._active_key = None
         self._active_task = None
+        self._update_submit_button()
         self._active_bundle = None
         self._bundles = {}
         self._view_states = {}
@@ -1529,6 +1537,7 @@ class LabelPage(ttk.Frame):
         return self._camera_ids[self._cam_idx]
 
     def _refresh_view(self) -> None:
+        self._update_submit_button()
         task = self._active_task
         if task is None or not self._bundles:
             self._canvas.clear()
@@ -1709,26 +1718,58 @@ class LabelPage(ttk.Frame):
         if rec is None:
             rec = CorrectionProgress(task_key=task.key, total_frames=task.total_frames)
             self._progress[task.key] = rec
-        was_complete = rec.done_count >= task.total_frames
         rec.done_positions.add(self._frame_pos)
         save_correction_progress(self._jsonl_path, self._progress)
         self._update_tree_row(task)
+        self._update_submit_button()
 
         next_pos = min(task.total_frames - 1, self._frame_pos + 1)
         keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano
         self._update_mano_button()
-        if rec.done_count >= task.total_frames:
-            if not self._complete_backend_job(task):
-                self._refresh_view()
-                return
-            if not was_complete:
-                messagebox.showinfo("Done", "This task is fully completed.")
-
         self._frame_pos = next_pos
         self._view_states = {}
         self._load_current_sample()
+
+    def _can_submit_task(self) -> bool:
+        task = self._active_task
+        if task is None or task.total_frames <= 0 or self._backend_session is None:
+            return False
+        rec = self._progress.get(task.key)
+        return bool(
+            not self._backend_completed and not self._submitting and rec is not None
+            and all(position in rec.done_positions for position in range(task.total_frames))
+        )
+
+    def _update_submit_button(self) -> None:
+        task = self._active_task
+        rec = self._progress.get(task.key) if task is not None else None
+        text = "提交任务"
+        if self._submitting:
+            text = "正在提交..."
+        elif task is not None and self._backend_session is not None:
+            done = sum(position in rec.done_positions for position in range(task.total_frames)) if rec else 0
+            text = f"提交任务（{done}/{task.total_frames}）"
+        self._submit_btn.configure(text=text, state="normal" if self._can_submit_task() else "disabled")
+
+    def _submit_task(self) -> None:
+        if self._submitting or self._backend_completed or self._backend_session is None:
+            return
+        if not self._can_submit_task():
+            messagebox.showwarning("尚未完成", "请先确认所有帧，再提交整个任务。")
+            return
+        task = self._active_task
+        self._submitting = True
+        self._update_submit_button()
+        try:
+            if not self._complete_backend_job(task):
+                return
+            messagebox.showinfo("提交成功", "后端已确认整个标注任务的结果。")
+            self._on_back()
+        finally:
+            self._submitting = False
+            self._update_submit_button()
 
     def _complete_backend_job(self, task: CorrectionTask) -> bool:
         session = self._backend_session
