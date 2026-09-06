@@ -284,7 +284,7 @@ class QcWorkerApp(tk.Tk):
         if progress is None or media is None:
             return
         if not bad_episode and not progress.is_complete:
-            messagebox.showwarning("尚未完成", "当前 Episode 还没有检查到末尾，暂不能提交。")
+            messagebox.showwarning("尚未完成", "当前 Episode 尚未完成一次播放，暂不能提交。")
             return
         bad_ranges = normalize_ranges(progress.bad_frame_ranges, max_gap_frames=self.config.range_merge_gap_frames)
         ego_bad_ranges = normalize_ranges(progress.ego_bad_frame_ranges, max_gap_frames=self.config.range_merge_gap_frames)
@@ -1232,12 +1232,12 @@ class QcPage(ttk.Frame):
         self._set_enabled(self._reject_button, paused_controls and not self._buffering)
         self._set_enabled(self._bad_episode_button, not disabled)
         self._set_enabled(self._play_button, not disabled and (self._playing or not self._buffering))
-        self._set_enabled(self._submit_button, bool(progress and progress.is_complete and not disabled and not self._playing))
+        self._set_enabled(self._submit_button, bool(progress and progress.is_complete and not disabled))
         self._play_button.configure(text="暂停" if self._playing else "播放")
         if progress is None:
             status = ""
         elif progress.playback_complete:
-            status = "已播放至末尾，可提交"
+            status = "已完成一次播放，可随时提交"
         elif self._buffering:
             status = f"目标帧 {self._display_frame()} 渲染中 · 可继续拖动进度条"
         elif self._timeline_dragging:
@@ -1245,7 +1245,7 @@ class QcPage(ttk.Frame):
         elif self._playing:
             status = f"播放中 · 目标 {self.app.config.playback_fps:g} FPS"
         else:
-            status = "已暂停 · 播放至末尾后可提交"
+            status = "已暂停 · 完成一次播放后可提交"
         self._playback_status.configure(text=status)
 
     def toggle_playback(self) -> None:
@@ -1391,8 +1391,7 @@ class QcPage(ttk.Frame):
                 self._play_after_id = None
         index = max(0, min(len(progress.frames) - 1, int(position)))
         progress.current_frame = progress.frames[index]
-        if index < len(progress.frames) - 1:
-            progress.playback_complete = False
+        # Completion records a finished playback, not the current cursor position.
         if commit:
             self._timeline_dragging = False
             self.app.save_current_progress()

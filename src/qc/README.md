@@ -54,6 +54,6 @@ Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json`
 - 播放按单调时钟维持真实 `playback_fps`；界面刷新落后时跳过中间显示帧，不会把刷新耗时叠加成慢放。Pico 投影仍在原始分辨率完成，播放器读取自动生成的 960 像素宽预览。
 - 暂停后可把当前帧标记为不通过并选择坏帧区间，随后二选一确认为“手部 Pose 不准”或“EgoPose 外参不准”。
 - 手部 Pose 区间沿用进度条内的红色块，并进入原 QC/人工返修流程；EgoPose 区间以紧贴进度条下方的红色实线显示，只写 `<episode>/ego/ego_pose_qc.json`，不改变后端 QC 结果和后续流程。
-- 正常结果必须播放到末帧后才能提交；“Episode 异常”仍可直接提交。
+- 正常结果完成一次播放后即可提交；回退、拖动或再次播放不会清除已完成记录，不要求停留在末帧。再次播放时也可提交，提交时自动暂停；“Episode 异常”仍可直接提交。
 - QC 提交会先写 `<episode>/qc/qc_report.json`，再调用后端 complete。
 - “Episode 异常”提交为 `result_type=bad_episode`，不会创建人工返修 segment。
