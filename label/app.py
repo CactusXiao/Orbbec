@@ -1400,7 +1400,7 @@ class LabelPage(ttk.Frame):
         if self._mesh_poll_id is not None:
             self.after_cancel(self._mesh_poll_id)
             self._mesh_poll_id = None
-        if not self._show_mano or self._mode != "mano" or self._active_task is None:
+        if not self._show_mano or self._active_task is None:
             return
         cache = self._original_mesh_cache
         camera = self._active_cam_id()
@@ -1421,66 +1421,21 @@ class LabelPage(ttk.Frame):
         if self._show_mano:
             self._reset_mano()
             return
-
-        task = self._active_task
-        if task is None:
-            return
-        self._reset_skeleton()
-        if self._mode == "mano":
-            self._show_mano = True
-            self._start_original_mesh_cache()
-            self._update_mano_button()
-            self._refresh_original_mesh_preview()
-            self._sync_visualization_canvas_state()
+        if self._active_task is None:
             return
         self._cache_current_source_state()
-        frame_idx = task.frames[self._frame_pos]
-        self._ensure_all_view_states_loaded(frame_idx)
-
-        missing = self._incomplete_joint_count(min_views=2)
-        if missing > 0:
-            messagebox.showwarning("Show MANO", f"标注量不足：还有 {missing} 个关节点的可见视角数少于 2。")
-            self._reset_mano()
-            return
-
-        try:
-            self._mano_mesh = self._mano_runtime_instance().build_mesh(
-                episode_dir=task.episode_dir(),
-                camera_ids=self._camera_ids,
-                view_states=self._view_states,
-            )
-        except Exception as exc:
-            messagebox.showerror("Show MANO", str(exc))
-            self._reset_mano()
-            return
-
+        self._reset_skeleton()
         self._show_mano = True
+        self._start_original_mesh_cache()
         self._update_mano_button()
-        self._refresh_mano_overlay()
+        self._refresh_original_mesh_preview()
         self._sync_visualization_canvas_state()
 
     def _refresh_mano_overlay(self) -> None:
-        if self._show_mano and self._mode == "mano":
+        if self._show_mano:
             self._refresh_original_mesh_preview()
-            return
-        if not self._show_mano or self._mano_mesh is None or self._active_task is None:
+        else:
             self._canvas.set_mano_overlay([])
-            return
-        cam_id = self._active_cam_id()
-        if cam_id is None:
-            self._canvas.set_mano_overlay([])
-            return
-        try:
-            lines = self._mano_runtime_instance().project_mesh(
-                episode_dir=self._active_task.episode_dir(),
-                cam_id=cam_id,
-                mesh=self._mano_mesh,
-            )
-        except Exception as exc:
-            self._reset_mano()
-            messagebox.showerror("Show MANO", str(exc))
-            return
-        self._canvas.set_mano_overlay(lines)
 
     def _refresh_visual_overlays(self) -> None:
         self._refresh_skeleton_overlay()
@@ -1627,7 +1582,7 @@ class LabelPage(ttk.Frame):
             return
         self._source_state_cache.clear()
         self._view_states = {}
-        keep_mano = self._mode == "mano" and self._show_mano
+        keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano
         self._update_mano_button()
@@ -1643,7 +1598,7 @@ class LabelPage(ttk.Frame):
             return
         self._source_state_cache.clear()
         self._view_states = {}
-        keep_mano = self._mode == "mano" and self._show_mano
+        keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano
         self._update_mano_button()

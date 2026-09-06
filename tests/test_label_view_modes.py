@@ -135,6 +135,33 @@ class LabelViewUiTest(unittest.TestCase):
             self.assertIsNone(p._mesh_poll_id)
             self.assertIsNone(p._canvas._rendered_image)
 
+    def test_modified_view_reuses_original_mano_without_changing_edits(self):
+        p = self.page
+        p._active_task = SimpleNamespace(frames=[5])
+        p._camera_ids = ["00"]
+        points = [[(50.0 + j, 20.0) for j in range(21)] for _ in range(2)]
+        visible = [[False] * 21 for _ in range(2)]
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "mesh.jpg"
+            Image.new("RGB", (100, 80), "red").save(image)
+            p._canvas.set_image(image)
+            p._canvas.set_hand_state(points, visible)
+            cache = Mock(error="", done_event=threading.Event())
+            cache.path.return_value = image
+            p._original_mesh_cache = cache
+            with patch.object(p, "_mano_runtime_instance", side_effect=AssertionError("must not fit edited points")), \
+                 patch.object(p, "_incomplete_joint_count", side_effect=AssertionError("no visibility restriction")):
+                for mode in ("mano", "correct"):
+                    p._mode = mode
+                    p._toggle_mano()
+                    self.assertEqual(p._canvas._rendered_path, image)
+                    self.assertEqual(p._canvas.get_hand_state(), (points, visible))
+                    self.assertEqual(p._view_states["00"], (points, visible))
+                    p._toggle_mano()
+                    self.assertIsNone(p._canvas._rendered_image)
+                    self.assertEqual(p._canvas.get_hand_state(), (points, visible))
+                    self.assertEqual(p._canvas._read_only, mode == "mano")
+
     def test_preview_swap_preserves_coordinates_visibility_and_zoom(self):
         canvas = self.page._canvas
         with tempfile.TemporaryDirectory() as temp:
