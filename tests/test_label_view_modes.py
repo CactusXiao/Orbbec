@@ -162,6 +162,44 @@ class LabelViewUiTest(unittest.TestCase):
                     self.assertEqual(p._canvas.get_hand_state(), (points, visible))
                     self.assertEqual(p._canvas._read_only, mode == "mano")
 
+    def test_confirm_from_original_and_mano_saves_corrected_state_and_continues(self):
+        p = self.page
+        original = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[True] * 21 for _ in range(2)])
+        initial = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[False] * 21 for _ in range(2)])
+        edited = ([[(42.0, 24.0)] * 21 for _ in range(2)], [[False] * 21 for _ in range(2)])
+        for mode in ("mano", "correct"):
+            for show_mano in (False, True):
+                with self.subTest(mode=mode, show_mano=show_mano):
+                    p._active_task = SimpleNamespace(key="test", frames=[5, 6], total_frames=2)
+                    p._active_key = "test"
+                    p._jsonl_path = "unused"
+                    p._camera_ids = ["00", "01"]
+                    p._cam_idx = p._frame_pos = 0
+                    p._mode = mode
+                    p._show_mano = show_mano
+                    p._progress = {}
+                    p._source_state_cache = {("test", 0, "00", "correct"): edited}
+                    p._canvas.set_hand_state(*(original if mode == "mano" else edited))
+                    p._view_states = {"00": original if mode == "mano" else edited}
+                    with patch.object(p, "_save_bundle", return_value=object()), \
+                         patch.object(p, "_build_modified_view_state", return_value=initial), \
+                         patch.object(p, "_load_current_sample") as next_frame, \
+                         patch.object(p, "_update_tree_row"), \
+                         patch("label.app.apply_view_state_to_corrected") as save, \
+                         patch("label.app.save_corrected_array"), \
+                         patch("label.app.save_correction_progress"), \
+                         patch("label.app.messagebox.showwarning") as warning:
+                        p._confirm()
+                        warning.assert_not_called()
+                        self.assertEqual(save.call_count, 2)
+                        self.assertEqual(save.call_args_list[0].args[3:], edited)
+                        self.assertEqual(save.call_args_list[1].args[3:], initial)
+                        self.assertEqual(p._progress["test"].done_positions, {0})
+                        self.assertEqual(p._frame_pos, 1)
+                        self.assertEqual(p._mode, mode)
+                        self.assertEqual(p._show_mano, show_mano)
+                        next_frame.assert_called_once()
+
     def test_preview_swap_preserves_coordinates_visibility_and_zoom(self):
         canvas = self.page._canvas
         with tempfile.TemporaryDirectory() as temp:

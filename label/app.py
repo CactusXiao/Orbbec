@@ -1610,22 +1610,23 @@ class LabelPage(ttk.Frame):
         bundle = self._save_bundle()
         if task is None or bundle is None or self._active_key is None or self._jsonl_path is None:
             return
-        if self._visualization_active():
-            messagebox.showwarning("Notice", "Please hide MANO/Skeleton visualization before confirming annotations.")
+        if self._show_skeleton:
+            messagebox.showwarning("Notice", "Please hide Skeleton visualization before confirming annotations.")
             return
         if not self._camera_ids:
             messagebox.showwarning("Notice", "No camera directories found for the current task.")
             return
-        if self._mode != "correct":
-            messagebox.showwarning("Notice", "请切换到“修改后视角”再确认标注。")
-            return
-
         self._cache_current_source_state()
-        self._ensure_all_view_states_loaded(task.frames[self._frame_pos])
         frame_idx = task.frames[self._frame_pos]
         try:
+            # Preview state is never the annotation source: original view omits
+            # visibility. Use edits, saved corrections, or masked initial values.
+            corrected_states = {
+                cam_id: self._build_initial_view_state(frame_idx, cam_id, "correct")
+                for cam_id in self._camera_ids
+            }
             for cam_id in self._camera_ids:
-                points, visible = self._view_states[cam_id]
+                points, visible = corrected_states[cam_id]
                 apply_view_state_to_corrected(bundle, frame_idx, cam_id, points, visible)
             save_corrected_array(bundle)
             self._invalidate_corrected_source_cache()
@@ -1643,7 +1644,10 @@ class LabelPage(ttk.Frame):
         self._update_tree_row(task)
 
         next_pos = self._next_unconfirmed_position(task, self._frame_pos + 1)
+        keep_mano = self._show_mano
         self._reset_visualizations()
+        self._show_mano = keep_mano
+        self._update_mano_button()
         if next_pos < 0:
             if not self._complete_backend_job(task):
                 self._refresh_view()
