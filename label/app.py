@@ -1667,12 +1667,6 @@ class LabelPage(ttk.Frame):
 
         self._cache_current_source_state()
         self._ensure_all_view_states_loaded(task.frames[self._frame_pos])
-        missing = self._incomplete_joint_count(min_views=2)
-        if missing > 0:
-            messagebox.showwarning("Notice", f"未标注完全：还有 {missing} 个关节点的可见视角数少于 2。")
-            self._refresh_view()
-            return
-
         frame_idx = task.frames[self._frame_pos]
         try:
             for cam_id in self._camera_ids:
