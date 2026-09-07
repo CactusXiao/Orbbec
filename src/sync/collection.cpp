@@ -6102,15 +6102,12 @@ private:
         row.push_back(std::to_string(frame.imuZ));
         row.push_back(frame.imuValid ? "1" : "0");
         row.push_back(frame.qualityFlag);
-        for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
-            if(i < frame.rawAdc.size()) {
-                row.push_back(std::to_string(frame.rawAdc[i]));
-            }
-            else {
-                row.emplace_back();
-            }
+        for(size_t i = 0; i < row.size(); ++i) {
+            if(i) stream->rawOfs << ",";
+            stream->rawOfs << row[i];
         }
-        writeCsvRow(stream->rawOfs, row);
+        writeTactileMeasurementCsvValues(stream->rawOfs, frame, cfg_.touch.save.csvFloatPrecision);
+        stream->rawOfs << "\n";
     }
 
     void commitTouchSampleLocked(TouchQueuedSample &&queued) {
@@ -6580,9 +6577,7 @@ private:
                 stream.rawOfs << "sample_index,touch_timestamp_us,touch_timestamp_s,side,sensor_type,"
                               << "packet1_ts_us,packet2_ts_us,packet_gap_us,"
                               << "imu_raw_hex,imu_w,imu_x,imu_y,imu_z,imu_valid,quality_flag";
-                for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
-                    stream.rawOfs << ",pressure_" << std::setw(3) << std::setfill('0') << i;
-                }
+                writeTactileMeasurementCsvHeader(stream.rawOfs);
                 stream.rawOfs << std::setfill(' ') << "\n";
             }
         }
@@ -6702,9 +6697,29 @@ private:
 
     void writeTouchManifestJson(const fs::path &touchDir) const {
         cJSON *root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "schema", "orbbec.touch.jq_shroom.v1");
+        cJSON_AddStringToObject(root, "schema", "orbbec.touch.jq_shroom.v2");
         cJSON_AddStringToObject(root, "protocol", "jq_shroom_record_tactile_py");
         cJSON_AddNumberToObject(root, "pressure_channels", static_cast<double>(kJqShroomPressureChannelCount));
+        cJSON_AddStringToObject(root, "force_unit", "N");
+        cJSON_AddStringToObject(root, "force_columns", "force_000_n..force_255_n (zero-based channel indices)");
+        cJSON_AddStringToObject(root, "raw_adc_columns", "raw_adc_000..raw_adc_255 (unit: ADC)");
+        cJSON_AddStringToObject(root, "force_calibration_method", "hill_inverse_sum_adc");
+        cJSON *hill = cJSON_CreateObject();
+        cJSON_AddNumberToObject(hill, "a_max_adc", TactileForceCalibration::kHillMaxAdc);
+        cJSON_AddNumberToObject(hill, "b_half_force_n", TactileForceCalibration::kHillHalfForceN);
+        cJSON_AddNumberToObject(hill, "n_exponent", TactileForceCalibration::kHillExponent);
+        cJSON_AddStringToObject(hill, "formula", "F_N = b * pow(adc_sum / (a - adc_sum), 1 / n)");
+        cJSON_AddStringToObject(hill, "source", "tactile/微信图片_2026-09-07_165536_559.jpg");
+        cJSON_AddItemToObject(root, "hill_fit", hill);
+        cJSON_AddStringToObject(root, "channel_force_method", "calibrated region total distributed by ADC fraction; estimates, not independent channel calibration");
+        cJSON_AddStringToObject(root, "uncalibrated_force", "nan");
+        cJSON_AddStringToObject(root, "out_of_range_policy", "no clamping: above measured ADC range is flagged; ADC >= a or invalid force is nan and flagged");
+        cJSON_AddStringToObject(root, "sensor_id_convention", "CSV sensor# IDs are one-based; mapped to serial channel index = ID - 1; shared across configured gloves");
+        cJSON *calibrationFiles = cJSON_CreateArray();
+        for(const auto &path : cfg_.touch.calibrationPaths) {
+            cJSON_AddItemToArray(calibrationFiles, cJSON_CreateString(path.string().c_str()));
+        }
+        cJSON_AddItemToObject(root, "calibration_files", calibrationFiles);
         cJSON_AddNumberToObject(root, "target_fps", cfg_.touch.targetFps);
         cJSON_AddStringToObject(root, "timestamp_domain", "collection_ref_timestamp_us");
         cJSON *devices = cJSON_CreateArray();

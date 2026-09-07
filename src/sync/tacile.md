@@ -1,3 +1,5 @@
+> 当前 Shroom/JQ 256 通道采集与 N 单位保存说明见 [TACTILE_FORCE_CALIBRATION.md](../../docs/TACTILE_FORCE_CALIBRATION.md)。下文为旧版 48 通道方案说明。
+
 # Tactile Module Interface
 
 `src/tacile.hpp` / `src/tacile.cpp` 提供了一套和 `fisheyes` 同风格的触觉模块接口。目标是先把串口采集、标定、抽样缓冲、落盘索引这些职责拆出来，后续 `collection` 只需要决定“是否启用触觉”“何时取样”“何时保存”“如何按时间戳软对齐”。

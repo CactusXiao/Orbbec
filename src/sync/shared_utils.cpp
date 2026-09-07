@@ -1214,11 +1214,27 @@ AppConfig loadConfig(const fs::path &configPath) {
         }
     }
 
+    for(auto &path : cfg.touch.calibrationPaths) {
+        path = resolveConfigRelativePath("../../" + path.generic_string());
+    }
     cJSON *touchObj = cJSON_GetObjectItemCaseSensitive(root, "touch");
     if(!touchObj) {
         touchObj = cJSON_GetObjectItemCaseSensitive(root, "tactile");
     }
     if(touchObj && cJSON_IsObject(touchObj)) {
+        if(auto *paths = cJSON_GetObjectItemCaseSensitive(touchObj, "calibrationPaths")) {
+            if(!cJSON_IsArray(paths) || cJSON_GetArraySize(paths) == 0) {
+                throw std::runtime_error("touch.calibrationPaths must be a nonempty array of CSV paths");
+            }
+            cfg.touch.calibrationPaths.clear();
+            cJSON *path = nullptr;
+            cJSON_ArrayForEach(path, paths) {
+                if(!cJSON_IsString(path) || trimString(path->valuestring).empty()) {
+                    throw std::runtime_error("touch.calibrationPaths entries must be nonempty strings");
+                }
+                cfg.touch.calibrationPaths.push_back(resolveConfigRelativePath(path->valuestring));
+            }
+        }
         if(auto v = getBool(touchObj, "enabled")) {
             cfg.touch.enabled = *v;
         }

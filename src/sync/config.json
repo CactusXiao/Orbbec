@@ -214,6 +214,7 @@
         "required": true,
         "targetFps": 60,
         "maxBufferedSamples": 8192,
+        "calibrationPaths": ["../../tactile/5 (1).csv", "../../tactile/5 (2).csv", "../../tactile/5 (3).csv"],
         "directoryName": "touch",
         "csvFloatPrecision": 6,
         "serial": {

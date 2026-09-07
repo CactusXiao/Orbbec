@@ -15,6 +15,7 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -77,23 +78,6 @@ std::vector<std::string> splitCsvLineSimple(const std::string &line) {
     return parts;
 }
 
-std::vector<std::string> splitTokensFlexible(const std::string &line) {
-    std::string normalized = line;
-    for(char &ch : normalized) {
-        if(ch == ',' || ch == '\t') {
-            ch = ' ';
-        }
-    }
-
-    std::istringstream iss(normalized);
-    std::vector<std::string> parts;
-    std::string token;
-    while(iss >> token) {
-        parts.push_back(token);
-    }
-    return parts;
-}
-
 const std::vector<std::string> &regionNames() {
     static const std::vector<std::string> kNames = {
         "Thumb",
@@ -105,97 +89,6 @@ const std::vector<std::string> &regionNames() {
     };
     return kNames;
 }
-
-class CalibrationModel {
-public:
-    bool load(const std::filesystem::path &path, std::string *errorMessage) {
-        params_.clear();
-        sourcePath_ = path;
-
-        std::ifstream ifs(path);
-        if(!ifs.is_open()) {
-            if(errorMessage) {
-                *errorMessage = "Failed to open tactile calibration file: " + path.string();
-            }
-            return false;
-        }
-
-        std::string line;
-        size_t lineNo = 0;
-        while(std::getline(ifs, line)) {
-            ++lineNo;
-            if(line.empty()) {
-                continue;
-            }
-
-            const auto firstNonWs = line.find_first_not_of(" \t\r\n");
-            if(firstNonWs == std::string::npos || line[firstNonWs] == '#') {
-                continue;
-            }
-
-            const auto parts = splitTokensFlexible(line);
-            if(parts.size() < 5) {
-                continue;
-            }
-
-            try {
-                TactileCalibrationEntry entry;
-                entry.regionIndex = static_cast<int>(std::lround(std::stod(parts[0])));
-                entry.pointIndex = static_cast<int>(std::lround(std::stod(parts[1])));
-                entry.a = std::stod(parts[2]);
-                entry.b = std::stod(parts[3]);
-                entry.c = std::stod(parts[4]);
-                entry.rsquare = parts.size() > 5 ? std::stod(parts[5]) : 0.0;
-                entry.validCount = parts.size() > 6 ? static_cast<int>(std::lround(std::stod(parts[6]))) : 0;
-                params_[{ entry.regionIndex, entry.pointIndex }] = entry;
-            }
-            catch(const std::exception &) {
-                if(errorMessage) {
-                    *errorMessage = "Failed to parse tactile calibration file at line " + std::to_string(lineNo);
-                }
-                return false;
-            }
-        }
-
-        if(params_.empty()) {
-            if(errorMessage) {
-                *errorMessage = "Tactile calibration file contains no valid entries: " + path.string();
-            }
-            return false;
-        }
-        return true;
-    }
-
-    bool empty() const {
-        return params_.empty();
-    }
-
-    double apply(size_t channelIndex, uint16_t adcValue) const {
-        const int regionIndex = static_cast<int>(channelIndex / kTactileChannelsPerRegion) + 1;
-        const int pointIndex = static_cast<int>(channelIndex % kTactileChannelsPerRegion) + 1;
-
-        const auto it = params_.find({ regionIndex, pointIndex });
-        if(it == params_.end()) {
-            return static_cast<double>(adcValue);
-        }
-        return compute(static_cast<double>(adcValue), it->second);
-    }
-
-private:
-    static double compute(double x, const TactileCalibrationEntry &entry) {
-        if(x > entry.c) {
-            x = entry.c;
-        }
-        const double denominator = entry.c - entry.a * x;
-        if(denominator <= 0.0) {
-            return entry.b > 0.0 ? (entry.b * entry.c) : 0.0;
-        }
-        return entry.b * entry.c * x / denominator;
-    }
-
-    std::filesystem::path                         sourcePath_;
-    std::map<std::pair<int, int>, TactileCalibrationEntry> params_;
-};
 
 struct SerialFrameResult {
     bool                  ok = false;
@@ -624,6 +517,9 @@ public:
 
         auto state = std::make_shared<State>();
         state->config = config;
+        if(!state->calibration.load(config.calibrationPaths, errorMessage)) {
+            return false;
+        }
 
 #if defined(__unix__) || defined(__APPLE__)
         if(!state->port.openDevice(config.serial, errorMessage)) {
@@ -717,6 +613,7 @@ public:
 private:
     struct State {
         TactileModuleConfig config;
+        TactileForceCalibration calibration;
 #if defined(__unix__) || defined(__APPLE__)
         PosixSerialPort     port;
 #endif
@@ -749,14 +646,6 @@ private:
         sample.frame.imuValid = frame.imuValid;
         sample.frame.qualityFlag = frame.qualityFlag.empty() ? "ok" : frame.qualityFlag;
         sample.frame.rawAdc = frame.rawAdc;
-        sample.frame.calibratedValues.reserve(frame.rawAdc.size());
-        sample.frame.outputValues.reserve(frame.rawAdc.size());
-
-        for(size_t i = 0; i < frame.rawAdc.size(); ++i) {
-            const double calibrated = static_cast<double>(frame.rawAdc[i]);
-            sample.frame.calibratedValues.push_back(calibrated);
-            sample.frame.outputValues.push_back(calibrated);
-        }
         return sample;
     }
 
@@ -778,6 +667,12 @@ private:
             }
 
             TactileSample sample = buildSample(frame, state.config);
+            std::string calibrationError;
+            if(!state.calibration.apply(sample.frame, &calibrationError)) {
+                std::lock_guard<std::mutex> lock(state.sampleMtx);
+                state.lastError = calibrationError;
+                continue;
+            }
             bool becameReady = false;
             {
                 std::lock_guard<std::mutex> lock(state.sampleMtx);
@@ -815,7 +710,7 @@ bool saveSingleSampleCsv(const TactileSample &sample,
         return false;
     }
 
-    ofs << "channel_index,region_id,region_name,point_id,raw_adc,calibrated_value,output_value\n";
+    ofs << "channel_index,region_id,region_name,point_id,raw_adc,calibrated_value,output_value,force_unit,calibrated_region_force_n,force_out_of_range\n";
     ofs << std::fixed << std::setprecision(std::max(0, options.csvFloatPrecision));
     const auto &names = regionNames();
     for(size_t i = 0; i < sample.frame.rawAdc.size(); ++i) {
@@ -824,7 +719,7 @@ bool saveSingleSampleCsv(const TactileSample &sample,
         const std::string regionName = regionIndex < names.size()
             ? names[regionIndex]
             : ("SensorBlock" + std::to_string(regionIndex + 1));
-        const double calibrated = i < sample.frame.calibratedValues.size() ? sample.frame.calibratedValues[i] : 0.0;
+        const double calibrated = i < sample.frame.calibratedValues.size() ? sample.frame.calibratedValues[i] : std::numeric_limits<double>::quiet_NaN();
         const double output = i < sample.frame.outputValues.size() ? sample.frame.outputValues[i] : calibrated;
         ofs << i
             << "," << (regionIndex + 1)
@@ -833,12 +728,161 @@ bool saveSingleSampleCsv(const TactileSample &sample,
             << "," << sample.frame.rawAdc[i]
             << "," << calibrated
             << "," << output
+            << ",N," << sample.frame.calibratedRegionForceN
+            << "," << (sample.frame.forceOutOfRange ? 1 : 0)
             << "\n";
     }
     return true;
 }
 
 }  // namespace
+
+bool TactileForceCalibration::load(const std::vector<std::filesystem::path> &paths, std::string *errorMessage) {
+    channelIndices_.clear();
+    maxMeasuredAdcSum_ = 0.0;
+    std::vector<size_t> channels;
+    // CSVs define channel membership and the observed range, not new fit parameters.
+    double maxMeasuredAdcSum = 0.0;
+    auto fail = [&](const std::string &message) {
+        if(errorMessage) *errorMessage = message;
+        return false;
+    };
+    if(paths.empty()) return fail("No tactile force calibration CSV configured");
+    for(const auto &path : paths) {
+        std::ifstream in(path);
+        std::string line;
+        if(!in || !std::getline(in, line)) return fail("Cannot read tactile calibration: " + path.string());
+        const auto header = splitCsvLineSimple(line);
+        if(header.size() < 3 || header[1].find("(N)") == std::string::npos) {
+            return fail("Expected time,force(N),sensor#... calibration CSV: " + path.string());
+        }
+        std::vector<size_t> fileChannels;
+        try {
+            for(size_t i = 2; i < header.size(); ++i) {
+                const auto hash = header[i].find('#');
+                if(hash == std::string::npos) throw std::runtime_error("Missing sensor number");
+                std::istringstream idStream(header[i].substr(hash + 1));
+                int id = 0;
+                if(!(idStream >> id) || !(idStream >> std::ws).eof()
+                   || id < 1 || id > static_cast<int>(kJqShroomPressureChannelCount)) {
+                    throw std::runtime_error("Invalid sensor number");
+                }
+                fileChannels.push_back(static_cast<size_t>(id - 1));
+            }
+            if(std::set<size_t>(fileChannels.begin(), fileChannels.end()).size() != fileChannels.size()) {
+                throw std::runtime_error("Duplicate sensor number");
+            }
+            auto sorted = fileChannels;
+            std::sort(sorted.begin(), sorted.end());
+            if(channels.empty()) channels = sorted;
+            if(channels != sorted) throw std::runtime_error("Calibration sensor sets differ");
+        }
+        catch(const std::exception &ex) {
+            return fail(path.string() + ": " + ex.what());
+        }
+        size_t lineNo = 1;
+        size_t positiveCount = 0;
+        while(std::getline(in, line)) {
+            ++lineNo;
+            if(line.find_first_not_of(" \t\r") == std::string::npos) continue;
+            const auto columns = splitCsvLineSimple(line);
+            try {
+                if(columns.size() != header.size()) throw std::runtime_error("Wrong row width");
+                auto number = [](const std::string &value) {
+                    size_t consumed = 0;
+                    double result = std::stod(value, &consumed);
+                    if(!std::isfinite(result)
+                       || value.find_first_not_of(" \t\r", consumed) != std::string::npos) {
+                        throw std::runtime_error("Invalid finite number");
+                    }
+                    return result;
+                };
+                const double force = number(columns[1]);
+                double adcSum = 0.0;
+                for(size_t i = 2; i < columns.size(); ++i) {
+                    double adc = number(columns[i]);
+                    if(adc < 0.0 || adc > 255.0) throw std::runtime_error("ADC outside uint8 range");
+                    adcSum += adc;
+                }
+                // No-contact samples anchor the origin; zero-ADC force readings
+                // cannot identify a response and must not create an offset.
+                if(adcSum > 0.0) {
+                    if(force < 0.0) throw std::runtime_error("Negative force with nonzero ADC");
+                    maxMeasuredAdcSum = std::max(maxMeasuredAdcSum, adcSum);
+                    if(force > 0.0) ++positiveCount;
+                }
+            }
+            catch(const std::exception &ex) {
+                return fail(path.string() + ":" + std::to_string(lineNo) + ": " + ex.what());
+            }
+        }
+        if(!in.eof()) return fail("Error reading tactile calibration: " + path.string());
+        if(positiveCount == 0) return fail("No positive force measurements: " + path.string());
+    }
+    channelIndices_ = std::move(channels);
+    maxMeasuredAdcSum_ = maxMeasuredAdcSum;
+    return true;
+}
+
+double TactileForceCalibration::forceN(double adcSum) const {
+    // The inverse is defined for 0 <= ADC < a. Do not clamp valid high
+    // readings: the requested Hill curve intentionally grows near saturation.
+    if(channelIndices_.empty() || !std::isfinite(adcSum) || adcSum < 0.0 || adcSum >= kHillMaxAdc) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    if(adcSum == 0.0) return 0.0;
+    const double force = kHillHalfForceN * std::pow(adcSum / (kHillMaxAdc - adcSum), 1.0 / kHillExponent);
+    return std::isfinite(force) ? force : std::numeric_limits<double>::quiet_NaN();
+}
+
+bool TactileForceCalibration::apply(TactileFrame &frame, std::string *errorMessage) const {
+    frame.calibratedValues.assign(frame.rawAdc.size(), std::numeric_limits<double>::quiet_NaN());
+    frame.outputValues = frame.calibratedValues;
+    frame.calibratedRegionForceN = std::numeric_limits<double>::quiet_NaN();
+    frame.forceOutOfRange = false;
+    if(channelIndices_.empty() || channelIndices_.back() >= frame.rawAdc.size()) {
+        if(errorMessage) *errorMessage = "Missing tactile force calibration or incomplete ADC frame";
+        return false;
+    }
+    double adcSum = 0.0;
+    for(size_t i : channelIndices_) adcSum += frame.rawAdc[i];
+    frame.calibratedRegionForceN = forceN(adcSum);
+    frame.forceOutOfRange = adcSum > maxMeasuredAdcSum_ || !std::isfinite(frame.calibratedRegionForceN);
+    for(size_t i : channelIndices_) {
+        frame.calibratedValues[i] = adcSum > 0.0 ? frame.calibratedRegionForceN * frame.rawAdc[i] / adcSum : 0.0;
+    }
+    frame.outputValues = frame.calibratedValues;
+    return true;
+}
+
+void writeTactileMeasurementCsvHeader(std::ostream &out) {
+    out << ",calibrated_region_force_n,force_out_of_range";
+    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+        out << ",force_" << std::setw(3) << std::setfill('0') << i << "_n";
+    }
+    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+        out << ",raw_adc_" << std::setw(3) << std::setfill('0') << i;
+    }
+    out << std::setfill(' ');
+}
+
+void writeTactileMeasurementCsvValues(std::ostream &out, const TactileFrame &frame, int precision) {
+    const auto flags = out.flags();
+    const auto oldPrecision = out.precision();
+    out << std::fixed << std::setprecision(std::max(0, precision));
+    out << "," << frame.calibratedRegionForceN << "," << (frame.forceOutOfRange ? 1 : 0);
+    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+        out << ",";
+        if(i < frame.outputValues.size()) out << frame.outputValues[i];
+        else out << "nan";
+    }
+    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+        out << ",";
+        if(i < frame.rawAdc.size()) out << frame.rawAdc[i];
+    }
+    out.flags(flags);
+    out.precision(oldPrecision);
+}
 
 std::string formatTactileTimestampUs(uint64_t timestampUs) {
     std::ostringstream oss;

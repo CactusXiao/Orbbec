@@ -28,6 +28,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+try:
+    from .tactile_viewer import TactileTimeline
+    from .tactile_viewer_ui import TACTILE_CSS, TACTILE_HTML, TACTILE_JS
+except ImportError:
+    from tactile_viewer import TactileTimeline  # type: ignore
+    from tactile_viewer_ui import TACTILE_CSS, TACTILE_HTML, TACTILE_JS  # type: ignore
+
+
 VIDEO_SUFFIXES = {".h265", ".hevc", ".mkv", ".mp4", ".mov", ".avi"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
 VIEWER_MODES = ("rgb", "pico", "pointcloud", "manomesh", "picohand")
@@ -385,7 +393,8 @@ class ViewerSessionManager:
                 raise ViewerError("RGB 相机不存在")
             path = self._rgb_frame_path(source, frame)
         elif mode == "pico":
-            path = session.temp_dir / "modes" / "pico" / f"{frame:05d}.jpg"
+            suffix = ".tactile.json" if source_id == "tactile" else ".jpg"
+            path = session.temp_dir / "modes" / "pico" / f"{frame:05d}{suffix}"
         elif mode == "pointcloud":
             path = session.temp_dir / "modes" / "pointcloud" / f"{frame:05d}.bin"
         elif mode == "manomesh":
@@ -780,6 +789,7 @@ class ViewerSessionManager:
         by_frame = {_integer(row.get("frame_index"), index): row for index, row in enumerate(metadata)}
         ego_params = self._ego_rgb_params(session.episode_dir / "ego")
         local_pose = self._ego_rgb_local_pose(session.episode_dir / "ego" / "camera.json")
+        tactile = TactileTimeline(session.episode_dir, session.fps)
         state.total = len(session.frame_indices)
 
         def render(frame: int) -> None:
@@ -787,6 +797,9 @@ class ViewerSessionManager:
             destination = out_dir / f"{frame:05d}.jpg"
             metadata_frame = source.rgb_metadata_map.get(frame, source.rgb_frame_map.get(frame, frame))
             self._render_pico_frame(source_path, destination, by_frame.get(metadata_frame, {}), ego_params, local_pose)
+            (out_dir / f"{frame:05d}.tactile.json").write_text(
+                json.dumps(tactile.frame(frame), ensure_ascii=False, allow_nan=False), encoding="utf-8"
+            )
 
         with ThreadPoolExecutor(max_workers=min(self.max_decode_workers, max(1, len(session.frame_indices)))) as executor:
             futures = [executor.submit(render, frame) for frame in session.frame_indices]
@@ -1383,16 +1396,18 @@ header{{display:flex;align-items:center;gap:14px;padding:0 20px;border-bottom:1p
 #loading{{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#080c10e8;z-index:4}}.card{{width:min(520px,80%);text-align:center}}.track{{height:7px;background:#202b34;border-radius:10px;overflow:hidden;margin:18px 0}}#bar{{height:100%;width:0;background:var(--accent);transition:width .2s}}#loadError{{color:var(--danger);white-space:pre-wrap}}
 footer{{border-top:1px solid var(--line);display:grid;grid-template-columns:auto 1fr auto;gap:14px;align-items:center;padding:12px 20px;background:#0e151b}}button.control{{border:1px solid var(--line);background:#17212a;color:var(--text);padding:8px 14px;border-radius:6px;cursor:pointer}}#timelineWrap{{position:relative;height:30px;display:flex;align-items:center}}#timeline{{position:relative;z-index:2;width:100%;accent-color:var(--accent);margin:0}}#badRanges{{position:absolute;z-index:3;pointer-events:none;left:0;right:0;top:1px;height:6px;display:none}}#badRanges span{{position:absolute;height:100%;min-width:3px;border-radius:3px;background:#ff5365;box-shadow:0 0 5px #ff536599}}#counter{{font:12px ui-monospace;color:var(--muted);min-width:110px;text-align:right}}
 @media(max-width:850px){{.app{{grid-template-columns:190px 1fr}}#grid{{grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(3,1fr)}}}}
+{TACTILE_CSS}
 </style></head><body><div class="app"><aside><h1>Episode Viewer</h1><div class="sub" id="episodeLabel"></div>
 <button class="mode active" data-mode="rgb" disabled>6 路 RGB</button><button class="mode" data-mode="pico" disabled>Pico + 眼动</button>
 <button class="mode" data-mode="pointcloud" disabled>彩色融合点云</button><button class="mode" data-mode="manomesh" disabled>MANO mesh 视频</button>
 <button class="mode" data-mode="picohand" disabled>Pico 手部 Pose</button>
 <div class="spacer"></div><div id="sessionState">正在创建临时会话…</div></aside><main><header><strong id="title">6 路 RGB</strong><span id="modeStatus"></span><span id="manoSource"></span></header>
-<div id="stage"><div id="grid"></div><div id="single"><img class="active" alt=""><img alt=""></div><canvas id="cloud"></canvas><div id="cloudHint">左键拖动旋转 · 右键拖动平移</div><div id="cloudTools"><button id="zoomIn" title="放大">＋</button><button id="zoomOut" title="缩小">－</button><button id="resetView" title="重置视角" style="font-size:13px">重置</button></div><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
+<div id="stage"><div id="grid"></div><div id="single"><img class="active" alt=""><img alt=""></div>{TACTILE_HTML}<canvas id="cloud"></canvas><div id="cloudHint">左键拖动旋转 · 右键拖动平移</div><div id="cloudTools"><button id="zoomIn" title="放大">＋</button><button id="zoomOut" title="缩小">－</button><button id="resetView" title="重置视角" style="font-size:13px">重置</button></div><div id="loading"><div class="card"><div id="loadText">正在扫描 Episode 视频…</div><div class="track"><div id="bar"></div></div><div id="loadError"></div></div></div></div>
 <footer><button class="control" id="play">播放</button><div id="timelineWrap"><div id="badRanges"></div><input id="timeline" type="range" min="0" max="0" value="0"></div><span id="counter">0 / 0</span></footer></main></div>
 <script>
 const episodeId={encoded_id};let sessionId=null,info=null,mode='rgb',framePos=0,playing=false,timer=null,closed=false,gridRenderToken=0,lastGridKey='',pendingGridKey='',gridSignature='',imageCacheEpoch=0,prefetchDesired=-1,prefetchRunning=false;const frameCache=new Map();
 const $=s=>document.querySelector(s), buttons=[...document.querySelectorAll('.mode')];$('#episodeLabel').textContent=episodeId;
+{TACTILE_JS}
 async function api(url,options={{}}){{const r=await fetch(url,options);const data=await r.json().catch(()=>({{}}));if(!r.ok)throw new Error(data.error||r.statusText);return data}}
 function showLoading(text,pct=0,error=''){{$('#loading').style.display='flex';$('#loadText').textContent=text;$('#bar').style.width=`${{Math.max(0,Math.min(100,pct))}}%`;$('#loadError').textContent=error}}
 function hideLoading(){{$('#loading').style.display='none'}}
@@ -1410,11 +1425,11 @@ function ensureSixGrid(sources){{const signature=sources.map(s=>s.id).join('|');
 function preloadImage(url){{return new Promise((resolve,reject)=>{{const image=new Image();image.onload=async()=>{{try{{if(image.decode)await image.decode()}}catch(_e){{}}resolve(image)}};image.onerror=()=>reject(new Error('画面加载失败'));image.src=url}})}}
 function cachedImage(url){{let promise=frameCache.get(url);if(!promise){{promise=preloadImage(url).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
 function cachedCloud(url){{let promise=frameCache.get(url);if(!promise){{promise=fetch(url).then(r=>{{if(!r.ok)throw new Error('点云帧加载失败');return r.arrayBuffer()}}).catch(error=>{{frameCache.delete(url);throw error}});frameCache.set(url,promise)}}return promise}}
-function frameUrlsAt(position){{const frames=info.frames||[],frame=frames[(position+frames.length)%frames.length];if(mode==='rgb'||mode==='manomesh'){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);return sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame))}}return [mediaUrl(mode==='pointcloud'?'cloud':'ego',frame)]}}
-async function requestFramePrefetch(){{if(!['rgb','pico','manomesh','picohand','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(mode==='pointcloud'?cachedCloud:cachedImage))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
+function frameUrlsAt(position){{const frames=info.frames||[],frame=frames[(position+frames.length)%frames.length];if(mode==='rgb'||mode==='manomesh'){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);return sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame))}}if(mode==='pico')return [mediaUrl('ego',frame),mediaUrl('tactile',frame)];return [mediaUrl(mode==='pointcloud'?'cloud':'ego',frame)]}}
+async function requestFramePrefetch(){{if(!['rgb','pico','manomesh','picohand','pointcloud'].includes(mode)||!info||!info.frames.length)return;prefetchDesired=framePos;if(prefetchRunning)return;prefetchRunning=true;const epoch=imageCacheEpoch;try{{while(epoch===imageCacheEpoch){{const start=prefetchDesired;for(let i=1;i<=24&&epoch===imageCacheEpoch;i++){{const position=(start+i)%info.frames.length,frame=info.frames[position];if(!frameAvailable(frame))break;try{{await Promise.all(frameUrlsAt(position).map(cachedFrameAsset))}}catch(_e){{break}}}}const keep=new Set();for(let i=-2;i<=24;i++)frameUrlsAt((prefetchDesired+i+info.frames.length)%info.frames.length).forEach(url=>keep.add(url));for(const url of frameCache.keys())if(!keep.has(url))frameCache.delete(url);if(start===prefetchDesired)break}}}}finally{{prefetchRunning=false}}}}
 async function renderSix(frame){{const sources=info.sources.filter(s=>s.kind==='multiview').slice(0,6);ensureSixGrid(sources);const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,urls=sources.map(s=>mediaUrl(mode==='rgb'?s.id:s.camera,frame));try{{await Promise.all(urls.map(cachedImage));if(token!==gridRenderToken)return false;const tiles=[...document.querySelectorAll('#grid .tile')],backs=tiles.map(tile=>tile.querySelector('img.frame:not(.active)'));backs.forEach((img,i)=>img.src=urls[i]);await Promise.all(backs.map(async img=>{{try{{if(img.decode)await img.decode()}}catch(_e){{}}}}));if(token!==gridRenderToken)return false;tiles.forEach((tile,i)=>{{tile.querySelectorAll('img.frame').forEach(img=>img.classList.remove('active'));backs[i].classList.add('active')}});lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
-async function renderSingle(frame,source){{const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,url=mediaUrl(source,frame);try{{await cachedImage(url);if(token!==gridRenderToken)return false;const images=[...document.querySelectorAll('#single img')],back=images.find(img=>!img.classList.contains('active'));back.src=url;try{{if(back.decode)await back.decode()}}catch(_e){{}}if(token!==gridRenderToken)return false;images.forEach(img=>img.classList.remove('active'));back.classList.add('active');lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
-async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'||mode==='picohand'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';
+async function renderSingle(frame,source){{const key=`${{mode}}:${{frame}}`;if(key===lastGridKey||key===pendingGridKey){{requestFramePrefetch();return true}}pendingGridKey=key;const token=++gridRenderToken,url=mediaUrl(source,frame);try{{const [,tactile]=await Promise.all([cachedImage(url),mode==='pico'?cachedTactile(mediaUrl('tactile',frame)):Promise.resolve(null)]);if(token!==gridRenderToken)return false;const images=[...document.querySelectorAll('#single img')],back=images.find(img=>!img.classList.contains('active'));back.src=url;try{{if(back.decode)await back.decode()}}catch(_e){{}}if(token!==gridRenderToken)return false;images.forEach(img=>img.classList.remove('active'));back.classList.add('active');if(mode==='pico')renderTactile(tactile);lastGridKey=key;requestFramePrefetch();return true}}finally{{if(pendingGridKey===key)pendingGridKey=''}}}}
+async function renderFrame(){{if(!info||!info.frames.length)return false;const frame=info.frames[framePos];setupFrames();$('#stage').classList.toggle('pico-tactile',mode==='pico');$('#grid').style.display=mode==='rgb'||mode==='manomesh'?'grid':'none';$('#single').style.display=mode==='pico'||mode==='picohand'?'flex':'none';$('#cloud').style.display=mode==='pointcloud'?'block':'none';$('#cloudTools').style.display=mode==='pointcloud'?'flex':'none';$('#cloudHint').style.display=mode==='pointcloud'?'block':'none';
 if(!frameAvailable(frame)){{$('#modeStatus').textContent='后台渲染中，正在缓冲该同步帧…';return false}}
 if(mode==='rgb'||mode==='manomesh'){{try{{return await renderSix(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}
 else if(mode==='pico'||mode==='picohand'){{try{{return await renderSingle(frame,'ego')}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}else{{try{{return await renderCloudFrame(frame)}}catch(e){{$('#modeStatus').textContent=e.message;return false}}}}}}

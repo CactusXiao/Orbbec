@@ -8,6 +8,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ostream>
+#include <limits>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -17,16 +20,6 @@ constexpr size_t kTactileChannelCount = 48;
 constexpr size_t kTactileRegionCount = 6;
 constexpr size_t kTactileChannelsPerRegion = 8;
 constexpr size_t kJqShroomPressureChannelCount = 256;
-
-struct TactileCalibrationEntry {
-    int    regionIndex = 0;
-    int    pointIndex = 0;
-    double a = 0.0;
-    double b = 0.0;
-    double c = 0.0;
-    double rsquare = 0.0;
-    int    validCount = 0;
-};
 
 struct TactileSerialConfig {
     std::string portPath;
@@ -55,6 +48,10 @@ struct TactileModuleConfig {
     int                   sensorType = 2;
     int                   targetFps = 60;
     size_t                maxBufferedSamples = 8192;
+    // CSV paths are resolved relative to config.json by loadConfig.
+    std::vector<std::filesystem::path> calibrationPaths{
+        "tactile/5 (1).csv", "tactile/5 (2).csv", "tactile/5 (3).csv"
+    };
     TactileSerialConfig   serial;
     TactileSaveOptions    save;
     std::vector<TactileDeviceConfig> devices;
@@ -76,9 +73,32 @@ struct TactileFrame {
     bool                  imuValid = false;
     std::string           qualityFlag = "ok";
     std::vector<uint16_t> rawAdc;
+    double                calibratedRegionForceN = std::numeric_limits<double>::quiet_NaN();
+    bool                  forceOutOfRange = false;
+    // N; NaN for channels not covered by the calibration CSVs.
     std::vector<double>   calibratedValues;
     std::vector<double>   outputValues;
 };
+
+// Uses the supplied image's Hill fit on the sum ADC of the CSV sensor channels.
+// Channel numbers in the source CSV are one-based hardware sensor IDs.
+class TactileForceCalibration {
+public:
+    // Parameters displayed in tactile/微信图片_2026-09-07_165536_559.jpg.
+    static constexpr double kHillMaxAdc = 1257.0210;
+    static constexpr double kHillHalfForceN = 18.2084;
+    static constexpr double kHillExponent = 1.1685;
+    bool load(const std::vector<std::filesystem::path> &paths, std::string *errorMessage = nullptr);
+    double forceN(double adcSum) const;
+    bool apply(TactileFrame &frame, std::string *errorMessage = nullptr) const;
+    const std::vector<size_t> &channelIndices() const { return channelIndices_; }
+private:
+    std::vector<size_t> channelIndices_;
+    double maxMeasuredAdcSum_ = 0.0;
+};
+
+void writeTactileMeasurementCsvHeader(std::ostream &out);
+void writeTactileMeasurementCsvValues(std::ostream &out, const TactileFrame &frame, int precision);
 
 struct TactileSample {
     uint64_t     sequence = 0;
