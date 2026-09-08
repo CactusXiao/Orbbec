@@ -9,6 +9,7 @@ import tempfile
 import threading
 import tkinter as tk
 from frontend_runtime import cancel_tk_callbacks
+from label.overview import CameraOverview
 from dataclasses import replace
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -464,6 +465,7 @@ class LabelPage(ttk.Frame):
         self._active_bundle: Optional[PredictionBundle] = None
         self._bundles: Dict[str, PredictionBundle] = {}
         self._camera_ids: List[str] = []
+        self._overview = False
         self._cam_idx: int = 0
         self._frame_pos: int = 0
         self._view_states: ViewStateByCam = {}
@@ -484,7 +486,7 @@ class LabelPage(ttk.Frame):
         self._original_mesh_cache = None
         self._mesh_poll_id = None
         self._build_ui()
-        for number in range(1, 7):
+        for number in range(7):
             self.winfo_toplevel().bind(
                 f"<KeyPress-{number}>", lambda event, index=number - 1: self._camera_shortcut(event, index), add="+"
             )
@@ -529,7 +531,8 @@ class LabelPage(ttk.Frame):
         btn_row.pack(side="bottom", fill="x", padx=12, pady=(8, 12))
         btn_row.add(ttk.Button(btn_row, text="上一帧", style="Small.TButton", command=self._back_frame))
         btn_row.add(ttk.Button(btn_row, text="下一帧", style="Small.TButton", command=self._skip_frame))
-        btn_row.add(ttk.Button(btn_row, text="上一机位（1–6 切换）", style="Small.TButton", command=self._prev_cam))
+        btn_row.add(ttk.Button(btn_row, text="六视角总览（0）", style="Small.TButton", command=lambda: self._select_camera(-1)))
+        btn_row.add(ttk.Button(btn_row, text="上一机位", style="Small.TButton", command=self._prev_cam))
         btn_row.add(ttk.Button(btn_row, text="下一机位", style="Small.TButton", command=self._next_cam))
         btn_row.add(ttk.Button(btn_row, text="撤销", style="Small.TButton", command=self._undo))
         btn_row.add(ttk.Button(btn_row, text="忽略视角", style="Small.TButton", command=self._ignore_view))
@@ -580,6 +583,7 @@ class LabelPage(ttk.Frame):
         canvas_host = ttk.Frame(right, style="Panel2.TFrame")
         canvas_host.pack(fill="both", expand=True, padx=12, pady=(0, 10))
 
+        self._overview_grid = CameraOverview(canvas_host)
         self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
         self._canvas.pack(fill="both", expand=True)
         self._mesh_notice = ttk.Label(canvas_host, text="", style="PanelMuted.TLabel", padding=8)
@@ -590,6 +594,9 @@ class LabelPage(ttk.Frame):
         self._cancel_backend_heartbeat()
         self._cleanup_decode_cache()
         self._canvas.clear()
+        self._overview_grid.clear()
+        self._overview = False
+        self._show_view_layout()
         self._timeline.set_data(frames=[], position=0, done=set())
         self._timeline_status.configure(text="帧进度")
         self._jsonl_path = None
@@ -1238,6 +1245,8 @@ class LabelPage(ttk.Frame):
         return self._bundles.get("pred") or self._active_bundle
 
     def _cache_current_source_state(self) -> None:
+        if self._overview:
+            return
         cam_id = self._active_cam_id()
         if cam_id is None:
             return
@@ -1346,6 +1355,8 @@ class LabelPage(ttk.Frame):
         self._update_skeleton_button()
         try:
             self._canvas.set_skeleton_overlay(None)
+            for canvas in self._overview_grid.canvases.values():
+                canvas.set_skeleton_overlay(None)
         except Exception:
             pass
         self._sync_visualization_canvas_state()
@@ -1361,6 +1372,8 @@ class LabelPage(ttk.Frame):
         try:
             self._canvas.set_mano_overlay([])
             self._canvas.set_skeleton_overlay(None)
+            for canvas in self._overview_grid.canvases.values():
+                canvas.set_skeleton_overlay(None)
         except Exception:
             pass
         self._sync_visualization_canvas_state()
@@ -1371,8 +1384,11 @@ class LabelPage(ttk.Frame):
     def _sync_visualization_canvas_state(self) -> None:
         active = self._visualization_active()
         try:
-            self._canvas.set_read_only(active or self._mode == "mano")
+            self._canvas.set_read_only(active or self._mode == "mano" or self._overview)
             self._canvas.set_annotation_visible(not active)
+            for canvas in self._overview_grid.canvases.values():
+                canvas.set_read_only(True)
+                canvas.set_annotation_visible(not active)
         except Exception:
             pass
 
@@ -1417,24 +1433,21 @@ class LabelPage(ttk.Frame):
         self._sync_visualization_canvas_state()
 
     def _refresh_skeleton_overlay(self) -> None:
-        if not self._show_skeleton or self._skeleton_joints_3d is None or self._active_task is None:
-            self._canvas.set_skeleton_overlay(None)
-            return
-        cam_id = self._active_cam_id()
-        if cam_id is None:
-            self._canvas.set_skeleton_overlay(None)
-            return
-        try:
-            points, visible = self._mano_runtime_instance().project_skeleton(
-                episode_dir=self._active_task.episode_dir(),
-                cam_id=cam_id,
-                joints_3d=self._skeleton_joints_3d,
-            )
-        except Exception as exc:
-            self._reset_skeleton()
-            messagebox.showerror("Show Skeleton", str(exc))
-            return
-        self._canvas.set_skeleton_overlay(points, visible)
+        targets = self._overview_grid.canvases if self._overview else {self._active_cam_id(): self._canvas}
+        for cam_id, canvas in targets.items():
+            if not self._show_skeleton or self._skeleton_joints_3d is None or self._active_task is None or cam_id is None:
+                canvas.set_skeleton_overlay(None)
+                continue
+            try:
+                points, visible = self._mano_runtime_instance().project_skeleton(
+                    episode_dir=self._active_task.episode_dir(), cam_id=cam_id,
+                    joints_3d=self._skeleton_joints_3d,
+                )
+            except Exception as exc:
+                self._reset_skeleton()
+                messagebox.showerror("Show Skeleton", str(exc))
+                return
+            canvas.set_skeleton_overlay(points, visible)
 
     def _start_original_mesh_cache(self) -> None:
         if self._active_task is None or self._original_mesh_cache is not None:
@@ -1457,6 +1470,9 @@ class LabelPage(ttk.Frame):
             self._mesh_poll_id = None
         self._canvas.set_rendered_image(None)
         self._mesh_notice.place_forget()
+        for camera, canvas in self._overview_grid.canvases.items():
+            canvas.set_rendered_image(None)
+            self._overview_grid.notices[camera].place_forget()
 
     def _refresh_original_mesh_preview(self) -> None:
         if self._mesh_poll_id is not None:
@@ -1465,19 +1481,22 @@ class LabelPage(ttk.Frame):
         if not self._show_mano or self._active_task is None:
             return
         cache = self._original_mesh_cache
-        camera = self._active_cam_id()
         frame = self._active_task.frames[self._frame_pos]
-        path = cache.path(camera, frame) if cache is not None else None
-        self._canvas.set_rendered_image(path)
-        if path is not None:
-            self._mesh_notice.place_forget()
-            return
-        if cache is not None:
-            text = f"MANO 渲染失败：{cache.error}" if cache.error else f"MANO 后台渲染中 · 机位 {camera} · 帧 {frame}"
-            self._mesh_notice.configure(text=text)
-            if not cache.done_event.is_set():
-                self._mesh_poll_id = self.after(200, self._refresh_original_mesh_preview)
-        self._mesh_notice.place(relx=0.5, y=12, anchor="n")
+        targets = self._overview_grid.canvases if self._overview else {self._active_cam_id(): self._canvas}
+        pending = False
+        for camera, canvas in targets.items():
+            notice = self._overview_grid.notices[camera] if self._overview else self._mesh_notice
+            path = cache.path(camera, frame) if cache is not None else None
+            canvas.set_rendered_image(path)
+            if path is not None:
+                notice.place_forget()
+                continue
+            pending = True
+            text = f"MANO 渲染失败：{cache.error}" if cache is not None and cache.error else f"MANO 渲染中 · 机位 {camera} · 帧 {frame}"
+            notice.configure(text=text)
+            notice.place(relx=0.5, y=28 if self._overview else 12, anchor="n")
+        if pending and cache is not None and not cache.done_event.is_set():
+            self._mesh_poll_id = self.after(200, self._refresh_original_mesh_preview)
 
     def _toggle_mano(self) -> None:
         if self._show_mano:
@@ -1536,8 +1555,35 @@ class LabelPage(ttk.Frame):
         self._cam_idx = max(0, min(self._cam_idx, len(self._camera_ids) - 1))
         return self._camera_ids[self._cam_idx]
 
+    def _show_view_layout(self) -> None:
+        self._mesh_notice.place_forget()
+        if self._overview:
+            self._canvas.pack_forget()
+            self._overview_grid.pack(fill="both", expand=True)
+        else:
+            self._overview_grid.pack_forget()
+            self._canvas.pack(fill="both", expand=True)
+
+    def _refresh_overview(self) -> None:
+        task = self._active_task
+        frame = task.frames[self._frame_pos]
+        self._overview_grid.set_cameras(self._camera_ids)
+        self._view_states = {
+            camera: self._build_initial_view_state(frame, camera, self._mode)
+            for camera in self._camera_ids
+        }
+        self._overview_grid.show_frame(task, frame, self._view_states)
+        self._update_source_button()
+        self._refresh_visual_overlays()
+        self._refresh_timeline()
+        self._info.configure(text=f"Task: {task.display_name} · 六视角总览（0，只读） · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–6 返回单视角")
+        frame_done = self._is_frame_done(task, self._frame_pos)
+        self._frame_status.configure(text=f"当前帧：{'已完成' if frame_done else '未完成'}",
+                                     fg=STATUS_DONE_COLOR if frame_done else STATUS_TODO_COLOR)
+
     def _refresh_view(self) -> None:
         self._update_submit_button()
+        self._show_view_layout()
         task = self._active_task
         if task is None or not self._bundles:
             self._canvas.clear()
@@ -1547,6 +1593,9 @@ class LabelPage(ttk.Frame):
             self._canvas.clear()
             return
 
+        if self._overview:
+            self._refresh_overview()
+            return
         frame_idx = task.frames[self._frame_pos]
         source = self._mode
         state = self._view_states.get(cam_id)
@@ -1606,17 +1655,25 @@ class LabelPage(ttk.Frame):
             return None
         if event.state & (0x4 | 0x8 | 0x20000):
             return None
-        if index >= len(self._camera_ids):
+        if index < -1 or index >= len(self._camera_ids):
             return None
-        self._cache_current_source_state()
-        self._cam_idx = index
-        self._refresh_view()
+        self._select_camera(index)
         return "break"
+
+    def _select_camera(self, index: int) -> None:
+        if self._active_task is None or not self._camera_ids:
+            return
+        self._cache_current_source_state()
+        self._overview = index == -1
+        if not self._overview:
+            self._cam_idx = index
+        self._refresh_view()
 
     def _prev_cam(self) -> None:
         if not self._camera_ids:
             return
         self._cache_current_source_state()
+        self._overview = False
         self._cam_idx = (self._cam_idx - 1) % len(self._camera_ids)
         self._refresh_view()
 
@@ -1624,16 +1681,17 @@ class LabelPage(ttk.Frame):
         if not self._camera_ids:
             return
         self._cache_current_source_state()
+        self._overview = False
         self._cam_idx = (self._cam_idx + 1) % len(self._camera_ids)
         self._refresh_view()
 
     def _undo(self) -> None:
-        if self._mode == "mano" or self._visualization_active():
+        if self._overview or self._mode == "mano" or self._visualization_active():
             return
         self._canvas.undo()
 
     def _ignore_view(self) -> None:
-        if self._mode == "mano" or self._visualization_active():
+        if self._overview or self._mode == "mano" or self._visualization_active():
             return
         self._canvas.ignore_view()
 

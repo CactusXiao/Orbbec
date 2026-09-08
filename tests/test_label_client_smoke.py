@@ -200,6 +200,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 return edited
 
         class PageStub:
+            _overview = False
             _mode = "correct"
             _view_states = {"00": original}
             _source_state_cache = {}
@@ -239,6 +240,8 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 self.annotation_visible = value
 
         class PageStub:
+            _overview = False
+            _overview_grid = type("GridStub", (), {"canvases": {}})()
             _mode = "mano"
             _canvas = CanvasStub()
 
