@@ -77,6 +77,9 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._overlay_items: List[int] = []
         self._message_item: Optional[int] = None
         self._history: List[Tuple[HandPoints, HandVisible]] = []
+        self._tracked_joints = set()
+        self.on_track_joint = None
+        self._schematic_first_click = None
 
         self._panning = False
         self._pan_last: Tuple[int, int] = (0, 0)
@@ -105,6 +108,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self.bind("<Escape>", self._on_escape)
 
     def clear(self) -> None:
+        self._tracked_joints = set()
+        self._schematic_first_click = None
         self._cancel_pending_fit()
         self._img_path = None
         self._base_image = None
@@ -182,6 +187,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._render_overlay()
 
     def set_hand_state(self, points: HandPoints, visible: HandVisible) -> None:
+        self._schematic_first_click = None
         self._locate_joint = None
         self._panning = False
         self._points = self._coerce_points(points)
@@ -191,6 +197,10 @@ class ImageAnnotatorCanvas(tk.Canvas):
 
     def set_count_base(self, counts: JointCounts) -> None:
         self._count_base = self._coerce_counts(counts)
+        self._render_overlay()
+
+    def set_tracked_joints(self, joints) -> None:
+        self._tracked_joints = set(joints)
         self._render_overlay()
 
     def set_mano_overlay(self, lines: Optional[List[MeshLine]]) -> None:
@@ -367,6 +377,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._render_overlay()
 
     def _on_left_down(self, evt) -> None:
+        self._schematic_first_click = None
         if self._read_only:
             self._cancel_selection_timer()
             return
@@ -384,6 +395,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self._selection_start = None
             self._selection_current = None
             hand, joint = schematic_hit
+            self._schematic_first_click = (schematic_hit, self._visible[hand][joint])
             self._push_history()
             self._visible[hand][joint] = not self._visible[hand][joint]
             self._render_overlay()
@@ -458,7 +470,20 @@ class ImageAnnotatorCanvas(tk.Canvas):
             return
         self._cancel_selection_timer()
         self._press_joint_candidate = None
-        if self._editable_schematic_hit(evt.x, evt.y) is not None:
+        schematic_hit = self._editable_schematic_hit(evt.x, evt.y)
+        if schematic_hit is not None:
+            if self.on_track_joint is not None and self._visibility_schematic_hit(evt.x, evt.y) == schematic_hit:
+                # Tk delivers the first press as a single click. Undo its
+                # visibility toggle before interpreting the double click.
+                first = self._schematic_first_click
+                if first is not None and first[0] == schematic_hit:
+                    hand, joint = schematic_hit
+                    self._visible[hand][joint] = first[1]
+                    if self._history:
+                        self._history.pop()
+                self._schematic_first_click = None
+                self.on_track_joint(*schematic_hit)
+                self._render_overlay()
             return
         hit = self._nearest_joint(evt.x, evt.y, max_dist=14.0)
         if hit is None:
@@ -796,6 +821,7 @@ class ImageAnnotatorCanvas(tk.Canvas):
                 color = self._joint_color(hand, joint, faded=False)
                 item = self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=color, outline=color)
                 self._overlay_items.append(item)
+                self._render_tracking_ring(hand, joint, cx, cy)
 
     def _render_hand_points(self, hand: int, *, faded: bool, focus_joint: Optional[int] = None) -> None:
         for joint in range(self._JOINT_COUNT):
@@ -813,6 +839,15 @@ class ImageAnnotatorCanvas(tk.Canvas):
             if point_faded:
                 opts["stipple"] = "gray50"
             item = self.create_oval(cx - r, cy - r, cx + r, cy + r, **opts)
+            self._overlay_items.append(item)
+            self._render_tracking_ring(hand, joint, cx, cy)
+
+    def _render_tracking_ring(self, hand: int, joint: int, x: float, y: float, radius: float = 7) -> None:
+        if (hand, joint) not in self._tracked_joints:
+            return
+        for r, color, width in ((radius + 1, "#111111", 4), (radius, "#ffea00", 2)):
+            item = self.create_oval(x-r, y-r, x+r, y+r, outline=color, width=width,
+                                    tags=("tracking-highlight", f"tracking-{hand}-{joint}"))
             self._overlay_items.append(item)
 
     def _render_joint_location_hint(self) -> None:
@@ -861,6 +896,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
             else:
                 item = self.create_oval(x - r, y - r, x + r, y + r, fill="", outline=outline, width=outline_width)
             self._overlay_items.append(item)
+
+            self._render_tracking_ring(hand, joint, x, y, r + 4)
 
     def _render_count_schematic(self) -> None:
         centers, scale = self._count_schematic_layout()

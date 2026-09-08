@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import locale
+import math
 import os
 import queue
 import signal
@@ -471,6 +472,7 @@ class LabelPage(ttk.Frame):
         self._view_states: ViewStateByCam = {}
         self._source_state_cache: SourceStateCache = {}
         self._tracker: Optional[CoTrackerRuntime] = None
+        self._tracked_joints_by_cam: Dict[str, set] = {}
         self._mano_runtime: Optional[ManoViewRuntime] = None
         self._mano_mesh: Optional[ManoMeshResult] = None
         self._show_mano: bool = False
@@ -585,10 +587,12 @@ class LabelPage(ttk.Frame):
 
         self._overview_grid = CameraOverview(canvas_host)
         self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
+        self._canvas.on_track_joint = self._toggle_joint_tracking
         self._canvas.pack(fill="both", expand=True)
         self._mesh_notice = ttk.Label(canvas_host, text="", style="PanelMuted.TLabel", padding=8)
 
     def on_hide(self) -> None:
+        self._tracked_joints_by_cam = {}
         self._stop_original_mesh_cache()
         self._decode_generation += 1
         self._cancel_backend_heartbeat()
@@ -781,6 +785,7 @@ class LabelPage(ttk.Frame):
         auto_open_first: bool = False,
         initial_source: str = "correct",
     ) -> bool:
+        self._tracked_joints_by_cam = {}
         self._mode = self._normalize_source(initial_source)
         self._tasks = tasks
         self._tasks_by_key = {t.key: t for t in tasks}
@@ -936,6 +941,7 @@ class LabelPage(ttk.Frame):
 
         self._stop_original_mesh_cache()
         self._active_key = task.key
+        self._tracked_joints_by_cam = {}
         self._active_task = task
         self._active_bundle = bundle
         self._bundles = {"pred": bundle}
@@ -1167,6 +1173,71 @@ class LabelPage(ttk.Frame):
         if self._tracker is None:
             self._tracker = CoTrackerRuntime()
         return self._tracker
+
+    def _toggle_joint_tracking(self, hand: int, joint: int) -> None:
+        cam_id = self._active_cam_id()
+        if cam_id is None or self._active_task is None or self._overview or self._mode != "correct":
+            return
+        selected = self._tracked_joints_by_cam.setdefault(cam_id, set())
+        target = (hand, joint)
+        points, visible = self._canvas.get_hand_state()
+        if target in selected:
+            selected.remove(target)
+        elif not visible[hand][joint] or not all(math.isfinite(v) for v in points[hand][joint]) or min(points[hand][joint]) < 0:
+            messagebox.showwarning("Tracking", "请先将这个关节在当前视角下标为可见，并设置有效位置。")
+            return
+        else:
+            selected.add(target)
+        self._cache_current_source_state()
+        self._refresh_tracking_highlights()
+
+    def _refresh_tracking_highlights(self) -> None:
+        self._canvas.set_tracked_joints(self._tracked_joints_by_cam.get(self._active_cam_id(), set()))
+        for cam_id, canvas in self._overview_grid.canvases.items():
+            canvas.set_tracked_joints(self._tracked_joints_by_cam.get(cam_id, set()))
+
+    def _track_selected_to_frame(self, position: int) -> None:
+        """Seed unvisited forward frames; preserve cached edits and confirmed frames."""
+        task = self._active_task
+        selected_by_cam = getattr(self, "_tracked_joints_by_cam", {})
+        if task is None or position <= self._frame_pos or not any(selected_by_cam.values()):
+            return
+        if self._is_frame_done(task, position):
+            return
+        previous_frame = task.frames[self._frame_pos]
+        target_frame = task.frames[position]
+        errors = []
+        self._info.configure(text=f"正在跟踪关节点：帧 {previous_frame} → {target_frame}…")
+        self.update_idletasks()
+        for cam_id, selected in selected_by_cam.items():
+            key = (self._active_key, position, cam_id, "correct")
+            if not selected or key in self._source_state_cache:
+                continue
+            points, visible = self._build_initial_view_state(previous_frame, cam_id, "correct")
+            mask = self._none_visible()
+            for hand, joint in selected:
+                mask[hand][joint] = visible[hand][joint]
+            if not any(any(hand) for hand in mask):
+                continue
+            try:
+                predicted, tracked_visible = self._tracking_runtime().track_points(
+                    episode_dir=task.episode_dir(), cam_id=cam_id,
+                    prev_frame_idx=previous_frame, frame_idx=target_frame,
+                    points=points, visible=mask, rgb_path_template=task.rgb_path_template,
+                )
+                state = self._copy_view_state(self._build_modified_view_state(target_frame, cam_id))
+                for hand, joint in selected:
+                    if not mask[hand][joint]:
+                        continue
+                    point = predicted[hand][joint]
+                    if not all(math.isfinite(v) for v in point) or min(point) < 0:
+                        raise ValueError("跟踪返回了无效关节坐标。")
+                    state[0][hand][joint] = point
+                    state[1][hand][joint] = tracked_visible[hand][joint]
+                self._source_state_cache[key] = state
+            except Exception as exc:
+                errors.append(f"Camera {cam_id}: {exc}")
+        self._show_tracking_errors_once(target_frame, errors)
 
     def _build_tracking_source_states(self, frame_idx: int) -> ViewStateByCam:
         errors: List[str] = []
@@ -1522,6 +1593,7 @@ class LabelPage(ttk.Frame):
         self._refresh_skeleton_overlay()
         self._refresh_mano_overlay()
         self._sync_visualization_canvas_state()
+        self._refresh_tracking_highlights()
 
     def _toggle_source(self) -> None:
         cam_id = self._active_cam_id()
@@ -1728,6 +1800,7 @@ class LabelPage(ttk.Frame):
         if position == self._frame_pos:
             return
         self._cache_current_source_state()
+        self._track_selected_to_frame(position)
         self._view_states = {}
         keep_mano = self._show_mano
         self._reset_visualizations()
@@ -1782,6 +1855,7 @@ class LabelPage(ttk.Frame):
         self._update_submit_button()
 
         next_pos = min(task.total_frames - 1, self._frame_pos + 1)
+        self._track_selected_to_frame(next_pos)
         keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -37,7 +38,21 @@ class CoTrackerRuntime:
         rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
     ) -> Tuple[HandPoints, HandVisible]:
         prev_ann = self._load_previous_annotation(episode_dir, cam_id, prev_frame_idx, correction_dir)
-        queries_np, indices = self._queries_from_annotation(prev_ann)
+        return self.track_points(
+            episode_dir=episode_dir, cam_id=cam_id, prev_frame_idx=prev_frame_idx,
+            frame_idx=frame_idx, points=prev_ann, visible=~np.all(prev_ann == -1, axis=-1),
+            rgb_path_template=rgb_path_template,
+        )
+
+    def track_points(
+        self, *, episode_dir: Path, cam_id: str, prev_frame_idx: int,
+        frame_idx: int, points: HandPoints, visible: HandVisible,
+        rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
+    ) -> Tuple[HandPoints, HandVisible]:
+        """Track only the selected points, including unsaved canvas corrections."""
+        queries_np, indices = self._queries_from_annotation(
+            np.asarray(points, dtype=np.float32), np.asarray(visible, dtype=bool),
+        )
         if not indices:
             return self._hidden_points(), self._none_visible()
 
@@ -70,10 +85,14 @@ class CoTrackerRuntime:
         if self._model is not None:
             return self._model
         torch = self._ensure_torch()
+        configured_repo = os.environ.get("COTRACKER_REPO")
+        repo = Path(configured_repo).expanduser() if configured_repo else Path(_MODEL_REPO)
+        if not configured_repo and not repo.is_dir():
+            repo = Path(__file__).resolve().parent / "co-tracker"
         try:
-            model = torch.hub.load(_MODEL_REPO, "cotracker3_offline", source="local")
+            model = torch.hub.load(str(repo), "cotracker3_offline", source="local")
         except Exception as exc:
-            raise RuntimeError(f"Failed to load CoTracker model from {_MODEL_REPO}.") from exc
+            raise RuntimeError(f"Failed to load CoTracker model from {repo}.") from exc
         self._model = model.to(self._device)
         self._model.eval()
         return self._model
@@ -139,8 +158,13 @@ class CoTrackerRuntime:
         except Exception as exc:
             raise ValueError(f"Failed to load RGB frame: {path}") from exc
 
-    def _queries_from_annotation(self, ann: np.ndarray) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
-        visible = ~np.all(ann == -1, axis=-1)
+    def _queries_from_annotation(
+        self,
+        ann: np.ndarray,
+        visible: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
+        if visible is None:
+            visible = ~np.all(ann == -1, axis=-1)
         queries = []
         indices: List[Tuple[int, int]] = []
         for hand_idx in range(_HAND_COUNT):
