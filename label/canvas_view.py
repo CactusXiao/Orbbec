@@ -53,8 +53,9 @@ class ImageAnnotatorCanvas(tk.Canvas):
         (-1.12, -0.48), (-0.50, -0.95), (-0.02, -1.15), (0.48, -0.95), (0.92, -0.58),
     )
 
-    def __init__(self, master, *, bg: str, **kwargs):
+    def __init__(self, master, *, bg: str, show_schematics: bool = True, **kwargs):
         super().__init__(master, bg=bg, highlightthickness=0, **kwargs)
+        self._show_schematics = show_schematics
 
         self._img_path: Optional[Path] = None
         self._base_image: Optional[Image.Image] = None
@@ -873,6 +874,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._overlay_items.append(item)
 
     def _render_visibility_schematic(self) -> None:
+        if not self._show_schematics:
+            return
         centers, scale = self._visibility_schematic_layout()
         for hand, (cx, cy) in zip(self._schematic_hand_order(), centers):
             self._render_visibility_hand(hand, cx, cy, scale)
@@ -900,6 +903,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self._render_tracking_ring(hand, joint, x, y, r + 4)
 
     def _render_count_schematic(self) -> None:
+        if not self._show_schematics:
+            return
         centers, scale = self._count_schematic_layout()
         counts = self._effective_counts()
         for hand, (cx, cy) in zip(self._schematic_hand_order(), centers):
@@ -961,6 +966,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         return best
 
     def _editable_schematic_hit(self, x: float, y: float) -> Optional[Tuple[int, int]]:
+        if not self._show_schematics:
+            return None
         hit = self._visibility_schematic_hit(x, y)
         if hit is not None:
             return hit

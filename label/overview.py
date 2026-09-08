@@ -29,7 +29,7 @@ class CameraOverview(ttk.Frame):
             host.grid(row=index // 3, column=index % 3, sticky="nsew", padx=3, pady=3)
             ttk.Label(host, text=f"{index + 1} · 机位 {camera} · 只读",
                       style="PanelMuted.TLabel").pack(anchor="w", padx=6, pady=4)
-            canvas = ImageAnnotatorCanvas(host, bg=Theme.PANEL_2, width=1, height=1)
+            canvas = ImageAnnotatorCanvas(host, bg=Theme.PANEL_2, show_schematics=False, width=1, height=1)
             canvas.pack(fill="both", expand=True, padx=4, pady=(0, 4))
             canvas.set_read_only(True)
             self.canvases[camera] = canvas
