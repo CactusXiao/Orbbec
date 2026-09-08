@@ -12,6 +12,14 @@ class LabelJointTrackingTest(unittest.TestCase):
     tearDown = overview_tests.LabelOverviewTest.tearDown
     state = staticmethod(overview_tests.LabelOverviewTest.state)
 
+    def confirm(self):
+        p = self.page
+        p._jsonl_path = 'unused.jsonl'
+        with patch('label.app.apply_view_state_to_corrected'), patch('label.app.save_corrected_array'), \
+             patch('label.app.save_correction_progress'), patch.object(p, '_update_tree_row'), \
+             patch.object(p, '_invalidate_corrected_source_cache'):
+            p._confirm()
+
     def double_click(self, hand=0, joint=4):
         canvas = self.page._canvas
         centers, scale = canvas._visibility_schematic_layout()
@@ -74,20 +82,19 @@ class LabelJointTrackingTest(unittest.TestCase):
         p._tracker.track_points.assert_not_called()
         self.assertEqual(p._canvas.get_hand_state(), self.state(12))
 
-    def test_confirm_also_tracks_to_next_frame(self):
+    def test_confirm_tracks_to_next_frame_and_keeps_selection(self):
         p = self.page
         p._jsonl_path = 'unused.jsonl'
         p._canvas.set_hand_state(*self.state(30, True))
         self.double_click()
         p._tracker = Mock()
         p._tracker.track_points.return_value = self.state(200, True)
-        with patch('label.app.apply_view_state_to_corrected'), patch('label.app.save_corrected_array'), \
-             patch('label.app.save_correction_progress'), patch.object(p, '_update_tree_row'), \
-             patch.object(p, '_invalidate_corrected_source_cache'):
-            p._confirm()
+        self.confirm()
         p._tracker.track_points.assert_called_once()
         self.assertEqual(p._frame_pos, 1)
         self.assertEqual(p._canvas._points[0][4], (204.0, 44.0))
+        self.assertEqual(p._tracked_joints_by_cam['00'], {(0, 4)})
+        self.assertTrue(p._canvas.find_withtag('tracking-highlight'))
 
     def test_highlights_follow_camera_including_overview_and_skeleton_overlay(self):
         p = self.page
@@ -115,7 +122,7 @@ class LabelJointTrackingTest(unittest.TestCase):
         predicted = self.state(200, True)
         p._tracker = Mock()
         p._tracker.track_points.return_value = predicted
-        p._skip_frame()
+        self.confirm()
         call = p._tracker.track_points.call_args.kwargs
         self.assertEqual((call['prev_frame_idx'], call['frame_idx'], call['cam_id']), (5, 12, '00'))
         self.assertEqual(call['points'][0][4], (123.0, 87.0))
@@ -138,9 +145,68 @@ class LabelJointTrackingTest(unittest.TestCase):
         p._tracker = Mock()
         p._tracker.track_points.side_effect = RuntimeError('model unavailable')
         with patch('label.app.messagebox.showwarning') as warning:
-            p._skip_frame()
+            self.confirm()
         warning.assert_called_once()
         self.assertEqual(p._canvas.get_hand_state(), self.state(12))
+
+    def test_browsing_frames_does_not_run_tracking(self):
+        p = self.page
+        p._canvas.set_hand_state(*self.state(30, True))
+        self.double_click()
+        p._tracker = Mock()
+        p._skip_frame()
+        p._back_frame()
+        p._seek_timeline(1, True)
+        p._tracker.track_points.assert_not_called()
+
+    def test_confirm_replaces_selected_cached_point_only(self):
+        p = self.page
+        p._canvas.set_hand_state(*self.state(30, True))
+        self.double_click()
+        p._progress['overview'] = CorrectionProgress(task_key='overview', total_frames=2, done_positions={1})
+        p._source_state_cache[('overview', 1, '00', 'correct')] = self.state(90, True)
+        p._tracker = Mock()
+        p._tracker.track_points.return_value = self.state(200, True)
+        self.confirm()
+        self.assertEqual(p._canvas._points[0][4], (204.0, 44.0))
+        self.assertEqual(p._canvas._points[0][5], (95.0, 45.0))
+        self.assertEqual(p._progress['overview'].done_positions, {0})
+
+    def test_manual_visibility_change_cancels_tracking_and_undo_does_not_reenable(self):
+        p = self.page
+        p._canvas.set_hand_state(*self.state(30, True))
+        self.double_click()
+        centers, scale = p._canvas._visibility_schematic_layout()
+        x, y = p._canvas._schematic_point(0, 4, *centers[0], scale)
+        p._canvas._on_left_down(SimpleNamespace(x=x, y=y))
+        p._canvas._on_left_up(SimpleNamespace(x=x, y=y))
+        self.assertFalse(p._tracked_joints_by_cam['00'])
+        self.assertFalse(p._canvas.find_withtag('tracking-highlight'))
+        p._undo()
+        self.assertTrue(p._canvas._visible[0][4])
+        self.assertFalse(p._tracked_joints_by_cam['00'])
+
+    def test_tracker_visibility_change_cancels_only_that_point(self):
+        p = self.page
+        p._canvas.set_hand_state(*self.state(30, True))
+        self.double_click(0, 4)
+        self.double_click(1, 8)
+        predicted = self.state(200, True)
+        predicted[1][0][4] = False
+        p._tracker = Mock()
+        p._tracker.track_points.return_value = predicted
+        self.confirm()
+        self.assertEqual(p._tracked_joints_by_cam['00'], {(1, 8)})
+        self.assertFalse(p._canvas._visible[0][4])
+        self.assertFalse(p._canvas.find_withtag('tracking-0-4'))
+        self.assertTrue(p._canvas.find_withtag('tracking-1-8'))
+
+    def test_ignore_view_cancels_tracking_immediately(self):
+        p = self.page
+        p._canvas.set_hand_state(*self.state(30, True))
+        self.double_click()
+        p._ignore_view()
+        self.assertFalse(p._tracked_joints_by_cam['00'])
 
     def test_empty_selection_does_not_load_model(self):
         runtime = CoTrackerRuntime()

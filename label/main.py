@@ -32,6 +32,8 @@ def main() -> None:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from label.runtime_env import ensure_tracking_environment
+    ensure_tracking_environment()
     from frontend_runtime import SingleInstance
 
     with SingleInstance("label") as instance:

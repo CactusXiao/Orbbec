@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -76,7 +77,10 @@ class CoTrackerRuntime:
         try:
             import torch
         except Exception as exc:
-            raise RuntimeError("Tracking mode requires PyTorch. Install a compatible `torch` package first.") from exc
+            raise RuntimeError(
+                f"当前 Label 使用 {sys.executable}，无法导入 PyTorch：{exc}。"
+                "请用 LABEL_PYTHON 指定已安装 PyTorch 的 Python 环境后重新打开 Label。"
+            ) from exc
         self._torch = torch
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         return torch

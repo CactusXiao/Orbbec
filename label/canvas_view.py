@@ -80,6 +80,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._history: List[Tuple[HandPoints, HandVisible]] = []
         self._tracked_joints = set()
         self.on_track_joint = None
+        self.on_tracking_cancelled = None
+        self._applying_hand_state = False
         self._schematic_first_click = None
 
         self._panning = False
@@ -194,7 +196,11 @@ class ImageAnnotatorCanvas(tk.Canvas):
         self._points = self._coerce_points(points)
         self._visible = self._coerce_visible(visible)
         self._history = []
-        self._render_overlay()
+        self._applying_hand_state = True
+        try:
+            self._render_overlay()
+        finally:
+            self._applying_hand_state = False
 
     def set_count_base(self, counts: JointCounts) -> None:
         self._count_base = self._coerce_counts(counts)
@@ -396,7 +402,8 @@ class ImageAnnotatorCanvas(tk.Canvas):
             self._selection_start = None
             self._selection_current = None
             hand, joint = schematic_hit
-            self._schematic_first_click = (schematic_hit, self._visible[hand][joint])
+            self._schematic_first_click = (schematic_hit, self._visible[hand][joint],
+                                           schematic_hit in self._tracked_joints)
             self._push_history()
             self._visible[hand][joint] = not self._visible[hand][joint]
             self._render_overlay()
@@ -483,7 +490,10 @@ class ImageAnnotatorCanvas(tk.Canvas):
                     if self._history:
                         self._history.pop()
                 self._schematic_first_click = None
-                self.on_track_joint(*schematic_hit)
+                # If the first click already cancelled an active track, the
+                # double click must leave it off instead of enabling it again.
+                if first is None or not first[2]:
+                    self.on_track_joint(*schematic_hit)
                 self._render_overlay()
             return
         hit = self._nearest_joint(evt.x, evt.y, max_dist=14.0)
@@ -723,6 +733,13 @@ class ImageAnnotatorCanvas(tk.Canvas):
         return expand_region_to_aspect(region, (iw, ih), target_aspect)
 
     def _render_overlay(self, *, drag_hand: Optional[int] = None) -> None:
+        if (getattr(self, "on_tracking_cancelled", None) is not None
+                and not self._applying_hand_state and not self._read_only):
+            cancelled = {(hand, joint) for hand, joint in self._tracked_joints
+                         if not self._visible[hand][joint]}
+            if cancelled:
+                self._tracked_joints.difference_update(cancelled)
+                self.on_tracking_cancelled(cancelled)
         self._clear_overlay_items()
         locate_target = self._locate_joint
         if self._annotation_visible:

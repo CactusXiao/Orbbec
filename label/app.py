@@ -588,6 +588,7 @@ class LabelPage(ttk.Frame):
         self._overview_grid = CameraOverview(canvas_host)
         self._canvas = ImageAnnotatorCanvas(canvas_host, bg=Theme.PANEL_2)
         self._canvas.on_track_joint = self._toggle_joint_tracking
+        self._canvas.on_tracking_cancelled = self._cancel_joint_tracking
         self._canvas.pack(fill="both", expand=True)
         self._mesh_notice = ttk.Label(canvas_host, text="", style="PanelMuted.TLabel", padding=8)
 
@@ -1192,28 +1193,39 @@ class LabelPage(ttk.Frame):
         self._refresh_tracking_highlights()
 
     def _refresh_tracking_highlights(self) -> None:
+        if self._mode == "correct":
+            for cam_id, selected in self._tracked_joints_by_cam.items():
+                state = self._view_states.get(cam_id)
+                if state is not None:
+                    selected.difference_update({target for target in selected
+                                                if not state[1][target[0]][target[1]]})
         self._canvas.set_tracked_joints(self._tracked_joints_by_cam.get(self._active_cam_id(), set()))
         for cam_id, canvas in self._overview_grid.canvases.items():
             canvas.set_tracked_joints(self._tracked_joints_by_cam.get(cam_id, set()))
 
-    def _track_selected_to_frame(self, position: int) -> None:
-        """Seed unvisited forward frames; preserve cached edits and confirmed frames."""
+    def _cancel_joint_tracking(self, joints) -> None:
+        self._tracked_joints_by_cam.get(self._active_cam_id(), set()).difference_update(joints)
+        self._refresh_tracking_highlights()
+
+    def _track_selected_to_frame(self, position: int, source_states: ViewStateByCam) -> bool:
+        """Apply selected tracks to the next frame after confirming annotations."""
         task = self._active_task
         selected_by_cam = getattr(self, "_tracked_joints_by_cam", {})
         if task is None or position <= self._frame_pos or not any(selected_by_cam.values()):
-            return
-        if self._is_frame_done(task, position):
-            return
+            return False
         previous_frame = task.frames[self._frame_pos]
         target_frame = task.frames[position]
         errors = []
+        changed = False
         self._info.configure(text=f"正在跟踪关节点：帧 {previous_frame} → {target_frame}…")
         self.update_idletasks()
         for cam_id, selected in selected_by_cam.items():
             key = (self._active_key, position, cam_id, "correct")
-            if not selected or key in self._source_state_cache:
+            if not selected:
                 continue
-            points, visible = self._build_initial_view_state(previous_frame, cam_id, "correct")
+            points, visible = source_states[cam_id]
+            selected.difference_update({target for target in selected
+                                        if not visible[target[0]][target[1]]})
             mask = self._none_visible()
             for hand, joint in selected:
                 mask[hand][joint] = visible[hand][joint]
@@ -1225,7 +1237,10 @@ class LabelPage(ttk.Frame):
                     prev_frame_idx=previous_frame, frame_idx=target_frame,
                     points=points, visible=mask, rgb_path_template=task.rgb_path_template,
                 )
-                state = self._copy_view_state(self._build_modified_view_state(target_frame, cam_id))
+                cached = self._source_state_cache.get(key)
+                state = self._copy_view_state(cached if cached is not None else
+                                             self._build_modified_view_state(target_frame, cam_id))
+                cancelled = set()
                 for hand, joint in selected:
                     if not mask[hand][joint]:
                         continue
@@ -1234,10 +1249,15 @@ class LabelPage(ttk.Frame):
                         raise ValueError("跟踪返回了无效关节坐标。")
                     state[0][hand][joint] = point
                     state[1][hand][joint] = tracked_visible[hand][joint]
+                    if not tracked_visible[hand][joint]:
+                        cancelled.add((hand, joint))
                 self._source_state_cache[key] = state
+                changed = True
+                selected.difference_update(cancelled)
             except Exception as exc:
                 errors.append(f"Camera {cam_id}: {exc}")
         self._show_tracking_errors_once(target_frame, errors)
+        return changed
 
     def _build_tracking_source_states(self, frame_idx: int) -> ViewStateByCam:
         errors: List[str] = []
@@ -1800,7 +1820,6 @@ class LabelPage(ttk.Frame):
         if position == self._frame_pos:
             return
         self._cache_current_source_state()
-        self._track_selected_to_frame(position)
         self._view_states = {}
         keep_mano = self._show_mano
         self._reset_visualizations()
@@ -1850,12 +1869,16 @@ class LabelPage(ttk.Frame):
             rec = CorrectionProgress(task_key=task.key, total_frames=task.total_frames)
             self._progress[task.key] = rec
         rec.done_positions.add(self._frame_pos)
+
+        next_pos = min(task.total_frames - 1, self._frame_pos + 1)
+        had_tracks = any(self._tracked_joints_by_cam.values())
+        if self._track_selected_to_frame(next_pos, corrected_states):
+            rec.done_positions.discard(next_pos)
+        if had_tracks:
+            self._mode = "correct"
         save_correction_progress(self._jsonl_path, self._progress)
         self._update_tree_row(task)
         self._update_submit_button()
-
-        next_pos = min(task.total_frames - 1, self._frame_pos + 1)
-        self._track_selected_to_frame(next_pos)
         keep_mano = self._show_mano
         self._reset_visualizations()
         self._show_mano = keep_mano
