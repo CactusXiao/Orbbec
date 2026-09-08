@@ -1,4 +1,5 @@
 #include "calibration.hpp"
+#include "calibration_repair.hpp"
 
 #include "utils/utils.hpp"
 
@@ -72,7 +73,7 @@ public:
             icpMaxDepth_ = oss.str();
         }
         pushLog("auto chessboard calibration ui ready");
-        pushLog("fixed board: 11x8, fixed cameras: 00 01 02 03 04 05");
+        pushLog("fixed board: 11x8, cameras: 00 01 02 03 04 05 06");
 
         const std::string win = "Calibration";
         cv::namedWindow(win, cv::WINDOW_NORMAL);
@@ -105,7 +106,7 @@ private:
     static constexpr int kFixedChessboardRows = 8;
 
     static std::vector<std::string> fixedCalibrationCameraIds() {
-        return { "00", "01", "02", "03", "04", "05" };
+        return calibration_repair::cameraIds();
     }
 
     struct DeviceRuntimeLite {
@@ -1183,6 +1184,29 @@ private:
     }
 
     bool calcOverallAndSave() {
+        if(singleCamera_) {
+            try {
+                const auto &edge = edges_.at(pairKey(repairReference_, repairTarget_));
+                if(!edge.valid) return false;
+                calibration_repair::Json rgbDepth(cJSON_CreateObject(), cJSON_Delete);
+                const auto d2c = depthToRgbByCam_.find(repairTarget_);
+                const auto c2d = rgbToDepthByCam_.find(repairTarget_);
+                if(d2c != depthToRgbByCam_.end() && c2d != rgbToDepthByCam_.end()) {
+                    cJSON_AddItemToObject(rgbDepth.get(), "d2c_extrinsic", makeExtrinsicJson(d2c->second));
+                    cJSON_AddItemToObject(rgbDepth.get(), "c2d_extrinsic", makeExtrinsicJson(c2d->second));
+                }
+                const auto updated = calibration_repair::patch(repairSnapshot_, repairTarget_, repairReference_, {edge.R, edge.t},
+                                                               rgbDepth->child ? rgbDepth.get() : nullptr);
+                calibration_repair::save(fs::absolute(cfg_.initExtrinsicPath), repairSnapshot_, updated);
+                pushLog("saved camera " + repairTarget_ + "; all other camera entries preserved");
+                pushLog("backup: " + cfg_.initExtrinsicPath + ".before_single_camera.bak");
+                return true;
+            }
+            catch(const std::exception &e) {
+                pushLog(std::string("single camera save failed: ") + e.what());
+                return false;
+            }
+        }
         const std::string root = "00";
         std::unordered_map<std::string, EdgeExtrinsic> worldToCam;
         std::unordered_set<std::string> vis;
@@ -1651,7 +1675,7 @@ private:
             mode_ = UIMode::Chessboard;
             activeField_.clear();
         }
-        if(uiButton(ui, btnIcp, "ICP", fm)) {
+        if(uiButton(ui, btnIcp, "ICP (all)", fm) && !singleCamera_) {
             stopActivePair();
             mode_ = UIMode::ICP;
             activeField_.clear();
@@ -1692,10 +1716,34 @@ private:
     void drawChessboardPanel(cv::Mat &ui, FrameMouse &fm, int key, bool &running, const cv::Rect &left, const cv::Rect &mid, const cv::Rect &right) {
         forceFixedChessboardConfig();
         cv::putText(ui, "Auto Chessboard", cv::Point(left.x + 12, left.y + 78), cv::FONT_HERSHEY_DUPLEX, 0.66, cv::Scalar(245, 245, 245), 1, cv::LINE_AA);
-        cv::putText(ui, "cameras: 00 01 02 03 04 05", cv::Point(left.x + 12, left.y + 106), cv::FONT_HERSHEY_DUPLEX, 0.47, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, "cameras: 00 01 02 03 04 05 06", cv::Point(left.x + 12, left.y + 106), cv::FONT_HERSHEY_DUPLEX, 0.47, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         cv::putText(ui, "board: 11 x 8", cv::Point(left.x + 12, left.y + 130), cv::FONT_HERSHEY_DUPLEX, 0.47, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
 
-        cv::Rect f1(left.x + 12, left.y + 164, left.width - 24, 34);
+        if(uiButton(ui, cv::Rect(left.x + 12, 144, left.width - 24, 30),
+                    singleCamera_ ? "mode: Single camera" : "mode: All 7 cameras", fm)) {
+            clearAllState();
+            singleCamera_ = !singleCamera_;
+        }
+        if(singleCamera_) {
+            const auto ids = fixedCalibrationCameraIds();
+            cv::putText(ui, "Moved camera (target)", cv::Point(left.x + 12, 195), cv::FONT_HERSHEY_DUPLEX, 0.46, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            cv::putText(ui, "Unmoved camera (reference)", cv::Point(left.x + 12, 257), cv::FONT_HERSHEY_DUPLEX, 0.46, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+            for(size_t i = 0; i < ids.size(); ++i) {
+                const int x = left.x + 12 + static_cast<int>(i) * 42;
+                if(uiButton(ui, cv::Rect(x, 204, 40, 30), ids[i], fm) && ids[i] != repairTarget_) {
+                    clearAllState();
+                    repairTarget_ = ids[i];
+                    if(repairReference_ == repairTarget_) repairReference_ = ids[(i + 1) % ids.size()];
+                }
+                if(uiButton(ui, cv::Rect(x, 266, 40, 30), ids[i], fm) && ids[i] != repairReference_ && ids[i] != repairTarget_) {
+                    clearAllState();
+                    repairReference_ = ids[i];
+                }
+                if(ids[i] == repairTarget_) cv::rectangle(ui, cv::Rect(x, 204, 40, 30), cv::Scalar(80, 220, 120), 2);
+                if(ids[i] == repairReference_) cv::rectangle(ui, cv::Rect(x, 266, 40, 30), cv::Scalar(80, 220, 120), 2);
+            }
+        }
+        cv::Rect f1(left.x + 12, singleCamera_ ? 326 : 210, left.width - 24, 34);
         if(uiField(ui, f1, "valid samples per pair", sampleTarget_, activeField_, "sampleTarget", fm)) {
             activeField_ = "sampleTarget";
         }
@@ -1712,7 +1760,7 @@ private:
             pk = pairKey(autoPairPlan_[displayIdx].first, autoPairPlan_[displayIdx].second);
         }
         if(pk.empty()) {
-            pk = "00->01";
+            pk = singleCamera_ ? pairKey(repairReference_, repairTarget_) : "00->01";
         }
         int valid = 0;
         double rms = -1.0;
@@ -1748,10 +1796,10 @@ private:
             }
             cv::putText(ui, "stereo rms (px): " + oss.str(), cv::Point(left.x + 12, f1.y + 140), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         }
-        cv::putText(ui, "calibrated pairs: " + std::to_string(calibratedCount) + "/5", cv::Point(left.x + 12, f1.y + 166), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+        cv::putText(ui, "calibrated pairs: " + std::to_string(calibratedCount) + "/" + std::to_string(singleCamera_ ? 1 : fixedCalibrationCameraIds().size() - 1), cv::Point(left.x + 12, f1.y + 166), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
         cv::putText(ui, std::string("graph connected: ") + (fixedCalibrationGraphConnected() ? "yes" : "no"), cv::Point(left.x + 12, f1.y + 192), cv::FONT_HERSHEY_DUPLEX, 0.5, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
 
-        cv::Rect logBox(left.x + 10, f1.y + 214, left.width - 20, 330);
+        cv::Rect logBox(left.x + 10, f1.y + 214, left.width - 20, left.height - 164 - (f1.y + 214));
         drawLogBox(ui, logBox, fm);
 
         const int by = left.y + left.height - 154;
@@ -1955,6 +2003,10 @@ private:
     }
 
     bool fixedCalibrationGraphConnected() {
+        if(singleCamera_) {
+            const auto it = edges_.find(pairKey(repairReference_, repairTarget_));
+            return it != edges_.end() && it->second.valid;
+        }
         const auto ids = fixedCalibrationCameraIds();
         std::unordered_set<std::string> required(ids.begin(), ids.end());
         std::unordered_set<std::string> vis;
@@ -1982,6 +2034,27 @@ private:
     }
 
     bool prepareAutoCalibrationPlan() {
+        if(singleCamera_) {
+            try {
+                calibration_repair::validateSelection(repairTarget_, repairReference_);
+                if(!hasIndex(repairTarget_) || !hasIndex(repairReference_)) {
+                    throw std::runtime_error("Target or reference camera is not connected/configured");
+                }
+                repairSnapshot_ = calibration_repair::readFile(fs::absolute(cfg_.initExtrinsicPath));
+                calibration_repair::referencePose(repairSnapshot_, repairTarget_, repairReference_);
+                autoPairPlan_ = {{repairReference_, repairTarget_}};
+                autoPairIndex_ = 0;
+                pushLog("repair " + repairTarget_ + " using unmoved reference " + repairReference_);
+                return true;
+            }
+            catch(const std::exception &e) {
+                autoRunning_ = false;
+                autoError_ = true;
+                autoStatus_ = "single camera start failed";
+                pushLog(e.what());
+                return false;
+            }
+        }
         const auto missing = missingFixedCalibrationCameras();
         if(!missing.empty()) {
             autoRunning_ = false;
@@ -2299,6 +2372,8 @@ private:
 
     void clearAllState() {
         stopActivePair();
+        // Drain detection before clearing samples so old jobs cannot enter a new plan.
+        stopSampleWorker();
         {
             std::lock_guard<std::mutex> lock(pairMtx_);
             pairStore_.clear();
@@ -2320,6 +2395,10 @@ private:
             std::lock_guard<std::mutex> lock(icpDepthMtx_);
             icpDepthSlots_.clear();
         }
+        repairSnapshot_.clear();
+        activePairKey_.clear();
+        activeField_.clear();
+        startSampleWorker();
         pushLog("state cleared");
     }
 
@@ -2362,6 +2441,10 @@ private:
     std::unordered_map<std::string, EdgeExtrinsic> rgbToDepthByCam_;
     std::unordered_map<std::string, EdgeExtrinsic> depthToRgbByCam_;
 
+    bool singleCamera_ = false;
+    std::string repairTarget_ = "01";
+    std::string repairReference_ = "00";
+    std::string repairSnapshot_;
     bool autoRunning_ = false;
     bool autoError_ = false;
     bool calibrationComplete_ = false;

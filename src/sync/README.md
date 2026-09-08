@@ -1,3 +1,7 @@
+# Calibration 功能
+
+`calibration` 支持 00–06 七相机全量标定，以及选择待修复相机和未移动参考相机的单相机外参修复。操作方法、保存范围和回归检查见 [单相机标定说明](../../docs/SINGLE_CAMERA_CALIBRATION.md)。
+
 # C++ Sample: 3.advanced.multi_devices_sync
 
 ## Overview
