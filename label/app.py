@@ -488,7 +488,7 @@ class LabelPage(ttk.Frame):
         self._original_mesh_cache = None
         self._mesh_poll_id = None
         self._build_ui()
-        for number in range(7):
+        for number in range(8):
             self.winfo_toplevel().bind(
                 f"<KeyPress-{number}>", lambda event, index=number - 1: self._camera_shortcut(event, index), add="+"
             )
@@ -941,6 +941,7 @@ class LabelPage(ttk.Frame):
             return
 
         self._stop_original_mesh_cache()
+        self._overview_grid.clear()
         self._active_key = task.key
         self._tracked_joints_by_cam = {}
         self._active_task = task
@@ -1526,7 +1527,7 @@ class LabelPage(ttk.Frame):
     def _refresh_skeleton_overlay(self) -> None:
         targets = self._overview_grid.canvases if self._overview else {self._active_cam_id(): self._canvas}
         for cam_id, canvas in targets.items():
-            if not self._show_skeleton or self._skeleton_joints_3d is None or self._active_task is None or cam_id is None:
+            if cam_id == "ego" or not self._show_skeleton or self._skeleton_joints_3d is None or self._active_task is None or cam_id is None:
                 canvas.set_skeleton_overlay(None)
                 continue
             try:
@@ -1576,6 +1577,9 @@ class LabelPage(ttk.Frame):
         targets = self._overview_grid.canvases if self._overview else {self._active_cam_id(): self._canvas}
         pending = False
         for camera, canvas in targets.items():
+            if camera == "ego":
+                canvas.set_rendered_image(None)
+                continue
             notice = self._overview_grid.notices[camera] if self._overview else self._mesh_notice
             path = cache.path(camera, frame) if cache is not None else None
             canvas.set_rendered_image(path)
@@ -1668,7 +1672,7 @@ class LabelPage(ttk.Frame):
         self._update_source_button()
         self._refresh_visual_overlays()
         self._refresh_timeline()
-        self._info.configure(text=f"Task: {task.display_name} · 六视角总览（0，只读） · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–6 返回单视角")
+        self._info.configure(text=f"Task: {task.display_name} · 六视角总览（0，只读） · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–7 返回单视角（00–06）")
         frame_done = self._is_frame_done(task, self._frame_pos)
         self._frame_status.configure(text=f"当前帧：{'已完成' if frame_done else '未完成'}",
                                      fg=STATUS_DONE_COLOR if frame_done else STATUS_TODO_COLOR)

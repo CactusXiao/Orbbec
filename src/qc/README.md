@@ -39,7 +39,7 @@ python3 -m src.qc.main --config /tmp/orbbec_qc_frontend_config.json
 }
 ```
 
-`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。00/02/03/05 四路 RGB 和 Pico Ego 视频会边解码、边渲染；前 30 个完整五视图 mesh 帧准备好后即可播放，RGB 与 mesh 图片会保留到离开当前 Episode。针对 9950X 的播放并发实测配置为 6 个渲染进程、0.5 倍 mesh 图层，并优先选择 AMD 核显 EGL 设备；不存在可用 OpenGL 时会自动回退 CPU。
+`sample_interval` 仅为旧进度和 QC 报告协议保留，播放界面不再按采样点检查。mesh renderer 使用独立 Python，需能导入优化工具包、PyTorch、OpenCV、`trimesh` 和 `pyrender`。00/02/03/05/06 五路 RGB 和 Pico Ego 视频会边解码、边渲染；前 30 个完整六视图 mesh 帧准备好后即可播放，RGB 与 mesh 图片会保留到离开当前 Episode。针对 9950X 的播放并发实测配置为 6 个渲染进程、0.5 倍 mesh 图层，并优先选择 AMD 核显 EGL 设备；不存在可用 OpenGL 时会自动回退 CPU。
 
 Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json` 和带有 `frame_index`/`ego_frame_index` 的同步时间戳表。投影遵循 `mano/ego_pose.py`：使用逐帧 `T_ego_from_reference` 变换 MANO 顶点，按原始 OpenCV fisheye 标定扭曲透明 mesh 图层，再叠加到不做几何变换的 Pico RGB 上。
 
@@ -48,7 +48,7 @@ Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json`
 - Task / Episode 列表来自后端 `qc` stage 的可租 job。
 - 双击 Episode 后才会正式租借。
 - 本机未提交进度会合并显示；已退出的任务显示“已释放”，继续时重新向后端领取。
-- 00/02/03/05 和 Pico Ego RGB H.265 会并行解码为高质量 JPEG 缓存，旧 PNG 缓存仍可继续使用。
+- 00/02/03/05/06 和 Pico Ego RGB H.265 会并行解码为高质量 JPEG 缓存，旧 PNG 缓存仍可继续使用。
 - `<episode>/optimized_pose/<frame>.npy` 会生成 MANO 表面，并预渲染到 `tmp_dir/<episode_id>/mesh/<camera>/<frame>.jpg`。
 - 五个视图使用同一个播放帧游标，不裁剪画面；播放中和暂停时都支持点击、拖动进度条。拖到尚未完成的帧时保留上一张完整画面并显示“目标帧渲染中”，后台完成后自动切换，UI 不等待渲染。暂停后也可前后移动 1 帧或 10 帧。
 - 播放按单调时钟维持真实 `playback_fps`；界面刷新落后时跳过中间显示帧，不会把刷新耗时叠加成慢放。Pico 投影仍在原始分辨率完成，播放器读取自动生成的 960 像素宽预览。

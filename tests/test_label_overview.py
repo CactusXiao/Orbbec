@@ -24,12 +24,16 @@ class LabelOverviewTest(unittest.TestCase):
         self.page = LabelPage(self.root, config=LabelConfig(), on_back=Mock())
         self.page.pack(fill="both", expand=True)
         p = self.page
-        cameras = [f"{i:02d}" for i in range(6)]
+        cameras = [f"{i:02d}" for i in range(7)]
         base = Path(self.temp.name)
         for index, camera in enumerate(cameras):
             (base/camera).mkdir()
             for frame in (5, 12):
                 Image.new("RGB", (360, 220), (index * 30, frame * 10, 60)).save(base/camera/f"{frame:05d}.png")
+        (base / "ego" / "RGB").mkdir(parents=True)
+        for ego_frame in (2, 3):
+            Image.new("RGB", (360, 220), (10, 20, 30)).save(base / "ego" / "RGB" / f"{ego_frame:05d}.png")
+        (base / "timestamps.csv").write_text("frame_index,ego_frame_index\n5,2\n12,3\n")
         p._active_task = SimpleNamespace(key="overview", frames=[5, 12], total_frames=2,
             cameras=cameras, display_name="Overview test", episode_dir=lambda: base,
             rgb_path_template="{camera}/{frame:05d}.png")
@@ -73,7 +77,9 @@ class LabelOverviewTest(unittest.TestCase):
         self.root.update()
         self.assertTrue(p._overview)
         self.assertFalse(p._canvas.winfo_ismapped())
-        self.assertEqual(len(p._overview_grid.canvases), 6)
+        self.assertEqual(list(p._overview_grid.canvases), ["00", "02", "03", "05", "06", "ego"])
+        self.assertNotIn("ego", p._camera_ids)
+        self.assertNotIn("ego", p._view_states)
         self.assertEqual(p._overview_grid.canvases['00'].get_hand_state(), edited)
         for canvas in p._overview_grid.canvases.values():
             before = canvas.get_hand_state()
@@ -94,7 +100,7 @@ class LabelOverviewTest(unittest.TestCase):
         with patch.object(p._canvas, 'undo') as undo, patch.object(p._canvas, 'ignore_view') as ignore:
             p._undo(); p._ignore_view()
             undo.assert_not_called(); ignore.assert_not_called()
-        for index in range(6):
+        for index in range(7):
             self.shortcut(index)
             self.assertFalse(p._overview)
             self.assertEqual(p._active_cam_id(), f"{index:02d}")
@@ -141,10 +147,16 @@ class LabelOverviewTest(unittest.TestCase):
         self.assertIsNone(p._mesh_poll_id)
         self.assertEqual(vars(camera._view), transform)
         for cam, canvas in canvases.items():
+            if cam == "ego":
+                self.assertIsNone(canvas._rendered_path)
+                continue
             self.assertEqual(canvas._rendered_path, base/cam/'00005.png')
             self.assertFalse(canvas._annotation_visible)
         p._skip_frame()
         for cam, canvas in canvases.items():
+            if cam == "ego":
+                self.assertIsNone(canvas._rendered_path)
+                continue
             self.assertEqual(canvas._rendered_path, base/cam/'00012.png')
         p._toggle_mano()
         for canvas in canvases.values():
@@ -164,7 +176,8 @@ class LabelOverviewTest(unittest.TestCase):
              patch("label.app.save_correction_progress"), \
              patch.object(p, "_update_tree_row"):
             p._confirm()
-        self.assertEqual(apply.call_count, 6)
+        self.assertEqual(apply.call_count, 7)
+        self.assertEqual({call.args[2] for call in apply.call_args_list}, {f"{i:02d}" for i in range(7)})
         self.assertEqual(apply.call_args_list[0].args[3:], edited)
         self.assertEqual(p._frame_pos, 1)
         self.assertTrue(p._overview)

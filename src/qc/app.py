@@ -755,13 +755,13 @@ class DecodePage(ttk.Frame):
 
     def reset(self, progress: QcProgress) -> None:
         display_id = episode_display_id(progress.episode, progress.payload)
-        self._status.configure(text=f"Episode ID：{display_id}    正在准备四路 RGB 与 Pico Ego MANO 投影视图")
+        self._status.configure(text=f"Episode ID：{display_id}    正在准备五路 RGB 与 Pico Ego MANO 投影视图")
         self._tree.delete(*self._tree.get_children())
         self._rows = {}
         available = [str(camera) for camera in progress.payload.get("cameras") or []]
-        cameras = [camera for camera in ("00", "02", "03", "05") if camera in available]
+        cameras = [camera for camera in ("00", "02", "03", "05", "06") if camera in available]
         if not cameras:
-            cameras = available[:4]
+            cameras = available[:5]
         cameras.append("ego")
         for camera in cameras:
             cam = str(camera)

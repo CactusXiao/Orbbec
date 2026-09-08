@@ -42,6 +42,14 @@ class CorrectionTask:
     mano_episode_dir: str = MANO_EPISODE_DIR
     nas_root_path: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Old job payloads can still list six cameras after a seventh is installed.
+        # Auxiliary views stay out of prediction loading and annotation writes.
+        cameras = list(dict.fromkeys(_label_camera_ids(self.cameras)))
+        if "06" not in cameras and (self.episode_dir() / "06" / "RGB").is_dir():
+            cameras.append("06")
+        object.__setattr__(self, "cameras", cameras)
+
     @property
     def key(self) -> str:
         return str(self.line_no)

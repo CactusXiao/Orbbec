@@ -25,7 +25,7 @@ except Exception:
 
 
 ProgressCallback = Callable[[str, Dict[str, Any]], None]
-QC_RGB_CAMERAS = ("00", "02", "03", "05")
+QC_RGB_CAMERAS = ("00", "02", "03", "05", "06")
 EGO_CAMERA = "ego"
 
 
@@ -47,7 +47,7 @@ class QcEpisodeMedia:
 
     @property
     def display_cameras(self) -> List[str]:
-        return list(self.view_cameras or tuple(str(camera) for camera in self.task.cameras[:6]))
+        return list(self.view_cameras) if self.view_cameras else _qc_view_cameras(self.task, include_ego=False)
 
     def frame_path(self, camera: str, frame_idx: int) -> Optional[Path]:
         if str(camera) == EGO_CAMERA:
@@ -500,7 +500,7 @@ def _qc_view_cameras(task: CorrectionTask, *, include_ego: bool) -> List[str]:
     available = [str(camera) for camera in task.cameras]
     selected = [camera for camera in QC_RGB_CAMERAS if camera in available]
     if not selected:
-        selected = available[:4]
+        selected = available[:5]
     if include_ego:
         selected.append(EGO_CAMERA)
     return selected
@@ -630,7 +630,7 @@ def _prepare_mesh_frames(
     process_callback: Optional[Callable[[Optional[subprocess.Popen[str]]], None]] = None,
     cameras: Optional[List[str]] = None,
 ) -> None:
-    cameras = list(cameras or [str(camera) for camera in task.cameras[:6]])
+    cameras = list(cameras or [str(camera) for camera in task.cameras])
     frames = [int(frame) for frame in task.frames]
     output_dir = cache_dir / "mesh"
     preview_output_dir = cache_dir / "mesh_preview"

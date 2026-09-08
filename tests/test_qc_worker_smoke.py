@@ -207,11 +207,11 @@ class QcWorkerSmokeTest(unittest.TestCase):
             subject="S001",
             task="pick_object",
             episode="episode_001",
-            cameras=["00", "01", "02", "03", "04", "05"],
+            cameras=["00", "01", "02", "03", "04", "05", "06"],
             frames=[0],
         )
 
-        self.assertEqual(_qc_view_cameras(task, include_ego=True), ["00", "02", "03", "05", "ego"])
+        self.assertEqual(_qc_view_cameras(task, include_ego=True), ["00", "02", "03", "05", "06", "ego"])
 
     def test_qc_media_prefers_small_pico_playback_preview(self) -> None:
         from label.storage import CorrectionTask

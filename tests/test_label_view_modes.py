@@ -22,7 +22,7 @@ class MeshCacheTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             episode = root / "subject/task/episode"
-            cameras = [f"{i:02d}" for i in range(6)]
+            cameras = [f"{i:02d}" for i in range(7)]
             for camera in cameras:
                 folder = episode / camera / "RGB"
                 folder.mkdir(parents=True)
@@ -96,19 +96,19 @@ class LabelViewUiTest(unittest.TestCase):
     def test_number_keys_switch_all_cameras_and_keep_current_edits(self):
         p = self.page
         p._active_task = object()
-        p._camera_ids = [f"{i:02d}" for i in range(6)]
+        p._camera_ids = [f"{i:02d}" for i in range(7)]
         with patch.object(p, "_cache_current_source_state") as save, patch.object(p, "_refresh_view") as refresh:
             self.root.focus_force()
-            for index in range(6):
+            for index in range(7):
                 self.root.event_generate(f"<KeyPress-{index + 1}>")
                 self.root.update()
                 self.assertEqual(p._cam_idx, index)
-            self.assertEqual(save.call_count, 6)
-            self.assertEqual(refresh.call_count, 6)
+            self.assertEqual(save.call_count, 7)
+            self.assertEqual(refresh.call_count, 7)
             entry = ttk.Entry(p)
             event = SimpleNamespace(widget=entry, state=0)
             self.assertIsNone(p._camera_shortcut(event, 0))
-            self.assertEqual(p._cam_idx, 5)
+            self.assertEqual(p._cam_idx, 6)
 
     def test_original_show_mano_uses_cache_and_switching_source_clears_preview(self):
         p = self.page

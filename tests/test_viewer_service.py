@@ -20,7 +20,7 @@ PNG_1X1 = base64.b64decode(
 class ViewerSessionManagerTest(unittest.TestCase):
     def _episode(self, root: Path) -> Path:
         episode = root / "episode_1"
-        for camera in ("00", "01", "02", "03", "04", "05"):
+        for camera in ("00", "01", "02", "03", "04", "05", "06"):
             rgb = episode / camera / "RGB"
             rgb.mkdir(parents=True)
             (rgb / "00000.png").write_bytes(PNG_1X1)
@@ -41,7 +41,7 @@ class ViewerSessionManagerTest(unittest.TestCase):
             time.sleep(0.02)
         raise AssertionError("viewer preparation timed out")
 
-    def test_rgb_session_uses_six_sources_and_removes_temp_dir_on_close(self) -> None:
+    def test_rgb_session_uses_seven_sources_and_removes_temp_dir_on_close(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manager = ViewerSessionManager(temp_root=root / "viewer")
@@ -50,13 +50,29 @@ class ViewerSessionManagerTest(unittest.TestCase):
             payload = session.payload()
             self.assertEqual(payload["state"], "ready")
             self.assertEqual(payload["frames"], [0, 1])
-            self.assertEqual(len([source for source in payload["sources"] if source["kind"] == "multiview"]), 6)
+            self.assertEqual(len([source for source in payload["sources"] if source["kind"] == "multiview"]), 7)
             path, content_type = manager.media_path(session.session_id, "rgb", "mv:00", 0)
             self.assertTrue(path.is_file())
             self.assertEqual(content_type, "image/png")
+            path06, _ = manager.media_path(session.session_id, "rgb", "mv:06", 1)
+            self.assertTrue(path06.is_file())
             temp_dir = session.temp_dir
             self.assertTrue(manager.close(session.session_id))
             self.assertFalse(temp_dir.exists())
+
+    def test_manomesh_renders_all_seven_cameras(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            episode = self._episode(root)
+            (episode / "optimized_pose").mkdir()
+            manager = ViewerSessionManager(temp_root=root / "viewer", mano_toolkit_root=root, mano_model_dir=root)
+            session = manager.create("seven-camera-mesh", episode)
+            self._wait(session)
+            with patch.object(manager, "_run_mesh_renderer") as render:
+                manager._prepare_manomesh(session, session.modes["manomesh"])
+            self.assertEqual(render.call_args.kwargs["cameras"], [f"{i:02d}" for i in range(7)])
+            self.assertTrue((session.temp_dir / "mesh_rgb/06/00001.png").is_file())
+            manager.close_all()
 
     def test_pointcloud_is_prepared_only_after_mode_request(self) -> None:
         try:
@@ -69,7 +85,7 @@ class ViewerSessionManagerTest(unittest.TestCase):
             episode = self._episode(root)
             params = {}
             extrinsics = {}
-            for index, camera in enumerate(("00", "01", "02", "03", "04", "05")):
+            for index, camera in enumerate(("00", "01", "02", "03", "04", "05", "06")):
                 depth_dir = episode / camera / "Depth"
                 depth_dir.mkdir()
                 cv2.imwrite(str(depth_dir / "00000.png"), np.array([[1000]], dtype=np.uint16))
@@ -94,20 +110,23 @@ class ViewerSessionManagerTest(unittest.TestCase):
             data = path.read_bytes()
             frame, count = __import__("struct").unpack("<II", data[:8])
             self.assertEqual(frame, 0)
-            self.assertEqual(count, 6)
+            self.assertEqual(count, 7)
             self.assertEqual(len(data), 8 + count * 16)
             manager.close_all()
 
     def test_viewer_page_contains_five_modes_and_cleanup_beacon(self) -> None:
         page = render_viewer_page("episode<script>")
-        self.assertIn("6 路 RGB", page)
+        self.assertIn("7 路 RGB", page)
         self.assertIn("Pico + 眼动", page)
         self.assertIn("彩色融合点云", page)
         self.assertIn("MANO mesh 视频", page)
         self.assertIn("Pico 手部 Pose", page)
         self.assertIn('data-mode="picohand"', page)
         self.assertIn("sendBeacon", page)
-        self.assertIn("renderSix", page)
+        self.assertIn("renderCameraGrid", page)
+        self.assertNotIn("slice(0,6)", page)
+        self.assertIn("grid-auto-rows:calc((100% - 8px)/2)", page)
+        self.assertIn("overflow-y:auto", page)
         self.assertIn("img.frame:not(.active)", page)
         self.assertIn('id="badRanges"', page)
         self.assertIn('id="manoSource"', page)

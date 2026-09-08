@@ -74,7 +74,7 @@ class OriginalMeshCache:
     def _run(self):
         try:
             # Reuse Label's decoded RGB frames without decoding or copying again.
-            for camera in self.task.cameras[:6]:
+            for camera in self.task.cameras:
                 folder = self.cache_dir / str(camera)
                 folder.mkdir()
                 for frame in self.task.frames:
@@ -89,7 +89,7 @@ class OriginalMeshCache:
                     task=self.task, cache_dir=self.cache_dir, settings=self.settings,
                     on_progress=None, stop_event=self.stop_event,
                     process_callback=self._register_process,
-                    cameras=list(self.task.cameras[:6]),
+                    cameras=list(self.task.cameras),
                 )
         except Exception as exc:
             if not self.stop_event.is_set():
