@@ -84,9 +84,10 @@ except Exception:
 
 ViewStateByCam = Dict[str, Tuple[HandPoints, HandVisible]]
 SourceStateCache = Dict[Tuple[str, int, str, str], Tuple[HandPoints, HandVisible]]
-SOURCE_ORDER = ("mano", "correct")
+SOURCE_ORDER = ("mano", "mano_visible", "correct")
 SOURCE_LABELS = {
     "mano": "原始视角",
+    "mano_visible": "原始视角（含可见性）",
     "correct": "修改后视角",
 }
 STATUS_DONE_COLOR = "#46d36b"
@@ -1044,8 +1045,9 @@ class LabelPage(ttk.Frame):
             state = self._build_tracking_view_state(frame_idx, cam_id, errors)
             self._show_tracking_errors_once(frame_idx, errors)
             return state
-        if source == "mano":
-            state = self._build_mano_3d_view_state(frame_idx, cam_id)
+        if source in {"mano", "mano_visible"}:
+            state = (self._build_visible_mano_view_state(frame_idx, cam_id)
+                     if source == "mano_visible" else self._build_mano_3d_view_state(frame_idx, cam_id))
             if state is None:
                 return self._hidden_points(), self._none_visible()
             return state
@@ -1142,6 +1144,8 @@ class LabelPage(ttk.Frame):
         source = self._normalize_source(source)
         if source == "tracking":
             return False
+        if source == "mano_visible":
+            return self._build_visible_mano_view_state(frame_idx, cam_id) is None
         if source == "mano":
             task = self._active_task
             if task is None:
@@ -1318,7 +1322,7 @@ class LabelPage(ttk.Frame):
 
     def _ensure_bundle(self, source: str) -> PredictionBundle:
         source = self._normalize_source(source)
-        if source == "mano":
+        if source in {"mano", "mano_visible"}:
             raise ValueError("MANO mode uses episode 3D results and does not load a 2D prediction bundle.")
         if source == "tracking":
             raise ValueError("Tracking mode uses runtime CoTracker results and does not load a prediction bundle.")
@@ -1368,6 +1372,11 @@ class LabelPage(ttk.Frame):
     def _view_source_status(self, source: str, frame_idx: int, cam_id: str, visible: HandVisible) -> str:
         source = self._normalize_source(source)
         label = self._source_label(source)
+        if source == "mano_visible":
+            # An entirely occluded frame is valid, not a missing projection.
+            task = self._active_task
+            error = self._mano_projection_errors.get((task.key, int(frame_idx), str(cam_id))) if task else "no active task"
+            return f"{label} (missing: {error})" if error else label
         if source == "mano":
             if self._has_any_visible(visible):
                 return label
@@ -1476,7 +1485,7 @@ class LabelPage(ttk.Frame):
     def _sync_visualization_canvas_state(self) -> None:
         active = self._visualization_active()
         try:
-            self._canvas.set_read_only(active or self._mode == "mano" or self._overview)
+            self._canvas.set_read_only(active or self._mode in {"mano", "mano_visible"} or self._overview)
             self._canvas.set_annotation_visible(not active)
             for canvas in self._overview_grid.canvases.values():
                 canvas.set_read_only(True)
@@ -1782,12 +1791,12 @@ class LabelPage(ttk.Frame):
         self._refresh_view()
 
     def _undo(self) -> None:
-        if self._overview or self._mode == "mano" or self._visualization_active():
+        if self._overview or self._mode in {"mano", "mano_visible"} or self._visualization_active():
             return
         self._canvas.undo()
 
     def _ignore_view(self) -> None:
-        if self._overview or self._mode == "mano" or self._visualization_active():
+        if self._overview or self._mode in {"mano", "mano_visible"} or self._visualization_active():
             return
         self._canvas.ignore_view()
 

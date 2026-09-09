@@ -32,9 +32,9 @@ from task_backend.workflow_store import WorkflowStore
 
 
 class LabelBackendClientSmokeTest(unittest.TestCase):
-    def test_only_original_and_modified_views_are_exposed(self) -> None:
-        self.assertEqual(SOURCE_ORDER, ("mano", "correct"))
-        self.assertEqual(SOURCE_LABELS, {"mano": "原始视角", "correct": "修改后视角"})
+    def test_original_visibility_and_modified_views_are_exposed(self) -> None:
+        self.assertEqual(SOURCE_ORDER, ("mano", "mano_visible", "correct"))
+        self.assertEqual(SOURCE_LABELS, {"mano": "原始视角", "mano_visible": "原始视角（含可见性）", "correct": "修改后视角"})
 
     def test_modified_view_starts_from_original_when_no_saved_correction_exists(self) -> None:
         original = (

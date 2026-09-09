@@ -93,6 +93,40 @@ class LabelViewUiTest(unittest.TestCase):
         p._sync_visualization_canvas_state()
         self.assertFalse(p._canvas._read_only)
 
+    def test_visible_original_applies_only_original_mask_and_is_read_only(self):
+        p = self.page
+        p._active_task = SimpleNamespace(key="visibility", episode_dir=lambda: Path("unused"))
+        p._active_key = "visibility"
+        p._camera_ids = ["00"]
+        p._mode = "mano_visible"
+        original = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[True] * 21 for _ in range(2)])
+        original[1][0][1] = False
+        mask = [[True] * 21 for _ in range(2)]
+        mask[1][7] = False
+        edited = ([[(99.0, 88.0)] * 21 for _ in range(2)], [[True] * 21 for _ in range(2)])
+        p._source_state_cache[("visibility", 0, "00", "correct")] = edited
+        with patch.object(p, "_build_mano_3d_view_state", return_value=original), \
+             patch("label.app.load_joint_visibility", return_value=mask) as load, \
+             patch.object(p, "_build_modified_view_state", side_effect=AssertionError("original must ignore edits")):
+            points, visible = p._build_initial_view_state(5, "00", "mano_visible")
+            self.assertEqual(points, original[0])
+            self.assertFalse(visible[0][1])
+            self.assertFalse(visible[1][7])
+            self.assertTrue(visible[0][0])
+            self.assertTrue(original[1][1][7])
+            load.assert_called_once_with(Path("unused/joints_vis"), "00", 5)
+            load.return_value = [[False] * 21 for _ in range(2)]
+            _, hidden = p._build_initial_view_state(5, "00", "mano_visible")
+            self.assertEqual(p._view_source_status("mano_visible", 5, "00", hidden), "原始视角（含可见性）")
+            load.return_value = None
+            p._build_initial_view_state(5, "00", "mano_visible")
+            self.assertIn("Missing joints_vis", p._view_source_status("mano_visible", 5, "00", hidden))
+        p._sync_visualization_canvas_state()
+        self.assertTrue(p._canvas._read_only)
+        with patch.object(p._canvas, "undo") as undo, patch.object(p._canvas, "ignore_view") as ignore:
+            p._undo(); p._ignore_view()
+        undo.assert_not_called(); ignore.assert_not_called()
+
     def test_number_keys_switch_all_cameras_and_keep_current_edits(self):
         p = self.page
         p._active_task = object()
@@ -151,7 +185,7 @@ class LabelViewUiTest(unittest.TestCase):
             p._original_mesh_cache = cache
             with patch.object(p, "_mano_runtime_instance", side_effect=AssertionError("must not fit edited points")), \
                  patch.object(p, "_incomplete_joint_count", side_effect=AssertionError("no visibility restriction")):
-                for mode in ("mano", "correct"):
+                for mode in ("mano", "mano_visible", "correct"):
                     p._mode = mode
                     p._toggle_mano()
                     self.assertEqual(p._canvas._rendered_path, image)
@@ -160,14 +194,14 @@ class LabelViewUiTest(unittest.TestCase):
                     p._toggle_mano()
                     self.assertIsNone(p._canvas._rendered_image)
                     self.assertEqual(p._canvas.get_hand_state(), (points, visible))
-                    self.assertEqual(p._canvas._read_only, mode == "mano")
+                    self.assertEqual(p._canvas._read_only, mode in {"mano", "mano_visible"})
 
     def test_confirm_from_original_and_mano_saves_corrected_state_and_continues(self):
         p = self.page
         original = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[True] * 21 for _ in range(2)])
         initial = ([[(10.0, 20.0)] * 21 for _ in range(2)], [[False] * 21 for _ in range(2)])
         edited = ([[(42.0, 24.0)] * 21 for _ in range(2)], [[False] * 21 for _ in range(2)])
-        for mode in ("mano", "correct"):
+        for mode in ("mano", "mano_visible", "correct"):
             for show_mano in (False, True):
                 with self.subTest(mode=mode, show_mano=show_mano):
                     p._active_task = SimpleNamespace(key="test", frames=[5, 6], total_frames=2)
@@ -180,8 +214,8 @@ class LabelViewUiTest(unittest.TestCase):
                     p._progress = {}
                     p._source_state_cache = {("test", 0, "00", "correct"): edited,
                                              ("test", 1, "01", "correct"): edited}
-                    p._canvas.set_hand_state(*(original if mode == "mano" else edited))
-                    p._view_states = {"00": original if mode == "mano" else edited}
+                    p._canvas.set_hand_state(*(original if mode in {"mano", "mano_visible"} else edited))
+                    p._view_states = {"00": original if mode in {"mano", "mano_visible"} else edited}
                     with patch.object(p, "_save_bundle", return_value=object()), \
                          patch.object(p, "_build_modified_view_state", return_value=initial), \
                          patch.object(p, "_load_current_sample") as next_frame, \
@@ -235,6 +269,8 @@ class LabelViewUiTest(unittest.TestCase):
                 p._toggle_source()
                 self.assertEqual(p._canvas.get_hand_state(), state(90))
                 p._back_frame()
+                p._toggle_source()
+                self.assertEqual(p._mode, "mano_visible")
                 p._toggle_source()
                 self.assertEqual(p._canvas.get_hand_state(), state(1))
                 p._next_cam()

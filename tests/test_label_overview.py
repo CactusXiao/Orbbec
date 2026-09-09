@@ -114,6 +114,10 @@ class LabelOverviewTest(unittest.TestCase):
         self.assertEqual(p._overview_grid.canvases['02'].get_hand_state(), self.state(7))
         p._toggle_source()
         self.assertEqual(p._overview_grid.canvases['02'].get_hand_state(), self.state(92, True))
+        with patch("label.app.load_joint_visibility", return_value=[[False]*21 for _ in range(2)]):
+            p._toggle_source()
+        self.assertEqual(p._overview_grid.canvases['02'].get_hand_state(), self.state(92, False))
+        self.assertTrue(p._overview_grid.canvases['02']._read_only)
         p._toggle_source()
         self.assertEqual(p._overview_grid.canvases['02'].get_hand_state(), self.state(7))
 
