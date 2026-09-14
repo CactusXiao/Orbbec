@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from task_backend.job_service import JobService
+from task_backend.optimized_pose_source import OptimizedPoseSource
 from task_backend.publisher_bridge import (
     ManualPublisherBridge,
     ManualPublisherBridgeConfig,
@@ -47,7 +48,7 @@ class FakePublisher:
 class FakeMaterializer:
     def run(self, *, episode_dir: Path, generation: int, result_manifest_sha256: str, cameras: list[str]) -> dict:
         pose_dir = episode_dir / "optimized_pose"
-        frames = sorted(int(path.stem) for path in pose_dir.glob("*.npy") if path.stem.isdigit())
+        frames = OptimizedPoseSource(pose_dir).frames
         output_dir = episode_dir / "mano" / "episode"
         output_dir.mkdir(parents=True, exist_ok=True)
         joints = np.zeros((len(frames), 2, 21, 3), dtype=np.float32)
@@ -274,6 +275,11 @@ class PublisherBridgeTest(unittest.TestCase):
             self.assertEqual(config.mano_python, launcher.absolute())
 
     def test_bridge_publishes_materializes_and_creates_qc_from_actual_pose_frames(self) -> None:
+        for packed in (False, True):
+            with self.subTest(packed=packed):
+                self._bridge_completes_from_actual_pose_frames(packed)
+
+    def _bridge_completes_from_actual_pose_frames(self, packed: bool) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             episode_dir = root / "S001" / "pick_object" / "episode1"
@@ -281,6 +287,12 @@ class PublisherBridgeTest(unittest.TestCase):
             pose_dir.mkdir(parents=True)
             np.save(pose_dir / "00002.npy", np.zeros((2, 99), dtype=np.float32), allow_pickle=False)
             np.save(pose_dir / "00005.npy", np.zeros((2, 99), dtype=np.float32), allow_pickle=False)
+
+            if packed:
+                (pose_dir / "00002.npy").unlink()
+                (pose_dir / "00005.npy").unlink()
+                np.savez_compressed(pose_dir / "poses.npz", frame_ids=np.array([5, 2]),
+                                    poses=np.zeros((2, 2, 99), dtype=np.float32))
 
             store = WorkflowStore(root / "workflow.sqlite3")
             service = JobService(store, nas_mounts={"nas://ego": str(root)})

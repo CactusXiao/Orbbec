@@ -250,6 +250,31 @@ class ViewerSessionManagerTest(unittest.TestCase):
             corrected = ViewerSessionManager._mano_context(episode, [0, 1, 2])
             self.assertEqual(corrected["source"], "corrected_3d")
 
+    def test_archive_mtime_and_ids_control_corrected_pose_status(self) -> None:
+        import numpy as np
+        with tempfile.TemporaryDirectory() as tmp:
+            episode = Path(tmp)
+            (episode / "qc").mkdir()
+            (episode / "qc/qc_report.json").write_text(json.dumps({
+                "passed": False, "segments": [{"start_frame": 1, "end_frame": 2}]}))
+            manual = episode / "manual_2d/00"
+            manual.mkdir(parents=True)
+            poses = episode / "optimized_pose"
+            poses.mkdir()
+            for frame in (1, 2):
+                manual_path = manual / f"{frame:05d}.npy"
+                manual_path.touch()
+                os.utime(manual_path, (20, 20))
+                stale = poses / f"{frame:05d}.npy"
+                stale.touch()
+                os.utime(stale, (40, 40))
+            archive = poses / "poses.npz"
+            for ids, mtime, expected in [([1, 2], 10, "auto_label"), ([1], 30, "auto_label"),
+                                         ([2, 1], 30, "corrected_3d")]:
+                np.savez(archive, frame_ids=np.array(ids), poses=np.zeros((len(ids), 2, 99), dtype=np.float32))
+                os.utime(archive, (mtime, mtime))
+                self.assertEqual(ViewerSessionManager._mano_context(episode, [0, 1, 2])["source"], expected)
+
 
 if __name__ == "__main__":
     unittest.main()

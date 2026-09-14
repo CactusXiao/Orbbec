@@ -10,6 +10,11 @@ _MANO_SOURCE_DIR = str(Path(__file__).resolve().parent)
 if _MANO_SOURCE_DIR not in sys.path:
     sys.path.insert(0, _MANO_SOURCE_DIR)
 
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from task_backend.optimized_pose_source import load_archive_frame
+
 from joint_order import MANO_HAND_ORDER, SMPLX_MANO_JOINT_NAMES, SMPLX_MANO_PARENT_INDICES
 from optimizer.mano_wrapper import build_mano_aa, mano_forward
 from optimizer.rotation import pose_rot6d_to_axis_angle
@@ -92,9 +97,12 @@ def project_points(points_camera: torch.Tensor, intrinsics: torch.Tensor) -> tup
 
 
 def load_pose(path: Path) -> np.ndarray:
+    path = Path(path)
+    if path.stem.isdigit() and (path.parent / "poses.npz").is_file():
+        return load_archive_frame(path.parent, int(path.stem))
     if not path.is_file():
         raise FileNotFoundError(f"pose file not found: {path}")
-    pose = np.load(path)
+    pose = np.load(path, allow_pickle=False)
     if pose.ndim == 1 and pose.size >= 198:
         pose = pose[:198].reshape(2, 99)
     if pose.ndim != 2 or pose.shape[0] != 2 or pose.shape[1] < 99:

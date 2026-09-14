@@ -13,14 +13,20 @@ import importlib.util
 import json
 import os
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
+try:
+    from .optimized_pose_source import OptimizedPoseSource
+except ImportError:  # Direct script execution in ORBBEC_MANO_PYTHON.
+    from optimized_pose_source import OptimizedPoseSource
+
 
 SCHEMA_VERSION = 1
-CONVERTER_NAME = "optimized_pose_to_mano_v1"
+CONVERTER_NAME = "optimized_pose_to_mano_v2"
 EXPECTED_POSE_SHAPE = (2, 99)
 EXPECTED_FRAME_JOINTS_SHAPE = (2, 21, 3)
 
@@ -90,25 +96,17 @@ def _load_shape_and_scale(episode_dir: Path, default_shape_path: Path | None) ->
 
 
 def discover_optimized_pose_files(optimized_pose_dir: Path) -> List[Tuple[int, Path]]:
-    if not optimized_pose_dir.is_dir():
-        raise MaterializationNotReady(f"optimized_pose directory is not visible yet: {optimized_pose_dir}")
-    frames: List[Tuple[int, Path]] = []
-    seen = set()
+    source = _pose_source(optimized_pose_dir)
+    return [(frame, source.path_for_frame(frame)) for frame in source.frames]
+
+
+def _pose_source(directory: Path) -> OptimizedPoseSource:
     try:
-        for path in optimized_pose_dir.glob("*.npy"):
-            if not path.stem.isdigit():
-                continue
-            frame = int(path.stem)
-            if frame in seen:
-                raise MaterializationError(f"duplicate optimized pose frame number {frame}: {optimized_pose_dir}")
-            seen.add(frame)
-            frames.append((frame, path))
-    except OSError as exc:
-        raise MaterializationNotReady(f"cannot list optimized_pose yet {optimized_pose_dir}: {exc}") from exc
-    frames.sort(key=lambda item: item[0])
-    if not frames:
-        raise MaterializationNotReady(f"optimized_pose has no numeric .npy frames yet: {optimized_pose_dir}")
-    return frames
+        return OptimizedPoseSource(directory)
+    except (OSError, EOFError, zipfile.BadZipFile) as exc:
+        raise MaterializationNotReady(f"cannot read optimized_pose yet {directory}: {exc}") from exc
+    except (ValueError, SyntaxError) as exc:
+        raise MaterializationError(f"invalid optimized_pose {directory}: {exc}") from exc
 
 
 def _validate_existing_artifact(
@@ -124,7 +122,7 @@ def _validate_existing_artifact(
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         source = meta.get("source") if isinstance(meta, dict) else None
-        if not isinstance(source, dict):
+        if not isinstance(source, dict) or meta.get("converter") != CONVERTER_NAME:
             return None
         if int(source.get("generation") or 0) != generation:
             return None
@@ -212,7 +210,7 @@ def materialize(
     if existing is not None:
         return existing
 
-    frame_files = discover_optimized_pose_files(episode_dir / "optimized_pose")
+    pose_source = _pose_source(episode_dir / "optimized_pose")
     betas, scales, shape_source, scale_value = _load_shape_and_scale(episode_dir, default_shape_path)
     mano = _load_mano_module(toolkit_root)
     mano_model_dir = mano_model_dir.expanduser().resolve()
@@ -222,9 +220,10 @@ def materialize(
 
     joints_by_frame: List[np.ndarray] = []
     frame_numbers: List[int] = []
-    for frame, pose_path in frame_files:
+    for frame in pose_source.frames:
+        pose_path = pose_source.path_for_frame(frame)
         try:
-            pose = mano.load_pose(pose_path)
+            pose = pose_source.load(frame)
             if tuple(pose.shape) != EXPECTED_POSE_SHAPE:
                 raise ValueError(f"normalized pose has shape {pose.shape}")
             outputs = mano.mano_outputs_from_pose(pose, betas, scales, layers)
@@ -232,7 +231,7 @@ def materialize(
                 [outputs[hand]["joints"][0].detach().cpu().numpy() for hand in (0, 1)],
                 axis=0,
             ).astype(np.float32, copy=False)
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, zipfile.BadZipFile) as exc:
             raise MaterializationNotReady(f"cannot read optimized pose yet {pose_path}: {exc}") from exc
         except Exception as exc:
             raise MaterializationError(f"failed to convert optimized pose {pose_path}: {exc}") from exc
@@ -256,6 +255,7 @@ def materialize(
         "source": {
             "kind": "optimized_pose",
             "shape": list(EXPECTED_POSE_SHAPE),
+            "layout": "archive" if pose_source.is_packed else "per_frame",
             "generation": generation,
             "result_manifest_sha256": result_manifest_sha256,
         },

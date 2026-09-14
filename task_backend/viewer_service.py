@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +30,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 try:
+    from .optimized_pose_source import archive_frame_ids
     from .tactile_viewer import TactileTimeline
     from .tactile_viewer_ui import TACTILE_CSS, TACTILE_HTML, TACTILE_JS
 except ImportError:
+    from optimized_pose_source import archive_frame_ids
     from tactile_viewer import TactileTimeline  # type: ignore
     from tactile_viewer_ui import TACTILE_CSS, TACTILE_HTML, TACTILE_JS  # type: ignore
 
@@ -505,7 +508,14 @@ class ViewerSessionManager:
                     continue
         pose_mtime: Dict[int, float] = {}
         pose_root = episode_dir / "optimized_pose"
-        if pose_root.is_dir():
+        archive_path = pose_root / "poses.npz"
+        if archive_path.is_file():
+            try:
+                archive_mtime = archive_path.stat().st_mtime
+                pose_mtime = {frame: archive_mtime for frame in archive_frame_ids(archive_path) if frame in frame_set}
+            except (OSError, ValueError, SyntaxError, zipfile.BadZipFile):
+                pass  # An incomplete archive must not fall back to stale frame files.
+        elif pose_root.is_dir():
             for path in pose_root.glob("*.npy"):
                 frame = _frame_number(path)
                 if frame is None or frame not in frame_set:

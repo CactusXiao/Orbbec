@@ -49,7 +49,7 @@ Pico 视图读取 `<episode>/ego/camera_params.json`、`<episode>/ego_pose.json`
 - 双击 Episode 后才会正式租借。
 - 本机未提交进度会合并显示；已退出的任务显示“已释放”，继续时重新向后端领取。
 - 00/02/03/05/06 和 Pico Ego RGB H.265 会并行解码为高质量 JPEG 缓存，旧 PNG 缓存仍可继续使用。
-- `<episode>/optimized_pose/<frame>.npy` 会生成 MANO 表面，并预渲染到 `tmp_dir/<episode_id>/mesh/<camera>/<frame>.jpg`。
+- `<episode>/optimized_pose/poses.npz`（按 `frame_ids` 读取 `(N,2,99)` 的 `poses`，优先于残留逐帧文件）或旧版 `<episode>/optimized_pose/<frame>.npy` 会生成 MANO 表面，并预渲染到 `tmp_dir/<episode_id>/mesh/<camera>/<frame>.jpg`。
 - 五个视图使用同一个播放帧游标，不裁剪画面；播放中和暂停时都支持点击、拖动进度条。拖到尚未完成的帧时保留上一张完整画面并显示“目标帧渲染中”，后台完成后自动切换，UI 不等待渲染。暂停后也可前后移动 1 帧或 10 帧。
 - 播放按单调时钟维持真实 `playback_fps`；界面刷新落后时跳过中间显示帧，不会把刷新耗时叠加成慢放。Pico 投影仍在原始分辨率完成，播放器读取自动生成的 960 像素宽预览。
 - 暂停后可把当前帧标记为不通过并选择坏帧区间，随后二选一确认为“手部 Pose 不准”或“EgoPose 外参不准”。

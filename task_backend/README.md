@@ -349,6 +349,16 @@ shared MANO conversion in `ORBBEC_MANO_PYTHON`, atomically writes
 `auto_label` job with `optimized_pose` and `mano_episode` artifacts. Completion
 creates the QC job directly; no episode-level `mano_opt` job is inserted.
 
+Publisher optimized poses support both `optimized_pose/poses.npz` and legacy
+`optimized_pose/<frame>.npy` files. When present, `poses.npz` is authoritative:
+its `frame_ids` is a nonempty vector of unique, nonnegative integers, and `poses`
+is C-order float32 `(N, 2, 99)`. Rows map to the explicit IDs, including sparse
+or unsorted IDs; the output `mano_episode.json.frames` and `joints_3d.npy` are
+sorted together by frame number. Invalid archives never fall back to residual
+per-frame files. The backend validates this schema without NumPy; conversion
+and mesh previews share the same frame mapping. The v2 converter regenerates
+cached v1 artifacts once, then reuses matching generation/hash v2 artifacts.
+
 `ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT` limits backend jobs held by the Bridge,
 not Publisher GPU jobs. On backend shutdown, slots stop leasing, release jobs
 still in flight, and leave already-published Publisher episodes untouched so a

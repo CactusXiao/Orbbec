@@ -8,16 +8,19 @@ import shutil
 import struct
 import time
 import uuid
+import zipfile
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urlparse
 
 try:
+    from .optimized_pose_source import OptimizedPoseSource
     from .storage_resolver import uri_join
     from .workflow_models import is_shape_calibration_episode, SHAPE_CALIBRATION_TASK, TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type
     from .workflow_store import WorkflowStore
 except ImportError:  # pragma: no cover - script execution fallback
+    from optimized_pose_source import OptimizedPoseSource
     from storage_resolver import uri_join  # type: ignore
     from workflow_models import is_shape_calibration_episode, SHAPE_CALIBRATION_TASK, TERMINAL_JOB_STATUSES, WorkflowError, json_object, require_job_type, require_stage_job_type  # type: ignore
     from workflow_store import WorkflowStore  # type: ignore
@@ -2093,28 +2096,19 @@ class JobService:
             raise WorkflowError(HTTPStatus.BAD_REQUEST, "Publisher Bridge job has no resolvable NAS episode URI")
 
         optimized_pose_dir = episode_dir / "optimized_pose"
-        if not optimized_pose_dir.is_dir():
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"optimized_pose artifact is missing: {optimized_pose_dir}")
-        pose_files: List[Tuple[int, Path]] = []
-        seen_frames = set()
-        for pose_path in optimized_pose_dir.glob("*.npy"):
-            if not pose_path.stem.isdigit():
-                continue
-            frame = int(pose_path.stem)
-            if frame in seen_frames:
-                raise WorkflowError(HTTPStatus.BAD_REQUEST, f"duplicate optimized_pose frame: {frame}")
-            seen_frames.add(frame)
+        try:
+            pose_source = OptimizedPoseSource(optimized_pose_dir)
+        except (OSError, ValueError, SyntaxError, zipfile.BadZipFile) as exc:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"invalid optimized_pose artifact: {exc}") from exc
+        # Packed schema and explicit frame IDs are checked by the shared reader.
+        for pose_path in pose_source.files.values():
             shape, descr, fortran_order = self._npy_header(pose_path)
             if shape != (2, 99) or descr not in {"<f4", ">f4", "=f4", "|f4"} or fortran_order:
                 raise WorkflowError(
                     HTTPStatus.BAD_REQUEST,
                     f"optimized_pose frame must be C-order float32 (2,99), got shape={shape} dtype={descr}: {pose_path}",
                 )
-            pose_files.append((frame, pose_path))
-        pose_files.sort(key=lambda value: value[0])
-        pose_frames = [frame for frame, _ in pose_files]
-        if not pose_frames:
-            raise WorkflowError(HTTPStatus.BAD_REQUEST, f"optimized_pose has no numeric frames: {optimized_pose_dir}")
+        pose_frames = pose_source.frames
 
         frames = _as_int_list(result.get("frames"))
         if frames != pose_frames:
