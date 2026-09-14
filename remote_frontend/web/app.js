@@ -82,7 +82,7 @@ function notice(text) {
   clearTimeout(noticeTimer);
   noticeTimer = null;
   $("notice").textContent = text;
-  if (text) noticeTimer = setTimeout(() => notice(""), 3000);
+  if (text) noticeTimer = setTimeout(() => notice(""), 1000);
 }
 // Clear the old reminder before the next action can produce a new one.
 for (const event of ["pointerdown", "keydown", "wheel"])

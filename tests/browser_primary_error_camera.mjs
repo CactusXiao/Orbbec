@@ -94,12 +94,12 @@ try {
   await page.clock.install();
   await page.clock.pauseAt(new Date());
   await page.evaluate(()=>cameraTest.notify('计算完成，结果尚未提交。'));
-  await page.clock.fastForward(2000);
+  await page.clock.fastForward(600);
   assert.equal(await page.locator('#notice').isVisible(),true);
   await page.evaluate(()=>cameraTest.notify('新的操作提醒'));
-  await page.clock.fastForward(1000);
+  await page.clock.fastForward(400);
   assert.equal(await page.locator('#notice').textContent(),'新的操作提醒');
-  await page.clock.fastForward(2000);
+  await page.clock.fastForward(600);
   assert.equal(await page.locator('#notice').textContent(),'');
   assert.equal(await page.locator('#notice').isVisible(),false);
   assert.deepEqual(errors,[]);
