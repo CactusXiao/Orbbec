@@ -1,0 +1,684 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    system-ui,
+    -apple-system,
+    sans-serif;
+  background: #111720;
+  color: #e1e9f4;
+  font-size: 14px;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+header {
+  height: 58px;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #354052;
+  background: #1b2532;
+}
+header b {
+  font-size: 23px;
+  color: #62c3ff;
+}
+header span {
+  margin-left: 20px;
+  color: #abbace;
+}
+h1 {
+  font-size: 25px;
+}
+h2 {
+  font-size: 19px;
+}
+p {
+  color: #a9b8ca;
+  line-height: 1.65;
+}
+button,
+select,
+input {
+  font: inherit;
+}
+button,
+select {
+  padding: 8px 13px;
+  border: 1px solid #425167;
+  background: #243246;
+  color: inherit;
+  border-radius: 5px;
+  cursor: pointer;
+}
+button:hover {
+  background: #354c67;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.primary {
+  background: #1268a2;
+  border-color: #3ba4e8;
+}
+.selected {
+  border-color: #63c5ff;
+  background: #294e68;
+}
+input[type="number"] {
+  width: 82px;
+  padding: 6px;
+  background: #152132;
+  border: 1px solid #425167;
+  color: inherit;
+}
+#picker {
+  max-width: 1040px;
+  margin: 45px auto;
+  padding: 0 25px;
+}
+nav {
+  display: flex;
+  gap: 12px;
+  margin: 25px 0;
+}
+.row {
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  align-items: center;
+  background: #1b2532;
+  padding: 16px;
+  margin: 10px 0;
+  border-radius: 6px;
+}
+.toolbar {
+  display: flex;
+  gap: 15px;
+  padding: 14px 20px;
+  align-items: center;
+  border-bottom: 1px solid #354052;
+}
+.toolbar strong {
+  margin-right: auto;
+}
+#saveState {
+  color: #91dab6;
+}
+#preparing,
+#receipt {
+  padding: 40px;
+}
+#content {
+  padding: 16px;
+}
+#video {
+  display: block;
+  width: min(100%, 1100px);
+  max-height: 60vh;
+  background: black;
+  margin: auto;
+}
+.qcActions {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 15px 0;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.grid img {
+  width: 100%;
+  display: block;
+}
+.tile {
+  background: #1b2532;
+  padding: 6px;
+  border: 1px solid #344458;
+}
+.tile span {
+  font-size: 12px;
+  color: #b3c5d8;
+}
+.cameraTabs {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.editorLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: 18px;
+}
+#editorWrap {
+  background: #080d14;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#editor {
+  width: 100%;
+  height: 65vh;
+  touch-action: none;
+}
+aside {
+  background: #1b2532;
+  padding: 16px;
+}
+aside label {
+  display: block;
+  margin: 14px 0;
+}
+aside select {
+  margin-left: 8px;
+}
+#thumbnails {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 20px;
+}
+footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 15px 0;
+  position: sticky;
+  bottom: 0;
+  background: #111720;
+}
+#timeline {
+  flex: 1;
+}
+#notice {
+  position: fixed;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: 85vw;
+  background: #31445d;
+  padding: 12px 18px;
+  border-radius: 6px;
+  z-index: 10;
+  box-shadow: 0 4px 30px #0008;
+}
+#notice:empty {
+  display: none;
+}
+#ranges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.range {
+  background: #4a3433;
+  padding: 6px 10px;
+  border-radius: 5px;
+}
+.range button {
+  margin-left: 8px;
+  padding: 2px 6px;
+}
+dialog {
+  max-width: 500px;
+  border: 1px solid #62778c;
+  border-radius: 9px;
+  background: #1d2939;
+  padding: 25px;
+}
+dialog::backdrop {
+  background: #0009;
+}
+#receipt {
+  color: #91dab6;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+[hidden] {
+  display: none !important;
+}
+@media (max-width: 900px) {
+  .editorLayout {
+    grid-template-columns: 1fr;
+  }
+  .toolbar {
+    flex-wrap: wrap;
+  }
+  .grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  footer {
+    flex-wrap: wrap;
+  }
+}
+.editorLayout {
+  align-items: start;
+}
+#editorWrap {
+  height: 65vh;
+}
+aside {
+  max-height: 65vh;
+  overflow: auto;
+}
+/* Workbench layout follows the desktop task/progress/viewer/control arrangement. */
+#picker {
+  max-width: 1200px;
+  margin: 28px auto;
+}
+.pickerFilter,
+.labelActions,
+.playbackBar,
+.jointActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+.pickerFilter #jobCount {
+  flex: 1;
+  color: #a9b8ca;
+}
+.row small {
+  color: #8197ad;
+  font-size: 12px;
+}
+#content {
+  display: grid;
+  grid-template-columns: 155px minmax(0, 1fr);
+  gap: 14px;
+  padding: 12px;
+}
+#content.qcWorkspace {
+  grid-template-columns: minmax(0, 1fr);
+}
+#workArea {
+  min-width: 0;
+}
+#taskProgress {
+  max-height: calc(100vh - 155px);
+  padding: 10px;
+  position: sticky;
+  top: 10px;
+}
+#taskProgress h3 {
+  margin: 6px 0 14px;
+}
+#frameList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.frameRow {
+  text-align: left;
+  white-space: nowrap;
+}
+.labelActions {
+  margin-top: 0;
+}
+button {
+  transition: background 0.12s;
+}
+.danger {
+  border-color: #bc6867;
+  color: #ffc2bd;
+}
+#overviewGrid {
+  gap: 10px;
+}
+#overviewGrid .tile {
+  min-width: 0;
+  padding: 7px;
+}
+#overviewGrid svg {
+  display: block;
+  width: 100%;
+  height: 25vh;
+  background: #080d14;
+  touch-action: none;
+}
+#overviewGrid button {
+  font-size: 12px;
+  margin-top: 4px;
+  width: 100%;
+}
+#viewNotice {
+  font-size: 13px;
+  color: #aec3d7;
+  margin: 8px 0 12px;
+}
+.editorLayout {
+  grid-template-columns: minmax(0, 1fr) 255px;
+  gap: 12px;
+}
+#editor,
+#editorWrap {
+  height: 61vh;
+}
+.editorLayout aside {
+  max-height: 61vh;
+  padding: 12px;
+}
+.editorLayout h3 {
+  margin: 0;
+}
+.editorLayout aside p {
+  font-size: 12px;
+  margin: 7px 0;
+}
+.editorLayout aside label {
+  margin: 9px 0;
+}
+.editorLayout select {
+  max-width: 175px;
+  padding: 5px;
+}
+#jointMap {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin: 12px 0;
+}
+#jointMap button {
+  padding: 5px 2px;
+  font-size: 11px;
+}
+.visibleJoint {
+  color: #99e8cb;
+}
+.hiddenJoint {
+  color: #8a94a6;
+}
+#jointMap .insufficient {
+  border-bottom-color: #d67c6e;
+}
+#thumbnails {
+  margin-top: 10px;
+}
+#thumbnails .tile {
+  padding: 3px;
+  font-size: 11px;
+}
+#frameStatus {
+  margin: 12px 0 7px;
+  font-size: 13px;
+}
+.done {
+  color: #7cdfaf;
+}
+.todo {
+  color: #efaf87;
+}
+#timelineMarks {
+  width: 100%;
+  height: 16px;
+}
+#timelineMarks canvas {
+  width: 100%;
+  height: 16px;
+  cursor: pointer;
+}
+footer {
+  padding: 10px 0;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+footer button {
+  padding: 7px 10px;
+}
+#frameJump {
+  width: 70px;
+}
+#video {
+  max-height: 56vh;
+  width: min(100%, 1200px);
+}
+.playbackBar {
+  justify-content: center;
+}
+#playbackHealth {
+  font-size: 12px;
+  color: #94c7ac;
+}
+.qcActions {
+  padding: 10px;
+  background: #1b2532;
+  border-radius: 6px;
+  gap: 10px;
+}
+.qcActions button {
+  padding: 6px 9px;
+  font-size: 13px;
+}
+#qcHint {
+  margin: 6px 0;
+  font-size: 12px;
+}
+#qcStills {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+#qcStills img {
+  cursor: zoom-in;
+}
+#imageDialog {
+  width: 94vw;
+  max-width: 1600px;
+  padding: 12px;
+}
+#imageDialog p {
+  margin: 6px;
+}
+#imageDialog .toolbar {
+  padding: 4px 8px;
+}
+#inspection {
+  width: 100%;
+  height: 72vh;
+  background: #080d14;
+  touch-action: none;
+}
+#notice {
+  font-size: 13px;
+  pointer-events: none;
+  bottom: 4px;
+  padding: 8px 14px;
+  max-height: 150px;
+  overflow: hidden;
+}
+@media (max-width: 1100px) {
+  #content {
+    grid-template-columns: 110px minmax(0, 1fr);
+  }
+  .editorLayout {
+    grid-template-columns: minmax(0, 1fr) 225px;
+  }
+  .toolbar {
+    gap: 8px;
+    padding: 8px 12px;
+  }
+}
+@media (max-width: 800px) {
+  #content {
+    grid-template-columns: 1fr;
+  }
+  #taskProgress {
+    display: none;
+  }
+  .editorLayout {
+    grid-template-columns: 1fr;
+  }
+  #overviewGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.authPanel {
+  max-width: 500px;
+  margin: 64px auto;
+  padding: 28px;
+  border: 1px solid #354052;
+  border-radius: 12px;
+  background: #1b2532;
+}
+.accountForm {
+  display: grid;
+  gap: 12px;
+}
+.accountForm input:not([type="checkbox"]) {
+  width: 100%;
+  padding: 10px;
+  background: #111720;
+  color: inherit;
+  border: 1px solid #536781;
+  border-radius: 5px;
+}
+.accountForm fieldset {
+  display: flex;
+  gap: 24px;
+  border: 1px solid #425167;
+}
+#accountName {
+  font-size: 14px;
+  margin-right: 12px;
+}
+#accountTools button {
+  margin-left: 6px;
+}
+#accountsDialog {
+  width: min(800px, 95vw);
+  max-height: 90vh;
+  overflow: auto;
+}
+#passwordDialog {
+  width: min(480px, 95vw);
+}
+#loginError,
+#passwordError,
+#accountError {
+  color: #ffc18b;
+}
+/* Desktop theme and page structure: label/theme.py, label/app.py, src/qc/app.py. */
+:root {background:#101722;color:#f0f4fa;font-size:17px;}
+button,select {background:#29394e;border-color:#3b4d64;border-radius:0;padding:8px 12px;}
+.primary {background:#2563eb;border-color:#2563eb;}
+[hidden] {display:none !important;}
+#picker {max-width:none;margin:0;padding:20px 24px;height:calc(100vh - 58px);overflow:auto;}
+#nativeQueue h1 {font-size:29px;margin:8px 0;}
+.nativeConnection {display:grid;grid-template-columns:3fr 2fr;gap:20px;padding:16px;background:#182231;margin:16px 0;}
+.nativeConnection label {display:grid;gap:6px;color:#b4c3d5;}
+.nativeConnection input {background:#202d3e;color:#f0f4fa;border:1px solid #3b4d64;padding:10px;font:inherit;}
+.nativeQueues {display:grid;grid-template-columns:1fr 1fr;gap:16px;min-height:300px;}
+.nativeQueues.single {grid-template-columns:1fr;}
+.queueCard {background:#182231;padding:14px;min-width:0;overflow:auto;}
+.nativeTable {width:100%;border-collapse:collapse;font-size:17px;background:#182231;}
+.nativeTable th {background:#202d3e;color:#b4c3d5;text-align:left;padding:10px;white-space:nowrap;}
+.nativeTable td {padding:10px;white-space:nowrap;}
+.nativeTable tr {cursor:default;}
+.nativeTable tr.selected {background:#254d7b;}
+#workspace {padding:14px 16px;height:calc(100vh - 58px);min-height:610px;overflow:hidden;}
+#content {height:100%;display:flex;gap:14px;}
+#taskProgress {width:290px;flex:0 0 290px;background:#182231;padding:12px;overflow:auto;}
+#taskProgress h3 {margin:0 0 10px;font-size:20px;}
+#frameList {display:block;max-height:none;overflow:auto;}
+#workArea {background:#182231;padding:10px 12px 12px;min-width:0;flex:1;display:flex;flex-direction:column;height:100%;}
+#nativeInfo {flex:none;color:#b4c3d5;line-height:1.5;min-height:54px;}
+#nativeInfo strong {font-weight:400;font-size:16px;}
+#frameStatus {margin:4px 0;font-size:16px;}
+#labelPanel,#qcPanel {flex:1;min-height:0;display:flex;flex-direction:column;}
+#editorLayout {flex:1;display:block;position:relative;min-height:0;height:100%;}
+#nativeLabelCanvas {position:absolute;inset:0;width:100%;height:100%;touch-action:none;}
+#overviewGrid,.nativeCameraGrid {flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:6px;height:100%;}
+.nativeCameraCell {min-height:0;min-width:0;display:flex;flex-direction:column;position:relative;background:#182231;padding:4px;}
+.cameraTitle {font-size:16px;color:#b4c3d5;padding:4px 6px;flex:none;}
+.nativeCameraCell canvas {width:100%;height:100%;min-height:0;flex:1;touch-action:none;background:#202d3e;}
+.tileStatus {position:absolute;top:42%;left:10%;right:10%;text-align:center;color:#ffd60a;pointer-events:none;}
+.nativeToolbar {display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:none;padding-top:8px;}
+.nativeToolbar span {color:#b4c3d5;}
+#nativeTimeline {flex:none;padding-top:6px;}
+#progress {font-size:14px;color:#b4c3d5;}
+#timeline {width:100%;display:block;margin:0;height:16px;}
+#timelineMarks {height:32px;}
+#timelineMarks canvas {display:block;width:100%;height:32px;}
+#timelineMarks.disabled {pointer-events:none;}
+#video.videoTransport {display:block !important;position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;pointer-events:none;}
+#notice {max-height:80px;overflow:auto;}
+#notice:empty {display:none;}
+
+/* Image-first workspace. Queue/login layouts remain independent. */
+body:has(#workspace:not([hidden]) #content:not([hidden])) > header {
+  height:36px;padding:0 10px;font-size:13px;
+}
+body:has(#workspace:not([hidden]) #content:not([hidden])) > header b {font-size:15px;}
+body:has(#workspace:not([hidden]) #content:not([hidden])) #workspaceLabel {display:none;}
+body:has(#workspace:not([hidden]) #content:not([hidden])) #accountTools button {padding:3px 7px;font-size:12px;}
+body:has(#workspace:not([hidden]) #content:not([hidden])) #connection {font-size:12px;margin-left:8px;}
+#workspace:has(#content:not([hidden])) {
+  height:calc(100vh - 36px);height:calc(100dvh - 36px);
+  min-height:0;padding:3px;overflow:auto;
+}
+#content {padding:0;gap:4px;}
+#workArea {padding:0;gap:0;min-height:0;}
+#content #taskProgress {display:none;position:static;top:auto;width:180px;flex-basis:180px;padding:6px;max-height:none;}
+#content.showProgress #taskProgress:not([hidden]) {display:block;}
+#taskProgress .nativeTable {font-size:13px;}
+#taskProgress .nativeTable th,#taskProgress .nativeTable td {padding:5px;}
+#taskProgress h3 {font-size:14px;}
+#nativeInfo {display:flex;align-items:center;gap:8px;flex:none;min-height:26px;padding:2px 6px;color:#b4c3d5;font-size:13px;}
+#nativeInfo #title {font-size:13px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#nativeInfo #frameStatus {display:none;}
+#nativeInfo #viewNotice {margin:0;font-size:12px;}
+#nativeInfo #viewNotice:empty {display:none;}
+#toggleProgress {margin-left:auto;padding:2px 7px;font-size:12px;white-space:nowrap;}
+#overviewGrid,.nativeCameraGrid {gap:3px;}
+.nativeCameraCell {padding:0;}
+.cameraTitle {display:none;}
+.nativeCameraCell canvas {display:block;}
+.nativeToolbar {gap:4px;padding:3px 4px 0;font-size:13px;}
+.nativeToolbar button {padding:5px 8px;min-height:29px;font-size:13px;}
+#nativePlaybackStatus {font-size:12px;}
+#nativeTimeline {padding-top:2px;}
+#progress {display:none;}
+#timelineMarks,#timelineMarks canvas {height:12px;}
+#timeline {height:14px;}
+#qcDisplayToolbar {padding-bottom:3px;min-height:30px;}
+#qcDisplayToolbar label {display:inline-flex;align-items:center;gap:4px;white-space:nowrap;}
+#manoOpacity {width:105px;margin:0;}
+#manoOpacityValue {min-width:30px;font-size:12px;}
+#nativeBadStatus {font-size:13px;}
+@media (max-width:800px) {
+  #content.showProgress #taskProgress:not([hidden]) {width:130px;flex-basis:130px;}
+  .nativeToolbar {gap:3px;}
+  .nativeToolbar button {padding:4px 6px;font-size:12px;}
+  body:has(#workspace:not([hidden]) #content:not([hidden])) #connection {max-width:140px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle;}
+}
+
+/* One QC control row, including MANO opacity. Narrow windows scroll the row. */
+#qcControlBar {flex-wrap:nowrap;overflow-x:auto;overflow-y:hidden;gap:4px;padding:3px 4px;scrollbar-width:thin;}
+#qcControlBar > .nativeToolbar:not([hidden]) {display:contents;}
+#qcControlBar button,#qcControlBar label,#qcControlBar span {flex-shrink:0;white-space:nowrap;}
+#nativeInfo #nativePlaybackStatus {margin-left:auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+#qcControlBar #manoOpacity {width:90px;}
+#qcControlBar #qcBufferStatus:empty {display:none;}
+
+/* Equal camera cells keep all row and column dividers aligned. */
+#nativeQcGrid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(2,minmax(0,1fr));gap:2px;overflow:hidden;background:#101722;}
+#nativeQcGrid .nativeCameraCell {min-height:0;min-width:0;overflow:hidden;}
+#nativeQcGrid canvas {display:block;}
+.nativeCameraCell.primaryErrorCamera {
+  outline: 3px solid #e5484d;
+  outline-offset: -3px;
+}
+#overviewGrid.primaryEgoView .nativeCameraCell:not([hidden]) {
+  grid-column: 1 / -1;
+  grid-row: 1 / -1;
+}

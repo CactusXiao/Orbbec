@@ -23,6 +23,7 @@ _HAND_COUNT = 2
 _JOINT_COUNT = 21
 PREDICTION_DIR = "pred_2d"
 MANUAL_SEGMENTS_DIR = "manual_2d/segments"
+MANUAL_JOINTS_VIS_SEGMENTS_DIR = "manual_joints_vis/segments"
 MANO_EPISODE_DIR = "mano/episode"
 JOINTS_VIS_DIR = "joints_vis"
 
@@ -39,8 +40,10 @@ class CorrectionTask:
     rgb_path_template: str = "{camera}/RGB/{frame:05d}.png"
     prediction_dir: str = PREDICTION_DIR
     correction_dir: str = "corrected_2d"
+    correction_visibility_dir: str = "corrected_joints_vis"
     mano_episode_dir: str = MANO_EPISODE_DIR
     nas_root_path: Optional[str] = None
+    segments: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Old job payloads can still list six cameras after a seventh is installed.
@@ -73,6 +76,21 @@ class CorrectionProgress:
     task_key: str
     done_positions: Set[int] = field(default_factory=set)
     total_frames: int = 0
+    visited_segments: Set[str] = field(default_factory=set)
+
+    def enter_segment(self, task: CorrectionTask, frame: int) -> Optional[str]:
+        camera = None
+        for segment in getattr(task, "segments", []):
+            if not int(segment["start_frame"]) <= frame <= int(segment["end_frame"]):
+                continue
+            key = str(segment.get("segment_id") or f"{segment['start_frame']}:{segment['end_frame']}:{segment.get('primary_camera', '')}")
+            if key in self.visited_segments:
+                continue
+            self.visited_segments.add(key)
+            primary = segment.get("primary_camera")
+            if camera is None and (primary in task.cameras or primary == "ego"):
+                camera = primary
+        return camera
 
     @property
     def done_count(self) -> int:
@@ -85,9 +103,12 @@ class PredictionBundle:
     episode_dir: Path
     prediction_dir: Path
     pred_dir: Path
+    pred_visibility_dir: Path
     corrected_dir: Path
+    corrected_visibility_dir: Path
     samples: Dict[Tuple[str, int], "PredictionSample"]
     pending: Dict[Tuple[str, int], np.ndarray] = field(default_factory=dict)
+    pending_visibility: Dict[Tuple[str, int], np.ndarray] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,7 +116,9 @@ class PredictionSample:
     cam_id: str
     frame_idx: int
     source_path: Optional[Path]
+    source_visibility_path: Optional[Path]
     corrected_path: Path
+    corrected_visibility_path: Path
 
 
 def find_frame_path(
@@ -245,6 +268,7 @@ def load_correction_tasks(jsonl_path: str) -> List[CorrectionTask]:
                     episode=_as_str(obj, "episode", line_no),
                     cameras=_as_str_list(obj, "cameras", line_no),
                     frames=_as_int_list(obj, "frames", line_no),
+                    segments=list(obj.get("segments") or []),
                 )
             )
 
@@ -296,8 +320,10 @@ def correction_task_from_backend_payload(
         rgb_path_template="{camera}/RGB/{frame:05d}.png",
         prediction_dir=PREDICTION_DIR,
         correction_dir=f"{MANUAL_SEGMENTS_DIR}/{str(payload.get('job_id') or '').strip()}".rstrip("/"),
+        correction_visibility_dir=f"{MANUAL_JOINTS_VIS_SEGMENTS_DIR}/{str(payload.get('job_id') or '').strip()}".rstrip("/"),
         mano_episode_dir=MANO_EPISODE_DIR,
         nas_root_path=str(episode_dir),
+        segments=[dict(item) for item in payload.get("segments") or [] if isinstance(item, dict)],
     )
 
 
@@ -309,6 +335,7 @@ def progress_csv_path(jsonl_path: str) -> Path:
 def load_correction_progress(jsonl_path: str, tasks: List[CorrectionTask]) -> Dict[str, CorrectionProgress]:
     p = progress_csv_path(jsonl_path)
     existing: Dict[str, Set[int]] = {}
+    visited: Dict[str, Set[str]] = {}
     if p.exists() and p.is_file():
         try:
             with p.open("r", newline="", encoding="utf-8") as f:
@@ -320,13 +347,15 @@ def load_correction_progress(jsonl_path: str, tasks: List[CorrectionTask]) -> Di
                     if not key:
                         continue
                     existing[key] = _parse_done_positions(row[1] if len(row) > 1 else "")
+                    visited[key] = set(json.loads(row[3])) if len(row) > 3 and row[3] else set()
         except Exception:
             existing = {}
 
     out: Dict[str, CorrectionProgress] = {}
     for task in tasks:
         done = {pos for pos in existing.get(task.key, set()) if 0 <= pos < task.total_frames}
-        out[task.key] = CorrectionProgress(task_key=task.key, done_positions=done, total_frames=task.total_frames)
+        out[task.key] = CorrectionProgress(task_key=task.key, done_positions=done, total_frames=task.total_frames,
+                                         visited_segments=visited.get(task.key, set()))
     return out
 
 
@@ -365,10 +394,10 @@ def save_correction_progress(jsonl_path: str, records: Dict[str, CorrectionProgr
     try:
         with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["task_key", "done_positions", "total_frames"])
+            writer.writerow(["task_key", "done_positions", "total_frames", "visited_segments"])
             for key in sorted(records, key=lambda x: int(x) if x.isdigit() else x):
                 r = records[key]
-                writer.writerow([r.task_key, json.dumps(sorted(r.done_positions)), int(r.total_frames)])
+                writer.writerow([r.task_key, json.dumps(sorted(r.done_positions)), int(r.total_frames), json.dumps(sorted(r.visited_segments))])
         os.replace(tmp_name, p)
     finally:
         try:
@@ -385,13 +414,17 @@ def load_prediction_bundle(task: CorrectionTask, *, mode: str = "pred") -> Predi
 
     episode_dir = task.episode_dir()
     pred_dir = _source_dir_for_mode(task, mode)
+    pred_visibility_dir = _source_visibility_dir_for_mode(task, mode)
     corrected_dir = episode_dir / task.correction_dir
+    corrected_visibility_dir = episode_dir / task.correction_visibility_dir
     return PredictionBundle(
         mode=mode,
         episode_dir=episode_dir,
         prediction_dir=episode_dir / task.prediction_dir,
         pred_dir=pred_dir,
+        pred_visibility_dir=pred_visibility_dir,
         corrected_dir=corrected_dir,
+        corrected_visibility_dir=corrected_visibility_dir,
         samples={},
     )
 
@@ -401,6 +434,13 @@ def _source_dir_for_mode(task: CorrectionTask, mode: str) -> Path:
     if mode in {"correct", "last"}:
         return episode_dir / task.correction_dir
     return episode_dir / task.prediction_dir
+
+
+def _source_visibility_dir_for_mode(task: CorrectionTask, mode: str) -> Path:
+    episode_dir = task.episode_dir()
+    if mode in {"correct", "last"}:
+        return episode_dir / task.correction_visibility_dir
+    return episode_dir / JOINTS_VIS_DIR
 
 
 def _source_frame_idx(mode: str, frame_idx: int) -> int:
@@ -509,11 +549,15 @@ def load_joint_visibility(base_dir: Path, cam_id: str, frame_idx: int) -> Option
 
 def _sample_for(bundle: PredictionBundle, frame_idx: int, cam_id: str) -> PredictionSample:
     key = (str(cam_id), int(frame_idx))
+    source_frame_idx = _source_frame_idx(bundle.mode, frame_idx)
+    corrected_name = _corrected_name(bundle.prediction_dir, cam_id, frame_idx)
     sample = PredictionSample(
         cam_id=str(cam_id),
         frame_idx=int(frame_idx),
-        source_path=source_frame_path(bundle, frame_idx, cam_id),
-        corrected_path=bundle.corrected_dir / str(cam_id) / _corrected_name(bundle.prediction_dir, cam_id, frame_idx),
+        source_path=find_optional_prediction_frame_path(bundle.pred_dir, cam_id, source_frame_idx),
+        source_visibility_path=find_optional_prediction_frame_path(bundle.pred_visibility_dir, cam_id, source_frame_idx),
+        corrected_path=bundle.corrected_dir / str(cam_id) / corrected_name,
+        corrected_visibility_path=bundle.corrected_visibility_dir / str(cam_id) / corrected_name,
     )
     bundle.samples[key] = sample
     return sample
@@ -533,6 +577,23 @@ def _load_corrected_view(path: Path) -> np.ndarray:
         raise ValueError(f"Failed to load corrected npy: {path}") from exc
 
 
+def _load_visibility_view(path: Path) -> np.ndarray:
+    try:
+        values = np.asarray(np.load(path))
+    except Exception as exc:
+        raise ValueError(f"Failed to load joint visibility npy: {path}") from exc
+    if values.shape == (_HAND_COUNT, _JOINT_COUNT, 1):
+        values = values[:, :, 0]
+    if values.shape != (_HAND_COUNT, _JOINT_COUNT):
+        raise ValueError(
+            "Joint visibility frame array must have shape (2,21) or (2,21,1), "
+            f"got {values.shape}: {path}"
+        )
+    if values.dtype.kind not in {"b", "i", "u", "f"}:
+        raise ValueError(f"Joint visibility frame array must be numeric or bool: {path}")
+    return np.logical_and(np.isfinite(values), values > 0)
+
+
 def view_state_from_bundle(
     bundle: PredictionBundle,
     frame_idx: int,
@@ -549,9 +610,17 @@ def view_state_from_bundle(
     key = (sample.cam_id, sample.frame_idx)
     if key in bundle.pending:
         points_view = np.asarray(bundle.pending[key], dtype=float)
-        visible = _visibility_from_array(points_view)
+        visible = np.asarray(bundle.pending_visibility[key], dtype=bool)
     elif sample.source_path is not None:
-        visible = _visibility_from_array(points_view)
+        if sample.source_visibility_path is not None:
+            visible = _load_visibility_view(sample.source_visibility_path)
+        elif bundle.mode in {"correct", "last"}:
+            raise ValueError(
+                "Manual joint visibility file is required for saved label coordinates: "
+                f"{bundle.pred_visibility_dir / sample.cam_id / sample.source_path.name}"
+            )
+        else:
+            visible = _visibility_from_array(points_view)
     else:
         visible = np.zeros((_HAND_COUNT, _JOINT_COUNT), dtype=bool)
 
@@ -590,10 +659,12 @@ def apply_view_state_to_corrected(
         raise ValueError(f"Expected points shape (2,21,2), got {pts.shape}.")
     if vis.shape != (_HAND_COUNT, _JOINT_COUNT):
         raise ValueError(f"Expected visibility shape (2,21), got {vis.shape}.")
+    if not np.all(np.isfinite(pts)) or np.any(_missing_points(pts)):
+        raise ValueError("Manual 2D output must retain a finite coordinate for every joint.")
 
-    out = pts.copy()
-    out[~vis] = -1
-    bundle.pending[(sample.cam_id, sample.frame_idx)] = out
+    key = (sample.cam_id, sample.frame_idx)
+    bundle.pending[key] = pts.copy()
+    bundle.pending_visibility[key] = vis.astype(np.uint8)
 
 
 def _empty_points_array() -> np.ndarray:
@@ -618,20 +689,26 @@ def _array_to_points(arr: np.ndarray) -> List[List[Tuple[float, float]]]:
 def save_corrected_array(bundle: PredictionBundle) -> None:
     for key, arr in list(bundle.pending.items()):
         sample = bundle.samples[key]
-        p = sample.corrected_path
-        p.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=f"{p.stem}_", suffix=".npy", dir=str(p.parent))
-        try:
-            with os.fdopen(fd, "wb") as f:
-                np.save(f, arr)
-            os.replace(tmp_name, p)
-        finally:
-            try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
-            except Exception:
-                pass
+        visibility = bundle.pending_visibility[key]
+        _atomic_save_npy(sample.corrected_visibility_path, visibility)
+        _atomic_save_npy(sample.corrected_path, arr)
     bundle.pending.clear()
+    bundle.pending_visibility.clear()
+
+
+def _atomic_save_npy(path: Path, value: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{path.stem}_", suffix=".npy", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            np.save(f, value)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except Exception:
+            pass
 
 
 # Legacy helpers retained for locating frame counts in older datasets.

@@ -16,10 +16,7 @@
 
 namespace sync_app {
 
-constexpr size_t kTactileChannelCount = 48;
-constexpr size_t kTactileRegionCount = 6;
-constexpr size_t kTactileChannelsPerRegion = 8;
-constexpr size_t kJqShroomPressureChannelCount = 256;
+constexpr size_t kJqGloveAdcChannelCount = 256;
 
 struct TactileSerialConfig {
     std::string portPath;
@@ -46,7 +43,8 @@ struct TactileModuleConfig {
     std::string           streamId;
     std::string           handSide = "right";
     int                   sensorType = 2;
-    int                   targetFps = 60;
+    // Nominal rate from the glove manual; passive serial capture does not set it.
+    int                   targetFps = 100;
     size_t                maxBufferedSamples = 8192;
     // CSV paths are resolved relative to config.json by loadConfig.
     std::vector<std::filesystem::path> calibrationPaths{
@@ -75,9 +73,7 @@ struct TactileFrame {
     std::vector<uint16_t> rawAdc;
     double                calibratedRegionForceN = std::numeric_limits<double>::quiet_NaN();
     bool                  forceOutOfRange = false;
-    // N; NaN for channels not covered by the calibration CSVs.
-    std::vector<double>   calibratedValues;
-    std::vector<double>   outputValues;
+    std::string           forceCalibrationStatus = "unavailable";
 };
 
 // Uses the supplied image's Hill fit on the sum ADC of the CSV sensor channels.

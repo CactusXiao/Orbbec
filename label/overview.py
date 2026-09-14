@@ -41,6 +41,15 @@ class CameraOverview(ttk.Frame):
             self.canvases[camera] = canvas
             self.notices[camera] = ttk.Label(host, style="PanelMuted.TLabel", padding=5)
 
+    def focus_camera(self, camera=None):
+        for index, (cam, canvas) in enumerate(self.canvases.items()):
+            host = canvas.master
+            if camera is not None and cam != camera:
+                host.grid_remove()
+            else:
+                host.grid(row=0 if camera else index // 3, column=0 if camera else index % 3,
+                          rowspan=2 if camera else 1, columnspan=3 if camera else 1)
+
     def show_frame(self, task, frame, states):
         self._frame = frame
         key = (str(task.episode_dir()), tuple(task.frames))

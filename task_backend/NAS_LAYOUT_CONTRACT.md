@@ -67,6 +67,7 @@ Path:         /mnt/nas/xiaojiazhou/task-clean-the-bowl/episode12
     Depth/
   pred_2d/
   manual_2d/
+  manual_joints_vis/
   mano/
   qc/
   workflow/
@@ -212,15 +213,23 @@ QC 失败时，`segments` 使用：
 
 ```text
 <episode>/manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
+<episode>/manual_joints_vis/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
 ```
 
-文件要求同 `pred_2d`：
+人工坐标文件要求：
 
 - dtype：`float32`
 - shape：`(2, 21, 2)`
 - hand order：`left, right`
 - joint order：`mano/mano(1).py` 中的 `SMPLX_MANO_JOINT_NAMES`
-- 不可见点：`[-1.0, -1.0]`
+- 可见和不可见关节点均保留完整 RGB 像素坐标
+
+人工可见性文件要求与自动结果的 `joints_vis` 一致：
+
+- dtype：`uint8`
+- shape：`(2, 21)`
+- `0` 表示不可见，`1` 表示可见
+- hand order 和 joint order 与对应人工坐标文件完全一致
 
 对应后端 artifact：
 
@@ -228,6 +237,10 @@ QC 失败时，`segments` 使用：
 {
   "kind": "manual_2d",
   "uri": "nas://.../<episode>/manual_2d"
+},
+{
+  "kind": "manual_joints_vis",
+  "uri": "nas://.../<episode>/manual_joints_vis"
 }
 ```
 
@@ -302,6 +315,7 @@ worker 不得写该文件。它声明当前整个 episode 使用的 `mano/episod
 ```text
 <episode>/
   manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
+  manual_joints_vis/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
   mano/episode/joints_3d.npy
   mano/episode/mano_episode.json
 ```

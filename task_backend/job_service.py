@@ -32,7 +32,7 @@ AUTO_LABEL_PUSHABLE_STATUSES = {"uploaded"}
 STAGE_ARTIFACT_KINDS = {
     "auto_label": {"pred_2d", "auto_2d", "optimized_pose", "mano_episode"},
     "qc": {"qc_report"},
-    "manual_label": {"manual_2d", "corrected_2d"},
+    "manual_label": {"manual_2d", "manual_joints_vis", "corrected_2d"},
     "manual_3d": {"optimized_pose", "mano_episode"},
 }
 FINAL_3D_SOURCES_REL_PATH = "workflow/final_3d_sources.json"
@@ -1023,6 +1023,7 @@ class JobService:
                 "end_frame": int(segment.get("end_frame") or 0),
                 "status": str(segment.get("status") or ""),
                 "reason": str((segment.get("metadata") or {}).get("reason") or ""),
+                "primary_camera": str((segment.get("metadata") or {}).get("primary_camera") or ""),
             }
             for segment in segments
         ]
@@ -1036,6 +1037,12 @@ class JobService:
         payload["manual_2d_output_uri"] = uri_join(
             str(payload.get("episode_uri") or ""),
             "manual_2d",
+            "segments",
+            str(job.get("job_id") or ""),
+        )
+        payload["manual_joints_vis_output_uri"] = uri_join(
+            str(payload.get("episode_uri") or ""),
+            "manual_joints_vis",
             "segments",
             str(job.get("job_id") or ""),
         )
@@ -1382,11 +1389,24 @@ class JobService:
                 "segments",
                 str(job.get("job_id") or ""),
             )
+            manual_visibility_uri = uri_join(
+                str(payload.get("episode_uri") or ""),
+                "manual_joints_vis",
+                "segments",
+                str(job.get("job_id") or ""),
+            )
             if not any(str(artifact.get("kind") or "") in {"manual_2d", "corrected_2d"} for artifact in artifacts) and manual_uri:
                 self.store.register_artifact(
                     episode_id=episode_id,
                     kind="manual_2d",
                     uri=manual_uri,
+                    metadata={"source_job_id": job.get("job_id"), "scope": "episode"},
+                )
+            if not any(str(artifact.get("kind") or "") == "manual_joints_vis" for artifact in artifacts) and manual_visibility_uri:
+                self.store.register_artifact(
+                    episode_id=episode_id,
+                    kind="manual_joints_vis",
+                    uri=manual_visibility_uri,
                     metadata={"source_job_id": job.get("job_id"), "scope": "episode"},
                 )
             manual_metadata = (
@@ -1744,6 +1764,7 @@ class JobService:
                     "source_qc_job_id": job.get("job_id"),
                     "reason": metadata.get("reason") or metadata.get("label") or "qc_failed",
                     "score": metadata.get("score"),
+                    "primary_camera": str(metadata.get("primary_camera") or ""),
                 },
             )
             created.append(segment)
@@ -1811,6 +1832,20 @@ class JobService:
             "scope": "episode",
             "mano_scope": "episode",
             "source_manual_label_job_id": source_job_id,
+            "manual_2d_uri": uri_join(
+                str(episode.get("episode_uri") or ""),
+                "manual_2d",
+                "segments",
+                source_job_id,
+            ),
+            "manual_2d_dir": f"manual_2d/segments/{source_job_id}",
+            "manual_joints_vis_uri": uri_join(
+                str(episode.get("episode_uri") or ""),
+                "manual_joints_vis",
+                "segments",
+                source_job_id,
+            ),
+            "manual_joints_vis_dir": f"manual_joints_vis/segments/{source_job_id}",
             "reason": "manual_2d_episode_completed",
         }
         job = self._create_job_once(job_id=job_id, job_type="manual_3d", episode_id=episode_id, payload=payload)
@@ -1953,6 +1988,11 @@ class JobService:
             end_frame = _optional_int(segment.get("end_frame")) or start_frame
             status = str(segment.get("status") or "")
             manual_2d_uri = str(segment.get("manual_2d_uri") or "")
+            manual_joints_vis_uri = manual_2d_uri.replace(
+                "/manual_2d/segments/",
+                "/manual_joints_vis/segments/",
+                1,
+            )
             manual_segments.append(
                 {
                     "segment_id": segment_id,
@@ -1963,6 +2003,11 @@ class JobService:
                     "segment_status": status,
                     "manual_2d_uri": manual_2d_uri,
                     "manual_2d_relative_path": self._relative_episode_uri_path(episode_uri, manual_2d_uri),
+                    "manual_joints_vis_uri": manual_joints_vis_uri,
+                    "manual_joints_vis_relative_path": self._relative_episode_uri_path(
+                        episode_uri,
+                        manual_joints_vis_uri,
+                    ),
                 }
             )
 
@@ -1985,6 +2030,12 @@ class JobService:
                 "source": "manual_label_episode" if segments else "auto_label",
                 "uri": uri_join(episode_uri, "manual_2d") if segments else pred_uri,
                 "relative_path": "manual_2d" if segments else self._relative_episode_uri_path(episode_uri, pred_uri),
+                "visibility_uri": (
+                    uri_join(episode_uri, "manual_joints_vis")
+                    if segments
+                    else uri_join(episode_uri, "joints_vis")
+                ),
+                "visibility_relative_path": "manual_joints_vis" if segments else "joints_vis",
             },
             "base_3d": {
                 "source": "manual_3d_episode" if manual_3d_ready else "auto_label",
@@ -2205,6 +2256,8 @@ class JobService:
             return uri_join(episode_uri, "qc", "qc_report.json")
         if kind in {"manual_2d", "corrected_2d"}:
             return uri_join(episode_uri, "manual_2d")
+        if kind == "manual_joints_vis":
+            return uri_join(episode_uri, "manual_joints_vis")
         return ""
 
     @staticmethod

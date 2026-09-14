@@ -8,6 +8,11 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+try:
+    from .tactile_layout import FINGERS, glove_layout
+except ImportError:
+    from tactile_layout import FINGERS, glove_layout
+
 
 def _number(value: Any) -> Optional[float]:
     try:
@@ -38,6 +43,7 @@ class TactileTimeline:
         self.root = episode_dir.resolve()
         self.rows: Dict[int, Dict[str, str]] = {}
         self.streams = []
+        self.error = ""
         self.tolerance_us = max(50000, round(2_000_000 / max(1.0, fps)))
         timestamps = _inside(self.root, self.root / "timestamps.csv")
         if timestamps:
@@ -57,19 +63,26 @@ class TactileTimeline:
                 continue
             try:
                 manifest = json.loads(safe.read_text(encoding="utf-8-sig"))
+                if manifest.get("schema") != "orbbec.touch.jq_shroom.v3":
+                    self.error = "触觉数据格式不支持，请使用更新后的采集程序重新采集"
+                    continue
                 for item in manifest.get("devices", []):
                     if isinstance(item, dict) and item.get("id"):
                         devices.append((safe.parent, item))
             except (OSError, ValueError, AttributeError, TypeError):
+                self.error = "触觉数据清单无法读取"
                 continue
-        if not devices:
-            devices = [(self.root / "touch", {"id": side, "side": side, "raw_csv": side + "_raw.csv"})
-                       for side in ("left", "right")]
+        if not manifests and (self.root / "touch").exists():
+            self.error = "缺少新版触觉数据清单，请使用更新后的采集程序重新采集"
         for directory, device in devices:
-            stream = {"id": str(device["id"]), "side": str(device.get("side") or device["id"]),
+            side = {1: "left", 2: "right"}.get(_index(device.get("sensor_type")))
+            if side is None or side != device.get("side"):
+                self.error = "触觉数据的左右手标识与传感器类型不一致"
+                continue
+            stream = {"id": str(device["id"]), "side": side,
                       "samples": {}, "ordered": [], "times": [], "force_max": 0.0, "adc_max": 255.0,
                       "has_force": False, "error": ""}
-            name = Path(str(device.get("raw_csv") or (str(device["id"]) + "_raw.csv")))
+            name = Path(str(device.get("raw_csv") or ""))
             safe = None if name.is_absolute() or ".." in name.parts else _inside(self.root, directory / name)
             if safe:
                 try:
@@ -87,23 +100,34 @@ class TactileTimeline:
         with path.open(encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle)
             header = set(reader.fieldnames or [])
-            stream["has_force"] = any(f"force_{i:03d}_n" in header for i in range(256))
+            required = {"sample_index", "touch_timestamp_us", "calibrated_region_force_n",
+                        "force_out_of_range", "force_calibration_status"}
+            required.update(f"raw_adc_{i:03d}" for i in range(256))
+            old_fields = {f"pressure_{i:03d}" for i in range(256)} | {f"force_{i:03d}_n" for i in range(256)}
+            if not required <= header or header & old_fields:
+                stream["error"] = "触觉 CSV 格式不支持，需要新版区域力和原始 ADC 数据"
+                return
+            stream["has_force"] = stream["side"] == "right" and "calibrated_region_force_n" in header
             for row in reader:
                 index = _index(row.get("sample_index"))
                 if index is None:
                     continue
-                force = [_number(row.get(f"force_{i:03d}_n")) for i in range(256)]
-                adc = [_number(row.get(f"raw_adc_{i:03d}", row.get(f"pressure_{i:03d}"))) for i in range(256)]
+                adc = [_number(row.get(f"raw_adc_{i:03d}")) for i in range(256)]
                 timestamp = _index(row.get("touch_timestamp_us"))
                 if timestamp is None:
-                    seconds = _number(row.get("touch_timestamp_s"))
-                    timestamp = round(seconds * 1_000_000) if seconds is not None else None
-                sample = {"index": index, "timestamp_us": timestamp, "force": force, "adc": adc,
-                          "total_n": _number(row.get("calibrated_region_force_n")),
+                    continue
+                status = row["force_calibration_status"]
+                allowed = {"right_middle_region", "invalid_force"} if stream["side"] == "right" else {"uncalibrated_hand"}
+                if status not in allowed:
+                    raise ValueError("Invalid force calibration status")
+                valid_scope = stream["side"] == "right" and status == "right_middle_region"
+                total = _number(row.get("calibrated_region_force_n")) if valid_scope else None
+                sample = {"index": index, "timestamp_us": timestamp, "adc": adc,
+                          "total_n": total, "force_status": status,
                           "out_of_range": str(row.get("force_out_of_range", "0")).lower() in ("1", "true"),
                           "quality": str(row.get("quality_flag") or "ok")}
                 stream["samples"][index] = sample
-                stream["force_max"] = max(stream["force_max"], max((v for v in force if v is not None), default=0.0))
+                stream["force_max"] = max(stream["force_max"], total or 0.0)
 
     def frame(self, frame: int) -> Dict[str, Any]:
         row = self.rows.get(frame, {})
@@ -112,6 +136,8 @@ class TactileTimeline:
         for stream in self.streams:
             prefix = "touch_" + stream["id"]
             hand = {"id": stream["id"], "side": stream["side"], "status": "missing",
+                    "layout": glove_layout(stream["side"]),
+                    "calibrated_sensor_ids": FINGERS["right"][2] if stream["side"] == "right" and stream["has_force"] else [],
                     "message": stream["error"] or "未采集触觉数据", "sample": None,
                     "delta_ms": None, "has_force": stream["has_force"],
                     "force_max": stream["force_max"], "adc_max": stream["adc_max"]}
@@ -139,4 +165,4 @@ class TactileTimeline:
                 else:
                     hand.update(status="unaligned", message="当前帧无同步触觉样本")
             hands.append(hand)
-        return {"frame_index": frame, "hands": hands}
+        return {"frame_index": frame, "hands": hands, "error": self.error}

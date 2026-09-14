@@ -8,9 +8,9 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 try:
-    from .storage import find_frame_path, find_optional_prediction_frame_path
+    from .storage import find_frame_path, find_optional_prediction_frame_path, load_joint_visibility
 except Exception:
-    from storage import find_frame_path, find_optional_prediction_frame_path
+    from storage import find_frame_path, find_optional_prediction_frame_path, load_joint_visibility
 
 
 Point = Tuple[float, float]
@@ -36,12 +36,19 @@ class CoTrackerRuntime:
         prev_frame_idx: int,
         frame_idx: int,
         correction_dir: str = "corrected_2d",
+        correction_visibility_dir: str = "corrected_joints_vis",
         rgb_path_template: str = "{camera}/RGB/{frame:05d}.png",
     ) -> Tuple[HandPoints, HandVisible]:
-        prev_ann = self._load_previous_annotation(episode_dir, cam_id, prev_frame_idx, correction_dir)
+        prev_ann, prev_visible = self._load_previous_annotation(
+            episode_dir,
+            cam_id,
+            prev_frame_idx,
+            correction_dir,
+            correction_visibility_dir,
+        )
         return self.track_points(
             episode_dir=episode_dir, cam_id=cam_id, prev_frame_idx=prev_frame_idx,
-            frame_idx=frame_idx, points=prev_ann, visible=~np.all(prev_ann == -1, axis=-1),
+            frame_idx=frame_idx, points=prev_ann, visible=prev_visible,
             rgb_path_template=rgb_path_template,
         )
 
@@ -107,7 +114,8 @@ class CoTrackerRuntime:
         cam_id: str,
         prev_frame_idx: int,
         correction_dir: str,
-    ) -> np.ndarray:
+        correction_visibility_dir: str,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         path = find_optional_prediction_frame_path(episode_dir / (correction_dir or "corrected_2d"), cam_id, prev_frame_idx)
         if path is None:
             raise FileNotFoundError(f"Missing previous {correction_dir or 'corrected_2d'} for camera {cam_id}, frame {prev_frame_idx}.")
@@ -117,7 +125,17 @@ class CoTrackerRuntime:
             raise ValueError(f"Failed to load previous {correction_dir or 'corrected_2d'}: {path}") from exc
         if ann.shape != (_HAND_COUNT, _JOINT_COUNT, 2):
             raise ValueError(f"Previous {correction_dir or 'corrected_2d'} must have shape (2,21,2), got {ann.shape}: {path}")
-        return ann
+        visibility = load_joint_visibility(
+            episode_dir / (correction_visibility_dir or "corrected_joints_vis"),
+            cam_id,
+            prev_frame_idx,
+        )
+        if visibility is None:
+            raise FileNotFoundError(
+                f"Missing previous {correction_visibility_dir or 'corrected_joints_vis'} "
+                f"for camera {cam_id}, frame {prev_frame_idx}."
+            )
+        return ann, np.asarray(visibility, dtype=bool)
 
     def _load_clip(
         self,

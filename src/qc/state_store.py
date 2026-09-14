@@ -78,6 +78,26 @@ def normalize_ranges(ranges: Iterable[Iterable[int]], *, max_gap_frames: int = 5
     return merged
 
 
+def normalize_segments(segments: Iterable[Dict[str, Any]], *, max_gap_frames: int = 5) -> List[Dict[str, Any]]:
+    """Merge intervals only within the same primary camera."""
+    by_camera: Dict[str, List[Range]] = {}
+    for segment in segments:
+        camera = str(segment.get("primary_camera") or "")
+        by_camera.setdefault(camera, []).append((int(segment["start_frame"]), int(segment["end_frame"])))
+    out = []
+    for camera, ranges in by_camera.items():
+        for start, end in normalize_ranges(ranges, max_gap_frames=max_gap_frames):
+            item = {"start_frame": start, "end_frame": end}
+            if camera:
+                item["primary_camera"] = camera
+            out.append(item)
+    return sorted(out, key=lambda item: (item["start_frame"], item["end_frame"], item.get("primary_camera", "")))
+
+
+def segments_from_ranges(ranges: Iterable[Range]) -> List[Dict[str, Any]]:
+    return [{"start_frame": int(a), "end_frame": int(b)} for a, b in ranges]
+
+
 def first_sample_after(frame: int, *, first_frame: int, last_frame: int, sample_interval: int) -> int:
     base = int(first_frame)
     last = int(last_frame)
@@ -107,6 +127,8 @@ class QcProgress:
     result_type: str = "in_progress"
     bad_frame_ranges: List[Range] = field(default_factory=list)
     ego_bad_frame_ranges: List[Range] = field(default_factory=list)
+    bad_frame_segments: List[Dict[str, Any]] = field(default_factory=list)
+    ego_bad_frame_segments: List[Dict[str, Any]] = field(default_factory=list)
     checked_sample_frames: List[int] = field(default_factory=list)
     playback_complete: bool = False
     payload: Dict[str, Any] = field(default_factory=dict)
@@ -155,6 +177,8 @@ class QcProgress:
             "result_type": self.result_type,
             "bad_frame_ranges": [[int(a), int(b)] for a, b in self.bad_frame_ranges],
             "ego_bad_frame_ranges": [[int(a), int(b)] for a, b in self.ego_bad_frame_ranges],
+            "bad_frame_segments": self.bad_frame_segments,
+            "ego_bad_frame_segments": self.ego_bad_frame_segments,
             "checked_sample_frames": [int(frame) for frame in self.checked_sample_frames],
             "playback_complete": bool(self.playback_complete),
             "payload": self.payload,
@@ -201,6 +225,8 @@ class QcProgress:
             result_type=str(obj.get("result_type") or "in_progress"),
             bad_frame_ranges=ranges,
             ego_bad_frame_ranges=ego_ranges,
+            bad_frame_segments=normalize_segments(obj.get("bad_frame_segments") or [], max_gap_frames=0),
+            ego_bad_frame_segments=normalize_segments(obj.get("ego_bad_frame_segments") or [], max_gap_frames=0),
             checked_sample_frames=sorted(set(checked)),
             playback_complete=playback_complete,
             payload=dict(obj.get("payload") or {}),

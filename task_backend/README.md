@@ -544,15 +544,18 @@ label.main --config <path>` GUI as a separate window. The main app writes that
 launch config from `src/sync/config.json`, including backend URL, operator
 default, lease settings, and NAS mounts. The backend leases one episode with a
 single `episode_uri`; the label frontend resolves that NAS root through the
-launch config's `nas_mounts` and writes corrected 2D arrays to:
+launch config's `nas_mounts` and writes corrected 2D coordinates and visibility to:
 
 ```text
 manual_2d/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
+manual_joints_vis/segments/<manual_label_job_id>/<camera>/<frame:05d>.npy
 ```
 
 After all failed frames in the leased episode are complete, the GUI calls the
-episode complete endpoint and registers a `manual_2d` artifact. The local progress
-CSV is retained only as a temporary cache/legacy aid.
+episode complete endpoint and registers `manual_2d` and `manual_joints_vis`
+artifacts. Coordinate files retain all joint positions; visibility files are
+`uint8` arrays with shape `(2, 21)`. The local progress CSV is retained only as
+a temporary cache/legacy aid.
 
 ## Artifact Kinds
 
@@ -560,6 +563,7 @@ Current artifact kind names:
 
 - `pred_2d` / `auto_2d`: automatic 2D output.
 - `manual_2d`: human-corrected episode 2D output, with segment ranges retained as metadata.
+- `manual_joints_vis`: human-corrected per-camera, per-frame visibility masks.
 - `mano_episode`: episode-level MANO output from automatic or corrected 2D.
 - `qc_report`: quality-control report.
 

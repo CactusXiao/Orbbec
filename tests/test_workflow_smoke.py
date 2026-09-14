@@ -496,8 +496,8 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
                         "score": 0.2,
                         "operator_id": "qc_user",
                         "segments": [
-                            {"start_frame": 10, "end_frame": 12, "reason": "low_confidence"},
-                            {"start_frame": 20, "end_frame": 21, "reason": "temporal_jump"},
+                            {"start_frame": 10, "end_frame": 12, "reason": "low_confidence", "primary_camera": "01"},
+                            {"start_frame": 20, "end_frame": 21, "reason": "temporal_jump", "primary_camera": "00"},
                         ],
                     }
                 },
@@ -514,20 +514,32 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             leased = service.lease_label_episode({"operator_id": "labeler", "task_name": "pick_object", "episode_id": "episode_fail"})
             self.assertEqual(len(leased["segments"]), 2)
             self.assertEqual(leased["payload"]["frames"], [10, 11, 12, 20, 21])
+            self.assertEqual([s["primary_camera"] for s in leased["payload"]["segments"]], ["01", "00"])
             self.assertEqual(leased["payload"]["cameras"], ["00", "01"])
             self.assertEqual(leased["payload"]["scope"], "episode")
+            self.assertTrue(leased["payload"]["manual_2d_output_uri"].endswith(f"/manual_2d/segments/{leased['job']['job_id']}"))
+            self.assertTrue(
+                leased["payload"]["manual_joints_vis_output_uri"].endswith(
+                    f"/manual_joints_vis/segments/{leased['job']['job_id']}"
+                )
+            )
             self.assertTrue(all(item["status"] == "manual_labeling" for item in store.segments_for_episode("episode_fail")))
 
             completed = service.complete_label_episode(
                 "episode_fail",
                 {
                     "result": {"operator_id": "labeler", "frames_completed": [10, 11, 12, 20, 21]},
-                    "artifacts": [{"kind": "manual_2d", "metadata": {"scope": "episode"}}],
+                    "artifacts": [
+                        {"kind": "manual_2d", "metadata": {"scope": "episode"}},
+                        {"kind": "manual_joints_vis", "metadata": {"scope": "episode"}},
+                    ],
                 },
             )
             self.assertTrue(completed["completed"])
             manual_3d_jobs = store.jobs_for_episode("episode_fail", "manual_3d")
             self.assertEqual(len(manual_3d_jobs), 1)
+            self.assertIn("/manual_2d/segments/", manual_3d_jobs[0]["payload"]["manual_2d_uri"])
+            self.assertIn("/manual_joints_vis/segments/", manual_3d_jobs[0]["payload"]["manual_joints_vis_uri"])
             self.assertTrue(all(item["status"] == "mano_queued" for item in store.segments_for_episode("episode_fail")))
             service.complete_job(
                 manual_3d_jobs[0]["job_id"],
@@ -542,7 +554,9 @@ class WorkflowStoreSmokeTest(unittest.TestCase):
             self.assertEqual(store.get_episode("episode_fail")["status"], "finalized")  # type: ignore[index]
             manifest = json.loads((episode_dir / FINAL_3D_SOURCES_REL_PATH).read_text(encoding="utf-8"))
             self.assertEqual(manifest["episode_status"], "finalized")
+            self.assertEqual(manifest["base_2d"]["visibility_relative_path"], "manual_joints_vis")
             self.assertEqual(manifest["base_3d"]["source"], "manual_3d_episode")
+            self.assertTrue(all(item["manual_joints_vis_relative_path"] for item in manifest["manual_segments"]))
             self.assertTrue(all(item["status"] == "mano_succeeded" for item in manifest["manual_segments"]))
 
     def test_qc_bad_episode_does_not_create_manual_segments(self) -> None:

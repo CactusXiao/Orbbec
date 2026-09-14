@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>外包浏览器传输实验</title>
+<style>
+body{margin:0;background:#101722;color:#f0f4fa;font:14px system-ui}header{padding:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{padding:8px 14px;background:#2563eb;color:white;border:0;border-radius:4px;cursor:pointer}#screen{height:calc(100vh - 135px)}video{width:100%;height:100%;object-fit:contain}#stats{white-space:pre-wrap;padding:8px 12px;background:#182231;font:12px monospace}#note{color:#b4c3d5}
+</style>
+<header><b id="title">传输实验</b><button id="start">开始测量</button><button id="stop">结束测量</button><button id="seek" hidden>跳至第 90 帧</button><span id="note"></span></header>
+<div id="stats">等待连接</div><div id="screen"></div>
+<script type="module">
+const $=id=>document.getElementById(id), query=new URLSearchParams(location.search), hash=new URLSearchParams(location.hash.slice(1));
+const kind=query.get('mode')||'vnc';
+let active=false,bytes=0,updates=0,started=0,video=null,frameTimes=[],seeks=[],waiting=0,intervalBytes=0,peakMbps=0,peakUpdates=0,intervalUpdates=0,rfb=null,firstFrameMs=null;
+function reset(){active=true;bytes=0;updates=0;frameTimes=[];seeks=[];waiting=0;started=performance.now();intervalBytes=0;peakMbps=0;peakUpdates=0;intervalUpdates=0;firstFrameMs=null;}
+$('stop').onclick=()=>{render();active=false;};
+if(kind==='vnc'){
+  $('title').textContent='整页远程画面 · 原版质检 UI';$('note').textContent='开始测量后，在下方原版 UI 点击播放。更新率是画面传输更新率，不等同于视频帧率。';
+  const {default:RFB}=await import('/core/rfb.js');
+  rfb=new RFB($('screen'), `${location.protocol==='https:'?'wss':'ws'}://${location.host}/websockify?token=${encodeURIComponent(hash.get('token')||'')}`);
+  rfb._sock._websocket.addEventListener('message',e=>{if(active){const n=e.data.byteLength??e.data.size??e.data.length??0;bytes+=n;intervalBytes+=n;}});
+  rfb.scaleViewport=true;rfb.qualityLevel=9;rfb.compressionLevel=2;
+  const flip=rfb._display.flip.bind(rfb._display);
+  rfb._display.flip=(...args)=>{if(active){updates++;intervalUpdates++;}return flip(...args);};
+  rfb.addEventListener('connect',()=>{$('stats').textContent='已连接实验室主机';});
+  rfb.addEventListener('disconnect',()=>{$('stats').textContent='连接已断开';active=false;});
+  $('start').onclick=reset;
+}else{
+  $('title').textContent='后端合成视频 · 浏览器独立播放';$('note').textContent='真实六视图 MANO 合成预览；只测试媒体链路，尚未接入标注提交。';
+  video=document.createElement('video');video.controls=true;video.muted=true;video.preload='none';video.playsInline=true;$('screen').append(video);$('seek').hidden=false;
+  video.addEventListener('waiting',()=>{if(active&&video.currentTime>0.1)waiting++;});
+  function frame(now,meta){if(active){frameTimes.push(now);if(firstFrameMs===null)firstFrameMs=now-started;}video.requestVideoFrameCallback(frame);}
+  video.requestVideoFrameCallback(frame);
+  $('start').onclick=()=>{video.pause();reset();video.src='/preview.mp4?profile='+encodeURIComponent(query.get('profile')||'lan')+'&run='+Date.now();video.play().catch(e=>{if(e.name!=='AbortError')$('stats').textContent=e.message;});};
+  $('seek').onclick=()=>{const t=performance.now();let buffered=false;for(let i=0;i<video.buffered.length;i++)if(video.buffered.start(i)<=3&&video.buffered.end(i)>3)buffered=true;video.pause();video.currentTime=3;function check(now,meta){const frame=Math.round(meta.mediaTime*30);if(frame!==90){video.requestVideoFrameCallback(check);return;}seeks.push({ms:+(performance.now()-t).toFixed(1),buffered,displayed_frame:frame});render();}video.requestVideoFrameCallback(check);};
+  video.addEventListener('ended',()=>{render();active=false;});
+}
+function render(){
+  if(!started)return;
+  const seconds=(performance.now()-started)/1000;
+  let data;
+  if(kind==='vnc')data={measurement:'framebuffer transport (not source video FPS)',seconds:+seconds.toFixed(2),websocket_MiB:+(bytes/1048576).toFixed(2),average_Mbps:+(bytes*8/seconds/1e6).toFixed(2),peak_1s_Mbps:+peakMbps.toFixed(2),peak_1s_framebuffer_updates:peakUpdates,framebuffer_updates:updates};
+  else{const q=video.getVideoPlaybackQuality(),n=frameTimes.length;data={measurement:'native video playback',profile:query.get('profile')||'lan',video_seconds:+video.currentTime.toFixed(3),callbacks:n,presented_fps:n>1?+((n-1)*1000/(frameTimes[n-1]-frameTimes[0])).toFixed(2):0,decoded_frames:q.totalVideoFrames,dropped_frames:q.droppedVideoFrames,rebuffer_events:waiting,first_frame_ms:firstFrameMs===null?null:+firstFrameMs.toFixed(1),seeks};}
+  $('stats').textContent=JSON.stringify(data);window.benchmarkResult=data;
+}
+setInterval(()=>{if(!active)return;peakMbps=Math.max(peakMbps,intervalBytes*8/1e6);peakUpdates=Math.max(peakUpdates,intervalUpdates);intervalBytes=0;intervalUpdates=0;render();},1000);
+</script></html>

@@ -1,4 +1,5 @@
 #include "tactile.hpp"
+#include "tactile_layout.hpp"
 
 #include <array>
 #include <algorithm>
@@ -379,12 +380,12 @@ std::optional<SerialFrameResult> parseOneJqFrame(JqParserState &state, const Tac
         SerialFrameResult result;
         result.ok = true;
         result.sensorType = static_cast<int>(sensorType);
-        result.side = !config.handSide.empty() ? config.handSide : sideForSensorType(result.sensorType);
+        result.side = sideForSensorType(result.sensorType);
         result.packet1TimestampUs = first.timestampUs;
         result.packet2TimestampUs = arrivalUs;
         result.packetGapUs = arrivalUs >= first.timestampUs ? (arrivalUs - first.timestampUs) : 0;
         result.timestampUs = std::max(result.packet1TimestampUs, result.packet2TimestampUs);
-        result.rawAdc.reserve(kJqShroomPressureChannelCount);
+        result.rawAdc.reserve(kJqGloveAdcChannelCount);
         for(uint8_t value : first.payload) {
             result.rawAdc.push_back(static_cast<uint16_t>(value));
         }
@@ -507,6 +508,12 @@ public:
 
     bool start(const TactileModuleConfig &config, std::string *errorMessage) override {
         stop();
+
+        if((config.sensorType != 1 && config.sensorType != 2)
+           || config.handSide != sideForSensorType(config.sensorType)) {
+            if(errorMessage) *errorMessage = "Glove handSide must match sensorType (1=left, 2=right)";
+            return false;
+        }
 
         if(config.serial.portPath.empty()) {
             if(errorMessage) {
@@ -710,26 +717,18 @@ bool saveSingleSampleCsv(const TactileSample &sample,
         return false;
     }
 
-    ofs << "channel_index,region_id,region_name,point_id,raw_adc,calibrated_value,output_value,force_unit,calibrated_region_force_n,force_out_of_range\n";
+    ofs << "channel_index,region_id,region_name,point_id,raw_adc,raw_adc_unit,region_force_unit,calibrated_region_force_n,force_out_of_range,sensor_id,channel_kind,force_calibration_status\n";
     ofs << std::fixed << std::setprecision(std::max(0, options.csvFloatPrecision));
-    const auto &names = regionNames();
     for(size_t i = 0; i < sample.frame.rawAdc.size(); ++i) {
-        const size_t regionIndex = i / kTactileChannelsPerRegion;
-        const size_t pointIndex = i % kTactileChannelsPerRegion;
-        const std::string regionName = regionIndex < names.size()
-            ? names[regionIndex]
-            : ("SensorBlock" + std::to_string(regionIndex + 1));
-        const double calibrated = i < sample.frame.calibratedValues.size() ? sample.frame.calibratedValues[i] : std::numeric_limits<double>::quiet_NaN();
-        const double output = i < sample.frame.outputValues.size() ? sample.frame.outputValues[i] : calibrated;
+        const auto channel = gloveChannel(sample.frame.side, static_cast<int>(i + 1));
         ofs << i
-            << "," << (regionIndex + 1)
-            << "," << regionName
-            << "," << (pointIndex + 1)
+            << "," << channel.region
+            << "," << channel.name
+            << "," << channel.point
             << "," << sample.frame.rawAdc[i]
-            << "," << calibrated
-            << "," << output
-            << ",N," << sample.frame.calibratedRegionForceN
+            << ",ADC,N," << sample.frame.calibratedRegionForceN
             << "," << (sample.frame.forceOutOfRange ? 1 : 0)
+            << "," << (i + 1) << "," << channel.kind << "," << sample.frame.forceCalibrationStatus
             << "\n";
     }
     return true;
@@ -764,7 +763,7 @@ bool TactileForceCalibration::load(const std::vector<std::filesystem::path> &pat
                 std::istringstream idStream(header[i].substr(hash + 1));
                 int id = 0;
                 if(!(idStream >> id) || !(idStream >> std::ws).eof()
-                   || id < 1 || id > static_cast<int>(kJqShroomPressureChannelCount)) {
+                   || id < 1 || id > static_cast<int>(kJqGloveAdcChannelCount)) {
                     throw std::runtime_error("Invalid sensor number");
                 }
                 fileChannels.push_back(static_cast<size_t>(id - 1));
@@ -819,6 +818,12 @@ bool TactileForceCalibration::load(const std::vector<std::filesystem::path> &pat
         if(!in.eof()) return fail("Error reading tactile calibration: " + path.string());
         if(positiveCount == 0) return fail("No positive force measurements: " + path.string());
     }
+    // The image's fit belongs to the supplied right-middle 12-point region.
+    // An arbitrary new sensor set cannot reuse those coefficients silently.
+    std::vector<size_t> expected;
+    for(int id : kGloveRightFingers[2]) expected.push_back(static_cast<size_t>(id - 1));
+    std::sort(expected.begin(), expected.end());
+    if(channels != expected) return fail("Hill image calibration requires the 12 right-middle glove sensor IDs");
     channelIndices_ = std::move(channels);
     maxMeasuredAdcSum_ = maxMeasuredAdcSum;
     return true;
@@ -836,31 +841,30 @@ double TactileForceCalibration::forceN(double adcSum) const {
 }
 
 bool TactileForceCalibration::apply(TactileFrame &frame, std::string *errorMessage) const {
-    frame.calibratedValues.assign(frame.rawAdc.size(), std::numeric_limits<double>::quiet_NaN());
-    frame.outputValues = frame.calibratedValues;
     frame.calibratedRegionForceN = std::numeric_limits<double>::quiet_NaN();
     frame.forceOutOfRange = false;
-    if(channelIndices_.empty() || channelIndices_.back() >= frame.rawAdc.size()) {
+    frame.forceCalibrationStatus = "unavailable";
+    if(channelIndices_.empty() || frame.rawAdc.size() != kJqGloveAdcChannelCount) {
         if(errorMessage) *errorMessage = "Missing tactile force calibration or incomplete ADC frame";
         return false;
+    }
+    if(frame.side != "right" || frame.sensorType != 2) {
+        // No left-hand calibration was supplied. Preserve ADC without borrowing
+        // right-hand coefficients or mixing middle and ring finger channels.
+        frame.forceCalibrationStatus = "uncalibrated_hand";
+        return true;
     }
     double adcSum = 0.0;
     for(size_t i : channelIndices_) adcSum += frame.rawAdc[i];
     frame.calibratedRegionForceN = forceN(adcSum);
     frame.forceOutOfRange = adcSum > maxMeasuredAdcSum_ || !std::isfinite(frame.calibratedRegionForceN);
-    for(size_t i : channelIndices_) {
-        frame.calibratedValues[i] = adcSum > 0.0 ? frame.calibratedRegionForceN * frame.rawAdc[i] / adcSum : 0.0;
-    }
-    frame.outputValues = frame.calibratedValues;
+    frame.forceCalibrationStatus = std::isfinite(frame.calibratedRegionForceN) ? "right_middle_region" : "invalid_force";
     return true;
 }
 
 void writeTactileMeasurementCsvHeader(std::ostream &out) {
-    out << ",calibrated_region_force_n,force_out_of_range";
-    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
-        out << ",force_" << std::setw(3) << std::setfill('0') << i << "_n";
-    }
-    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+    out << ",calibrated_region_force_n,force_out_of_range,force_calibration_status";
+    for(size_t i = 0; i < kJqGloveAdcChannelCount; ++i) {
         out << ",raw_adc_" << std::setw(3) << std::setfill('0') << i;
     }
     out << std::setfill(' ');
@@ -870,13 +874,9 @@ void writeTactileMeasurementCsvValues(std::ostream &out, const TactileFrame &fra
     const auto flags = out.flags();
     const auto oldPrecision = out.precision();
     out << std::fixed << std::setprecision(std::max(0, precision));
-    out << "," << frame.calibratedRegionForceN << "," << (frame.forceOutOfRange ? 1 : 0);
-    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
-        out << ",";
-        if(i < frame.outputValues.size()) out << frame.outputValues[i];
-        else out << "nan";
-    }
-    for(size_t i = 0; i < kJqShroomPressureChannelCount; ++i) {
+    out << "," << frame.calibratedRegionForceN << "," << (frame.forceOutOfRange ? 1 : 0)
+        << "," << frame.forceCalibrationStatus;
+    for(size_t i = 0; i < kJqGloveAdcChannelCount; ++i) {
         out << ",";
         if(i < frame.rawAdc.size()) out << frame.rawAdc[i];
     }

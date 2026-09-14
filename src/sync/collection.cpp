@@ -6081,7 +6081,7 @@ private:
         }
         const auto &frame = sample.frame;
         std::vector<std::string> row;
-        row.reserve(15 + kJqShroomPressureChannelCount);
+        row.reserve(15 + kJqGloveAdcChannelCount);
         row.push_back(std::to_string(sample.sequence));
         row.push_back(std::to_string(sample.representativeTimestampUs));
         {
@@ -6697,11 +6697,15 @@ private:
 
     void writeTouchManifestJson(const fs::path &touchDir) const {
         cJSON *root = cJSON_CreateObject();
-        cJSON_AddStringToObject(root, "schema", "orbbec.touch.jq_shroom.v2");
-        cJSON_AddStringToObject(root, "protocol", "jq_shroom_record_tactile_py");
-        cJSON_AddNumberToObject(root, "pressure_channels", static_cast<double>(kJqShroomPressureChannelCount));
+        cJSON_AddStringToObject(root, "schema", "orbbec.touch.jq_shroom.v3");
+        cJSON_AddStringToObject(root, "protocol", "jq_glove_2packet_256adc_16imu");
+        cJSON_AddStringToObject(root, "layout_source", "织物电子皮肤（触觉手套）v1.0, pages 11-15");
+        cJSON_AddNumberToObject(root, "adc_channels", static_cast<double>(kJqGloveAdcChannelCount));
+        cJSON_AddNumberToObject(root, "pressure_channels", 132);
+        cJSON_AddNumberToObject(root, "bend_channels", 5);
+        cJSON_AddStringToObject(root, "point_count_note", "Manual advertises 162 points but maps 132 pressure + 5 bend channels; other ADC slots remain unmapped");
         cJSON_AddStringToObject(root, "force_unit", "N");
-        cJSON_AddStringToObject(root, "force_columns", "force_000_n..force_255_n (zero-based channel indices)");
+        cJSON_AddStringToObject(root, "force_columns", "calibrated_region_force_n (right middle region total only)");
         cJSON_AddStringToObject(root, "raw_adc_columns", "raw_adc_000..raw_adc_255 (unit: ADC)");
         cJSON_AddStringToObject(root, "force_calibration_method", "hill_inverse_sum_adc");
         cJSON *hill = cJSON_CreateObject();
@@ -6711,16 +6715,19 @@ private:
         cJSON_AddStringToObject(hill, "formula", "F_N = b * pow(adc_sum / (a - adc_sum), 1 / n)");
         cJSON_AddStringToObject(hill, "source", "tactile/微信图片_2026-09-07_165536_559.jpg");
         cJSON_AddItemToObject(root, "hill_fit", hill);
-        cJSON_AddStringToObject(root, "channel_force_method", "calibrated region total distributed by ADC fraction; estimates, not independent channel calibration");
+        cJSON_AddStringToObject(root, "channel_force_method", "none; no independently calibrated point forces");
+        cJSON_AddStringToObject(root, "force_scope", "right_middle_region_only");
+        cJSON_AddStringToObject(root, "force_status_column", "force_calibration_status");
         cJSON_AddStringToObject(root, "uncalibrated_force", "nan");
         cJSON_AddStringToObject(root, "out_of_range_policy", "no clamping: above measured ADC range is flagged; ADC >= a or invalid force is nan and flagged");
-        cJSON_AddStringToObject(root, "sensor_id_convention", "CSV sensor# IDs are one-based; mapped to serial channel index = ID - 1; shared across configured gloves");
+        cJSON_AddStringToObject(root, "sensor_id_convention", "Manual and CSV IDs are one-based; serial index = ID - 1; left and right have distinct anatomical maps");
         cJSON *calibrationFiles = cJSON_CreateArray();
         for(const auto &path : cfg_.touch.calibrationPaths) {
             cJSON_AddItemToArray(calibrationFiles, cJSON_CreateString(path.string().c_str()));
         }
         cJSON_AddItemToObject(root, "calibration_files", calibrationFiles);
         cJSON_AddNumberToObject(root, "target_fps", cfg_.touch.targetFps);
+        cJSON_AddStringToObject(root, "sampling_rate_note", "target_fps is nominal metadata, not a device command; actual rate follows serial timestamps (manual 100Hz, wired custom <=600Hz)");
         cJSON_AddStringToObject(root, "timestamp_domain", "collection_ref_timestamp_us");
         cJSON *devices = cJSON_CreateArray();
         for(const auto &runtime: touchRuntimes_) {
@@ -6729,6 +6736,11 @@ private:
             cJSON_AddStringToObject(dev, "id", runtime.streamId.c_str());
             cJSON_AddStringToObject(dev, "side", touchCfg.handSide.c_str());
             cJSON_AddNumberToObject(dev, "sensor_type", touchCfg.sensorType);
+            cJSON_AddStringToObject(dev, "force_scope", touchCfg.sensorType == 2 ? "right_middle_region_only" : "uncalibrated");
+            if(touchCfg.sensorType == 2) {
+                const int ids[] = {8,9,10,24,25,26,232,233,234,248,249,250};
+                cJSON_AddItemToObject(dev, "calibrated_sensor_ids", cJSON_CreateIntArray(ids, 12));
+            }
             cJSON_AddNumberToObject(dev, "baud_rate", touchCfg.serial.baudRate);
             cJSON_AddStringToObject(dev, "port_path", touchCfg.serial.portPath.c_str());
             cJSON_AddStringToObject(dev, "raw_csv", (runtime.streamId + "_raw.csv").c_str());

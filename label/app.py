@@ -949,6 +949,7 @@ class LabelPage(ttk.Frame):
         self._active_bundle = bundle
         self._bundles = {"pred": bundle}
         self._camera_ids = list(task.cameras)
+        self._primary_ego_focus = False
         self._cam_idx = 0
         self._view_states = {}
         self._source_state_cache = {}
@@ -989,6 +990,17 @@ class LabelPage(ttk.Frame):
         self._frame_pos = max(0, min(self._frame_pos, task.total_frames - 1))
         self._view_states = {}
         self._cam_idx = max(0, min(self._cam_idx, max(0, len(self._camera_ids) - 1)))
+        if getattr(task, "segments", []):
+            rec = self._progress.setdefault(task.key, CorrectionProgress(task_key=task.key, total_frames=task.total_frames))
+            visited_before = set(rec.visited_segments)
+            primary = rec.enter_segment(task, task.frames[self._frame_pos])
+            if primary:
+                self._primary_ego_focus = primary == "ego"
+                self._overview = self._primary_ego_focus
+                if not self._overview:
+                    self._cam_idx = self._camera_ids.index(primary)
+            if visited_before != rec.visited_segments and self._jsonl_path:
+                save_correction_progress(self._jsonl_path, self._progress)
         self._refresh_view()
 
     def _normalize_source(self, source: str) -> str:
@@ -1065,18 +1077,7 @@ class LabelPage(ttk.Frame):
         bundle = self._ensure_bundle("correct")
         original = self._build_visible_mano_view_state(frame_idx, cam_id)
         if source_frame_path(bundle, frame_idx, cam_id) is not None:
-            saved_points, saved_visible = view_state_from_bundle(bundle, frame_idx, cam_id)
-            if original is None:
-                return saved_points, saved_visible
-            original_points, _original_visible = original
-            # Corrected files encode invisible points as (-1,-1). Keep their
-            # original projected position in memory so making a joint visible
-            # again writes a real coordinate instead of persisting (-1,-1).
-            for hand in range(2):
-                for joint in range(21):
-                    if not saved_visible[hand][joint]:
-                        saved_points[hand][joint] = original_points[hand][joint]
-            return saved_points, saved_visible
+            return view_state_from_bundle(bundle, frame_idx, cam_id)
 
         if original is None:
             return self._hidden_points(), self._none_visible()
@@ -1297,6 +1298,7 @@ class LabelPage(ttk.Frame):
                     prev_frame_idx=prev_frame_idx,
                     frame_idx=frame_idx,
                     correction_dir=task.correction_dir,
+                    correction_visibility_dir=task.correction_visibility_dir,
                     rgb_path_template=task.rgb_path_template,
                 )
             except Exception as exc:
@@ -1673,6 +1675,7 @@ class LabelPage(ttk.Frame):
         task = self._active_task
         frame = task.frames[self._frame_pos]
         self._overview_grid.set_cameras(self._camera_ids)
+        self._overview_grid.focus_camera("ego" if self._primary_ego_focus else None)
         self._view_states = {
             camera: self._build_initial_view_state(frame, camera, self._mode)
             for camera in self._camera_ids
@@ -1681,7 +1684,8 @@ class LabelPage(ttk.Frame):
         self._update_source_button()
         self._refresh_visual_overlays()
         self._refresh_timeline()
-        self._info.configure(text=f"Task: {task.display_name} · 六视角总览（0，只读） · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–7 返回单视角（00–06）")
+        view_name = "Pico Ego（只读）" if self._primary_ego_focus else "六视角总览（0，只读）"
+        self._info.configure(text=f"Task: {task.display_name} · {view_name} · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–7 返回单视角（00–06）")
         frame_done = self._is_frame_done(task, self._frame_pos)
         self._frame_status.configure(text=f"当前帧：{'已完成' if frame_done else '未完成'}",
                                      fg=STATUS_DONE_COLOR if frame_done else STATUS_TODO_COLOR)
@@ -1770,6 +1774,7 @@ class LabelPage(ttk.Frame):
             return
         self._cache_current_source_state()
         self._overview = index == -1
+        self._primary_ego_focus = False
         if not self._overview:
             self._cam_idx = index
         self._refresh_view()
@@ -1959,7 +1964,18 @@ class LabelPage(ttk.Frame):
                     "frames": list(task.frames),
                     "operator_id": session.operator_id,
                 },
-            }
+            },
+            {
+                "kind": "manual_joints_vis",
+                "metadata": {
+                    "scope": "episode",
+                    "episode_id": session.episode_id,
+                    "segment_ids": segment_ids,
+                    "cameras": list(task.cameras),
+                    "frames": list(task.frames),
+                    "operator_id": session.operator_id,
+                },
+            },
         ]
         try:
             session.client.complete_label_job(

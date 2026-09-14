@@ -209,10 +209,10 @@
         "cameraParamsPath": "../../camera_info/ego_camera_params.json"
     },
     "touch": {
-        "_comment": "Shroom/JQ tactile glove collection, matching tactile/record_tactile.py: continuous serial stream, header AA 55 03 99, packet 1 + packet 2 -> 256 uint8 pressure channels plus 16 raw IMU bytes. Both gloves are saved under each episode's touch/ directory and aligned in timestamps.csv.",
+        "_comment": "Fabric electronic skin glove manual pp.11-15: two packets, 256 ADC slots (132 mapped pressure + 5 bend), 16 IMU bytes. Separate left/right maps. Image Hill fit saves right-middle regional force only; other regions retain ADC without invented point forces. targetFps is nominal, not a device rate command.",
         "enabled": false,
         "required": true,
-        "targetFps": 60,
+        "targetFps": 100,
         "maxBufferedSamples": 8192,
         "calibrationPaths": ["../../tactile/5 (1).csv", "../../tactile/5 (2).csv", "../../tactile/5 (3).csv"],
         "directoryName": "touch",

@@ -22,7 +22,7 @@ from .config import QcConfig
 from .media import MeshRendererSettings, QcEpisodeMedia, prepare_qc_media
 from .playback import playback_target_position
 from .report import build_qc_result, write_ego_pose_qc_report, write_qc_report
-from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges
+from .state_store import QcProgress, QcStateStore, format_seconds, normalize_ranges, normalize_segments, segments_from_ranges
 
 
 class QcWorkerApp(tk.Tk):
@@ -332,6 +332,7 @@ class QcWorkerApp(tk.Tk):
             bad_ranges=bad_ranges,
             bad_episode=bad_episode,
             sample_interval=progress.sample_interval,
+            segments=progress.bad_frame_segments or None,
         )
         result["operator_id"] = self.config.operator_id
         self.qc_page.set_busy("正在提交 QC 结果...")
@@ -350,6 +351,7 @@ class QcWorkerApp(tk.Tk):
                     worker_id=self.config.worker_machine_id,
                     operator_id=self.config.operator_id,
                     bad_ranges=ego_bad_ranges,
+                    segments=progress.ego_bad_frame_segments or None,
                 )
                 artifacts = [
                     {
@@ -945,6 +947,7 @@ class QcPage(ttk.Frame):
         self.bad_cursor = 0
         self.bad_start: Optional[int] = None
         self.bad_end: Optional[int] = None
+        self.primary_camera: Optional[str] = None
         self._canvases: Dict[str, ImageAnnotatorCanvas] = {}
         self._labels: Dict[str, ttk.Label] = {}
         self._rendering_overlays: Dict[str, tk.Label] = {}
@@ -1034,6 +1037,7 @@ class QcPage(ttk.Frame):
         self.progress = progress
         self.media = media
         self.mode = "playback"
+        self.primary_camera = None
         self._buffering = False
         self._preparation_error_shown = False
         if progress.frames and progress.current_frame not in progress.frames:
@@ -1102,6 +1106,8 @@ class QcPage(ttk.Frame):
             canvas.pack(fill="both", expand=True, padx=6, pady=(0, 6))
             canvas.set_read_only(True)
             canvas.set_annotation_visible(False)
+            canvas.configure(highlightthickness=3, highlightbackground=Theme.PANEL_2, highlightcolor=Theme.PANEL_2)
+            canvas.bind("<Double-1>", lambda _event, camera=cam: self.select_primary_camera(camera))
             rendering_overlay = tk.Label(
                 host,
                 text="渲染中…",
@@ -1115,6 +1121,7 @@ class QcPage(ttk.Frame):
             self._rendering_overlays[cam] = rendering_overlay
 
     def _refresh(self) -> None:
+        self._refresh_primary_camera()
         progress = self.progress
         media = self.media
         if progress is None or media is None or not progress.frames:
@@ -1224,7 +1231,7 @@ class QcPage(ttk.Frame):
             if not self._bad_bar.winfo_manager():
                 self._bad_bar.pack(fill="x")
             self._bad_status.configure(
-                text=f"当前帧：{self.bad_cursor}    Start={self.bad_start if self.bad_start is not None else '-'}    End={self.bad_end if self.bad_end is not None else '-'}"
+                text=f"当前帧：{self.bad_cursor}    Start={self.bad_start if self.bad_start is not None else '-'}    End={self.bad_end if self.bad_end is not None else '-'}    主要错误视角：{self.primary_camera or '请双击图像选择'}"
             )
             return
         if self._bad_bar.winfo_manager():
@@ -1422,7 +1429,20 @@ class QcPage(ttk.Frame):
         self.bad_cursor = int(progress.current_frame)
         self.bad_start = None
         self.bad_end = None
+        self.primary_camera = None
         self._refresh()
+
+    def select_primary_camera(self, camera: str) -> None:
+        if self.mode != "bad_range" or camera not in self._canvases:
+            return
+        self.primary_camera = camera
+        self._refresh_primary_camera()
+        self._update_controls()
+
+    def _refresh_primary_camera(self) -> None:
+        for camera, canvas in self._canvases.items():
+            color = "#e5484d" if self.mode == "bad_range" and camera == self.primary_camera else Theme.PANEL_2
+            canvas.configure(highlightbackground=color, highlightcolor=color)
 
     def move_bad_cursor(self, delta: int) -> None:
         progress = self.progress
@@ -1453,12 +1473,22 @@ class QcPage(ttk.Frame):
         if self.bad_start > self.bad_end:
             messagebox.showwarning("坏帧区间", "坏帧起点不能大于终点。")
             return
+        if not self.primary_camera:
+            messagebox.showwarning("主要错误视角", "请双击主要错误视角的图像，红色边框高亮后再确认区间。")
+            return
         target = (
             progress.ego_bad_frame_ranges
             if kind == "egopose"
             else progress.bad_frame_ranges
         )
-        target.append((int(self.bad_start), int(self.bad_end)))
+        segment_field = "ego_bad_frame_segments" if kind == "egopose" else "bad_frame_segments"
+        segments = getattr(progress, segment_field) or segments_from_ranges(target)
+        segments = normalize_segments(
+            [*segments, {"start_frame": int(self.bad_start), "end_frame": int(self.bad_end), "primary_camera": self.primary_camera}],
+            max_gap_frames=self.app.config.range_merge_gap_frames,
+        )
+        setattr(progress, segment_field, segments)
+        target = [(item["start_frame"], item["end_frame"]) for item in segments]
         normalized = normalize_ranges(
             target, max_gap_frames=self.app.config.range_merge_gap_frames
         )
@@ -1468,6 +1498,7 @@ class QcPage(ttk.Frame):
             progress.bad_frame_ranges = normalized
         progress.current_frame = int(self.bad_end)
         self.mode = "playback"
+        self.primary_camera = None
         self.bad_start = None
         self.bad_end = None
         self._persist_and_refresh()
@@ -1478,6 +1509,7 @@ class QcPage(ttk.Frame):
             return
         progress.current_frame = self.bad_anchor_frame
         self.mode = "playback"
+        self.primary_camera = None
         self.bad_start = None
         self.bad_end = None
         self._persist_and_refresh()

@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Orbbec · 外包工作台</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div><b>Orbbec</b><span id="workspaceLabel">外包工作台</span></div>
+      <div class="loginTools">
+        <span id="connection">正在连接</span
+        ><span id="accountTools" hidden
+          ><b id="accountName"></b
+          ><button id="manageAccounts" hidden>账号管理</button
+          ><button id="changePassword">修改密码</button
+          ><button id="logout">退出登录</button></span
+        >
+      </div>
+    </header>
+    <section id="loginPanel" class="authPanel" hidden>
+      <h1>登录外包工作台</h1>
+      <p>连接企业 VPN 后，使用分配给你的账号登录。每个浏览器独立登录。</p>
+      <form id="loginForm" class="accountForm">
+        <label for="loginUsername">账号</label
+        ><input
+          id="loginUsername"
+          name="username"
+          autocomplete="username"
+          required
+          maxlength="64"
+          autocapitalize="none"
+          spellcheck="false"
+        />
+        <label for="loginPassword">密码</label
+        ><input
+          id="loginPassword"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+          maxlength="128"
+        />
+        <button id="loginSubmit" type="submit" class="primary">
+          登录工作台
+        </button>
+      </form>
+      <p id="loginError" role="alert"></p>
+      <p>
+        没有账号或忘记密码？请联系项目管理员。草稿保留在当前浏览器，请使用自己的设备或独立的系统账号。
+      </p>
+    </section>
+    <section id="picker" hidden>
+      <h1>标注与质检</h1>
+      <p>标注和质检在浏览器内操作。草稿保存在这台电脑，确认提交后写回后端。</p>
+      <nav>
+        <button id="labelRole">标注 Label</button
+        ><button id="qcRole">质检 QC</button
+        ><button id="refresh">刷新任务</button>
+      </nav>
+      <div class="pickerFilter">
+        <label
+          >任务
+          <select id="taskFilter">
+            <option value="">全部任务</option>
+          </select></label
+        ><span id="jobCount"></span><button id="importDraft">导入草稿</button
+        ><input id="draftFile" type="file" accept="application/json" hidden />
+      </div>
+      <div id="jobs"></div>
+      <h2>这台电脑上的草稿与回执</h2>
+      <div id="drafts"></div>
+    </section>
+    <main id="workspace" hidden>
+      <div class="toolbar">
+        <button id="home">返回任务</button><strong id="title"></strong
+        ><span id="saveState">本机草稿</span
+        ><button id="export">导出草稿</button
+        ><button id="submit" class="primary">确认提交</button>
+      </div>
+      <div id="preparing" hidden>后端正在准备画面，可以安全刷新页面。</div>
+      <button id="retryMedia" hidden>重试准备画面</button>
+      <div id="content" hidden>
+        <aside id="taskProgress">
+          <h3>标注进度</h3>
+          <div id="frameList"></div>
+        </aside>
+        <div id="workArea">
+          <section id="qcPanel" hidden>
+            <video id="video" controls preload="auto" playsinline></video>
+            <div class="playbackBar">
+              <button id="prevTen">上十帧</button
+              ><button id="play">播放 / 暂停 · 空格</button
+              ><button id="nextTen">下十帧</button
+              ><button id="enterRange" class="danger">该帧不通过</button
+              ><label
+                >速度
+                <select id="speed">
+                  <option value="0.5">0.5×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                </select></label
+              ><span id="playbackHealth"></span>
+            </div>
+            <div id="qcActions" class="qcActions">
+              <label><input type="checkbox" id="badEpisode" />整段异常</label>
+              <div class="rangeBoundary">
+                <label for="rangeStart">区间起点</label
+                ><input type="number" id="rangeStart" min="0" /><button
+                  id="setStart"
+                >
+                  将当前帧设为起点 [
+                </button>
+              </div>
+              <div class="rangeBoundary">
+                <label for="rangeEnd">终点</label
+                ><input type="number" id="rangeEnd" min="0" /><button
+                  id="setEnd"
+                >
+                  将当前帧设为终点 ]
+                </button>
+              </div>
+              <button id="badRange">确认为手部 Pose 不准</button
+              ><button id="egoRange">确认为 EgoPose 外参不准</button>
+            </div>
+            <div id="ranges"></div>
+            <p id="qcHint">
+              播放检查六视角；暂停后显示逐帧画面，点击机位可放大检查。
+            </p>
+            <div id="qcStills" class="grid"></div>
+          </section>
+          <section id="labelPanel" hidden>
+            <div class="labelActions">
+              <button id="overview">六视角总览 · 0</button
+              ><button id="prevCamera">上一机位</button
+              ><button id="nextCamera">下一机位</button
+              ><select id="source" aria-label="结果来源">
+                <option value="correct">修改后视角</option>
+                <option value="mano">原始视角</option>
+                <option value="mano_visible">
+                  原始视角（含可见性）
+                </option></select
+              ><button id="skeleton">显示三维骨架</button
+              ><button id="mesh">显示 MANO</button
+              ><button id="resetZoom">适应画面</button>
+            </div>
+            <div id="viewNotice"></div>
+            <div id="cameras" class="cameraTabs"></div>
+            <div id="overviewGrid" class="grid" hidden></div>
+            <div class="editorLayout" id="editorLayout">
+              <div id="editorWrap">
+                <svg id="editor" aria-label="关节点编辑画面"></svg>
+              </div>
+              <aside>
+                <h3>关节编辑</h3>
+                <p>拖动关节或点击放置 · 滚轮缩放 · 右键拖动平移</p>
+                <label
+                  >手部
+                  <select id="hand">
+                    <option value="0">左手</option>
+                    <option value="1">右手</option>
+                  </select></label
+                ><label
+                  >关节
+                  <select id="joint"></select></label
+                ><label><input id="visible" type="checkbox" />可见</label>
+                <div class="jointActions">
+                  <button id="undo">撤销</button
+                  ><button id="ignore">忽略视角</button
+                  ><button id="hideHand">隐藏该手</button>
+                </div>
+                <div id="jointMap" aria-label="关节可见性"></div>
+                <button id="trackJoint">跟踪所选关节</button>
+                <p id="trackingInfo"></p>
+                <button id="trackNext">跟踪到下一帧</button>
+                <p id="pointInfo"></p>
+                <div id="thumbnails" class="grid"></div>
+              </aside>
+            </div>
+          </section>
+          <div id="frameStatus"></div>
+          <div id="timelineMarks"></div>
+          <footer>
+            <button id="prev">上一帧 ←</button
+            ><input id="timeline" type="range" min="0" value="0" /><button
+              id="next"
+            >
+              下一帧 →</button
+            ><span id="frameInfo"></span
+            ><input id="frameJump" type="number" aria-label="跳转帧" /><button
+              id="goFrame"
+            >
+              跳转</button
+            ><button id="confirmFrame">确认并继续</button
+            ><span id="progress"></span>
+          </footer>
+        </div>
+      </div>
+      <div id="receipt" hidden></div>
+    </main>
+    <div id="notice" role="status"></div>
+    <dialog id="imageDialog">
+      <div class="toolbar">
+        <strong id="imageTitle"></strong
+        ><button id="closeImage">关闭 · Esc</button>
+      </div>
+      <p>滚轮缩放 · 右键拖动平移 · 双击复位</p>
+      <svg id="inspection" aria-label="放大检查画面"></svg>
+    </dialog>
+    <dialog id="submitDialog">
+      <h2>提交本次结果</h2>
+      <p id="submitSummary"></p>
+      <p>提交成功后该任务将进入下一阶段。收到回执前，草稿会一直保留。</p>
+      <button id="cancelSubmit">继续检查</button
+      ><button id="doSubmit" class="primary">提交结果</button>
+    </dialog>
+    <dialog id="passwordDialog">
+      <h2>设置自己的密码</h2>
+      <p id="passwordNote"></p>
+      <form id="passwordForm" class="accountForm">
+        <label for="oldPassword">当前密码 / 初始密码</label
+        ><input
+          id="oldPassword"
+          type="password"
+          autocomplete="current-password"
+          required
+          maxlength="128"
+        />
+        <label for="newPassword">新密码（15–128 个字符）</label
+        ><input
+          id="newPassword"
+          type="password"
+          autocomplete="new-password"
+          required
+          minlength="15"
+          maxlength="128"
+        />
+        <label for="repeatPassword">再次输入新密码</label
+        ><input
+          id="repeatPassword"
+          type="password"
+          autocomplete="new-password"
+          required
+          minlength="15"
+          maxlength="128"
+        />
+        <p id="passwordError" role="alert"></p>
+        <button id="passwordSubmit" type="submit" class="primary">
+          保存新密码</button
+        ><button id="passwordCancel" type="button">取消</button>
+        <button id="passwordLogout" type="button">退出并使用其他账号</button>
+      </form>
+    </dialog>
+    <dialog id="accountsDialog">
+      <div class="toolbar">
+        <h2>账号与任务权限</h2>
+        <button id="closeAccounts">关闭</button>
+      </div>
+      <div id="accountList"></div>
+      <button id="newAccount">新增账号</button>
+      <form id="accountForm" class="accountForm">
+        <label for="newUsername"
+          >账号（3–64 位字母、数字、点、下划线或连字符）</label
+        ><input
+          id="newUsername"
+          autocomplete="off"
+          required
+          pattern="[a-zA-Z0-9][a-zA-Z0-9_.-]{2,63}"
+          maxlength="64"
+        />
+        <label
+          ><input
+            id="backendAccount"
+            type="checkbox"
+          />使用原后端已注册账号（沿用原密码）</label
+        >
+        <label for="temporaryPassword">初始密码（编辑时留空表示不重置）</label
+        ><input
+          id="temporaryPassword"
+          type="password"
+          autocomplete="new-password"
+          required
+          minlength="15"
+          maxlength="128"
+        />
+        <fieldset>
+          <legend>工作类型</legend>
+          <label><input id="allowLabel" type="checkbox" />标注 Label</label
+          ><label><input id="allowQC" type="checkbox" />质检 QC</label>
+        </fieldset>
+        <label
+          ><input
+            id="allTasks"
+            type="checkbox"
+          />允许全部任务（包括以后新增的任务）</label
+        >
+        <label for="allowedTasks"
+          >指定任务（可多选；未选择则不能领取任务）</label
+        ><select id="allowedTasks" multiple size="6"></select>
+        <label
+          ><input id="accountEnabled" type="checkbox" checked />启用账号</label
+        >
+        <button id="accountSave" type="submit" class="primary">创建账号</button>
+        <p id="accountError" role="alert"></p>
+      </form>
+    </dialog>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

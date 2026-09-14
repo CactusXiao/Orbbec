@@ -48,7 +48,9 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 episode_dir=root,
                 prediction_dir=root / "pred_2d",
                 pred_dir=root / "manual_2d",
+                pred_visibility_dir=root / "manual_joints_vis",
                 corrected_dir=root / "manual_2d",
+                corrected_visibility_dir=root / "manual_joints_vis",
                 samples={},
             )
 
@@ -88,16 +90,22 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             corrected_dir = root / "manual_2d"
+            corrected_visibility_dir = root / "manual_joints_vis"
             (corrected_dir / "00").mkdir(parents=True)
+            (corrected_visibility_dir / "00").mkdir(parents=True)
             corrected = np.full((2, 21, 2), 25.0, dtype=np.float32)
-            corrected[1, 4] = [-1.0, -1.0]
             np.save(corrected_dir / "00" / "00005.npy", corrected)
+            corrected_visibility = np.ones((2, 21), dtype=np.uint8)
+            corrected_visibility[1, 4] = 0
+            np.save(corrected_visibility_dir / "00" / "00005.npy", corrected_visibility)
             bundle = PredictionBundle(
                 mode="correct",
                 episode_dir=root,
                 prediction_dir=root / "pred_2d",
                 pred_dir=corrected_dir,
+                pred_visibility_dir=corrected_visibility_dir,
                 corrected_dir=corrected_dir,
+                corrected_visibility_dir=corrected_visibility_dir,
                 samples={},
             )
 
@@ -116,7 +124,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             points, visible = LabelPage._build_modified_view_state(PageStub(), 5, "00")
             self.assertEqual(points[0][0], (25.0, 25.0))
             self.assertTrue(visible[0][0])
-            self.assertEqual(points[1][4], (104.0, 204.0))
+            self.assertEqual(points[1][4], (25.0, 25.0))
             self.assertFalse(visible[1][4])
 
             visible[1][4] = True
@@ -124,7 +132,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             save_corrected_array(bundle)
             reloaded_points, reloaded_visible = view_state_from_bundle(bundle, 5, "00")
 
-        self.assertEqual(reloaded_points[1][4], (104.0, 204.0))
+        self.assertEqual(reloaded_points[1][4], (25.0, 25.0))
         self.assertTrue(reloaded_visible[1][4])
 
     def test_modified_initial_view_uses_joints_vis_in_canvas_joint_order(self) -> None:
@@ -395,7 +403,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertTrue(np.isnan(points[1][0][0]))
             self.assertTrue(np.isnan(points[1][0][1]))
 
-    def test_manual_2d_is_saved_in_canonical_smplx_mano_order(self) -> None:
+    def test_manual_2d_and_visibility_are_saved_separately_in_canonical_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bundle = PredictionBundle(
@@ -403,7 +411,9 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 episode_dir=root,
                 prediction_dir=root / "pred_2d",
                 pred_dir=root / "manual_2d",
+                pred_visibility_dir=root / "manual_joints_vis",
                 corrected_dir=root / "manual_2d",
+                corrected_visibility_dir=root / "manual_joints_vis",
                 samples={},
             )
             points = [
@@ -411,15 +421,21 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
                 for hand in range(2)
             ]
             visible = [[True] * 21 for _ in range(2)]
+            visible[0][13] = False
 
             apply_view_state_to_corrected(bundle, 5, "00", points, visible)
             save_corrected_array(bundle)
             stored = np.load(root / "manual_2d" / "00" / "00005.npy")
+            stored_visibility = np.load(root / "manual_joints_vis" / "00" / "00005.npy")
 
         canonical = np.asarray(points, dtype=np.float32)
         np.testing.assert_array_equal(stored, canonical)
         self.assertEqual(stored[0, 13, 0], 13.0)  # canonical thumb MCP
         self.assertEqual(stored[0, 1, 0], 1.0)    # canonical index MCP
+        self.assertEqual(stored_visibility.shape, (2, 21))
+        self.assertEqual(stored_visibility.dtype, np.dtype("uint8"))
+        self.assertEqual(stored_visibility[0, 13], 0)
+        self.assertEqual(stored_visibility[0, 1], 1)
 
     def test_mano_source_reloads_when_npy_changes(self) -> None:
         try:
@@ -590,6 +606,7 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             (episode_dir / "camera_01" / "RGB").mkdir(parents=True)
             (episode_dir / "camera_01" / "RGB" / "00001.png").write_bytes(b"rgb")
             payload = {
+                "job_id": "manual_label_job_1",
                 "episode_uri": "nas://ego/S001/pick_object/episode_001",
                 "subject_id": "S001",
                 "task_name": "pick_object",
@@ -599,6 +616,8 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
             self.assertEqual(task.episode_dir(), episode_dir.resolve())
             self.assertEqual(task.cameras, ["camera_01"])
             self.assertEqual(task.frames, [1])
+            self.assertEqual(task.correction_dir, "manual_2d/segments/manual_label_job_1")
+            self.assertEqual(task.correction_visibility_dir, "manual_joints_vis/segments/manual_label_job_1")
 
     def test_backend_payload_nas_episode_uri_requires_mount(self) -> None:
         payload = {
@@ -761,12 +780,24 @@ class LabelBackendClientSmokeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             episode_dir = Path(tmp) / "S001" / "pick_object" / "episode_001"
             corrected = episode_dir / "human_fixed" / "00"
+            corrected_visibility = episode_dir / "human_fixed_visibility" / "00"
             corrected.mkdir(parents=True)
+            corrected_visibility.mkdir(parents=True)
             arr = np.zeros((2, 21, 2), dtype=np.float32)
             np.save(corrected / "00001.npy", arr)
+            visibility = np.ones((2, 21), dtype=np.uint8)
+            visibility[1, 4] = 0
+            np.save(corrected_visibility / "00001.npy", visibility)
 
-            loaded = CoTrackerRuntime()._load_previous_annotation(episode_dir, "00", 1, "human_fixed")
+            loaded, loaded_visibility = CoTrackerRuntime()._load_previous_annotation(
+                episode_dir,
+                "00",
+                1,
+                "human_fixed",
+                "human_fixed_visibility",
+            )
             self.assertEqual(loaded.shape, (2, 21, 2))
+            self.assertFalse(loaded_visibility[1, 4])
 
 
 if __name__ == "__main__":

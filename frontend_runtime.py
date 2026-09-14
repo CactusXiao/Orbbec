@@ -11,7 +11,10 @@ class SingleInstance:
     def __init__(self, name: str, *, runtime_dir=None):
         if name not in {"label", "qc"}:
             raise ValueError("unknown frontend")
-        self.directory = Path(runtime_dir or Path("/tmp") / f"orbbec-frontends-{os.getuid()}")
+        # Browser workers have a private virtual display and instance namespace.
+        # Normal desktop launches retain the existing per-user lock.
+        self.directory = Path(runtime_dir or os.environ.get("ORBBEC_FRONTEND_RUNTIME_DIR")
+                              or Path("/tmp") / f"orbbec-frontends-{os.getuid()}")
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path = self.directory / f"{name}.sock"
         self.lock = (self.directory / f"{name}.lock").open("a+")

@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
 
-from .state_store import now_iso
+from .state_store import now_iso, segments_from_ranges
 
 
 Range = Tuple[int, int]
@@ -19,6 +19,7 @@ def build_qc_result(
     bad_ranges: List[Range],
     bad_episode: bool = False,
     sample_interval: int = 10,
+    segments: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     if bad_episode:
         return {
@@ -33,7 +34,7 @@ def build_qc_result(
             "segments": [],
             "mano_3d_checked": True,
         }
-    segments = [{"start_frame": int(start), "end_frame": int(end)} for start, end in bad_ranges]
+    segments = segments if segments is not None else segments_from_ranges(bad_ranges)
     passed = len(segments) == 0
     return {
         "passed": passed,
@@ -68,7 +69,7 @@ def write_qc_report(
         "score": result.get("score", 0.0),
         "reason": str(result.get("reason") or ""),
         "sample_interval": int(sample_interval),
-        "segments": [{"start_frame": int(start), "end_frame": int(end)} for start, end in bad_ranges],
+        "segments": result.get("segments", segments_from_ranges(bad_ranges)),
         "metrics": {},
         "worker_id": str(result.get("worker_id") or ""),
         "operator_id": str(result.get("operator_id") or ""),
@@ -95,6 +96,7 @@ def write_ego_pose_qc_report(
     worker_id: str,
     operator_id: str,
     bad_ranges: List[Range],
+    segments: List[Dict[str, Any]] | None = None,
 ) -> Path:
     """Record Pico extrinsic QC without feeding ranges into the MANO repair flow."""
     ego_dir = Path(episode_dir) / "ego"
@@ -104,10 +106,7 @@ def write_ego_pose_qc_report(
         "schema_version": 1,
         "kind": "orbbec_ego_pose_qc",
         "episode_id": str(episode_id),
-        "segments": [
-            {"start_frame": int(start), "end_frame": int(end)}
-            for start, end in bad_ranges
-        ],
+        "segments": segments if segments is not None else segments_from_ranges(bad_ranges),
         "worker_id": str(worker_id),
         "operator_id": str(operator_id),
         "created_at": now_iso(),

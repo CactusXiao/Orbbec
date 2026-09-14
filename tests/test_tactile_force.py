@@ -19,6 +19,7 @@ class TactileForceTest(unittest.TestCase):
             program = work / "test.cpp"
             program.write_text(r'''
 #include "tactile.hpp"
+#include "tactile_layout.hpp"
 #include <cassert>
 #include <cmath>
 #include <fstream>
@@ -27,10 +28,23 @@ using namespace sync_app;
 int main(int argc, char **argv) {
     std::filesystem::path work = argv[1], repo = argv[2];
     auto fixture = work / "calibration.csv";
-    std::ofstream(fixture) << "time,force(N),sensor#8,sensor#250\n"
-                          << "t,0,0,0\nt,-0.24,0,0\nt,10,10,30\nt,20,20,60\n";
+    std::filesystem::copy_file(repo / "tactile/5 (1).csv", fixture);
+    std::filesystem::permissions(fixture, std::filesystem::perms::owner_write, std::filesystem::perm_options::add);
+    // Export the capture-side anatomy for comparison against the viewer map.
+    std::ofstream layout(work / "layout.csv");
+    layout << "side,id,region,kind,point\n";
+    for(const std::string side : {"left", "right"})
+        for(int id=1; id<=256; ++id) {
+            auto c = gloveChannel(side, id);
+            layout << side << "," << id << "," << c.region << "," << c.kind << "," << c.point << "\n";
+        }
     TactileForceCalibration model;
     std::string error;
+    auto module = createPosixSerialTactileModule();
+    TactileModuleConfig config;
+    config.handSide = "left"; // Defaults to type 2: fail before opening hardware.
+    assert(!module->start(config, &error));
+    assert(error.find("handSide must match") != std::string::npos);
     assert(model.load({fixture}, &error));
     assert(model.forceN(0) == 0);
     assert(std::abs(model.forceN(20) - 0.5336303022434962) < 1e-12);
@@ -54,6 +68,8 @@ int main(int argc, char **argv) {
     TactileSample sample;
     sample.representativeTimestampUs = 1234567;
     sample.representativeTimestampSec = 1.234567;
+    sample.frame.side = "right";
+    sample.frame.sensorType = 2;
     sample.frame.rawAdc.assign(256, 0);
     sample.frame.rawAdc[7] = 10;
     sample.frame.rawAdc[249] = 30;
@@ -61,9 +77,7 @@ int main(int argc, char **argv) {
     assert(model.apply(sample.frame, &error));
     const double expectedForce = 0.9793085705056488;
     assert(std::abs(sample.frame.calibratedRegionForceN - expectedForce) < 1e-12);
-    assert(std::abs(sample.frame.outputValues[7] - expectedForce / 4) < 1e-12);
-    assert(std::abs(sample.frame.outputValues[249] - expectedForce * 3 / 4) < 1e-12);
-    assert(std::isnan(sample.frame.outputValues[40]));
+    assert(sample.frame.forceCalibrationStatus == "right_middle_region");
     assert(!sample.frame.forceOutOfRange);
     assert(TactileRecorder::saveSamples({sample}, work / "samples", {}, nullptr, &error));
     std::ofstream saved(work / "collection.csv");
@@ -76,17 +90,31 @@ int main(int argc, char **argv) {
     sample.frame.rawAdc[7] = 255;
     sample.frame.rawAdc[249] = 255;
     assert(model.apply(sample.frame));
-    assert(sample.frame.forceOutOfRange && sample.frame.calibratedRegionForceN == model.forceN(510));
+    assert(!sample.frame.forceOutOfRange && sample.frame.calibratedRegionForceN == model.forceN(510));
     sample.frame.rawAdc.assign(256, 0);
     assert(model.apply(sample.frame));
-    assert(sample.frame.outputValues[7] == 0 && !sample.frame.forceOutOfRange);
+    assert(sample.frame.calibratedRegionForceN == 0 && !sample.frame.forceOutOfRange);
+    // The same IDs refer to 8 middle + 4 ring points on the left. Never convert.
+    sample.frame.side = "left";
+    sample.frame.sensorType = 1;
+    for(size_t i : model.channelIndices()) sample.frame.rawAdc[i] = 50;
+    assert(model.apply(sample.frame));
+    assert(std::isnan(sample.frame.calibratedRegionForceN));
+    assert(sample.frame.forceCalibrationStatus == "uncalibrated_hand");
+    assert(sample.frame.rawAdc[7] == 50);
+    assert(TactileRecorder::saveSamples({sample}, work / "left", {}, nullptr, &error));
+    // Conflicting/unknown identity also must never receive right-hand N.
+    sample.frame.side = "right";
+    assert(model.apply(sample.frame) && std::isnan(sample.frame.calibratedRegionForceN));
+    sample.frame.sensorType = 2;
     sample.frame.rawAdc.resize(10);
     assert(!model.apply(sample.frame));
+    sample.frame.rawAdc.resize(250);
+    assert(!model.apply(sample.frame)); // Even though all calibration IDs fit.
     // CSV force values and reversals must not refit or alter the image parameters.
     std::ofstream(fixture) << "time,force(N),sensor#8\n"
                           << "t,10,10\nt,30,10\nt,10,20\nt,40,30\n";
-    assert(model.load({fixture}));
-    assert(std::abs(model.forceN(20) - 0.5336303022434962) < 1e-12);
+    assert(!model.load({fixture})); // Cannot apply this image fit to arbitrary IDs.
     for(const auto &bad : {"t,nan,10", "t,-1,10", "t,1,256", "t,1,2junk", "t,1"}) {
         std::ofstream(fixture) << "time,force(N),sensor#8\n" << bad << "\n";
         assert(!model.load({fixture}, &error));
@@ -117,16 +145,12 @@ int main(int argc, char **argv) {
     assert(model.apply(sample.frame));
     assert(!sample.frame.forceOutOfRange);
     assert(std::abs(sample.frame.calibratedRegionForceN - 246.95503452513867) < 1e-9);
-    double allocated = 0;
-    for(size_t i : model.channelIndices()) allocated += sample.frame.outputValues[i];
-    assert(std::abs(allocated - sample.frame.calibratedRegionForceN) < 1e-9);
     for(size_t i : model.channelIndices()) sample.frame.rawAdc[i] = 104;
     assert(model.apply(sample.frame));
     assert(sample.frame.forceOutOfRange && std::isfinite(sample.frame.calibratedRegionForceN));
     for(size_t i : model.channelIndices()) sample.frame.rawAdc[i] = 108;
     assert(model.apply(sample.frame));
     assert(sample.frame.forceOutOfRange && std::isnan(sample.frame.calibratedRegionForceN));
-    for(size_t i : model.channelIndices()) assert(std::isnan(sample.frame.outputValues[i]));
     std::ofstream invalid(work / "saturated.csv");
     invalid << "sample_index";
     writeTactileMeasurementCsvHeader(invalid);
@@ -146,26 +170,47 @@ int main(int argc, char **argv) {
             self.assertEqual(result.returncode, 0, result.stderr)
             with (work / "collection.csv").open() as f:
                 row = next(csv.DictReader(f))
-            self.assertEqual(len(row), 515)
-            self.assertEqual(row["force_007_n"], "0.244827")
-            self.assertEqual(row["force_249_n"], "0.734481")
+            self.assertEqual(len(row), 260)
+            self.assertNotIn("force_007_n", row)
+            self.assertEqual(row["force_calibration_status"], "right_middle_region")
             self.assertEqual(row["calibrated_region_force_n"], "0.979309")
-            self.assertEqual(row["force_040_n"], "nan")
             self.assertEqual(row["raw_adc_040"], "255")
             with (work / "samples/samples/1.234567.csv").open() as f:
                 rows = list(csv.DictReader(f))
-            self.assertEqual(rows[7]["output_value"], "0.244827")
-            self.assertEqual(rows[7]["force_unit"], "N")
+            self.assertNotIn("output_value", rows[7])
+            self.assertEqual(rows[7]["region_name"], "Middle")
+            self.assertEqual(rows[40]["channel_kind"], "bend")
+            self.assertEqual(rows[40]["region_name"], "Middle")
+            self.assertEqual(rows[7]["region_force_unit"], "N")
             self.assertEqual(rows[7]["raw_adc"], "10")
+            from task_backend.tactile_layout import FINGERS, PALM_ROWS, BEND_IDS
+            with (work / "layout.csv").open() as f:
+                layout = list(csv.DictReader(f))
+            for side in ("left", "right"):
+                expected = {}
+                for finger, ids in enumerate(FINGERS[side], 1):
+                    expected.update({i: (finger, "pressure", point) for point, i in enumerate(ids, 1)})
+                palm = [i for row in PALM_ROWS[side] for i in row]
+                expected.update({i: (6, "pressure", point) for point, i in enumerate(palm, 1)})
+                expected.update({i: (finger, "bend", 1) for finger, i in enumerate(BEND_IDS[side], 1)})
+                for row in (r for r in layout if r["side"] == side):
+                    self.assertEqual((int(row["region"]), row["kind"], int(row["point"])),
+                                     expected.get(int(row["id"]), (0, "unmapped", 0)))
+            with (work / "left/samples/1.234567.csv").open() as f:
+                left = list(csv.DictReader(f))
+            self.assertEqual(left[249]["region_name"], "Ring")
+            self.assertEqual(left[215]["channel_kind"], "bend")
+            self.assertEqual(left[7]["force_calibration_status"], "uncalibrated_hand")
+            self.assertEqual(left[7]["calibrated_region_force_n"], "nan")
             with (work / "saturated.csv").open() as f:
                 invalid = next(csv.DictReader(f))
             self.assertEqual(invalid["calibrated_region_force_n"], "nan")
-            self.assertEqual(invalid["force_007_n"], "nan")
+            self.assertNotIn("force_007_n", invalid)
             self.assertEqual(invalid["force_out_of_range"], "1")
             self.assertEqual(invalid["raw_adc_007"], "108")
             with (work / "saturated/samples/1.234567.csv").open() as f:
                 invalid_rows = list(csv.DictReader(f))
-            self.assertEqual(invalid_rows[7]["output_value"], "nan")
+            self.assertNotIn("output_value", invalid_rows[7])
             self.assertEqual(invalid_rows[7]["force_out_of_range"], "1")
 
 
