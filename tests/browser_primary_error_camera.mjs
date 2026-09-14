@@ -28,6 +28,7 @@ window.cameraTest = {
     await renderFrame();
   },
   async jump(p) { position=p; await renderFrame(); },
+  notify(text) { notice(text); },
   state() {return {camera,overview,mode:qcFlow?.mode,selected:qcFlow?.primaryCamera,result:draft.result,visited:draft.visitedSegments};}
 };`;
 const server = createServer(async (req,res) => {
@@ -53,7 +54,9 @@ try {
   await page.locator('#setEnd').click();
   await page.locator('#badRange').click();
   assert.equal((await page.evaluate(()=>cameraTest.state())).mode,'bad_range');
+  assert.match(await page.locator('#notice').textContent(), /请双击/);
   await page.locator('#nativeQcGrid canvas[aria-label="Camera 02"]').dblclick();
+  assert.equal(await page.locator('#notice').textContent(),'');
   assert.equal(await page.locator('.primaryErrorCamera').count(),1);
   assert.equal(await page.locator('.primaryErrorCamera').evaluate(e=>getComputedStyle(e).outlineColor),'rgb(229, 72, 77)');
   await page.locator('#nativeQcGrid canvas[aria-label="Camera 03"]').dblclick();
@@ -85,6 +88,20 @@ try {
   await page.waitForFunction(()=>cameraTest.state().camera==='00');
   await page.evaluate(()=>cameraTest.jump(6));
   assert.equal((await page.evaluate(()=>cameraTest.state())).camera,'00');
+  await page.evaluate(()=>cameraTest.notify('计算完成，结果尚未提交。'));
+  await page.keyboard.press('1');
+  assert.equal(await page.locator('#notice').textContent(),'');
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
+  await page.evaluate(()=>cameraTest.notify('计算完成，结果尚未提交。'));
+  await page.clock.fastForward(2000);
+  assert.equal(await page.locator('#notice').isVisible(),true);
+  await page.evaluate(()=>cameraTest.notify('新的操作提醒'));
+  await page.clock.fastForward(1000);
+  assert.equal(await page.locator('#notice').textContent(),'新的操作提醒');
+  await page.clock.fastForward(2000);
+  assert.equal(await page.locator('#notice').textContent(),'');
+  assert.equal(await page.locator('#notice').isVisible(),false);
   assert.deepEqual(errors,[]);
-  console.log('Browser UI passed: required selection, exclusive red border, metadata, first entry, manual choice, revisit, Ego focus.');
+  console.log('Browser UI passed: QC/Label camera handoff, reminder expiry, replacement timer and clearing on next action.');
 } finally {await browser.close();await new Promise(r=>server.close(r));}

@@ -77,9 +77,19 @@ async function put(store, value, key) {
     t.onerror = () => reject(t.error);
   });
 }
+let noticeTimer = null;
 function notice(text) {
+  clearTimeout(noticeTimer);
+  noticeTimer = null;
   $("notice").textContent = text;
+  if (text) noticeTimer = setTimeout(() => notice(""), 3000);
 }
+// Clear the old reminder before the next action can produce a new one.
+for (const event of ["pointerdown", "keydown", "wheel"])
+  document.addEventListener(event, () => notice(""), {
+    capture: true,
+    passive: true,
+  });
 async function api(path, body) {
   const r = await fetch(path, {
     method: body === undefined ? "GET" : "POST",
