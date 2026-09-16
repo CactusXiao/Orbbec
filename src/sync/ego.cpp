@@ -1950,11 +1950,16 @@ private:
             }
 
             hevcQueue_.push_back(std::move(sample));
-            const size_t maxLiveHevcSamples = std::max<size_t>(256, config_.maxBufferedFrames);
-            if(hevcQueue_.size() > maxLiveHevcSamples) {
+            // Reserve half of the 200 ms preview budget for decoding/display.
+            // Recording buffers must not determine live-preview latency.
+            const int64_t cutoffUs = unixUsNow() - 100000;
+            const auto firstVideo = std::find_if(hevcQueue_.begin(), hevcQueue_.end(),
+                                                [](const EgoHevcSample &s) { return !s.codecConfig; });
+            if(hevcQueue_.size() > 256
+               || (firstVideo != hevcQueue_.end() && firstVideo->receivedUnixUs < cutoffUs)) {
                 auto newestKeyFrame = hevcQueue_.end();
                 for(auto it = hevcQueue_.begin(); it != hevcQueue_.end(); ++it) {
-                    if(!it->codecConfig && it->keyFrame) {
+                    if(!it->codecConfig && it->keyFrame && it->receivedUnixUs >= cutoffUs) {
                         newestKeyFrame = it;
                     }
                 }

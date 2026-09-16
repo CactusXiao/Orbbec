@@ -21,6 +21,7 @@
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -2326,17 +2327,21 @@ private:
                      "32",
                      "-analyzeduration",
                      "0",
-                     "-fflags",
-                     "nobuffer",
                      "-flags",
                      "low_delay",
+                     "-threads",
+                     "2",
+                     "-thread_type",
+                     "slice",
                      "-f",
                      "hevc",
                      "-i",
                      "pipe:0",
                      "-an",
                      "-vf",
-                     "scale=w='min(960\\,iw)':h=-2",
+                     "scale=w='min(640\\,iw)':h=-2",
+                     "-vsync",
+                     "0",
                      "-pix_fmt",
                      "rgb24",
                      "-f",
@@ -2352,6 +2357,10 @@ private:
 
         ::close(stdinPipe[0]);
         ::close(stdoutPipe[1]);
+        const int stdinFlags = ::fcntl(stdinPipe[1], F_GETFL, 0);
+        if(stdinFlags >= 0) {
+            (void)::fcntl(stdinPipe[1], F_SETFL, stdinFlags | O_NONBLOCK);
+        }
         const int stdoutFlags = ::fcntl(stdoutPipe[0], F_GETFL, 0);
         if(stdoutFlags >= 0) {
             (void)::fcntl(stdoutPipe[0], F_SETFL, stdoutFlags | O_NONBLOCK);
@@ -2419,7 +2428,41 @@ private:
             std::lock_guard<std::mutex> lock(processMtx_);
             fd = decoderStdinFd_;
         }
-        return fd >= 0 && writeAllFd(fd, sample.payload.data(), sample.payload.size());
+        if(fd < 0) {
+            return false;
+        }
+        // A blocked decoder must not turn the preview into delayed playback.
+        // On a partial-write timeout the caller resets at a new key frame.
+        int64_t budgetUs = 100000;
+        if(!sample.codecConfig && sample.receivedUnixUs > 0) {
+            const auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            budgetUs -= std::max<int64_t>(0, nowUs - sample.receivedUnixUs);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(budgetUs);
+        size_t offset = 0;
+        while(offset < sample.payload.size() && !stopRequested_.load()) {
+            if(std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            const ssize_t n = ::write(fd, sample.payload.data() + offset, sample.payload.size() - offset);
+            if(n > 0) {
+                offset += static_cast<size_t>(n);
+            }
+            else if(n < 0 && errno == EINTR) {
+                continue;
+            }
+            else if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                pollfd ready{fd, POLLOUT, 0};
+                if(::poll(&ready, 1, 10) < 0 && errno != EINTR) {
+                    return false;
+                }
+            }
+            else {
+                return false;
+            }
+        }
+        return offset == sample.payload.size();
     }
 
     static bool nextPpmToken(const std::vector<uint8_t> &buffer, size_t &pos, std::string &token) {
@@ -2532,7 +2575,10 @@ private:
                     continue;
                 }
                 if(errno == EAGAIN || errno == EWOULDBLOCK) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(4));
+                    pollfd ready{fd, POLLIN, 0};
+                    if(::poll(&ready, 1, 20) < 0 && errno != EINTR) {
+                        break;
+                    }
                     continue;
                 }
                 break;
