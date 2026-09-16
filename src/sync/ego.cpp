@@ -1950,7 +1950,8 @@ private:
             }
 
             hevcQueue_.push_back(std::move(sample));
-            if(hevcQueue_.size() > kMaxLiveHevcSamples) {
+            const size_t maxLiveHevcSamples = std::max<size_t>(256, config_.maxBufferedFrames);
+            if(hevcQueue_.size() > maxLiveHevcSamples) {
                 auto newestKeyFrame = hevcQueue_.end();
                 for(auto it = hevcQueue_.begin(); it != hevcQueue_.end(); ++it) {
                     if(!it->codecConfig && it->keyFrame) {
@@ -2043,7 +2044,6 @@ private:
     std::vector<EgoHevcSample> latestCodecConfigSamples_;
     uint64_t nextHevcSequence_ = 0;
     bool hevcAwaitingKeyFrame_ = false;
-    static constexpr size_t kMaxLiveHevcSamples = 96;
 };
 
 int EgoRecorder::Impl::videoFrameIndexForSourceFrame(int sourceFrameIndex) const {
