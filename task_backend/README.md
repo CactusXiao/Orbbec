@@ -189,6 +189,55 @@ percentage, copied bytes/files, NAS URI, and upload errors.
 
 ## Task File Format
 
+### Create an empty instance and add tasks
+
+The setup page now offers **从零创建实例**. Enter an instance name and click
+**创建空实例并启动**; the backend creates a separate empty `tasks.json` under
+`<dataRoot>/catalogs/<id>/`. No input task file is required. When the registry
+has no task files at all, it also registers an automatically created
+`<dataRoot>/tasks.json` and a default instance. Empty `{}`, `[]`, and
+`{"tasks": []}` catalogs are supported.
+
+On the running dashboard, click **增加任务** to open `/manage/tasks/new`.
+Select a single-task JSON, check the automatically populated task name, enter
+the required episode count, select a demo video, and click **确认增加**.
+The task name must exactly match the JSON's `task_name`. Example:
+
+```json
+{
+  "task_name": "整理杯子",
+  "repeat_times": 5,
+  "task_description": {
+    "step1": "拿起杯子",
+    "step2": "将杯子放回桌面"
+  }
+}
+```
+
+The multipart `POST /api/v1/tasks` endpoint accepts `task_name`, `total`,
+`task_json`, and `demo_video`. JSON is limited to 4 MB, and the complete upload
+to 2 GB. Supported video extensions are MP4, WebM, MOV, and M4V; browser playback
+depends on the video's codec. MP4 with H.264 is recommended for playback.
+Uploads stream to temporary files instead of buffering videos in memory.
+
+The configured `ORBBEC_NAS_ROOT` must be an accessible mounted directory.
+Files are published as `<NAS>/tasks/<task_name>/task.json` and
+`<NAS>/tasks/<task_name>/demo.<extension>`. Existing task names and existing
+NAS folders are rejected without overwriting them. The current catalog is
+extended in its existing object/list format and replaced atomically; existing
+task entries and instance progress remain unchanged. Failed catalog writes
+roll back the newly published NAS folder. New tasks become available immediately
+in the dashboard, task detail, collection APIs, and reservation workflow without
+restarting. Other running instances sharing that catalog also see the addition.
+
+Descriptions are read preferentially from the single-task JSON in the NAS
+task folder (`task.json` first, then other `.json` files with matching
+`task_name`). Supported description fields include `task_description`,
+`taskdescription`, `description`, `steps`, root-level `step*` entries, and the
+existing Chinese/English description fields. Nested step names and descriptions
+are flattened in order for existing clients. Missing, empty, or unreadable NAS
+descriptions fall back to the corresponding catalog descriptions.
+
 The existing object-style `tasks.json` is supported:
 
 ```json

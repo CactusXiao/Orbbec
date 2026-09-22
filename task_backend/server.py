@@ -34,6 +34,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
+    from . import task_assets
     from .job_service import JobService
     from .nas_status_sync import NasStatusSync, NasStatusSyncConfig
     from .nas_uploader import NasUploadConfig, NasUploader
@@ -47,6 +48,7 @@ try:
     from .workflow_store import WorkflowStore
     from .viewer_service import ViewerError, ViewerSessionManager, render_viewer_page
 except ImportError:  # pragma: no cover - script execution fallback
+    import task_assets
     from job_service import JobService  # type: ignore
     from nas_status_sync import NasStatusSync, NasStatusSyncConfig  # type: ignore
     from nas_uploader import NasUploadConfig, NasUploader  # type: ignore
@@ -114,8 +116,7 @@ def load_task_file(path: Path) -> List[Task]:
             total_int = 1
         return {
             "task_name": str(obj.get("task_name", obj.get("name", name))),
-            "description_cn": str(obj.get("description_cn", obj.get("task_description_cn", ""))),
-            "description_en": str(obj.get("description_en", obj.get("task_description_en", ""))),
+            **task_assets.task_descriptions(obj),
             "total": total_int,
             "raw": obj,
         }
@@ -139,8 +140,9 @@ def load_task_file(path: Path) -> List[Task]:
             tasks.append(normalize_task(name, item))
 
     tasks = [task for task in tasks if task["task_name"]]
-    if not tasks:
-        raise ValueError(f"no tasks found in {path}")
+    empty_catalog = parsed in ({}, []) or (isinstance(parsed, dict) and parsed.get("tasks") == [])
+    if not isinstance(parsed, (dict, list)) or (not tasks and not empty_catalog):
+        raise ValueError(f"invalid task catalog in {path}")
     return tasks
 
 
@@ -355,6 +357,12 @@ class TaskInstanceRegistry:
                     default_state_file=state_file.resolve() if state_file else None,
                 )
                 changed = changed or added
+            if not registry.get("task_files"):
+                empty_path = self.data_root / "tasks.json"
+                if not empty_path.exists():
+                    task_assets.atomic_json(empty_path, {})
+                self._add_task_file_unlocked(registry, empty_path, "tasks.json", seed_default=True)
+                changed = True
             if changed:
                 registry["updated_at"] = now_iso()
 
@@ -474,6 +482,17 @@ class TaskInstanceRegistry:
                 registry["updated_at"] = now_iso()
             return json.loads(json.dumps(entry, ensure_ascii=False))
 
+    def create_empty_instance(self, label: str) -> Tuple[str, str]:
+        if not label.strip():
+            raise BackendError(HTTPStatus.BAD_REQUEST, "请输入实例名称")
+        with self.locked_registry() as registry:
+            task_path = self.data_root / "catalogs" / uuid.uuid4().hex / "tasks.json"
+            task_assets.atomic_json(task_path, {})
+            entry, _ = self._add_task_file_unlocked(registry, task_path, label, seed_default=False)
+            instance = self._add_instance_unlocked(entry, label)
+            registry["updated_at"] = now_iso()
+            return entry["id"], instance["id"]
+
     def add_instance(self, task_file_id: str, label: str) -> Dict[str, Any]:
         label = label.strip()
         if not label:
@@ -518,10 +537,12 @@ class BackendRuntime:
         workflow_service: JobService,
         publisher_bridge: Optional[PublisherBridge] = None,
         viewer_manager: Optional[ViewerSessionManager] = None,
+        nas_root: Optional[Path] = None,
     ):
         self.registry = registry
         self.accounts = AccountStore(registry.data_root)
         self.workflow_service = workflow_service
+        self.nas_root = nas_root or next((Path(root) for root in workflow_service.nas_mounts.values()), None)
         self.publisher_bridge = publisher_bridge
         self.viewer_manager = viewer_manager or ViewerSessionManager()
         self.lock = threading.RLock()
@@ -555,6 +576,7 @@ class BackendRuntime:
                 state_file=resolved["state_file"],
                 runtime_info=info,
                 workflow_service=self.workflow_service,
+                nas_root=self.nas_root,
             )
             self.active_selection = info
             return dict(info)
@@ -1114,19 +1136,45 @@ class AccountStore:
 class TaskBackend:
     def __init__(self,
                  data_root: Path,
-                 task_file: Path,
+                 task_file: Optional[Path] = None,
                  state_file: Optional[Path] = None,
                  runtime_info: Optional[Dict[str, Any]] = None,
-                 workflow_service: Optional[JobService] = None):
+                 workflow_service: Optional[JobService] = None,
+                 nas_root: Optional[Path] = None):
         self.data_root = data_root
-        self.task_file = task_file
+        self.task_file = task_file or (data_root / "tasks.json")
+        self.task_file.parent.mkdir(parents=True, exist_ok=True)
+        with task_assets.catalog_lock(self.task_file):
+            if not self.task_file.exists():
+                task_assets.atomic_json(self.task_file, {})
+        self.nas_root = nas_root or next((Path(root) for root in (workflow_service.nas_mounts if workflow_service else {}).values()), None)
         self.state_file = state_file or (data_root / "progress_state.json")
         self.lock_file = self.state_file.with_suffix(self.state_file.suffix + ".lock")
-        self.tasks = load_task_file(task_file)
-        self.tasks_by_name = {task["task_name"]: task for task in self.tasks}
+        load_task_file(self.task_file)
         self.runtime_info = runtime_info or {}
         self.workflow_service = workflow_service
         self.data_root.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def tasks(self) -> List[Task]:
+        # Atomic catalog replacement makes additions visible to all live instances.
+        return [task_assets.enrich_task(task, self.nas_root) for task in load_task_file(self.task_file)]
+
+    @property
+    def tasks_by_name(self) -> Dict[str, Task]:
+        return {task["task_name"]: task for task in self.tasks}
+
+    def add_task(self, fields: Dict[str, Any]) -> str:
+        try:
+            return task_assets.add_task(
+                self.task_file, self.nas_root, fields["task_name"], fields["task_json"][0],
+                fields["demo_video"][0], fields["demo_video"][1] or "", fields["total"],
+                load_task_file, strip_json_comments,
+            )
+        except FileExistsError as exc:
+            raise BackendError(HTTPStatus.CONFLICT, str(exc)) from exc
+        except (ValueError, UnicodeError) as exc:
+            raise BackendError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
 
     def _workflow_hook(self, method_name: str, payload: Dict[str, Any], *, required: bool = False) -> None:
         if self.workflow_service is None:
@@ -1274,6 +1322,13 @@ class TaskBackend:
             item["workflow_summary"] = self._workflow_summary(str(item.get("reservation_id") or ""))
         subjects = sorted({str(item.get("subject_id", "")) for item in reservations if item.get("subject_id")})
         confirmed = [item for item in reservations if item.get("status") == "confirmed"]
+        if self.nas_root is not None:
+            try:
+                directory = task_assets.task_directory(self.nas_root, task_name)
+                task["demo_url"] = next(("/task-assets/" + url_part(task_name) + "/demo" + ext
+                                         for ext in task_assets.VIDEO_TYPES if (directory / ("demo" + ext)).is_file()), "")
+            except ValueError:
+                pass
         return {
             "task": task,
             "reservations": reservations,
@@ -1798,6 +1853,11 @@ def render_setup_page(registry: Registry, data_root: Path, message: str = "", er
         "</div><div class=\"actions\">"
         f"<button type=\"submit\"{start_disabled}>Create And Start</button>"
         "</div></form></section>"
+        '<section><h2>从零创建实例</h2><form method="post" action="/setup/empty">'
+        '<div class="form-grid"><label for="empty_instance">实例名称</label>'
+        '<input id="empty_instance" name="instance_label" type="text" required placeholder="新实例"></div>'
+        '<div class="actions"><button type="submit">创建空实例并启动</button></div>'
+        '<p class="empty">自动创建空 tasks.json，启动后点击“增加任务”。</p></form></section>'
         "<section><h2>Add Task File</h2>"
         "<form method=\"post\" action=\"/setup/task-files\">"
         "<div class=\"form-grid\">"
@@ -1844,6 +1904,7 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         f"<div class=\"crumbs\">Task backend / Overview / {html_escape(instance_label)}</div>"
         "<div class=\"notice warn\">This backend process is locked to the selected task file and instance. "
         "Restart the process to choose another instance.</div>"
+        + '<div class="actions top-actions"><a class="button" href="/manage/tasks/new">增加任务</a></div>'
         + render_workflow_stage_shortcuts()
         + "<div class=\"summary\">"
         + render_metric("Tasks", len(model["tasks"]), "from task file")
@@ -1920,7 +1981,8 @@ def render_task_detail(model: Dict[str, Any]) -> str:
         + "</div>"
         "<section><h2>Task Description</h2>"
         f"<div class=\"empty desc\">{html_escape(description or 'No description.')}</div></section>"
-        "<section><h2>Task Metadata</h2><div class=\"kv\">"
+        + (f'<section><h2>演示视频</h2><video controls preload="metadata" style="width:100%;max-height:540px" src="{html_escape(task["demo_url"])}"></video></section>' if task.get("demo_url") else "")
+        + "<section><h2>Task Metadata</h2><div class=\"kv\">"
         + "".join(meta_rows)
         + f"<div>Subjects</div><div>{html_escape(', '.join(model['subjects']) if model['subjects'] else '-')}</div>"
         + f"<div>Latest update</div><div class=\"mono\">{html_escape(model.get('latest_at') or '-')}</div>"
@@ -2656,6 +2718,23 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            if parsed.path == "/manage/tasks/new":
+                self.backend
+                self._html_response(HTTPStatus.OK, render_layout("增加任务", (Path(__file__).parent / "web" / "new_task.html").read_text(encoding="utf-8")))
+                return
+            if parsed.path.startswith("/task-assets/"):
+                parts = parsed.path[len("/task-assets/"):].split("/")
+                if len(parts) != 2 or self.backend.nas_root is None:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
+                name, filename = map(unquote, parts)
+                if name not in self.backend.tasks_by_name or filename not in {"task.json", *("demo" + ext for ext in task_assets.VIDEO_TYPES)}:
+                    raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
+                directory = task_assets.task_directory(self.backend.nas_root, name)
+                asset = directory / filename
+                if asset.resolve().parent != directory.resolve():
+                    raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
+                self._file_response(asset, "application/json" if filename == "task.json" else task_assets.VIDEO_TYPES[asset.suffix])
+                return
             viewer_session_prefix = "/api/v1/viewer/sessions/"
             if parsed.path.startswith(viewer_session_prefix):
                 rest = parsed.path[len(viewer_session_prefix):].strip("/")
@@ -2814,6 +2893,18 @@ class RequestHandler(BaseHTTPRequestHandler):
             parsed.path.startswith("/workflow/") or parsed.path.startswith("/tasks/")
         )
         try:
+            if parsed.path == "/api/v1/tasks":
+                backend = self.backend
+                with tempfile.TemporaryDirectory(prefix="orbbec-task-upload-") as temporary:
+                    try:
+                        fields = task_assets.read_multipart(self.rfile, self.headers.get("Content-Type", ""),
+                                                           int(self.headers.get("Content-Length", "0")), Path(temporary))
+                    except (ValueError, UnicodeError) as exc:
+                        raise BackendError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                    name = backend.add_task(fields)
+                self._json_response(HTTPStatus.CREATED, {"task_name": name, "url": "/tasks/" + url_part(name)})
+                return
+
             viewer_episode_prefix = "/api/v1/viewer/episodes/"
             if parsed.path.startswith(viewer_episode_prefix) and parsed.path.endswith("/sessions"):
                 raw_id = parsed.path[len(viewer_episode_prefix):-len("/sessions")]
@@ -2934,6 +3025,17 @@ class RequestHandler(BaseHTTPRequestHandler):
                         "task backend is already started; restart the process to choose another instance",
                     )
                 form = self._read_form()
+                if parsed.path == "/setup/empty":
+                    label = form.get("instance_label", "").strip()
+                    if not label:
+                        raise BackendError(HTTPStatus.BAD_REQUEST, "请输入实例名称")
+                    with self.runtime.lock:
+                        if self.runtime.is_started():
+                            raise BackendError(HTTPStatus.CONFLICT, "实例已经启动")
+                        file_id, instance_id = self.runtime.registry.create_empty_instance(label)
+                        self.runtime.start(file_id, instance_id)
+                    self._redirect("/")
+                    return
                 if parsed.path == "/setup/task-files":
                     task_path = path_from_user(form.get("task_path", ""))
                     label = form.get("task_label", "")
@@ -3267,7 +3369,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         mesh_python=str(mano_python or "python3"),
         mesh_prebuffer_frames=env_int(env, 30, "ORBBEC_VIEWER_MESH_PREBUFFER_FRAMES"),
     )
-    runtime = BackendRuntime(registry, workflow_service, publisher_bridge, viewer_manager)
+    runtime = BackendRuntime(registry, workflow_service, publisher_bridge, viewer_manager, nas_root=nas_root)
     host_info = socket.getfqdn(host) if host not in ("", "0.0.0.0", "::") else host
     if args.env_file.exists():
         print(f"[task-backend] env_file={args.env_file}", file=sys.stderr)
