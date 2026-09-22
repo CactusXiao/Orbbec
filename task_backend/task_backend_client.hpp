@@ -67,6 +67,11 @@ public:
                   std::vector<TaskBackendTask> &tasksOut,
                   std::string *errorMessage = nullptr) const;
 
+    bool getAssignedTask(const std::string &subjectId,
+                         const std::string &operatorId,
+                         std::vector<TaskBackendTask> &tasksOut,
+                         std::string *errorMessage = nullptr) const;
+
     bool reserveEpisode(const std::string &clientId,
                         const std::string &subjectId,
                         const std::string &taskName,

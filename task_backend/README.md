@@ -243,6 +243,55 @@ account passwords and hashes are never included in statistics responses.
 
 ## Task File Format
 
+### Automatic collection assignment and operator page
+
+Collection tasks are assigned by the backend as whole tasks. An operator keeps
+the same task until every required episode is confirmed; released/discarded
+episodes, logout, reconnects, and restarts do not transfer ownership. Existing
+unfinished reservations are respected. After completion the backend picks the
+first unclaimed task in catalog order. No available task means waiting; adding
+a task makes it available without restarting the instance.
+
+The collection client no longer has a task-selection page. After capture
+configuration it opens the assigned task directly. Start/Stop/Confirm still
+control recording and the existing camera/extrinsic readiness checks still
+apply. Assignment refreshes run asynchronously while idle. The backend rejects
+requests to reserve another task, and pending reservations count toward the
+task limit so background uploads cannot cause over-capture. With capture-side
+NAS uploading, a task advances only after its required episodes are confirmed
+by the backend, not merely saved locally.
+
+On another device in the same LAN, open
+`http://<backend-LAN-IP>:8765/operator` and sign in with the same operator account
+used by the collection client. This page shows only the current task, its
+description, demo video, and completed/required episodes. It checks for updates
+every three seconds, switches after the task completes, and preserves video
+playback position when the assignment is unchanged. Missing videos have a
+visible fallback. Video requests support byte ranges for seeking.
+
+For LAN access, bind the backend to `0.0.0.0` with `--host 0.0.0.0` or
+`ORBBEC_TASK_BACKEND_HOST=0.0.0.0`. Existing NAS and instance settings are still
+required. Web login uses the existing account store and a 12-hour HttpOnly
+session cookie; restarting the backend requires signing in again. Assignment
+ownership remains in the selected instance's progress file under
+`task_assignments` and `operator_tasks`. Separate instances retain separate
+progress/assignment state.
+
+The desktop collection integration uses:
+
+```text
+POST /api/v1/collection/assignment {"subject_id":"alice","operator_id":"alice"}
+  -> {"task": {...} or null, "tasks": [current task] or []}
+POST /api/v1/episodes/confirm
+  -> existing tasks/progress plus assigned_tasks: [current task] or []
+```
+
+The operator page uses `/api/v1/operator/login`, `/api/v1/operator/task`, and
+`/api/v1/operator/logout`. The current username is taken from the session, not a
+query parameter. Existing management task lists remain available. Deploy the
+updated backend and rebuild the collection executable together; older clients
+cannot choose arbitrary tasks against the new assignment rules.
+
 ### Create an empty instance and add tasks
 
 The setup page now offers **从零创建实例**. Enter an instance name and click

@@ -161,6 +161,19 @@ class TaskCreationTest(unittest.TestCase):
             self.assertIn("<video", detail)
         with urlopen(base + location.replace("/tasks/", "/task-assets/") + "/demo.mp4") as response:
             self.assertEqual(response.read(), fields["demo_video"][0].read_bytes())
+        video_url = base + location.replace("/tasks/", "/task-assets/") + "/demo.mp4"
+        video_bytes = fields["demo_video"][0].read_bytes()
+        for header, expected in (("bytes=10-19", video_bytes[10:20]),
+                                 ("bytes=-7", video_bytes[-7:]),
+                                 (f"bytes={len(video_bytes)-5}-", video_bytes[-5:])):
+            with urlopen(Request(video_url, headers={"Range": header})) as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+                self.assertEqual(int(response.headers["Content-Length"]), len(expected))
+                self.assertEqual(response.read(), expected)
+        with self.assertRaises(HTTPError) as invalid_range:
+            urlopen(Request(video_url, headers={"Range": "bytes=999999999-"}))
+        self.assertEqual(invalid_range.exception.code, 416)
         with self.assertRaises(HTTPError) as duplicate:
             urlopen(request)
         self.assertEqual(duplicate.exception.code, 409)

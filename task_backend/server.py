@@ -26,6 +26,7 @@ import tempfile
 import threading
 import time
 import uuid
+from http.cookies import SimpleCookie
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -550,6 +551,24 @@ class BackendRuntime:
         self.lock = threading.RLock()
         self.backend: Optional[TaskBackend] = None
         self.active_selection: Optional[Dict[str, Any]] = None
+        self.operator_sessions: Dict[str, Tuple[str, float]] = {}
+
+    def operator_login(self, payload: Dict[str, Any]) -> Tuple[str, str]:
+        account = self.accounts.login(payload)
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            now = time.time()
+            self.operator_sessions = {key: value for key, value in self.operator_sessions.items() if value[1] > now}
+            self.operator_sessions[token] = (account["username"], now + 12 * 3600)
+        return account["username"], token
+
+    def operator_username(self, token: str) -> str:
+        with self.lock:
+            username, expires = self.operator_sessions.get(token, ("", 0))
+            if expires <= time.time():
+                self.operator_sessions.pop(token, None)
+                raise BackendError(HTTPStatus.UNAUTHORIZED, "请先登录操作员账号")
+            return username
 
     def is_started(self) -> bool:
         with self.lock:
@@ -621,6 +640,9 @@ def confirmed_reservations(subject: Dict[str, Any], task_name: str) -> List[Dict
 
 
 def task_claim_owner(state: State, task_name: str) -> str:
+    assignment = state.get("task_assignments", {}).get(task_name)
+    if assignment:
+        return str(assignment["subject_id"])
     subjects = state.get("subjects", {})
     if not isinstance(subjects, dict):
         return ""
@@ -636,6 +658,17 @@ def task_claim_owner(state: State, task_name: str) -> str:
                 continue
             if item.get("task_name") == task_name and item.get("status") != "released":
                 return str(item.get("subject_id", subject_id))
+    return ""
+
+
+def task_claim_operator(state: State, task_name: str) -> str:
+    assignment = state.get("task_assignments", {}).get(task_name)
+    if assignment:
+        return str(assignment["operator_id"])
+    owner = task_claim_owner(state, task_name)
+    for item in state.get("subjects", {}).get(owner, {}).get("reservations", {}).values():
+        if item.get("task_name") == task_name and item.get("status") != "released":
+            return str(item.get("operator_id") or owner)
     return ""
 
 
@@ -1434,6 +1467,66 @@ class TaskBackend:
             subject = ensure_subject(state, subject_id)
             return progress_payload(subject_id, subject, self.tasks, state)
 
+    def _assigned_task_unlocked(self, state: State, subject_id: str, operator_id: str) -> Optional[Task]:
+        """Assign an entire task under the progress-file lock, never individual episodes."""
+        subject = ensure_subject(state, subject_id)
+        tasks = self.tasks
+        assignments = state.setdefault("task_assignments", {})
+        current = state.setdefault("operator_tasks", {}).get(operator_id)
+        available = []
+        owned = []
+        for task in tasks:
+            name = task["task_name"]
+            owner = task_claim_owner(state, name)
+            operator = task_claim_operator(state, name)
+            if owner:
+                # Preserve pre-allocation reservations and their historical ownership.
+                assignments.setdefault(name, {"subject_id": owner, "operator_id": operator, "assigned_at": now_iso()})
+                if owner == subject_id and operator == operator_id and len(confirmed_reservations(subject, name)) < task["total"]:
+                    owned.append(task)
+            else:
+                available.append(task)
+        selected = next((task for task in owned if task["task_name"] == current), None)
+        selected = selected or next(iter(owned), None) or next(iter(available), None)
+        if selected:
+            name = selected["task_name"]
+            assignments.setdefault(name, {"subject_id": subject_id, "operator_id": operator_id, "assigned_at": now_iso()})
+            state["operator_tasks"][operator_id] = name
+        else:
+            state["operator_tasks"].pop(operator_id, None)
+        return selected
+
+    def _assignment_payload(self, state: State, subject_id: str, operator_id: str) -> Dict[str, Any]:
+        task = self._assigned_task_unlocked(state, subject_id, operator_id)
+        item = task_progress(subject_id, ensure_subject(state, subject_id), task, state) if task else None
+        if item:
+            item["operator_id"] = operator_id
+            item["demo_url"] = None
+            if self.nas_root:
+                try:
+                    directory = task_assets.task_directory(self.nas_root, item["task_name"])
+                    for extension in sorted(task_assets.VIDEO_TYPES):
+                        if (directory / ("demo" + extension)).is_file():
+                            item["demo_url"] = "/task-assets/" + url_part(item["task_name"]) + "/demo" + extension
+                            break
+                except (OSError, ValueError):
+                    pass
+        return {"username": operator_id, "task": item, "tasks": [item] if item else []}
+
+    def assigned_task(self, subject_id: str, operator_id: str = "") -> Dict[str, Any]:
+        subject_id = str(subject_id or "").strip()
+        operator_id = str(operator_id or subject_id).strip()
+        if not subject_id or not operator_id:
+            raise BackendError(HTTPStatus.BAD_REQUEST, "subject_id is required")
+        with self.locked_state() as state:
+            return self._assignment_payload(state, subject_id, operator_id)
+
+    def _confirmation_payload(self, state: State, subject_id: str, operator_id: str) -> Dict[str, Any]:
+        assignment = self._assignment_payload(state, subject_id, operator_id)
+        result = progress_payload(subject_id, ensure_subject(state, subject_id), self.tasks, state)
+        result["assigned_tasks"] = assignment["tasks"]
+        return result
+
     def reserve(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         client_id = str(payload.get("client_id", "")).strip()
         subject_id = str(payload.get("subject_id", "")).strip()
@@ -1447,12 +1540,20 @@ class TaskBackend:
 
         with self.locked_state() as state:
             subject = ensure_subject(state, subject_id)
+            assigned = self._assigned_task_unlocked(state, subject_id, operator_id)
+            if assigned is None or assigned["task_name"] != task_name:
+                raise BackendError(HTTPStatus.CONFLICT, "只能采集后端分配的当前任务，请刷新任务分配")
             owner = task_claim_owner(state, task_name)
             if owner and owner != subject_id:
                 raise BackendError(HTTPStatus.CONFLICT, f"task already claimed by subject: {owner}")
             completed = len(confirmed_reservations(subject, task_name))
             if completed >= int(task["total"]):
                 raise BackendError(HTTPStatus.CONFLICT, f"task already complete: {task_name}")
+
+            pending = sum(item.get("task_name") == task_name and item.get("status") == "reserved"
+                          for item in subject.get("reservations", {}).values())
+            if completed + pending >= int(task["total"]):
+                raise BackendError(HTTPStatus.CONFLICT, "该任务的采集次数已全部预约，请等待确认或释放未完成的预约")
 
             reservation_id = str(uuid.uuid4())
             episode_number = next_episode_number(subject, task_name)
@@ -1498,6 +1599,9 @@ class TaskBackend:
 
         with self.locked_state() as state:
             subject = ensure_subject(state, subject_id)
+            owner = task_claim_operator(state, task_name)
+            if owner and owner != operator_id:
+                raise BackendError(HTTPStatus.CONFLICT, "该任务已分配给其他操作员")
             existing_reservation_id = subject["idempotency"].get(idempotency_key)
             if existing_reservation_id:
                 if existing_reservation_id != reservation_id:
@@ -1514,7 +1618,7 @@ class TaskBackend:
                     if episode_uri:
                         reservation["episode_uri"] = episode_uri
                     self._workflow_hook("record_collection_confirm", reservation)
-                return progress_payload(subject_id, subject, self.tasks, state)
+                return self._confirmation_payload(state, subject_id, operator_id)
 
             reservation = subject["reservations"].get(reservation_id)
             if reservation is None:
@@ -1542,7 +1646,7 @@ class TaskBackend:
                     if episode_uri:
                         reservation["episode_uri"] = episode_uri
                     self._workflow_hook("record_collection_confirm", reservation)
-                return progress_payload(subject_id, subject, self.tasks, state)
+                return self._confirmation_payload(state, subject_id, operator_id)
 
             reservation["status"] = "confirmed"
             reservation["confirmed_at"] = now_iso()
@@ -1564,7 +1668,7 @@ class TaskBackend:
                 reservation["fps"] = fps
             subject["idempotency"][idempotency_key] = reservation_id
             self._workflow_hook("record_collection_confirm", reservation)
-            return progress_payload(subject_id, subject, self.tasks, state)
+            return self._confirmation_payload(state, subject_id, operator_id)
 
     def release(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         reservation_id = str(payload.get("reservation_id", "")).strip()
@@ -1581,6 +1685,13 @@ class TaskBackend:
                 return {"released": False, "reason": "not_found", **progress_payload(subject_id, subject, self.tasks, state)}
             if task_name and reservation.get("task_name") != task_name:
                 raise BackendError(HTTPStatus.CONFLICT, "reservation does not match task")
+            name = reservation["task_name"]
+            owner_operator = task_claim_operator(state, name)
+            if owner_operator and owner_operator != operator_id:
+                raise BackendError(HTTPStatus.CONFLICT, "该任务已分配给其他操作员")
+            state.setdefault("task_assignments", {}).setdefault(name, {
+                "subject_id": subject_id, "operator_id": owner_operator or operator_id, "assigned_at": now_iso(),
+            })
             if reservation.get("status") == "reserved":
                 released_reservation = {
                     **reservation,
@@ -1752,7 +1863,7 @@ def render_layout(title: str, body: str) -> str:
   </style>
 </head>
 <body>
-  <header><h1>{html_escape(title)}</h1><nav><a href="/">任务总览</a> · <a href="/people">人员统计</a></nav></header>
+  <header><h1>{html_escape(title)}</h1><nav><a href="/">任务总览</a> · <a href="/people">人员统计</a> · <a href="/operator">我的采集任务</a></nav></header>
   <main>{body}</main>
 </body>
 </html>"""
@@ -2642,14 +2753,25 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (now_iso(), fmt % args))
 
-    def _json_response(self, status: HTTPStatus, payload: Dict[str, Any]) -> None:
+    def _json_response(self, status: HTTPStatus, payload: Dict[str, Any], cookie: str = "") -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+
+    def _operator_token(self) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            return cookie["orbbec_operator"].value if "orbbec_operator" in cookie else ""
+        except Exception:
+            return ""
 
     def _html_response(self, status: HTTPStatus, html_body: str) -> None:
         body = html_body.encode("utf-8")
@@ -2665,14 +2787,49 @@ class RequestHandler(BaseHTTPRequestHandler):
             size = path.stat().st_size
         except OSError as exc:
             raise BackendError(HTTPStatus.NOT_FOUND, f"viewer media not found: {exc}") from exc
-        self.send_response(int(HTTPStatus.OK))
+        start, end = 0, size - 1
+        range_header = self.headers.get("Range")
+        if range_header:
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+            try:
+                if not match or not any(match.groups()) or size == 0:
+                    raise ValueError("invalid range")
+                first, last = match.groups()
+                if first:
+                    start = int(first)
+                    end = min(int(last), size - 1) if last else size - 1
+                else:
+                    suffix = int(last)
+                    if suffix <= 0:
+                        raise ValueError("invalid suffix")
+                    start = max(0, size - suffix)
+                if start >= size or end < start:
+                    raise ValueError("range outside file")
+            except ValueError:
+                self.send_response(int(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE))
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        length = max(0, end - start + 1)
+        self.send_response(int(HTTPStatus.PARTIAL_CONTENT if range_header else HTTPStatus.OK))
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if range_header:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Cache-Control", "private, max-age=3600, immutable")
         self.send_header("Connection", "close")
         self.end_headers()
         with path.open("rb") as handle:
-            shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+            handle.seek(start)
+            remaining = length
+            while remaining:
+                block = handle.read(min(remaining, 1024 * 1024))
+                if not block:
+                    break
+                self.wfile.write(block)
+                remaining -= len(block)
 
     def _viewer_episode_dir(self, episode_id: str) -> Path:
         model = (self.backend.episode_detail_model(episode_id) if self.runtime.is_started()
@@ -2752,6 +2909,16 @@ class RequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         is_api = parsed.path.startswith("/api/")
         try:
+            if parsed.path in {"/operator", "/operator/"}:
+                self._html_response(HTTPStatus.OK, (Path(__file__).parent / "web" / "operator.html").read_text(encoding="utf-8"))
+                return
+            if parsed.path == "/api/v1/operator/task":
+                username = self.runtime.operator_username(self._operator_token())
+                if not self.runtime.is_started():
+                    self._json_response(HTTPStatus.OK, {"username": username, "task": None, "tasks": [], "waiting_for_setup": True})
+                    return
+                self._json_response(HTTPStatus.OK, self.backend.assigned_task(username))
+                return
             if parsed.path == "/manage/tasks/new":
                 self.backend
                 self._html_response(HTTPStatus.OK, render_layout("增加任务", (Path(__file__).parent / "web" / "new_task.html").read_text(encoding="utf-8")))
@@ -2949,6 +3116,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             parsed.path.startswith("/workflow/") or parsed.path.startswith("/tasks/")
         )
         try:
+            if parsed.path == "/api/v1/operator/login":
+                username, token = self.runtime.operator_login(self._read_json())
+                self._json_response(HTTPStatus.OK, {"username": username},
+                                    f"orbbec_operator={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=43200")
+                return
+            if parsed.path == "/api/v1/operator/logout":
+                with self.runtime.lock:
+                    self.runtime.operator_sessions.pop(self._operator_token(), None)
+                self._json_response(HTTPStatus.OK, {"ok": True},
+                                    "orbbec_operator=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+                return
+            if parsed.path == "/api/v1/collection/assignment":
+                body = self._read_json()
+                self._json_response(HTTPStatus.OK, self.backend.assigned_task(body.get("subject_id"), body.get("operator_id", "")))
+                return
             if parsed.path == "/api/v1/tasks":
                 backend = self.backend
                 with tempfile.TemporaryDirectory(prefix="orbbec-task-upload-") as temporary:

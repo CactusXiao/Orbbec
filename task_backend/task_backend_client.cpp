@@ -340,13 +340,14 @@ static std::string printJson(cJSON *root) {
 
 static bool parseTasksPayload(const std::string &body,
                               std::vector<TaskBackendTask> &tasksOut,
-                              std::string *errorMessage) {
+                              std::string *errorMessage,
+                              const char *field = "tasks") {
     cJSON *root = cJSON_Parse(body.c_str());
     if(!root) {
         setError(errorMessage, "Task backend returned invalid JSON");
         return false;
     }
-    auto *tasks = cJSON_GetObjectItemCaseSensitive(root, "tasks");
+    auto *tasks = cJSON_GetObjectItemCaseSensitive(root, field);
     if(!tasks || !cJSON_IsArray(tasks)) {
         cJSON_Delete(root);
         setError(errorMessage, "Task backend response missing tasks array");
@@ -497,6 +498,23 @@ bool TaskBackendClient::getTasks(const std::string &subjectId,
     return parseTasksPayload(response.body, tasksOut, errorMessage);
 }
 
+bool TaskBackendClient::getAssignedTask(const std::string &subjectId,
+                                        const std::string &operatorId,
+                                        std::vector<TaskBackendTask> &tasksOut,
+                                        std::string *errorMessage) const {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "subject_id", subjectId.c_str());
+    cJSON_AddStringToObject(root, "operator_id", operatorId.c_str());
+    const std::string body = printJson(root);
+    cJSON_Delete(root);
+    HttpResponse response;
+    if(!httpRequest(baseUrl_, timeoutMs_, "POST", "/api/v1/collection/assignment", body, response, errorMessage)
+       || !ensureSuccess(response, errorMessage)) {
+        return false;
+    }
+    return parseTasksPayload(response.body, tasksOut, errorMessage);
+}
+
 bool TaskBackendClient::reserveEpisode(const std::string &clientId,
                                        const std::string &subjectId,
                                        const std::string &taskName,
@@ -581,7 +599,7 @@ bool TaskBackendClient::confirmEpisode(const std::string &reservationId,
     if(!ensureSuccess(response, errorMessage)) {
         return false;
     }
-    return parseTasksPayload(response.body, tasksOut, errorMessage);
+    return parseTasksPayload(response.body, tasksOut, errorMessage, "assigned_tasks");
 }
 
 bool TaskBackendClient::releaseEpisode(const std::string &reservationId,
