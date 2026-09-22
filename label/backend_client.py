@@ -149,6 +149,10 @@ class LabelBackendClient:
             payload["artifacts"] = artifacts
         return self._post(f"/api/v1/label/episodes/{job_id}/complete", payload)
 
+    def record_label_frames(self, episode_id: str, operator_id: str, frames: List[int], decision: str) -> Dict[str, Any]:
+        return self._post(f"/api/v1/label/episodes/{episode_id}/frames",
+                          {"operator_id": operator_id, "frames": frames, "decision": decision})
+
     def release_label_job(self, job_id: str, *, reason: str = "") -> Dict[str, Any]:
         return self._post(f"/api/v1/label/episodes/{job_id}/release", {"reason": reason})
 

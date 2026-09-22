@@ -16,6 +16,42 @@ from task_backend.workflow_models import WorkflowError
 
 
 class BrowserBatchTest(unittest.TestCase):
+    def test_no_error_frames_persist_with_account_and_idempotent_receipt(self):
+        from task_backend.personnel import snapshot
+        item, _ = self.create('label')
+        self.batch.record_frames(item['id'], {'frames':[1], 'decision':'no_error'})
+        self.batch.heartbeat(item['id'])  # Frame progress must not invalidate the source revision.
+        body = self.body(item)
+        body['result']['no_error_frames'] = [1]
+        receipt = self.batch.submit(item['id'], body)
+        self.assertEqual(receipt, self.batch.submit(item['id'], body))
+        decisions = self.desktop.store.label_frame_decisions(item['job_id'])
+        self.assertEqual([(d['frame'], d['decision']) for d in decisions],
+                         [(0,'corrected'),(1,'no_error'),(2,'corrected')])
+        self.assertTrue(all(d['operator_id']=='alice' for d in decisions))
+        accounts = snapshot(self.desktop.store)['accounts']
+        self.assertTrue(any(a['username']=='alice' for a in accounts))
+        self.assertFalse(any(a['username'].startswith('browser:') for a in accounts))
+
+    def test_no_error_frames_reject_out_of_scope_without_writing(self):
+        item, episode = self.create('label')
+        for frames in ([3], [True], ['1']):
+            body = self.body(item)
+            body['result']['no_error_frames'] = frames
+            with self.assertRaises(WorkflowError):
+                self.batch.submit(item['id'], body)
+        self.assertFalse((episode/'manual_2d').exists())
+        self.assertEqual(self.desktop.store.label_frame_decisions(item['job_id']), [])
+
+    def test_frame_decision_rejects_wrong_role_and_expired_session(self):
+        qc, _ = self.create('qc')
+        with self.assertRaises(WorkflowError):
+            self.batch.record_frames(qc['id'], {'frames':[1], 'decision':'no_error'})
+        label, _ = self.create('label')
+        self.batch.release(label['id'])
+        with self.assertRaises(WorkflowError):
+            self.batch.record_frames(label['id'], {'frames':[1], 'decision':'no_error'})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

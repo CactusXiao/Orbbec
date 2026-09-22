@@ -77,6 +77,7 @@ class CorrectionProgress:
     done_positions: Set[int] = field(default_factory=set)
     total_frames: int = 0
     visited_segments: Set[str] = field(default_factory=set)
+    no_error_positions: Set[int] = field(default_factory=set)
 
     def enter_segment(self, task: CorrectionTask, frame: int) -> Optional[str]:
         camera = None
@@ -336,6 +337,7 @@ def load_correction_progress(jsonl_path: str, tasks: List[CorrectionTask]) -> Di
     p = progress_csv_path(jsonl_path)
     existing: Dict[str, Set[int]] = {}
     visited: Dict[str, Set[str]] = {}
+    no_error: Dict[str, Set[int]] = {}
     if p.exists() and p.is_file():
         try:
             with p.open("r", newline="", encoding="utf-8") as f:
@@ -348,6 +350,7 @@ def load_correction_progress(jsonl_path: str, tasks: List[CorrectionTask]) -> Di
                         continue
                     existing[key] = _parse_done_positions(row[1] if len(row) > 1 else "")
                     visited[key] = set(json.loads(row[3])) if len(row) > 3 and row[3] else set()
+                    no_error[key] = _parse_done_positions(row[4] if len(row) > 4 else "")
         except Exception:
             existing = {}
 
@@ -355,7 +358,8 @@ def load_correction_progress(jsonl_path: str, tasks: List[CorrectionTask]) -> Di
     for task in tasks:
         done = {pos for pos in existing.get(task.key, set()) if 0 <= pos < task.total_frames}
         out[task.key] = CorrectionProgress(task_key=task.key, done_positions=done, total_frames=task.total_frames,
-                                         visited_segments=visited.get(task.key, set()))
+                                         visited_segments=visited.get(task.key, set()),
+                                         no_error_positions=no_error.get(task.key, set()) & done)
     return out
 
 
@@ -394,10 +398,10 @@ def save_correction_progress(jsonl_path: str, records: Dict[str, CorrectionProgr
     try:
         with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["task_key", "done_positions", "total_frames", "visited_segments"])
+            writer.writerow(["task_key", "done_positions", "total_frames", "visited_segments", "no_error_positions"])
             for key in sorted(records, key=lambda x: int(x) if x.isdigit() else x):
                 r = records[key]
-                writer.writerow([r.task_key, json.dumps(sorted(r.done_positions)), int(r.total_frames), json.dumps(sorted(r.visited_segments))])
+                writer.writerow([r.task_key, json.dumps(sorted(r.done_positions)), int(r.total_frames), json.dumps(sorted(r.visited_segments)), json.dumps(sorted(r.no_error_positions & r.done_positions))])
         os.replace(tmp_name, p)
     finally:
         try:

@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 try:
     from . import task_assets
     from .job_service import JobService
+    from .personnel import snapshot as personnel_snapshot, query_records, render_personnel_page
     from .nas_status_sync import NasStatusSync, NasStatusSyncConfig
     from .nas_uploader import NasUploadConfig, NasUploader
     from .publisher_bridge import (
@@ -50,6 +51,7 @@ try:
 except ImportError:  # pragma: no cover - script execution fallback
     import task_assets
     from job_service import JobService  # type: ignore
+    from personnel import snapshot as personnel_snapshot, query_records, render_personnel_page
     from nas_status_sync import NasStatusSync, NasStatusSyncConfig  # type: ignore
     from nas_uploader import NasUploadConfig, NasUploader  # type: ignore
     from publisher_bridge import (  # type: ignore
@@ -552,6 +554,21 @@ class BackendRuntime:
     def is_started(self) -> bool:
         with self.lock:
             return self.backend is not None
+
+    def personnel_reservations(self) -> List[Dict[str, Any]]:
+        paths = {state_path_from_instance(self.registry.data_root, instance)
+                 for task in self.registry.snapshot().get("task_files", [])
+                 for instance in task.get("instances", [])}
+        if self.backend is not None:
+            paths.add(self.backend.state_file.resolve())
+        rows: Dict[str, Dict[str, Any]] = {}
+        for path in sorted(paths):
+            if not path.is_file():
+                continue
+            state = json.loads(path.read_text(encoding="utf-8"))
+            for row in TaskBackend.reservation_list(self.backend, state):
+                rows[row["reservation_id"]] = row
+        return list(rows.values())
 
     def start(self, task_file_id: str, instance_id: str) -> Dict[str, Any]:
         with self.lock:
@@ -1067,6 +1084,10 @@ class AccountStore:
             raise BackendError(HTTPStatus.BAD_REQUEST, "username is required")
         return username
 
+    def usernames(self) -> List[str]:
+        # Account files are replaced atomically; expose names, never credentials.
+        return sorted(self._read_unlocked().get("users", {}))
+
     @staticmethod
     def _password(value: Any) -> str:
         password = str(value or "")
@@ -1376,11 +1397,8 @@ class TaskBackend:
                 }
         if self.workflow_service is not None:
             episode = self.workflow_service.store.get_episode(reservation_id)
-            if episode and is_shape_calibration_episode(episode):
-                return {"reservation": with_episode_stats({
-                    **episode, "reservation_id": reservation_id, "episode_number": 1,
-                    "status": "confirmed", "confirmed_at": (episode.get("metadata") or {}).get("shape_published_at"),
-                }), "task": None, "metadata_pairs": [], "workflow": self.workflow_service.upload_status(reservation_id)}
+            if episode:
+                return workflow_episode_detail_model(self.workflow_service, reservation_id)
         raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {reservation_id}")
 
     def delete_episode(self, reservation_id: str) -> Dict[str, Any]:
@@ -1541,6 +1559,9 @@ class TaskBackend:
             frame_count = parse_nonnegative_int(payload.get("frame_count", payload.get("total_frames")))
             if frame_count is not None:
                 reservation["frame_count"] = frame_count
+            fps = parse_nonnegative_float(payload.get("fps", payload.get("frame_rate")))
+            if fps:
+                reservation["fps"] = fps
             subject["idempotency"][idempotency_key] = reservation_id
             self._workflow_hook("record_collection_confirm", reservation)
             return progress_payload(subject_id, subject, self.tasks, state)
@@ -1731,7 +1752,7 @@ def render_layout(title: str, body: str) -> str:
   </style>
 </head>
 <body>
-  <header><h1>{html_escape(title)}</h1></header>
+  <header><h1>{html_escape(title)}</h1><nav><a href="/">任务总览</a> · <a href="/people">人员统计</a></nav></header>
   <main>{body}</main>
 </body>
 </html>"""
@@ -2564,14 +2585,26 @@ def render_episode_detail(model: Dict[str, Any]) -> str:
         "<section><h2>后端记录</h2><div class=\"kv\">"
         + trace_html
         + "</div></section>"
-        "<section><h2>管理操作</h2>"
+        + ("" if model.get("read_only") else "<section><h2>管理操作</h2>"
         "<div class=\"empty\">删除只会移除后端进度记录，不会删除本地采集文件或 NAS 文件。</div>"
         f"<form method=\"post\" action=\"/episodes/{url_part(reservation_id)}/delete\" "
         "onsubmit=\"return confirm('Delete this episode from backend only? Local and NAS files will not be removed.');\">"
         "<div class=\"actions\"><button type=\"submit\" class=\"danger\">Delete Episode From Backend</button></div></form>"
-        "</section>"
+        "</section>")
     )
     return render_layout("Episode " + reservation_id[:8], body)
+
+
+def workflow_episode_detail_model(service: JobService, episode_id: str) -> Dict[str, Any]:
+    episode = service.store.get_episode(episode_id)
+    if episode is None:
+        raise BackendError(HTTPStatus.NOT_FOUND, f"episode not found: {episode_id}")
+    metadata = episode.get("metadata") or {}
+    item = {**episode, "reservation_id": episode_id, "episode_number": episode.get("episode_index"),
+            "confirmed_at": metadata.get("collection_confirmed_at") or metadata.get("shape_published_at"),
+            "duration_seconds": metadata.get("duration_seconds")}
+    return {"reservation": with_episode_stats(item), "task": None, "metadata_pairs": [],
+            "workflow": service.upload_status(episode_id), "read_only": True}
 
 
 def render_error_page(status: HTTPStatus, message: str) -> str:
@@ -2642,7 +2675,8 @@ class RequestHandler(BaseHTTPRequestHandler):
             shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
 
     def _viewer_episode_dir(self, episode_id: str) -> Path:
-        model = self.backend.episode_detail_model(episode_id)
+        model = (self.backend.episode_detail_model(episode_id) if self.runtime.is_started()
+                 else workflow_episode_detail_model(self.workflow, episode_id))
         reservation = model.get("reservation") if isinstance(model.get("reservation"), dict) else {}
         workflow = model.get("workflow") if isinstance(model.get("workflow"), dict) else {}
         workflow_episode = workflow.get("episode") if isinstance(workflow.get("episode"), dict) else {}
@@ -2734,6 +2768,28 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if asset.resolve().parent != directory.resolve():
                     raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
                 self._file_response(asset, "application/json" if filename == "task.json" else task_assets.VIDEO_TYPES[asset.suffix])
+                return
+            if parsed.path == "/people":
+                self._html_response(HTTPStatus.OK, render_personnel_page())
+                return
+            if parsed.path in {"/api/v1/personnel", "/api/v1/personnel/records"}:
+                reservations = self.runtime.personnel_reservations()
+                data = personnel_snapshot(self.workflow.store, self.runtime.accounts.usernames(), reservations)
+                try:
+                    result = query_records(data, parse_qs(parsed.query, keep_blank_values=True)) if parsed.path.endswith("/records") else {
+                        "accounts": data["accounts"], "generated_at": now_iso(), "duration_basis": "media_seconds"}
+                except ValueError as exc:
+                    raise BackendError(HTTPStatus.BAD_REQUEST, "invalid page number") from exc
+                self._json_response(HTTPStatus.OK, result)
+                return
+            if not self.runtime.is_started() and parsed.path.startswith("/episodes/"):
+                rest = parsed.path[len("/episodes/"):].strip("/")
+                if rest.endswith("/viewer"):
+                    episode_id = unquote(rest[:-len("/viewer")])
+                    self._viewer_episode_dir(episode_id)
+                    self._html_response(HTTPStatus.OK, render_viewer_page(episode_id))
+                else:
+                    self._html_response(HTTPStatus.OK, render_episode_detail(workflow_episode_detail_model(self.workflow, unquote(rest))))
                 return
             viewer_session_prefix = "/api/v1/viewer/sessions/"
             if parsed.path.startswith(viewer_session_prefix):
@@ -3082,6 +3138,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                     episode_id, action = label_action
                     if action == "heartbeat":
                         self._json_response(HTTPStatus.OK, self.workflow.heartbeat_label_episode(episode_id, body))
+                    elif action == "frames":
+                        self._json_response(HTTPStatus.OK, self.workflow.record_label_frames(episode_id, body))
                     elif action == "complete":
                         self._json_response(HTTPStatus.OK, self.workflow.complete_label_episode(episode_id, body))
                     elif action == "release":

@@ -1,4 +1,9 @@
-import { QcWorkflow, sources, sourceLabels, enterLabelSegment } from "/workflow.js";
+import {
+  QcWorkflow,
+  sources,
+  sourceLabels,
+  enterLabelSegment,
+} from "/workflow.js";
 import { LabelCanvas } from "/label-canvas.js";
 import { installDesktopLayout } from "/desktop-layout.js";
 import { NativeQueue } from "/queue.js";
@@ -605,7 +610,8 @@ async function tile(host, cam, url, sample, label) {
     const canvas = document.createElement("canvas");
     canvas.setAttribute("aria-label", `Camera ${cam}`);
     canvas.addEventListener("dblclick", () => {
-      if (label || locked() || !frameReady || qcFlow?.mode !== "bad_range") return;
+      if (label || locked() || !frameReady || qcFlow?.mode !== "bad_range")
+        return;
       qcFlow.primaryCamera = cam;
       updateProgress();
     });
@@ -651,7 +657,10 @@ async function renderFrame() {
       $("overviewGrid").hidden = !overview;
     }
     if (before !== draft.visitedSegments.length) save().catch(() => {});
-    $("overviewGrid").classList.toggle("primaryEgoView", overview && camera === "ego");
+    $("overviewGrid").classList.toggle(
+      "primaryEgoView",
+      overview && camera === "ego",
+    );
   }
   const renderStarted = performance.now();
   frameReady = false;
@@ -673,11 +682,15 @@ async function renderFrame() {
             : null,
         );
       } else {
-        const cameras = camera === "ego" ? ["ego"] : ["00", "02", "03", "05", "06"]
-          .filter((c) => draft.manifest.cameras.includes(c))
-          .concat("ego");
+        const cameras =
+          camera === "ego"
+            ? ["ego"]
+            : ["00", "02", "03", "05", "06"]
+                .filter((c) => draft.manifest.cameras.includes(c))
+                .concat("ego");
         for (const [key, entry] of nativeTiles)
-          if (key.startsWith("overviewGrid:")) entry.box.hidden = !cameras.includes(key.split(":")[1]);
+          if (key.startsWith("overviewGrid:"))
+            entry.box.hidden = !cameras.includes(key.split(":")[1]);
         for (const c of cameras) {
           let url = null;
           try {
@@ -766,6 +779,10 @@ function updateProgress() {
   $("confirmFrame").textContent = "确认并继续";
   $("confirmFrame").disabled =
     locked() || !frameReady || overlay?.action === "skeleton";
+  $("noErrorFrame").disabled = $("confirmFrame").disabled;
+  $("noErrorFrame").textContent = r.no_error_frames?.includes(frame)
+    ? "该帧已标为没问题"
+    : "该帧没问题";
   $("submit").textContent = draft.pending
     ? "重试提交"
     : `提交任务（${r.confirmed?.length || 0}/${frames.length}）`;
@@ -827,8 +844,11 @@ function updateProgress() {
     $("nativeBadStatus").textContent =
       `当前帧：${frame}    Start=${qcFlow.start ?? "-"}    End=${qcFlow.end ?? "-"}    主要错误视角：${qcFlow.primaryCamera || "请双击图像选择"}`;
     for (const [key, entry] of nativeTiles)
-      if (key.startsWith("nativeQcGrid:")) entry.box.classList.toggle("primaryErrorCamera",
-        bad && key === "nativeQcGrid:" + qcFlow.primaryCamera);
+      if (key.startsWith("nativeQcGrid:"))
+        entry.box.classList.toggle(
+          "primaryErrorCamera",
+          bad && key === "nativeQcGrid:" + qcFlow.primaryCamera,
+        );
     $("nativePlaybackStatus").textContent = r.playback_complete
       ? "已完成一次播放，可随时提交"
       : !frameReady
@@ -870,25 +890,65 @@ function finishDrag() {
 }
 $("undo").onclick = () => nativeCanvas.undo();
 $("ignore").onclick = () => nativeCanvas.ignore();
-$("confirmFrame").onclick = async () => {
+async function confirmLabelFrame(noError = false) {
   if (locked() || $("confirmFrame").disabled || qcFlow) return;
-  finishDrag();
-  const frame = draft.manifest.frames[position];
-  for (const cam of draft.manifest.cameras)
-    draft.confirmedSamples[`${frame}:${cam}`] = clone(
-      draft.result.samples[`${frame}:${cam}`],
+  busy = true;
+  updateProgress();
+  try {
+    finishDrag();
+    const frame = draft.manifest.frames[position];
+    if (noError) {
+      for (const cam of draft.manifest.cameras) {
+        const key = `${frame}:${cam}`;
+        const original = draft.sources?.[key]?.mano_visible;
+        if (!original || draft.sources?.[key]?.errors?.mano_visible) {
+          notice("原始结果不可用，不能将该帧标为没问题。");
+          return;
+        }
+      }
+      for (const cam of draft.manifest.cameras) {
+        const key = `${frame}:${cam}`;
+        draft.result.samples[key] = {
+          ...draft.result.samples[key],
+          ...clone(draft.sources[key].mano_visible),
+        };
+      }
+    }
+    draft.result.no_error_frames = (draft.result.no_error_frames || []).filter(
+      (f) => f !== frame,
     );
-  draft.result.confirmed = [
-    ...new Set([...draft.result.confirmed, frame]),
-  ].sort((a, b) => a - b);
-  await save();
+    if (noError) draft.result.no_error_frames.push(frame);
+    for (const cam of draft.manifest.cameras)
+      draft.confirmedSamples[`${frame}:${cam}`] = clone(
+        draft.result.samples[`${frame}:${cam}`],
+      );
+    draft.result.confirmed = [
+      ...new Set([...draft.result.confirmed, frame]),
+    ].sort((a, b) => a - b);
+    await save();
+    await api(`/api/sessions/${draft.id}/frames`, {
+      frames: [frame],
+      decision: noError ? "no_error" : "corrected",
+    }).catch((e) =>
+      notice(
+        `帧判定已保存在本机，后端同步失败：${e.message}。提交任务时会重试同步。`,
+      ),
+    );
+  } finally {
+    busy = false;
+    updateProgress();
+  }
   updateProgress();
   const hadTracks = Object.values(draft.tracked || {}).some((p) => p.length);
-  if (hadTracks && position < draft.manifest.frames.length - 1) {
+  if (!noError && hadTracks && position < draft.manifest.frames.length - 1) {
     source = "correct";
     await trackNext();
   } else step(1);
-};
+}
+$("confirmFrame").onclick = () =>
+  confirmLabelFrame().catch((e) => notice(e.message));
+$("noErrorFrame").onclick = () =>
+  confirmLabelFrame(true).catch((e) => notice(e.message));
 $("prev").onclick = () => step(-1);
 $("next").onclick = () => step(1);
 let timelinePlaying = false;
@@ -952,7 +1012,8 @@ function addRange(kind) {
 }
 $("badRange").onclick = () => addRange("hand_pose");
 $("egoRange").onclick = () => addRange("egopose");
-let reviewTimer, playbackUiAt = 0;
+let reviewTimer,
+  playbackUiAt = 0;
 $("video").onpause = () => {
   if (qcFlow) qcFlow.playing = false;
   if (draft && owner && qcFlow) {
@@ -1457,8 +1518,18 @@ async function trackNext() {
         );
     }
   }
-  if (Object.values(result.samples).some((sample) => sample.selected.length))
+  if (Object.values(result.samples).some((sample) => sample.selected.length)) {
     draft.result.confirmed = draft.result.confirmed.filter((f) => f !== target);
+    draft.result.no_error_frames = (draft.result.no_error_frames || []).filter(
+      (f) => f !== target,
+    );
+    await api(`/api/sessions/${draft.id}/frames`, {
+      frames: [target],
+      decision: "pending",
+    }).catch((e) =>
+      notice(`跟踪后的帧需要重新确认；后端进度同步失败：${e.message}`),
+    );
+  }
   changed();
   position = draft.manifest.frames.indexOf(target);
   await step(0);

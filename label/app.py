@@ -561,6 +561,7 @@ class LabelPage(ttk.Frame):
         )
         btn_row.add(self._mano_btn)
         btn_row.add(ttk.Button(btn_row, text="确认并继续", style="Primary.TButton", command=self._confirm))
+        btn_row.add(ttk.Button(btn_row, text="该帧没问题", style="Secondary.TButton", command=self._confirm_no_error))
         self._submit_btn = ttk.Button(
             btn_row, text="提交任务", style="Primary.TButton",
             command=self._submit_task, state="disabled",
@@ -1687,7 +1688,8 @@ class LabelPage(ttk.Frame):
         view_name = "Pico Ego（只读）" if self._primary_ego_focus else "六视角总览（0，只读）"
         self._info.configure(text=f"Task: {task.display_name} · {view_name} · 帧 {frame} · {self._source_label()}\n滚轮缩放 · 右键拖动平移 · 按 1–7 返回单视角（00–06）")
         frame_done = self._is_frame_done(task, self._frame_pos)
-        self._frame_status.configure(text=f"当前帧：{'已完成' if frame_done else '未完成'}",
+        rec = self._progress.get(task.key)
+        self._frame_status.configure(text=f"当前帧：{'已确认没问题' if rec and self._frame_pos in rec.no_error_positions and frame_done else '已完成' if frame_done else '未完成'}",
                                      fg=STATUS_DONE_COLOR if frame_done else STATUS_TODO_COLOR)
 
     def _refresh_view(self) -> None:
@@ -1733,7 +1735,7 @@ class LabelPage(ttk.Frame):
         )
         if self._frame_status is not None:
             self._frame_status.configure(
-                text=f"当前帧：{'已完成' if frame_done else '未完成'}",
+                text=f"当前帧：{'已确认没问题' if rec and self._frame_pos in rec.no_error_positions and frame_done else '已完成' if frame_done else '未完成'}",
                 fg=STATUS_DONE_COLOR if frame_done else STATUS_TODO_COLOR,
             )
 
@@ -1852,7 +1854,10 @@ class LabelPage(ttk.Frame):
     def _back_frame(self) -> None:
         self._jump_to_frame(self._frame_pos - 1)
 
-    def _confirm(self) -> None:
+    def _confirm_no_error(self) -> None:
+        self._confirm(no_error=True)
+
+    def _confirm(self, *, no_error: bool = False) -> None:
         task = self._active_task
         bundle = self._save_bundle()
         if task is None or bundle is None or self._active_key is None or self._jsonl_path is None:
@@ -1868,8 +1873,11 @@ class LabelPage(ttk.Frame):
         try:
             # Preview state is never the annotation source: original view omits
             # visibility. Use edits, saved corrections, or masked initial values.
+            if no_error and any(self._build_visible_mano_view_state(frame_idx, cam_id) is None for cam_id in self._camera_ids):
+                messagebox.showwarning("原始结果不可用", "无法读取所有机位的原始结果，不能将该帧标为没问题。")
+                return
             corrected_states = {
-                cam_id: self._build_initial_view_state(frame_idx, cam_id, "correct")
+                cam_id: self._build_initial_view_state(frame_idx, cam_id, "mano_visible" if no_error else "correct")
                 for cam_id in self._camera_ids
             }
             for cam_id in self._camera_ids:
@@ -1882,16 +1890,36 @@ class LabelPage(ttk.Frame):
             messagebox.showerror("Error", str(exc))
             return
 
+        session = self._backend_session
+        if session is not None:
+            try:
+                session.client.record_label_frames(session.episode_id, session.operator_id,
+                    [frame_idx], "no_error" if no_error else "corrected")
+            except Exception as exc:
+                messagebox.showerror("后端记录失败", f"当前帧尚未确认，请重试。\n{exc}")
+                return
+
         rec = self._progress.get(task.key)
         if rec is None:
             rec = CorrectionProgress(task_key=task.key, total_frames=task.total_frames)
             self._progress[task.key] = rec
         rec.done_positions.add(self._frame_pos)
+        if no_error:
+            rec.no_error_positions.add(self._frame_pos)
+        else:
+            rec.no_error_positions.discard(self._frame_pos)
 
         next_pos = min(task.total_frames - 1, self._frame_pos + 1)
         had_tracks = any(self._tracked_joints_by_cam.values())
-        if self._track_selected_to_frame(next_pos, corrected_states):
+        if not no_error and self._track_selected_to_frame(next_pos, corrected_states):
             rec.done_positions.discard(next_pos)
+            rec.no_error_positions.discard(next_pos)
+            if session is not None:
+                try:
+                    session.client.record_label_frames(session.episode_id, session.operator_id,
+                        [task.frames[next_pos]], "pending")
+                except Exception as exc:
+                    messagebox.showwarning("进度同步失败", f"下一帧需要重新确认；后端进度暂未更新。\n{exc}")
         if had_tracks:
             self._mode = "correct"
         save_correction_progress(self._jsonl_path, self._progress)
@@ -1983,6 +2011,8 @@ class LabelPage(ttk.Frame):
                 result={
                     "operator_id": session.operator_id,
                     "frames_completed": list(task.frames),
+                    "no_error_frames": [task.frames[pos] for pos in sorted(self._progress[task.key].no_error_positions)
+                                        if pos in self._progress[task.key].done_positions],
                 },
                 artifacts=artifacts,
             )

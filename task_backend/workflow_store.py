@@ -142,6 +142,15 @@ class WorkflowStore:
                 CREATE INDEX IF NOT EXISTS idx_jobs_episode
                     ON jobs(episode_id);
 
+                CREATE TABLE IF NOT EXISTS label_frame_decisions (
+                    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+                    frame INTEGER NOT NULL CHECK(frame >= 0),
+                    decision TEXT NOT NULL CHECK(decision IN ('corrected', 'no_error', 'pending')),
+                    operator_id TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(job_id, frame)
+                );
+
                 CREATE TABLE IF NOT EXISTS segments (
                     segment_id TEXT PRIMARY KEY,
                     episode_id TEXT NOT NULL,
@@ -948,6 +957,37 @@ class WorkflowStore:
                 (status, _json_dumps(merged), now_iso(), job_id),
             )
             return self._get_job_unlocked(conn, job_id) or job
+
+    def record_label_frames(self, *, job_id: str, operator_id: str,
+                            frames: List[int], decision: str, lease_owner: str = "") -> Dict[str, Any]:
+        if decision not in {"corrected", "no_error", "pending"}:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "invalid frame decision")
+        if not operator_id or not isinstance(frames, list) or not frames or len(frames) > 100000:
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "operator_id and frames are required")
+        if any(type(frame) is not int or frame < 0 for frame in frames):
+            raise WorkflowError(HTTPStatus.BAD_REQUEST, "frames must be nonnegative integers")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            job = self._get_job_unlocked(conn, job_id)
+            if not job or job["type"] != "manual_label":
+                raise WorkflowError(HTTPStatus.NOT_FOUND, "manual label job not found")
+            if (job["status"] not in {"leased", "running"} or job.get("lease_owner") != (lease_owner or operator_id)
+                    or not job.get("lease_until") or job["lease_until"] <= now_iso()):
+                raise WorkflowError(HTTPStatus.CONFLICT, "label lease expired or owned by another operator")
+            ranges = conn.execute("SELECT start_frame, end_frame FROM segments WHERE episode_id = ?",
+                                  (job["episode_id"],)).fetchall()
+            if any(not any(a <= frame <= b for a, b in ranges) for frame in frames):
+                raise WorkflowError(HTTPStatus.BAD_REQUEST, "frame outside assigned QC intervals")
+            conn.executemany("""INSERT INTO label_frame_decisions VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, frame) DO UPDATE SET decision=excluded.decision,
+                operator_id=excluded.operator_id, updated_at=excluded.updated_at""",
+                [(job_id, frame, decision, operator_id, now_iso()) for frame in sorted(set(frames))])
+        return {"saved": True, "frames": sorted(set(frames)), "decision": decision}
+
+    def label_frame_decisions(self, job_id: str) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM label_frame_decisions WHERE job_id = ? ORDER BY frame", (job_id,))]
 
     def complete_job(self, *, job_id: str, result: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         with self.connect() as conn:

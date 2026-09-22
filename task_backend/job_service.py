@@ -791,6 +791,12 @@ class JobService:
         job = self._manual_label_job_for_episode(episode_id)
         return self.complete_job(str(job.get("job_id") or ""), body)
 
+    def record_label_frames(self, episode_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        job = self._manual_label_job_for_episode(episode_id)
+        return self.store.record_label_frames(job_id=job["job_id"],
+            operator_id=str(body.get("operator_id") or "").strip(),
+            frames=body.get("frames"), decision=str(body.get("decision") or ""))
+
     def fail_label_episode(self, episode_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
         job = self._manual_label_job_for_episode(episode_id)
         return self.fail_job(str(job.get("job_id") or ""), body)
@@ -923,6 +929,9 @@ class JobService:
                 "nas_uri": episode_uri,
                 "collection_operator_id": operator_id,
                 "collection_confirmed_by": operator_id,
+                "duration_seconds": reservation.get("duration_seconds"),
+                "fps": reservation.get("fps"),
+                "collection_confirmed_at": reservation.get("confirmed_at"),
                 "last_human_operator_id": operator_id,
                 "source": "collection_api",
                 "upload_mode": "capture_side" if episode_uri else "backend_upload",
@@ -1016,6 +1025,7 @@ class JobService:
         payload = dict(response.get("payload") or {})
         payload["scope"] = "episode"
         payload["label_scope"] = "episode"
+        payload["frame_decisions"] = self.store.label_frame_decisions(str(job.get("job_id") or ""))
         payload["segments"] = [
             {
                 "segment_id": str(segment.get("segment_id") or ""),

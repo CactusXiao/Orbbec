@@ -152,7 +152,8 @@ class BatchService:
     def revision(self, context):
         # Heartbeats do not change the source revision. Updated upstream artifacts,
         # segment ranges, calibration, visibility or MANO files do.
-        payload = context["payload"]
+        payload = dict(context["payload"])
+        payload.pop("frame_decisions", None)
         task = correction_task_from_backend_payload(payload, mounts=self.mounts)
         root = task.episode_dir()
         signatures = []
@@ -260,6 +261,15 @@ class BatchService:
                 conn.execute("UPDATE browser_sessions SET revision=?, payload=json_set(payload, '$.released', json('false')) WHERE id=?", (self.revision(context), sid))
         return self.manifest(sid)
 
+    def record_frames(self, sid, body):
+        with self.store.transaction():
+            item = self.session(sid)
+            self.check(item)
+            if item["role"] != "label":
+                reject("仅标注任务可记录帧判定", 400)
+            return self.store.record_label_frames(job_id=item["job_id"], operator_id=self.operator, lease_owner=item["owner"],
+                frames=body.get("frames"), decision=body.get("decision"))
+
     def validate(self, item, result):
         task = correction_task_from_backend_payload(item["payload"], mounts=self.mounts)
         frames, cameras = set(task.frames), set(task.cameras)
@@ -268,6 +278,10 @@ class BatchService:
                 or not set(progress).issubset(frames) or len(progress) != len(set(progress))):
             reject("确认帧格式错误或超出任务范围", 400)
         if item["role"] == "label":
+            no_error = result.get("no_error_frames", [])
+            if (not isinstance(no_error, list) or any(type(f) is not int for f in no_error)
+                    or not set(no_error).issubset(set(progress))):
+                reject("无错误帧必须属于已确认的标注帧", 400)
             if set(result.get("confirmed", [])) != frames:
                 reject("请确认所有标注帧", 400)
             samples = result.get("samples", {})
@@ -378,7 +392,14 @@ class BatchService:
                     artifacts.append(dict(kind=kind, uri=payload["episode_uri"].rstrip("/")+"/"+directory,
                                           metadata=dict(scope="episode", frames=task.frames, cameras=task.cameras,
                                                         operator_id=self.operator)))
-                completed_result = dict(operator_id=self.operator, frames_completed=task.frames)
+                no_error = set(result.get("no_error_frames", []))
+                for decision, frames in (("no_error", sorted(no_error)),
+                                         ("corrected", sorted(set(task.frames) - no_error))):
+                    if frames:
+                        self.store.record_label_frames(job_id=item["job_id"], operator_id=self.operator, lease_owner=item["owner"],
+                                                       frames=frames, decision=decision)
+                completed_result = dict(operator_id=self.operator, frames_completed=task.frames,
+                                        no_error_frames=sorted(no_error))
             else:
                 bad_ranges = normalize_ranges(result.get("bad_ranges", []), max_gap_frames=5)
                 ego_ranges = normalize_ranges(result.get("ego_ranges", []), max_gap_frames=5)

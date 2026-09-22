@@ -1,5 +1,5 @@
 // App shell only. No task API, result, access key or media is stored here.
-const cacheName = "orbbec-browser-shell-v6";
+const cacheName = "orbbec-browser-shell-v7";
 const shell = [
   "/",
   "/app.js",

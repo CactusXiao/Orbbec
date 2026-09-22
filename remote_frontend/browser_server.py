@@ -232,6 +232,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.json(batch.heartbeat(sid))
                 if action == "submit":
                     return self.json(batch.submit(sid, body))
+                if action == "frames":
+                    return self.json(batch.record_frames(sid, body))
                 if action == "compute":
                     return self.json(self.compute.start(sid, body))
                 if action == "retry-media":

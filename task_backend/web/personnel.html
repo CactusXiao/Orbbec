@@ -1,0 +1,1311 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>人员统计 · Orbbec</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #162b35;
+        --muted: #6a7e87;
+        --line: #dce5e8;
+        --accent: #087f78;
+        --gray: #d4dde2;
+        --green: #25967a;
+        --orange: #e79a39;
+        --red: #d75362;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #f3f6f7;
+        color: var(--ink);
+        font:
+          14px/1.6 system-ui,
+          -apple-system,
+          "Segoe UI",
+          "Microsoft YaHei",
+          sans-serif;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      a,
+      input,
+      summary,
+      select {
+        touch-action: manipulation;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled {
+        cursor: default;
+        opacity: 0.45;
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      summary:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 3px solid #77c4bf;
+        outline-offset: 3px;
+      }
+      header {
+        height: 70px;
+        border-bottom: 1px solid var(--line);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 36px;
+        background: #fff;
+        gap: 20px;
+      }
+      .brand {
+        font-size: 18px;
+        font-weight: 750;
+        letter-spacing: 2px;
+        display: flex;
+        align-items: center;
+        gap: 13px;
+      }
+      .brand i {
+        display: block;
+        width: 25px;
+        height: 25px;
+        background: var(--accent);
+        border-radius: 8px;
+        box-shadow: inset 0 0 0 7px #c9e8e4;
+      }
+      .brand span {
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: var(--muted);
+        font-weight: 500;
+        border-left: 1px solid var(--line);
+        padding-left: 15px;
+      }
+      nav {
+        display: flex;
+        gap: 26px;
+        font-size: 13px;
+      }
+      nav a[aria-current] {
+        color: var(--ink);
+        font-weight: 700;
+      }
+      main {
+        max-width: 1600px;
+        margin: auto;
+        padding: 30px 36px 50px;
+      }
+      .page-heading {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 25px;
+      }
+      .eyebrow {
+        color: var(--accent);
+        letter-spacing: 2px;
+        font-size: 11px;
+        font-weight: 750;
+      }
+      h1 {
+        font-size: 28px;
+        letter-spacing: -0.5px;
+        margin: 3px 0 7px;
+        font-weight: 700;
+      }
+      p {
+        margin: 0;
+        color: var(--muted);
+      }
+      .refresh {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 9px 16px;
+        color: var(--ink);
+      }
+      .stamp {
+        text-align: right;
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 6px;
+      }
+      .workspace {
+        display: grid;
+        grid-template-columns: 250px minmax(0, 1fr);
+        gap: 24px;
+      }
+      .sidebar {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        align-self: start;
+        position: sticky;
+        top: 18px;
+        overflow: hidden;
+      }
+      .side-head {
+        padding: 20px 18px 14px;
+      }
+      .side-title {
+        display: flex;
+        justify-content: space-between;
+        font-weight: 700;
+        margin-bottom: 13px;
+      }
+      .count {
+        font-size: 11px;
+        color: var(--muted);
+        background: #f1f5f6;
+        padding: 1px 7px;
+        border-radius: 5px;
+      }
+      input[type="search"] {
+        width: 100%;
+        padding: 9px 11px;
+        border: 1px solid var(--line);
+        background: #f8fafb;
+        border-radius: 8px;
+        min-width: 0;
+        color: var(--ink);
+      }
+      select {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        max-width: 100%;
+        font-size: 12px;
+        margin-top: 10px;
+      }
+      .account-list {
+        max-height: 560px;
+        overflow: auto;
+        padding: 0 8px 8px;
+      }
+      .person {
+        width: 100%;
+        border: 0;
+        background: white;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        text-align: left;
+        border-radius: 9px;
+        padding: 12px 10px;
+        color: var(--ink);
+        margin: 2px 0;
+      }
+      .person:hover {
+        background: #f5f8f8;
+      }
+      .person[aria-pressed="true"] {
+        background: #e9f5f2;
+        box-shadow: inset 3px 0 var(--accent);
+      }
+      .avatar {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        border-radius: 10px;
+        flex-shrink: 0;
+        background: #eaf0f2;
+        color: #5d787f;
+        font-weight: 700;
+      }
+      .person[aria-pressed="true"] .avatar {
+        background: var(--accent);
+        color: white;
+      }
+      .person-text {
+        min-width: 0;
+      }
+      .person-name {
+        display: block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        font-weight: 650;
+      }
+      .person small {
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .side-foot {
+        padding: 10px 16px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .profile {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 17px;
+      }
+      .profile h2 {
+        margin: 0;
+        font-size: 20px;
+        overflow-wrap: anywhere;
+      }
+      .profile .tag {
+        font-size: 11px;
+        background: #e2f0ed;
+        color: var(--accent);
+        padding: 3px 8px;
+        border-radius: 5px;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 11px;
+        margin-bottom: 17px;
+      }
+      .metric {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        padding: 18px 15px 15px;
+        position: relative;
+        overflow: hidden;
+      }
+      .metric:before {
+        content: "";
+        display: block;
+        width: 22px;
+        height: 3px;
+        border-radius: 2px;
+        background: var(--accent);
+        margin-bottom: 12px;
+      }
+      .metric.orange:before {
+        background: var(--orange);
+      }
+      .metric.red:before {
+        background: var(--red);
+      }
+      .metric-label {
+        color: #59717b;
+        font-size: 12px;
+      }
+      .metric-value {
+        font-size: 24px;
+        font-weight: 720;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.7px;
+        margin: 4px 0;
+      }
+      .metric small {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .notice {
+        background: #fff7e9;
+        color: #8c6528;
+        border: 1px solid #ecdcbc;
+        border-radius: 8px;
+        padding: 10px 13px;
+        font-size: 12px;
+        margin: 0 0 17px;
+      }
+      .definition {
+        font-size: 11px;
+        color: var(--muted);
+        margin-bottom: 21px;
+      }
+      .panel {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 13px;
+        overflow: hidden;
+      }
+      .tabs {
+        display: flex;
+        gap: 28px;
+        border-bottom: 1px solid var(--line);
+        padding: 0 22px;
+      }
+      .tab {
+        padding: 18px 0 14px;
+        border: 0;
+        background: none;
+        color: var(--muted);
+        border-bottom: 3px solid transparent;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .tab[aria-selected="true"] {
+        color: var(--accent);
+        border-bottom-color: var(--accent);
+        font-weight: 700;
+      }
+      .tab .count {
+        font-weight: 400;
+      }
+      .filters {
+        padding: 17px 22px 13px;
+        display: flex;
+        align-items: center;
+        gap: 16px;
+      }
+      .filters input[type="search"] {
+        max-width: 340px;
+        background: white;
+      }
+      .filters label {
+        font-size: 12px;
+        white-space: nowrap;
+        color: var(--muted);
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .legend {
+        display: flex;
+        align-items: center;
+        gap: 17px;
+        font-size: 11px;
+        color: var(--muted);
+        padding: 0 22px 16px;
+        flex-wrap: wrap;
+      }
+      .legend span {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 3px;
+        display: inline-block;
+      }
+      .dot.gray,
+      .bar .gray {
+        background: var(--gray);
+      }
+      .dot.green,
+      .bar .green {
+        background: var(--green);
+      }
+      .dot.orange,
+      .bar .orange {
+        background: var(--orange);
+      }
+      .dot.red,
+      .bar .red {
+        background: var(--red);
+      }
+      .list-heading {
+        background: #f8fafb;
+        border-top: 1px solid var(--line);
+        border-bottom: 1px solid var(--line);
+        padding: 9px 22px;
+        display: flex;
+        justify-content: space-between;
+        color: var(--muted);
+        font-size: 11px;
+      }
+      .task {
+        border-bottom: 1px solid var(--line);
+      }
+      .task:last-child {
+        border-bottom: 0;
+      }
+      .task > summary {
+        list-style: none;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        gap: 11px;
+        padding: 17px 22px;
+      }
+      .task > summary::-webkit-details-marker {
+        display: none;
+      }
+      .chevron {
+        font-size: 17px;
+        color: #799098;
+        transition: transform 0.15s;
+      }
+      .task[open] > summary .chevron {
+        transform: rotate(90deg);
+      }
+      .task-name {
+        font-weight: 650;
+        overflow-wrap: anywhere;
+        flex: 1;
+        min-width: 0;
+      }
+      .task-count {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+      .issue-pill {
+        color: #a3671a;
+        background: #fff2dc;
+        font-size: 10px;
+        padding: 2px 7px;
+        border-radius: 5px;
+      }
+      .episodes {
+        background: #fafcfc;
+        border-top: 1px solid #e9eeef;
+        padding: 0 22px;
+      }
+      .episode {
+        padding: 16px 0;
+        border-bottom: 1px solid #e5edef;
+      }
+      .episode:last-child {
+        border: 0;
+      }
+      .episode-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: start;
+        gap: 12px;
+        margin-bottom: 8px;
+      }
+      .episode-title {
+        font-size: 12px;
+        font-weight: 700;
+        overflow-wrap: anywhere;
+      }
+      .episode-meta {
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .episode-meta code {
+        font-family: inherit;
+      }
+      .episode-side {
+        text-align: right;
+        white-space: nowrap;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .bar {
+        height: 19px;
+        display: flex;
+        width: 100%;
+        padding: 0;
+        border: 0;
+        border-radius: 5px;
+        overflow: hidden;
+        background: var(--gray);
+        position: relative;
+      }
+      .bar:hover {
+        box-shadow: 0 0 0 2px #bed6d5;
+      }
+      .bar span {
+        height: 100%;
+        flex-shrink: 0;
+        min-width: 0;
+      }
+      .ruler {
+        display: flex;
+        justify-content: space-between;
+        font-size: 10px;
+        color: #84979e;
+        margin-top: 4px;
+        font-variant-numeric: tabular-nums;
+      }
+      .range-details {
+        margin-top: 10px;
+        padding: 12px;
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        font-size: 11px;
+      }
+      .range-details ul {
+        padding: 0;
+        list-style: none;
+        max-height: 220px;
+        overflow: auto;
+        margin: 8px 0 0;
+      }
+      .range-details li {
+        display: flex;
+        gap: 10px;
+        border-bottom: 1px solid #eff3f4;
+        padding: 5px 0;
+        align-items: center;
+      }
+      .range-details li span:last-child {
+        margin-left: auto;
+        font-variant-numeric: tabular-nums;
+      }
+      .empty {
+        padding: 42px 24px;
+        text-align: center;
+        color: var(--muted);
+      }
+      .empty strong {
+        display: block;
+        color: #47616c;
+        margin-bottom: 4px;
+      }
+      .pagination {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 13px 22px;
+        border-top: 1px solid var(--line);
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .pagination div {
+        display: flex;
+        gap: 7px;
+      }
+      .pagination button {
+        border: 1px solid var(--line);
+        background: white;
+        border-radius: 6px;
+        padding: 5px 11px;
+        color: var(--ink);
+      }
+      .error {
+        color: #a82f42;
+        background: #fff1f2;
+      }
+      .hidden,
+      [hidden] {
+        display: none !important;
+      }
+      .hint {
+        font-size: 11px;
+        color: var(--muted);
+        padding-top: 12px;
+      }
+      @media (min-width: 1450px) {
+        .metric-value {
+          font-size: 28px;
+        }
+        .metrics {
+          gap: 15px;
+        }
+        .workspace {
+          grid-template-columns: 270px minmax(0, 1fr);
+        }
+      }
+      @media (max-width: 1100px) {
+        main {
+          padding: 25px 22px;
+        }
+        .workspace {
+          grid-template-columns: 210px minmax(0, 1fr);
+          gap: 17px;
+        }
+        .metrics {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+        .metric {
+          padding: 12px;
+        }
+        .metric-value {
+          font-size: 22px;
+        }
+        .metric:before {
+          margin-bottom: 7px;
+        }
+      }
+      @media (max-width: 720px) {
+        header {
+          padding: 0 18px;
+          height: 60px;
+        }
+        .brand span {
+          display: none;
+        }
+        nav {
+          gap: 14px;
+        }
+        main {
+          padding: 22px 14px;
+        }
+        .page-heading {
+          align-items: start;
+        }
+        h1 {
+          font-size: 23px;
+        }
+        .page-heading p {
+          font-size: 12px;
+        }
+        .workspace {
+          grid-template-columns: 1fr;
+        }
+        .sidebar {
+          position: static;
+        }
+        .account-list {
+          max-height: 150px;
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .side-head {
+          padding: 14px;
+        }
+        .side-foot {
+          display: none;
+        }
+        .metrics {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .metric:last-child {
+          grid-column: span 2;
+        }
+        .tabs {
+          gap: 20px;
+          padding: 0 14px;
+        }
+        .filters {
+          padding: 14px;
+          flex-wrap: wrap;
+          gap: 10px;
+        }
+        .legend {
+          padding: 0 14px 14px;
+          gap: 12px;
+        }
+        .task > summary {
+          padding: 14px;
+        }
+        .episodes {
+          padding: 0 14px;
+        }
+        .task-count {
+          font-size: 10px;
+        }
+        .issue-pill {
+          display: none;
+        }
+        .list-heading {
+          padding: 9px 14px;
+        }
+        .stamp {
+          max-width: 105px;
+        }
+        .profile {
+          margin-top: 4px;
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        * {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/people"
+        ><i aria-hidden="true"></i>ORBBEC<span>数据生产工作台</span></a
+      >
+      <nav>
+        <a href="/">任务总览</a
+        ><a href="/people" aria-current="page">人员统计</a>
+      </nav>
+    </header>
+    <main>
+      <div class="page-heading">
+        <div>
+          <div class="eyebrow">TEAM ACTIVITY</div>
+          <h1>人员工作统计</h1>
+          <p>从工作量到每一帧，查看采集、质检与标注记录。</p>
+        </div>
+        <div>
+          <button class="refresh" id="refresh">↻ 刷新数据</button>
+          <div class="stamp" id="stamp">正在读取统计…</div>
+        </div>
+      </div>
+      <div id="globalError" role="alert" class="notice error" hidden></div>
+      <div class="workspace">
+        <aside class="sidebar" aria-label="账号选择">
+          <div class="side-head">
+            <div class="side-title">
+              团队成员 <span class="count" id="accountCount">0</span>
+            </div>
+            <input
+              type="search"
+              id="accountSearch"
+              placeholder="搜索账号"
+              aria-label="搜索账号"
+            /><select id="accountSort" aria-label="账号排序">
+              <option value="username">按账号名称排序</option>
+              <option value="capture_seconds">按采集时长排序</option>
+              <option value="qc_seconds">按 QC 时长排序</option>
+              <option value="label_seconds">按标注时长排序</option>
+            </select>
+          </div>
+          <div class="account-list" id="accounts"></div>
+          <div class="side-foot" id="accountFoot">
+            包含已注册账号与历史操作员
+          </div>
+        </aside>
+        <section aria-label="人员工作详情">
+          <div class="profile">
+            <h2 id="personName">请选择账号</h2>
+            <span class="tag">按数据时长统计</span>
+          </div>
+          <div class="metrics" id="metrics"></div>
+          <div class="notice" id="missing" hidden></div>
+          <div class="definition">
+            同一账号、同一 Episode
+            的重叠帧合并计时；跨机位不重复计算。标注时长包含“该帧没问题”的确认时长。
+          </div>
+          <div class="panel">
+            <div class="tabs" role="tablist" aria-label="工作类型">
+              <button
+                class="tab"
+                id="tab-capture"
+                role="tab"
+                aria-controls="recordsPanel"
+                aria-selected="true"
+                data-kind="capture"
+              >
+                采集记录 <span class="count">0</span></button
+              ><button
+                class="tab"
+                id="tab-qc"
+                role="tab"
+                aria-controls="recordsPanel"
+                aria-selected="false"
+                data-kind="qc"
+              >
+                质检记录 <span class="count">0</span></button
+              ><button
+                class="tab"
+                id="tab-label"
+                role="tab"
+                aria-controls="recordsPanel"
+                aria-selected="false"
+                data-kind="label"
+              >
+                标注记录 <span class="count">0</span>
+              </button>
+            </div>
+            <section
+              id="recordsPanel"
+              role="tabpanel"
+              aria-labelledby="tab-capture"
+            >
+              <div class="filters">
+                <input
+                  type="search"
+                  id="recordSearch"
+                  placeholder="搜索 task、受试者或 Episode"
+                  aria-label="搜索工作记录"
+                /><label
+                  ><input type="checkbox" id="onlyIssues" />仅看待处理 /
+                  异常</label
+                >
+              </div>
+              <div class="legend" id="legend"></div>
+              <div class="list-heading">
+                <span id="recordCount">任务列表</span
+                ><span>展开 task · 点击时间条查看区间</span>
+              </div>
+              <div id="tasks" aria-live="polite"></div>
+              <div id="taskPagination"></div>
+            </section>
+          </div>
+          <p class="hint">
+            红色表示标注员确认的 QC 误报。每一条时间条覆盖完整 Episode；帧编号从
+            0 开始。
+          </p>
+        </section>
+      </div>
+    </main>
+    <script>
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const fields = [
+        ["采集总时长", "capture_seconds", "已确认的采集数据", ""],
+        ["QC 总时长", "qc_seconds", "已提交的质检数据", ""],
+        ["QC 错误区间", "qc_error_seconds", "质检判为不通过", "orange"],
+        [
+          "QC 误报时长",
+          "qc_false_positive_seconds",
+          "标注员确认该帧无误",
+          "red",
+        ],
+        ["标注总时长", "label_seconds", "已确认的标注帧", ""],
+      ];
+      const labels = {
+        capture: { gray: "未质检", green: "质检通过", orange: "质检不通过" },
+        qc: {
+          gray: "未质检",
+          green: "质检通过",
+          orange: "质检不通过",
+          red: "标注员确认无误",
+        },
+        label: {
+          gray: "正常 · 无需标注",
+          green: "已标注 / 已确认",
+          orange: "待标注",
+        },
+      };
+      const statuses = {
+        succeeded: "已完成",
+        queued: "待领取",
+        leased: "已领取",
+        running: "进行中",
+        failed: "失败",
+        canceled: "已取消",
+        captured: "已采集",
+        uploaded: "已上传",
+        finalized: "已完成",
+        manual_labeling: "标注中",
+        manual_correction_pending: "待标注",
+        qc_bad_episode: "整段异常",
+      };
+      let accounts = [],
+        current = "",
+        kind = "capture",
+        page = 1,
+        sequence = 0,
+        accountLimit = 80;
+      const urlState = new URLSearchParams(location.search);
+      if (labels[urlState.get("kind")]) kind = urlState.get("kind");
+      function el(tag, cls, text) {
+        const node = document.createElement(tag);
+        if (cls) node.className = cls;
+        if (text !== undefined) node.textContent = text;
+        return node;
+      }
+      function duration(seconds) {
+        if (seconds == null) return "待补充";
+        if (seconds === 0) return "0 秒";
+        if (seconds < 1) return `${seconds.toFixed(3)} 秒`;
+        if (seconds < 60) return `${seconds.toFixed(1).replace(/\.0$/, "")} 秒`;
+        const h = Math.floor(seconds / 3600),
+          m = Math.floor((seconds % 3600) / 60),
+          s = Math.floor(seconds % 60);
+        return h
+          ? `${h}时 ${String(m).padStart(2, "0")}分`
+          : `${m}分 ${String(s).padStart(2, "0")}秒`;
+      }
+      async function get(path) {
+        const response = await fetch(path, { cache: "no-store" });
+        let data;
+        try {
+          data = await response.json();
+        } catch {
+          throw new Error("服务器返回格式异常");
+        }
+        if (!response.ok) throw new Error(data.error || "读取失败");
+        return data;
+      }
+      function params(extra = {}) {
+        return new URLSearchParams({
+          username: current,
+          kind,
+          q: $("recordSearch").value,
+          only_issues: $("onlyIssues").checked ? "1" : "0",
+          page: String(page),
+          ...extra,
+        });
+      }
+      function empty(host, title, note = "") {
+        host.replaceChildren();
+        const block = el("div", "empty");
+        block.append(el("strong", "", title), el("span", "", note));
+        host.append(block);
+      }
+      function renderAccounts() {
+        const list = $("accounts"),
+          search = $("accountSearch").value.trim().toLocaleLowerCase(),
+          sort = $("accountSort").value;
+        list.replaceChildren();
+        const matched = accounts
+          .filter((a) => a.username.toLocaleLowerCase().includes(search))
+          .sort((a, b) =>
+            sort === "username"
+              ? a.username.localeCompare(b.username)
+              : b[sort] - a[sort] || a.username.localeCompare(b.username),
+          );
+        for (const a of matched.slice(0, accountLimit)) {
+          const button = el("button", "person");
+          button.setAttribute("aria-pressed", String(a.username === current));
+          const text = el("span", "person-text");
+          text.append(
+            el("span", "person-name", a.username),
+            el(
+              "small",
+              "",
+              `${a.capture_count + a.qc_count + a.label_count} 条工作记录`,
+            ),
+          );
+          button.append(
+            el(
+              "span",
+              "avatar",
+              Array.from(a.username)[0]?.toUpperCase() || "?",
+            ),
+            text,
+          );
+          button.title = a.username;
+          button.onclick = () => select(a.username);
+          list.append(button);
+        }
+        if (matched.length > accountLimit) {
+          const more = el("button", "refresh", "加载更多账号");
+          more.onclick = () => {
+            accountLimit += 80;
+            renderAccounts();
+          };
+          list.append(more);
+        }
+        if (!matched.length) empty(list, "没有匹配的账号");
+        $("accountCount").textContent = String(accounts.length);
+      }
+      function select(name) {
+        current = name;
+        page = 1;
+        renderAccounts();
+        renderProfile();
+        loadTasks();
+        history.replaceState(
+          null,
+          "",
+          `?${new URLSearchParams({ username: current, kind })}`,
+        );
+      }
+      function renderProfile() {
+        const person = accounts.find((a) => a.username === current);
+        $("personName").textContent = current || "暂无账号";
+        $("metrics").replaceChildren();
+        for (const [title, key, note, color] of fields) {
+          const card = el("div", `metric ${color}`);
+          card.append(
+            el("div", "metric-label", title),
+            el("div", "metric-value", duration(person?.[key] || 0)),
+            el("small", "", note),
+          );
+          card.title = `${person?.[key] || 0} 秒`;
+          $("metrics").append(card);
+        }
+        $("missing").hidden = !person?.unknown_duration_count;
+        $("missing").textContent =
+          `${person?.unknown_duration_count || 0} 个 Episode 缺少时长或帧率信息，暂未计入相关时长；记录仍完整展示。`;
+        for (const tab of document.querySelectorAll(".tab")) {
+          tab.setAttribute("aria-selected", String(tab.dataset.kind === kind));
+          tab.tabIndex = tab.dataset.kind === kind ? 0 : -1;
+          tab.querySelector(".count").textContent = String(
+            person?.[tab.dataset.kind + "_count"] || 0,
+          );
+        }
+        $("recordsPanel").setAttribute("aria-labelledby", `tab-${kind}`);
+        $("legend").replaceChildren();
+        for (const [state, label] of Object.entries(labels[kind])) {
+          const item = el("span");
+          item.append(el("i", `dot ${state}`), document.createTextNode(label));
+          $("legend").append(item);
+        }
+      }
+      function pager(host, total, p, size, change) {
+        host.replaceChildren();
+        if (!total) return;
+        const pages = Math.ceil(total / size),
+          box = el("div", "pagination"),
+          buttons = el("div");
+        box.append(el("span", "", `第 ${p} / ${pages} 页 · 共 ${total} 项`));
+        for (const [text, target, disabled] of [
+          ["上一页", p - 1, p <= 1],
+          ["下一页", p + 1, p >= pages],
+        ]) {
+          const b = el("button", "", text);
+          b.disabled = disabled;
+          b.onclick = () => change(target);
+          buttons.append(b);
+        }
+        box.append(buttons);
+        host.append(box);
+      }
+      async function loadTasks() {
+        const token = ++sequence;
+        $("tasks").setAttribute("aria-busy", "true");
+        empty($("tasks"), "正在读取记录…");
+        $("taskPagination").replaceChildren();
+        try {
+          if (!current) {
+            empty(
+              $("tasks"),
+              "暂无工作记录",
+              "注册账号或完成采集后，这里会显示人员统计。",
+            );
+            return;
+          }
+          const data = await get(`/api/v1/personnel/records?${params()}`);
+          if (token !== sequence) return;
+          $("recordCount").textContent =
+            `${data.total} 个 task · ${data.record_count} 条记录`;
+          $("tasks").replaceChildren();
+          if (!data.tasks.length)
+            empty(
+              $("tasks"),
+              "没有符合条件的记录",
+              "可切换工作类型，或清除搜索和异常筛选。",
+            );
+          for (const task of data.tasks) {
+            const detail = el("details", "task"),
+              summary = el("summary"),
+              body = el("div", "episodes");
+            summary.append(
+              el("span", "chevron", "›"),
+              el("span", "task-name", task.task_name || "未命名任务"),
+            );
+            if (task.issue_count)
+              summary.append(
+                el("span", "issue-pill", `${task.issue_count} 条待处理 / 异常`),
+              );
+            summary.append(el("span", "task-count", `${task.count} 条记录`));
+            detail.append(summary, body);
+            detail.addEventListener("toggle", () => {
+              if (detail.open && !detail.dataset.loaded) {
+                detail.dataset.loaded = "1";
+                loadEpisodes(body, task.task_name, 1, token);
+              }
+            });
+            $("tasks").append(detail);
+          }
+          pager(
+            $("taskPagination"),
+            data.total,
+            data.page,
+            data.page_size,
+            (p) => {
+              page = p;
+              loadTasks();
+            },
+          );
+        } catch (error) {
+          if (token === sequence) {
+            empty($("tasks"), "记录读取失败", error.message);
+            const retry = el("button", "refresh", "重试");
+            retry.onclick = loadTasks;
+            $("tasks").append(retry);
+          }
+        } finally {
+          if (token === sequence) $("tasks").removeAttribute("aria-busy");
+        }
+      }
+      async function loadEpisodes(host, task, p, token) {
+        empty(host, "正在读取 Episode…");
+        try {
+          const data = await get(
+            `/api/v1/personnel/records?${params({ task, page: String(p) })}`,
+          );
+          if (token !== sequence || !host.isConnected) return;
+          host.replaceChildren();
+          for (const record of data.episodes) host.append(episode(record));
+          if (!data.episodes.length) empty(host, "暂无 Episode");
+          const pages = el("div");
+          host.append(pages);
+          pager(pages, data.total, data.page, data.page_size, (next) =>
+            loadEpisodes(host, task, next, token),
+          );
+        } catch (error) {
+          empty(host, "Episode 读取失败", error.message);
+          const retry = el("button", "refresh", "重试");
+          retry.onclick = () => loadEpisodes(host, task, p, token);
+          host.append(retry);
+        }
+      }
+      function episode(r) {
+        const row = el("article", "episode"),
+          head = el("div", "episode-head"),
+          left = el("div"),
+          right = el("div", "episode-side");
+        left.append(
+          el("div", "episode-title", r.storage_name),
+          el(
+            "div",
+            "episode-meta",
+            `${r.subject_id || "未登记受试者"} · ${statuses[r.status] || r.status} ${r.job_id ? "· " + r.job_id : ""}`,
+          ),
+        );
+        right.append(
+          el("div", "", duration(r.duration_seconds)),
+          el("a", "", "查看 Episode ↗"),
+        );
+        const link = right.querySelector("a");
+        link.href = `/episodes/${encodeURIComponent(r.episode_id)}`;
+        link.target = "_blank";
+        link.rel = "noopener";
+        head.append(left, right);
+        row.append(head);
+        const bar = el("button", "bar"),
+          details = el("div", "range-details");
+        details.hidden = true;
+        bar.setAttribute("aria-expanded", "false");
+        bar.setAttribute("aria-label", `${r.storage_name} 帧区间详情`);
+        const runs = r.timeline || [];
+        if (runs.length <= 500) {
+          for (const s of runs) {
+            const segment = el("span", s.state);
+            segment.style.width = `${((s.end_frame - s.start_frame + 1) / r.frame_count) * 100}%`;
+            segment.title = `${labels[kind][s.state]} · 帧 ${s.start_frame}–${s.end_frame}`;
+            bar.append(segment);
+          }
+        } else {
+          const colors = {
+            gray: "#d4dde2",
+            green: "#25967a",
+            orange: "#e79a39",
+            red: "#d75362",
+          };
+          bar.style.background = `linear-gradient(to right,${runs.map((s) => `${colors[s.state]} ${(s.start_frame / r.frame_count) * 100}% ${((s.end_frame + 1) / r.frame_count) * 100}%`).join(",")})`;
+        }
+        bar.onclick = () => {
+          details.hidden = !details.hidden;
+          bar.setAttribute("aria-expanded", String(!details.hidden));
+          if (!details.hidden && !details.dataset.loaded) {
+            details.dataset.loaded = "1";
+            details.append(
+              el("strong", "", `${runs.length} 个区间 · ${r.frame_count} 帧`),
+            );
+            const list = el("ul");
+            let shown = 0;
+            const more = el("button", "refresh", "加载更多区间");
+            function append() {
+              for (const s of runs.slice(shown, shown + 100)) {
+                const item = el("li");
+                item.append(
+                  el("i", `dot ${s.state}`),
+                  el("span", "", labels[kind][s.state]),
+                  el(
+                    "span",
+                    "",
+                    `帧 ${s.start_frame}–${s.end_frame} · ${r.seconds_per_frame ? duration((s.end_frame - s.start_frame + 1) * r.seconds_per_frame) : "时长待补充"}`,
+                  ),
+                );
+                list.append(item);
+              }
+              shown += 100;
+              more.hidden = shown >= runs.length;
+            }
+            more.onclick = append;
+            details.append(list, more);
+            append();
+            if (kind === "label" && r.no_error_ranges?.length)
+              details.append(
+                el(
+                  "p",
+                  "",
+                  `其中“该帧没问题”：${r.no_error_ranges.map((s) => s.join("–")).join("、")}`,
+                ),
+              );
+          }
+        };
+        row.append(bar);
+        const ruler = el("div", "ruler");
+        ruler.append(
+          el("span", "", "帧 0"),
+          el(
+            "span",
+            "",
+            r.frame_count
+              ? `帧 ${r.frame_count - 1} · ${r.timing_known ? "点击查看区间" : "时长信息待补充"}`
+              : "帧数信息待补充",
+          ),
+        );
+        row.append(ruler, details);
+        return row;
+      }
+      async function refresh() {
+        const button = $("refresh");
+        button.disabled = true;
+        $("globalError").hidden = true;
+        try {
+          const data = await get("/api/v1/personnel");
+          accounts = data.accounts;
+          $("stamp").textContent =
+            `更新于 ${new Date(data.generated_at).toLocaleTimeString()}`;
+          select(
+            accounts.some((a) => a.username === current)
+              ? current
+              : accounts.some((a) => a.username === urlState.get("username"))
+                ? urlState.get("username")
+                : accounts[0]?.username || "",
+          );
+        } catch (error) {
+          $("globalError").textContent =
+            `统计读取失败：${error.message}。请点击刷新重试。`;
+          $("globalError").hidden = false;
+          $("stamp").textContent = "刷新失败";
+        } finally {
+          button.disabled = false;
+        }
+      }
+      let timer;
+      $("accountSearch").oninput = () => {
+        accountLimit = 80;
+        renderAccounts();
+      };
+      $("accountSort").onchange = renderAccounts;
+      $("recordSearch").oninput = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          page = 1;
+          loadTasks();
+        }, 250);
+      };
+      $("onlyIssues").onchange = () => {
+        page = 1;
+        loadTasks();
+      };
+      $("refresh").onclick = refresh;
+      const tabs = [...document.querySelectorAll(".tab")];
+      for (const tab of tabs) {
+        tab.onclick = () => {
+          kind = tab.dataset.kind;
+          select(current);
+        };
+        tab.onkeydown = (event) => {
+          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+            event.preventDefault();
+            const index =
+              event.key === "Home"
+                ? 0
+                : event.key === "End"
+                  ? tabs.length - 1
+                  : (tabs.indexOf(tab) +
+                      (event.key === "ArrowRight" ? 1 : -1) +
+                      tabs.length) %
+                    tabs.length;
+            tabs[index].click();
+            tabs[index].focus();
+          }
+        };
+      }
+      renderProfile();
+      refresh();
+    </script>
+  </body>
+</html>

@@ -187,6 +187,60 @@ task definitions, subject IDs, reservation IDs, episode numbers, status,
 timestamps, idempotency keys, local capture paths, upload job status, upload
 percentage, copied bytes/files, NAS URI, and upload errors.
 
+## Personnel Statistics
+
+Open `/people` from the **人员统计** navigation link. The page lists registered
+backend accounts and historical operators, including accounts with no activity.
+The workflow database and registered instance progress files supply the history;
+statistics requests do not scan NAS media directories.
+
+Each account has five totals: captured media, completed QC media, QC-failed
+intervals, QC false positives explicitly confirmed by a labeler, and confirmed
+manual-label media (including frames accepted without correction). These are
+**media seconds, not wall-clock working hours**. Capture duration is retained at
+confirmation. Frame intervals use `duration_seconds / frame_count`, or a recorded
+`fps` when available. Missing timing information is displayed and excluded from
+affected totals rather than assuming a playback rate. Closed frame intervals,
+overlapping camera reports, and repeated jobs are unioned per account and episode.
+
+The page uses account search/sorting, three activity tabs, task expansion,
+episode pagination, an issue filter, and keyboard-accessible frame interval
+details. Capture bars use gray/unreviewed, green/passed, orange/failed. QC adds
+red for frames a labeler explicitly accepted as **该帧没问题**. Label bars use
+gray/not requiring correction, green/confirmed, orange/awaiting annotation.
+An episode's annotation bar shows total progress; an account's label duration
+counts only frames attributed to that operator. Reconfirming a frame as corrected
+replaces its previous no-error decision. A tracking operation that invalidates a
+confirmation resets the corresponding frame to pending.
+
+Both `python -m label.main` and the browser label workbench expose **该帧没问题**.
+It accepts all annotation-camera views of the current frame using original MANO
+projection and visibility. Missing original results prevent this action. Desktop
+confirmation saves output files and then records the backend decision; failed
+backend writes do not advance the frame. Browser confirmation saves its local
+draft, attempts immediate synchronization, and repeats synchronization atomically
+with final submission. Final submission remains idempotent. The new frame table
+is additive and created at normal backend startup: **restart the backend before
+starting updated label/browser clients**. Existing completed labels remain
+countable, but historical false positives cannot be reconstructed without an
+explicit no-error decision.
+
+```
+GET  /api/v1/personnel
+GET  /api/v1/personnel/records?username=alice&kind=qc&page=1&page_size=20
+GET  /api/v1/personnel/records?username=alice&kind=qc&task=pick_cup&page=1
+POST /api/v1/label/episodes/{episode_id}/frames
+```
+
+Records support `q` and `only_issues=1`; page size is capped at 50. The frame
+endpoint accepts `{"operator_id":"alice","frames":[120],"decision":"no_error"}`
+(`corrected` and `pending` are also supported). It validates the active lease,
+operator, integer frame IDs, and assignment bounds. Decisions are stored in
+`label_frame_decisions` with an operator and update timestamp. Browser requests
+derive the operator and lease owner from the authenticated session. The personnel
+dashboard follows the existing backend dashboard's network access boundary;
+account passwords and hashes are never included in statistics responses.
+
 ## Task File Format
 
 ### Create an empty instance and add tasks
