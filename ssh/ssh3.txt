@@ -1,0 +1,5 @@
+Host ego_3
+  HostName 10.162.186.76
+  User xys
+  IdentityFile /Users/cactusxiao/.ssh/id_ed25519
+  IdentitiesOnly yes

@@ -1,0 +1,5 @@
+Host xys
+  HostName 10.162.208.158
+  User xys
+  IdentityFile /Users/cactusxiao/.ssh/id_ed25519
+  IdentitiesOnly yes

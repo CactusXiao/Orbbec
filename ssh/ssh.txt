@@ -1,0 +1,6 @@
+Host ego
+  HostName 10.162.241.5
+  User ubuntu
+  IdentityFile /Users/cactusxiao/.ssh/id_ed25519
+  IdentitiesOnly yes
+
