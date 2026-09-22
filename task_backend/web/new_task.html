@@ -1,22 +1,23 @@
 <div class="crumbs"><a href="/">任务总览</a> / 增加任务</div>
 <section>
   <h2>增加任务</h2>
-  <p class="empty">上传包含 task_name 和步骤描述的单任务 JSON，以及演示视频。确认后立即加入当前任务列表，并保存到 NAS 的 tasks/任务名称/ 目录。</p>
+  <p class="empty">直接选择 task_demo 中的 description 文件（YAML 格式），再上传演示视频。任务名称和中英文步骤会自动读取。</p>
   <form id="new-task">
     <div class="form-grid">
-      <label for="task-json">单任务 JSON</label>
-      <input id="task-json" name="task_json" type="file" accept=".json,application/json" required>
+      <label for="task-json">任务描述文件（YAML）</label>
+      <input id="task-json" name="task_json" type="file" required aria-describedby="description-help">
       <label for="task-name">任务名称</label>
-      <input id="task-name" name="task_name" type="text" maxlength="120" required placeholder="自动读取 task_name，也可输入同名任务名称">
-      <label for="total">每人采集次数</label>
-      <input id="total" name="total" type="number" min="1" step="1" value="1" required>
+      <input id="task-name" name="task_name" type="text" maxlength="120" required readonly placeholder="从描述文件的 task 字段自动读取">
+      <label for="total">重复次数（总 episode 数）</label>
+      <input id="total" name="total" type="number" min="1" step="1" value="1" required aria-describedby="total-help">
       <label for="demo-video">演示 demo 视频</label>
       <input id="demo-video" name="demo_video" type="file" accept=".mp4,.webm,.mov,.m4v" required>
     </div>
-    <p class="empty">单任务 JSON 最大 4 MB；上传总大小最大 2 GB。任务名称必须与 JSON 的 task_name 一致。同名任务不会被覆盖。</p>
+    <p id="total-help" class="empty">填写该任务需要完成的总 episode 数，至少为 1。所有 episode 分配给同一操作员，全部完成后自动分配下一任务。</p>
+    <p id="description-help" class="empty">支持无扩展名的 description、.yaml、.yml，以及原有 JSON。描述文件最大 4 MB；上传总大小最大 2 GB。同名任务不会被覆盖。</p>
     <div id="preview" class="empty desc" hidden></div>
     <video id="video-preview" controls style="display:none;width:100%;max-height:360px"></video>
-    <div class="actions top-actions"><button id="confirm" type="submit">确认增加</button><a class="button" href="/">返回总览</a></div>
+    <div class="actions top-actions"><button id="confirm" type="submit" disabled>确认增加</button><a class="button" href="/">返回总览</a></div>
     <p id="status" class="empty" role="status" aria-live="polite"></p>
     <progress id="upload-progress" max="100" value="0" style="width:100%" hidden></progress>
   </form>
@@ -33,21 +34,40 @@
   const status = document.getElementById('status');
   const preview = document.getElementById('preview');
   const video = document.getElementById('video-preview');
+  const button = document.getElementById('confirm');
   let videoUrl = '';
+  let previewVersion = 0;
+  let descriptionReady = false;
   jsonInput.addEventListener('change', async () => {
+    const version = ++previewVersion;
+    descriptionReady = false;
+    button.disabled = true;
+    nameInput.value = '';
     status.textContent = '';
     preview.hidden = true;
     const file = jsonInput.files[0];
     if (!file) return;
     try {
-      if (file.size > 4 * 1024 * 1024) throw new Error('单任务 JSON 不能超过 4 MB');
-      const data = JSON.parse((await file.text()).replace(/^\uFEFF/, ''));
-      if (!data || typeof data.task_name !== 'string' || !data.task_name.trim()) throw new Error('JSON 缺少 task_name 字段');
+      if (file.size > 4 * 1024 * 1024) throw new Error('任务描述文件不能超过 4 MB');
+      status.textContent = '正在读取任务描述…';
+      const response = await fetch('/api/v1/tasks/preview', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({content: await file.text()})
+      });
+      const data = await response.json();
+      if (version !== previewVersion) return;
+      if (!response.ok) throw new Error(data.error || '任务描述解析失败');
       nameInput.value = data.task_name;
-      document.getElementById('total').value = data.total || data.repeat_times || 1;
-      preview.textContent = JSON.stringify(data, null, 2);
+      preview.textContent = [data.description_cn && '中文步骤\n' + data.description_cn,
+        data.description_en && 'English steps\n' + data.description_en].filter(Boolean).join('\n\n');
       preview.hidden = false;
-    } catch (error) { status.textContent = error.message; jsonInput.value = ''; }
+      descriptionReady = true;
+      button.disabled = false;
+      status.textContent = '描述已读取，请填写总 episode 数并选择演示视频。';
+    } catch (error) {
+      if (version !== previewVersion) return;
+      status.textContent = error.message; jsonInput.value = '';
+    }
   });
   document.getElementById('demo-video').addEventListener('change', event => {
     if (videoUrl) URL.revokeObjectURL(videoUrl);
@@ -58,7 +78,7 @@
   });
   form.addEventListener('submit', event => {
     event.preventDefault();
-    const button = document.getElementById('confirm');
+    if (!descriptionReady) return;
     const progress = document.getElementById('upload-progress');
     const body = new FormData(form);
     const size = [...body.values()].reduce((sum, value) => sum + (value instanceof File ? value.size : 0), 0);

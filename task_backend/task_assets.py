@@ -1,4 +1,4 @@
-"""Task catalog additions and NAS assets (standard library only)."""
+"""Task catalog additions and NAS assets; YAML descriptions use PyYAML."""
 from __future__ import annotations
 
 import json
@@ -22,6 +22,7 @@ except ImportError:
 CATALOG_LOCK = threading.RLock()
 VIDEO_TYPES = {".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".m4v": "video/mp4"}
 MAX_UPLOAD = 2 * 1024**3
+MAX_DOCUMENT = 4 * 1024**2
 
 
 def validate_name(name):
@@ -86,10 +87,56 @@ def task_descriptions(document):
                     if document.get(key)), None)
     if generic is None:
         generic = {key: value for key, value in document.items() if key.lower().startswith("step")}
+    subtasks = document.get("subtasks") or {}
+    def steps(language):
+        values = subtasks.get(language, []) if isinstance(subtasks, dict) else []
+        return "\n".join(f"{index}. {value}" for index, value in enumerate(values, 1)) if isinstance(values, list) else ""
     return {
-        "description_cn": description_text(document.get("description_cn") or document.get("task_description_cn") or generic),
-        "description_en": description_text(document.get("description_en") or document.get("task_description_en") or generic),
+        "description_cn": description_text(document.get("description_cn") or document.get("task_description_cn") or steps("cn") or generic),
+        "description_en": description_text(document.get("description_en") or document.get("task_description_en") or steps("en") or generic),
     }
+
+
+def parse_task_document(text):
+    """Read task_demo YAML (including extensionless description) or legacy JSON."""
+    if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_DOCUMENT:
+        raise ValueError("任务描述文件不能超过 4 MB")
+    text = text.lstrip("\ufeff")
+    try:
+        document = json.loads(text)
+    except ValueError:
+        try:
+            import yaml
+        except ImportError as exc:
+            raise ValueError("服务器缺少 YAML 解析依赖，请安装 task_backend/requirements.txt") from exc
+        try:
+            # Descriptions do not need aliases; disallow cycles and expansion bombs.
+            if any(isinstance(event, yaml.AliasEvent) for event in yaml.parse(text)):
+                raise ValueError("任务描述不支持 YAML 别名，请直接填写步骤")
+            document = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ValueError("任务描述 YAML 格式无效，请检查缩进和引号") from exc
+    if not isinstance(document, dict) or any(not isinstance(key, str) for key in document):
+        raise ValueError("任务描述必须包含 task 和 subtasks 字段")
+    name = document.get("task") or document.get("task_name")
+    validate_name(name)
+    if document.get("task_name") and document["task_name"] != name:
+        raise ValueError("task 与 task_name 必须一致")
+    if "subtasks" in document:
+        subtasks = document["subtasks"]
+        if not isinstance(subtasks, dict) or any(
+                not isinstance(subtasks.get(lang, []), list) or any(
+                    not isinstance(step, str) or not step.strip() for step in subtasks.get(lang, []))
+                for lang in ("cn", "en")):
+            raise ValueError("subtasks.cn 和 subtasks.en 必须是文字步骤列表")
+    document = {**document, "task_name": name, **task_descriptions(document)}
+    if not any(document[key] for key in ("description_cn", "description_en")):
+        raise ValueError("任务描述必须包含 subtasks.cn/en 步骤或描述内容")
+    try:
+        json.dumps(document, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("任务描述包含不支持的值，请使用文字、数字和列表") from exc
+    return document
 
 
 def task_directory(root, name):
@@ -126,16 +173,14 @@ def add_task(catalog, root, name, document_path, video_path, video_name, total, 
     validate_name(name)
     if root is None or not root.is_dir():
         raise ValueError("NAS 挂载目录不可用，请检查 ORBBEC_NAS_ROOT")
-    if document_path.stat().st_size > 4 * 1024**2:
-        raise ValueError("单任务 JSON 不能超过 4 MB")
+    if document_path.stat().st_size > MAX_DOCUMENT:
+        raise ValueError("任务描述文件不能超过 4 MB")
     try:
-        document = json.loads(document_path.read_text(encoding="utf-8-sig"))
-    except (UnicodeError, ValueError) as exc:
-        raise ValueError("单任务 JSON 格式无效") from exc
-    if not isinstance(document, dict) or document.get("task_name") != name:
-        raise ValueError("任务名称必须与单任务 JSON 的 task_name 字段完全一致")
-    if not any(task_descriptions(document).values()):
-        raise ValueError("单任务 JSON 必须包含任务描述或步骤描述")
+        document = parse_task_document(document_path.read_text(encoding="utf-8-sig"))
+    except UnicodeError as exc:
+        raise ValueError("任务描述文件必须使用 UTF-8 编码") from exc
+    if document["task_name"] != name:
+        raise ValueError("任务名称必须与描述文件的 task 字段完全一致")
     suffix = Path(video_name).suffix.lower()
     if suffix not in VIDEO_TYPES or video_path.stat().st_size == 0:
         raise ValueError("请选择非空的 MP4、WebM、MOV 或 M4V 演示视频")
@@ -166,7 +211,8 @@ def add_task(catalog, root, name, document_path, video_path, video_name, total, 
         staging = Path(tempfile.mkdtemp(prefix=".new-task-", dir=destination.parent))
         published = False
         try:
-            shutil.copyfile(document_path, staging / "task.json")
+            atomic_json(staging / "task.json", {**document, "repeat_times": total, "total": total})
+            shutil.copyfile(document_path, staging / "description.yaml")
             shutil.copyfile(video_path, staging / ("demo" + suffix))
             staging.rename(destination)
             published = True
@@ -243,7 +289,7 @@ def read_multipart(stream, content_type, length, directory):
         ending, buffer = buffer[:2], buffer[2:]
         if ending == b"--":
             if set(fields) != {"task_name", "total", "task_json", "demo_video"}:
-                raise ValueError("请填写任务名称、采集次数并选择 JSON 和演示视频")
+                raise ValueError("请填写任务名称、总 episode 数并选择任务描述和演示视频")
             return fields
         if ending != b"\r\n":
             raise ValueError("multipart 分隔符无效")

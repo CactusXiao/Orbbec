@@ -2,8 +2,8 @@
 """Small HTTP task backend for Orbbec collection.
 
 The service owns task definitions, episode reservations, and confirmed
-progress.  It intentionally uses only the Python standard library so it can run
-on a capture host without extra packages.
+progress. YAML task-description uploads require PyYAML; the core backend
+otherwise uses the Python standard library.
 """
 
 from __future__ import annotations
@@ -2048,7 +2048,7 @@ def render_dashboard(model: Dict[str, Any]) -> str:
         + "</div>"
         "<section><h2>Task Summary</h2><div class=\"wide\"><table>"
         "<thead><tr>"
-        "<th>Task</th><th class=\"num\">Required / Subject</th><th class=\"num\">Confirmed</th>"
+        "<th>Task</th><th class=\"num\">Total Episodes</th><th class=\"num\">Confirmed</th>"
         "<th class=\"num\">Reserved</th><th class=\"num\">Released</th><th class=\"num\">Duration</th>"
         "<th class=\"num\">Storage</th><th>Subjects</th><th>Latest Update</th>"
         "</tr></thead><tbody>"
@@ -2104,7 +2104,7 @@ def render_task_detail(model: Dict[str, Any]) -> str:
     body = (
         f"<div class=\"crumbs\"><a href=\"/\">Task backend</a> / {html_escape(task_name)}</div>"
         "<div class=\"summary\">"
-        + render_metric("Required / Subject", task.get("total", ""), "configured episodes")
+        + render_metric("Total Episodes", task.get("total", ""), "required for the entire task")
         + render_metric("Confirmed", counts.get("confirmed", 0))
         + render_metric("Reserved", counts.get("reserved", 0))
         + render_metric("Released", counts.get("released", 0))
@@ -3130,6 +3130,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/v1/collection/assignment":
                 body = self._read_json()
                 self._json_response(HTTPStatus.OK, self.backend.assigned_task(body.get("subject_id"), body.get("operator_id", "")))
+                return
+            if parsed.path == "/api/v1/tasks/preview":
+                self.backend
+                try:
+                    if int(self.headers.get("Content-Length", "0")) > task_assets.MAX_DOCUMENT * 6 + 65536:
+                        raise ValueError("任务描述文件不能超过 4 MB")
+                    document = task_assets.parse_task_document(self._read_json().get("content"))
+                except ValueError as exc:
+                    raise BackendError(HTTPStatus.BAD_REQUEST, str(exc)) from exc
+                self._json_response(HTTPStatus.OK, document)
                 return
             if parsed.path == "/api/v1/tasks":
                 backend = self.backend

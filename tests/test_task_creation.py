@@ -134,6 +134,58 @@ class TaskCreationTest(unittest.TestCase):
             chunks.append(header.encode("utf-8") + b"\r\n\r\n" + value + b"\r\n")
         return b"".join(chunks) + b"--test-boundary--"
 
+    def yaml_fields(self):
+        fields = self.fields("place_the_cube_into_the_box")
+        document = self.root / "description"
+        document.write_text('''task: "place_the_cube_into_the_box"
+scene: ""
+objects: [1, 2, 3]
+subtasks:
+  cn:
+    - "拿起魔方"
+    - "将魔方放入纸盒中"
+  en:
+    - "Pick up the cube."
+    - "Place the cube into the box."
+repeat_times: 99
+''', encoding="utf-8")
+        return {**fields, "task_json": (document, "description"), "total": "3"}
+
+    def test_yaml_total_controls_entire_task_and_keeps_source(self):
+        fields = self.yaml_fields()
+        self.backend.add_task(fields)
+        self.backend.add_task(self.fields("next"))
+        task = self.backend.assigned_task("alice")["task"]
+        self.assertEqual(task["total"], 3)  # Form value overrides file metadata.
+        self.assertEqual(task["description_cn"], "1. 拿起魔方\n2. 将魔方放入纸盒中")
+        self.assertEqual(task["description_en"], "1. Pick up the cube.\n2. Place the cube into the box.")
+        self.assertEqual(self.backend.assigned_task("bob")["task"]["task_name"], "next")
+        directory = self.nas / "tasks" / fields["task_name"]
+        self.assertEqual((directory / "description.yaml").read_bytes(), fields["task_json"][0].read_bytes())
+        self.assertEqual(json.loads((directory / "task.json").read_text())["repeat_times"], 3)
+        for number in range(1, 4):
+            reservation = self.backend.reserve({"subject_id": "alice", "client_id": "test", "task_name": fields["task_name"]})
+            self.assertEqual(reservation["episode_number"], number)
+            result = self.backend.confirm({**reservation, "subject_id": "alice", "idempotency_key": reservation["reservation_id"]})
+            self.assertEqual(len(result["assigned_tasks"]), 1 if number < 3 else 0)
+        self.assertEqual(self.backend.assigned_task("bob")["task"]["task_name"], "next")
+
+    def test_yaml_invalid_documents_do_not_modify_catalog(self):
+        fields = self.yaml_fields()
+        before = self.backend.task_file.read_bytes()
+        for invalid in ('task: [broken', 'task: test\nsubtasks: {cn: text}',
+                        'task: test\nsubtasks: {cn: [5]}', 'task: test',
+                        'task: test\ntask_name: other\nsteps: hi',
+                        '!!python/object/apply:os.system ["echo unsafe"]',
+                        'task: test\nsubtasks: &x {cn: [*x]}'):
+            with self.subTest(invalid=invalid):
+                fields["task_json"][0].write_text(invalid)
+                with self.assertRaises(Exception) as error:
+                    self.backend.add_task(fields)
+                self.assertEqual(error.exception.status, 400)
+                self.assertEqual(self.backend.task_file.read_bytes(), before)
+        self.assertFalse((self.nas / "tasks").exists())
+
     def test_http_empty_setup_upload_and_detail(self):
         registry = TaskInstanceRegistry(self.root / "registry")
         self.assertEqual(len(registry.snapshot()["task_files"]), 1)
@@ -177,6 +229,25 @@ class TaskCreationTest(unittest.TestCase):
         with self.assertRaises(HTTPError) as duplicate:
             urlopen(request)
         self.assertEqual(duplicate.exception.code, 409)
+        fields = self.yaml_fields()
+        before = runtime.backend.task_file.read_bytes()
+        preview_request = Request(base + "/api/v1/tasks/preview", data=json.dumps({
+            "content": fields["task_json"][0].read_text()}).encode(), headers={"Content-Type": "application/json"})
+        with urlopen(preview_request) as response:
+            preview = json.load(response)
+            self.assertEqual(preview["task_name"], fields["task_name"])
+            self.assertIn("将魔方放入纸盒中", preview["description_cn"])
+        self.assertEqual(runtime.backend.task_file.read_bytes(), before)
+        for invalid in (None, "task: [broken", "task: missing_steps"):
+            with self.assertRaises(HTTPError) as error:
+                urlopen(Request(base + "/api/v1/tasks/preview", data=json.dumps({"content": invalid}).encode(),
+                                headers={"Content-Type": "application/json"}))
+            self.assertEqual(error.exception.code, 400)
+        with urlopen(Request(base + "/api/v1/tasks", data=self.multipart(fields),
+                             headers={"Content-Type": "multipart/form-data; boundary=test-boundary"})) as response:
+            self.assertEqual(response.status, 201)
+        with urlopen(base + "/tasks/" + fields["task_name"]) as response:
+            self.assertIn("将魔方放入纸盒中", response.read().decode())
 
     def test_multipart_truncation_and_chunk_boundaries(self):
         body = self.multipart(self.fields())

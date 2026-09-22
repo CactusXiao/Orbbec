@@ -302,28 +302,42 @@ has no task files at all, it also registers an automatically created
 `{"tasks": []}` catalogs are supported.
 
 On the running dashboard, click **增加任务** to open `/manage/tasks/new`.
-Select a single-task JSON, check the automatically populated task name, enter
-the required episode count, select a demo video, and click **确认增加**.
-The task name must exactly match the JSON's `task_name`. Example:
+Install the YAML upload dependency with `python -m pip install -r task_backend/requirements.txt`.
+Select the original `task_demo/<task>/description` YAML file (no filename extension
+required; `.yaml` and `.yml` also work). Check the automatically populated task
+name and Chinese/English steps, enter **重复次数（总 episode 数）**, select a demo
+video, and click **确认增加**. The count is the total for the entire task, all
+assigned to one operator; the next task is assigned only after completion.
+The form's count takes precedence over any count in the file and is not reset
+when selecting another description. Example description:
 
-```json
-{
-  "task_name": "整理杯子",
-  "repeat_times": 5,
-  "task_description": {
-    "step1": "拿起杯子",
-    "step2": "将杯子放回桌面"
-  }
-}
+```yaml
+task: "place_the_cube_into_the_box"
+scene: ""
+objects: [1, 2, 3]
+subtasks:
+  cn:
+    - "拿起魔方"
+    - "将魔方放入纸盒中"
+  en:
+    - "Pick up the cube."
+    - "Place the cube into the box."
 ```
 
+Legacy JSON descriptions with `task_name` remain supported.
+`POST /api/v1/tasks/preview` takes JSON `{"content": "<description text>"}`
+and validates/normalizes the description without changing the catalog or progress.
 The multipart `POST /api/v1/tasks` endpoint accepts `task_name`, `total`,
-`task_json`, and `demo_video`. JSON is limited to 4 MB, and the complete upload
+`task_json` (the description file, YAML or JSON), and `demo_video`.
+Descriptions are limited to 4 MB, and the complete upload
 to 2 GB. Supported video extensions are MP4, WebM, MOV, and M4V; browser playback
 depends on the video's codec. MP4 with H.264 is recommended for playback.
 Uploads stream to temporary files instead of buffering videos in memory.
 
 The configured `ORBBEC_NAS_ROOT` must be an accessible mounted directory.
+The original description is preserved as `<NAS>/tasks/<task_name>/description.yaml`.
+Normalized descriptions and the selected count are saved in `task.json`, with
+numbered `description_cn`/`description_en` derived from `subtasks.cn`/`subtasks.en`.
 Files are published as `<NAS>/tasks/<task_name>/task.json` and
 `<NAS>/tasks/<task_name>/demo.<extension>`. Existing task names and existing
 NAS folders are rejected without overwriting them. The current catalog is
