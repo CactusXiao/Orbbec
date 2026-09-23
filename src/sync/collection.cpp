@@ -2,6 +2,7 @@
 #include "handshape_calibration.hpp"
 #include "ego.hpp"
 #include "fisheyes.hpp"
+#include "collection_extrinsic_feedback.hpp"
 #include "tactile.hpp"
 #include "task_backend_client.hpp"
 
@@ -1272,6 +1273,7 @@ class VoiceAnnouncer {
 public:
     explicit VoiceAnnouncer(VoiceFeedbackConfig cfg)
         : cfg_(std::move(cfg)) {
+        cfg_.messages.try_emplace(extrinsic_feedback::failureMessageKey, extrinsic_feedback::failureMessage);
         if(cfg_.enabled) {
             initializeNaturalVoiceCache();
             worker_ = std::thread([this]() { workerLoop(); });
@@ -11533,6 +11535,10 @@ int run_collection(const AppConfig &cfg,
                 extrinsicReadyAllowsStart = recorder.runExtrinsicHealthCheckBeforeStart(
                     root, subject, taskName, episodeN, &checkLine, &checkDetails, &extrinsicReadyStatus);
                 extrinsicReadyChecked = true;
+                if(extrinsicReadyStatus == "fail") {
+                    // Announce once per completed check, including failed resamples.
+                    announce(extrinsic_feedback::failureMessageKey, extrinsic_feedback::failureMessage);
+                }
                 if(isManualRecheck) {
                     manualExtrinsicRecheckPending = false;
                     manualExtrinsicRecheckScreenShown = false;
@@ -11727,7 +11733,7 @@ int run_collection(const AppConfig &cfg,
                         if(extrinsicReadyStatus == "fail") {
                             sd = {"CHECK FAILED", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
                             stateEmphasisLine = "Extrinsic check failed; collection is blocked";
-                            stateFootnoteLine = "Fix the setup, then use Resample Extrinsic Check";
+                            stateFootnoteLine = "Fix the setup, then press F2 to resample extrinsics";
                         }
                         else {
                             sd = {"CHECK ERROR", cv::Scalar(80, 80, 255), cv::Scalar(55, 25, 25)};
@@ -11921,6 +11927,7 @@ int run_collection(const AppConfig &cfg,
                                      && (captureState == CaptureState::IDLE || captureState == CaptureState::BACKEND_SYNC_PENDING);
             const bool allowExtrinsicRecheck = !modalFault && !modalDelete && !modalExit
                                              && captureState == CaptureState::IDLE
+                                             && !manualExtrinsicRecheckPending
                                              && !currentReservation.active
                                              && cameraReadiness.allReady
                                              && selectedTaskSelectable
@@ -11960,7 +11967,11 @@ int run_collection(const AppConfig &cfg,
                     startLabel = "Start (checking)";
                 }
             }
-            bool doExtrinsicRecheck = uiButtonEx(ui, bExtrinsicRecheck, "Resample Extrinsic Check", fm, allowExtrinsicRecheck);
+            const bool failureResample = allowExtrinsicRecheck && extrinsicReadyStatus == "fail";
+            bool doExtrinsicRecheck = uiButtonEx(ui, bExtrinsicRecheck,
+                failureResample ? "Resample Extrinsic Check [F2]" : "Resample Extrinsic Check", fm, allowExtrinsicRecheck);
+            doExtrinsicRecheck = doExtrinsicRecheck
+                || extrinsic_feedback::resampleOnFailure(key, allowExtrinsicRecheck, extrinsicReadyStatus);
             bool doStart    = uiButtonEx(ui, bStart, startLabel, fm, allowStart);
             bool doStop     = uiButtonEx(ui, bStop,  "Stop   [Ctrl+2]", fm, allowStop);
             std::string saveLabel = shapeCalibration ? "Calibrate [Ctrl+3]" : "Confirm [Ctrl+3]";
