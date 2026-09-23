@@ -12,7 +12,6 @@ import argparse
 import csv
 import hashlib
 import hmac
-import ipaddress
 import html
 import json
 import math
@@ -36,6 +35,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:
+    from .access_policy import management_allowed
     from . import task_assets
     from .job_service import JobService
     from .personnel import snapshot as personnel_snapshot, query_records, render_personnel_page
@@ -51,6 +51,7 @@ try:
     from .workflow_store import WorkflowStore
     from .viewer_service import ViewerError, ViewerSessionManager, render_viewer_page
 except ImportError:  # pragma: no cover - script execution fallback
+    from access_policy import management_allowed
     import task_assets
     from job_service import JobService  # type: ignore
     from personnel import snapshot as personnel_snapshot, query_records, render_personnel_page
@@ -2734,7 +2735,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
     def _operator_only_connection(self) -> bool:
         # Use the actual TCP peer, never Host or client-supplied proxy headers.
-        return not ipaddress.ip_address(self.client_address[0]).is_loopback
+        return not management_allowed(self.client_address[0])
 
     def parse_request(self) -> bool:
         if not super().parse_request():
@@ -2745,7 +2746,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                        or (self.command == "POST" and path in {"/api/v1/operator/login", "/api/v1/operator/logout"})
                        or (self.command == "GET" and path.startswith("/task-assets/")))
             if not allowed:
-                self._json_response(HTTPStatus.FORBIDDEN, {"error": "局域网仅开放操作员页面 /operator，管理后端仅限主机本机访问"})
+                self._json_response(HTTPStatus.FORBIDDEN, {"error": "此网络仅开放操作员页面 /operator，管理后端仅限校园网或主机本机访问"})
                 self.close_connection = True
                 return False
         return True

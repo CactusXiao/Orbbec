@@ -277,19 +277,32 @@ ownership remains in the selected instance's progress file under
 `task_assignments` and `operator_tasks`. Separate instances retain separate
 progress/assignment state.
 
-Non-loopback connections are restricted to `/operator`, the three operator
+Connections outside loopback and the campus `10.0.0.0/8` network (including the
+operator `192.168.50.0/24` network) are restricted to `/operator`, the three operator
 session/task endpoints, and authenticated demo requests for the logged-in
 operator's current task. Other pages and APIs return 403, even after operator
 login. Downloading task JSON or another operator's video is forbidden. Access
 checks use the TCP peer address and ignore `Host`, `X-Forwarded-For`, and
 `X-Real-IP` headers.
 
-Management, capture, workflow and account-registration APIs are local-only.
+Management, capture, workflow and account-registration APIs are available from
+loopback and campus `10.0.0.0/8` peers.
 On the capture host, open `http://127.0.0.1:8765/` for management; local capture
 clients continue to use that address. Administrators working remotely can use
 an authenticated SSH tunnel, for example `ssh -L 18765:127.0.0.1:8765 <host>`,
 then open `http://127.0.0.1:18765/`. Do not place an unrestricted loopback reverse
 proxy in front of this listener: its connections would be treated as local.
+
+For an uninterrupted migration while an older backend is recording, start a
+separate campus-only entry with
+`python -m task_backend.campus_proxy --host <10.x-campus-address> --port 8766`.
+It checks the real TCP peer against `10.0.0.0/8` before forwarding bytes to
+`127.0.0.1:8765`; operator-network clients are denied even if they route to the
+campus address or spoof HTTP headers. This does not restart or reconfigure the
+running backend/capture process. Campus users can immediately open
+`http://<10.x-campus-address>:8766/`; the original listener picks up the revised
+network policy only at its next normal restart. Video ranges and uploads pass
+through unchanged, with bounded per-connection buffers.
 
 The desktop collection integration uses:
 

@@ -10,6 +10,7 @@ from urllib.request import Request, HTTPCookieProcessor, build_opener
 from task_backend.server import BackendRuntime, RequestHandler, TaskBackend, TaskHTTPServer, TaskInstanceRegistry
 from task_backend.job_service import JobService
 from task_backend.workflow_store import WorkflowStore
+from task_backend.access_policy import management_allowed
 
 
 class LanServer(TaskHTTPServer):
@@ -18,7 +19,19 @@ class LanServer(TaskHTTPServer):
         return connection, ('192.0.2.10', address[1])
 
 
+class CampusServer(TaskHTTPServer):
+    def get_request(self):
+        connection, address = super().get_request()
+        return connection, ('10.230.194.204', address[1])
+
+
 class OperatorAccessTest(unittest.TestCase):
+    def test_network_roles(self):
+        for peer in ('127.0.0.1', '::1', '10.162.208.158', '10.230.194.204', '::ffff:10.1.2.3'):
+            self.assertTrue(management_allowed(peer), peer)
+        for peer in ('192.168.50.177', '192.168.1.2', '172.16.1.2', '203.0.113.1', '::ffff:192.168.50.177'):
+            self.assertFalse(management_allowed(peer), peer)
+
     def test_lan_cannot_access_admin_or_other_operators_assets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -32,7 +45,7 @@ class OperatorAccessTest(unittest.TestCase):
             runtime = BackendRuntime(TaskInstanceRegistry(root / 'registry'), JobService(WorkflowStore(root / 'workflow.sqlite3')))
             runtime.backend = TaskBackend(root / 'progress', task_file=catalog, nas_root=root / 'nas')
             runtime.accounts.register({'username': 'alice', 'password': 'pw', 'password_repeat': 'pw'})
-            servers = [cls(('127.0.0.1', 0), RequestHandler, runtime) for cls in (LanServer, TaskHTTPServer)]
+            servers = [cls(('127.0.0.1', 0), RequestHandler, runtime) for cls in (LanServer, TaskHTTPServer, CampusServer)]
             threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in servers]
             for thread in threads:
                 thread.start()
@@ -68,6 +81,9 @@ class OperatorAccessTest(unittest.TestCase):
                 local = f'http://127.0.0.1:{servers[1].server_port}'
                 self.assertEqual(client.open(local + '/manage/tasks/new').status, 200)
                 self.assertEqual(client.open(local + '/tasks').status, 200)
+                campus = f'http://127.0.0.1:{servers[2].server_port}'
+                self.assertEqual(client.open(campus + '/manage/tasks/new').status, 200)
+                self.assertEqual(client.open(campus + '/api/v1/personnel').status, 200)
                 request('/api/v1/operator/logout', 'POST', {}).close()
                 denied('/task-assets/first/demo.mp4', status=401)
             finally:
