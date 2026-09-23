@@ -3,6 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, HTTPCookieProcessor, build_opener
@@ -31,6 +32,13 @@ class OperatorAccessTest(unittest.TestCase):
             self.assertTrue(management_allowed(peer), peer)
         for peer in ('192.168.50.177', '192.168.1.2', '172.16.1.2', '203.0.113.1', '::ffff:192.168.50.177'):
             self.assertFalse(management_allowed(peer), peer)
+
+    @patch.dict('os.environ', {'ORBBEC_OPERATOR_NAT_NETWORKS': '10.192.35.102/32'})
+    def test_operator_nat_is_not_campus_management(self):
+        self.assertFalse(management_allowed('10.192.35.102'))
+        self.assertFalse(management_allowed('::ffff:10.192.35.102'))
+        self.assertTrue(management_allowed('10.230.194.204'))
+        self.assertTrue(management_allowed('127.0.0.1'))
 
     def test_lan_cannot_access_admin_or_other_operators_assets(self):
         with tempfile.TemporaryDirectory() as temporary:

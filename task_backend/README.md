@@ -297,8 +297,13 @@ For an uninterrupted migration while an older backend is recording, start a
 separate campus-only entry with
 `python -m task_backend.campus_proxy --host <10.x-campus-address> --port 8766`.
 It checks the real TCP peer against `10.0.0.0/8` before forwarding bytes to
-`127.0.0.1:8765`; operator-network clients are denied even if they route to the
-campus address or spoof HTTP headers. This does not restart or reconfigure the
+`127.0.0.1:8765`. If the operator router translates LAN clients into a campus
+address, set the process environment `ORBBEC_OPERATOR_NAT_NETWORKS` to its
+comma-separated egress CIDRs on **both** the backend and proxy services (for
+the current site: `10.192.35.102/32`). These sources stay restricted, including
+requests with spoofed HTTP headers. Update this setting if the router's campus
+address changes; source-IP rules cannot distinguish clients hidden behind the
+same NAT address. This does not restart or reconfigure the
 running backend/capture process. Campus users can immediately open
 `http://<10.x-campus-address>:8766/`; the original listener picks up the revised
 network policy only at its next normal restart. Video ranges and uploads pass
