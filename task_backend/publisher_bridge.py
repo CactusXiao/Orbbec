@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path, PurePosixPath
@@ -108,6 +110,7 @@ def _local_mano_provenance(episode_dir: Path) -> Tuple[int, str]:
 class PublisherBridgeConfig:
     enabled: bool = False
     max_inflight: int = 4
+    monitor_capacity: int = 100
     poll_seconds: float = 20.0
     lease_seconds: int = 300
     heartbeat_seconds: float = 60.0
@@ -121,6 +124,8 @@ class PublisherBridgeConfig:
     mano_default_shape_path: Optional[Path] = None
 
     def validate(self) -> None:
+        if not 1 <= self.monitor_capacity <= 100:
+            raise ValueError("Publisher Bridge monitor capacity must be between 1 and 100")
         if self.max_inflight <= 0:
             raise ValueError("ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT must be greater than 0")
         if self.poll_seconds <= 0:
@@ -195,6 +200,30 @@ class PublisherClient:
     def publish(self, episode_id: str) -> None:
         self._run_remote(self.config.publisher_publish_command, episode_id)
 
+    def statuses(self, episode_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """One SSH connection and one read-only NAS query per monitoring round.
+
+        Require the batch API; silently falling back to per-episode SSH would
+        reintroduce the connection storm this scheduler is intended to avoid.
+        """
+        ids = list(dict.fromkeys(episode_ids))
+        if not ids:
+            return {}
+        if len(ids) > 100:
+            raise ValueError("Publisher status batch exceeds 100 episodes")
+        output = self._run_remote(self.config.publisher_status_command, "--batch", *ids)
+        try:
+            payload = json.loads(output)
+            rows = payload["episodes"]
+            if not isinstance(rows, list) or len(rows) != len(ids):
+                raise ValueError("incomplete status batch")
+            result = {row["episode_id"]: row for row in rows}
+            if set(result) != set(ids) or any(type(row.get("found")) is not bool for row in rows):
+                raise ValueError("status batch IDs or found flags do not match")
+            return result
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PublisherCommandError(f"Invalid Publisher batch status: {exc}") from exc
+
     def publish_manual(self, episode_id: str) -> None:
         self._run_remote(self.config.publisher_publish_command, "--manual-2d", episode_id)
 
@@ -213,8 +242,8 @@ class PublisherClient:
         ]
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         started = time.monotonic()
-        while process.poll() is None:
-            if self.stop_event.wait(0.2):
+        while True:
+            if self.stop_event.is_set():
                 process.terminate()
                 try:
                     process.wait(timeout=3.0)
@@ -225,7 +254,11 @@ class PublisherClient:
                 process.kill()
                 process.wait()
                 raise PublisherCommandError(f"Publisher command timed out after {self.config.command_timeout_seconds:g}s")
-        stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                continue
         if process.returncode != 0:
             detail = " ".join((stderr or stdout or "").strip().split())
             if len(detail) > 500:
@@ -356,23 +389,29 @@ class PublisherBridge:
         self.publisher = publisher_client or PublisherClient(config, self.stop_event)
         self.materializer = materializer or OptimizedPoseMaterializer(config, self.stop_event)
         self.threads: List[threading.Thread] = []
+        self._active: Dict[str, Dict[str, Any]] = {}
+        self._active_lock = threading.RLock()
+        self._monitor_owner = f"publisher_bridge:{self.hostname}:monitor-{uuid.uuid4().hex[:12]}"
+        self._publish_pool: Optional[ThreadPoolExecutor] = None
+        self._result_pool: Optional[ThreadPoolExecutor] = None
 
     def start(self) -> None:
         if not self.config.enabled or self.threads:
             return
         self.config.validate()
         self.stop_event.clear()
-        for slot_index in range(1, self.config.max_inflight + 1):
-            thread = threading.Thread(
-                target=self._run_slot,
-                args=(slot_index,),
-                name=f"publisher-bridge-slot-{slot_index:02d}",
-                daemon=True,
-            )
-            self.threads.append(thread)
+        self._publish_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="publisher-submit")
+        self._result_pool = ThreadPoolExecutor(
+            max_workers=self.config.max_inflight, thread_name_prefix="publisher-result")
+        self.threads = [
+            threading.Thread(target=self._run_monitor, name="publisher-monitor", daemon=True),
+            threading.Thread(target=self._run_heartbeats, name="publisher-heartbeats", daemon=True),
+        ]
+        for thread in self.threads:
             thread.start()
         _log(
-            f"started slots={self.config.max_inflight} publisher={self.config.publisher_ssh_host} "
+            f"started monitor_capacity={self.config.monitor_capacity} "
+            f"result_workers={self.config.max_inflight} publisher={self.config.publisher_ssh_host} "
             f"poll={self.config.poll_seconds:g}s lease={self.config.lease_seconds}s"
         )
 
@@ -384,7 +423,144 @@ class PublisherBridge:
         alive = [thread.name for thread in self.threads if thread.is_alive()]
         if alive:
             _log(f"shutdown timed out while waiting for: {', '.join(alive)}")
-        self.threads = []
+        # Retain still-running threads so a timed-out stop cannot start a second
+        # scheduler over the same active leases.
+        self.threads = [thread for thread in self.threads if thread.is_alive()]
+
+    def _run_heartbeats(self) -> None:
+        while not self.stop_event.wait(self.config.heartbeat_seconds):
+            try:
+                with self._active_lock:
+                    ids = list(self._active)
+                owned = set(self.service.store.heartbeat_jobs(
+                    job_ids=ids, lease_owner=self._monitor_owner,
+                    lease_seconds=self.config.lease_seconds))
+                with self._active_lock:
+                    for job_id in set(ids) - owned:
+                        entry = self._active.get(job_id)
+                        if entry is not None:
+                            entry["lost_lease"] = True
+                if set(ids) - owned:
+                    _log(f"monitor dropped {len(set(ids) - owned)} finished/reassigned/expired leases")
+            except Exception as exc:
+                _log(f"monitor heartbeat failed: {_format_error(exc)}")
+
+    def _run_monitor(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    self.poll_once()
+                except BridgeShutdown:
+                    break
+                except Exception as exc:
+                    _log(f"monitor poll failed (batch NAS status API required): {_format_error(exc)}")
+                self.stop_event.wait(self.config.poll_seconds)
+        finally:
+            # Workers check stop_event before each operation. Finish cancellation
+            # before releasing leases, so a restarted bridge cannot overlap them.
+            for pool in (self._publish_pool, self._result_pool):
+                if pool is not None:
+                    pool.shutdown(wait=True, cancel_futures=True)
+            with self._active_lock:
+                ids = list(self._active)
+            for job_id in ids:
+                try:
+                    self.service.store.release_job(
+                        job_id=job_id, reason="backend_shutdown", lease_owner=self._monitor_owner)
+                except Exception as exc:
+                    _log(f"monitor release failed job={job_id}: {_format_error(exc)}")
+            with self._active_lock:
+                self._active.clear()
+
+    def poll_once(self) -> None:
+        """Advance up to 100 episodes without waiting for any remote result."""
+        if self.stop_event.is_set():
+            return
+        with self._active_lock:
+            entries = list(self._active.items())
+        for job_id, entry in entries:
+            future = entry.get("future")
+            finished = False
+            if future is not None and future.done():
+                try:
+                    finished = future.result()
+                except BridgeShutdown:
+                    raise
+                except Exception as exc:
+                    _log(f"monitor job={job_id} retrying: {_format_error(exc)}")
+                entry.pop("future", None)
+            if finished or (entry.get("lost_lease") and "future" not in entry):
+                with self._active_lock:
+                    self._active.pop(job_id, None)
+
+        while not self.stop_event.is_set():
+            with self._active_lock:
+                if len(self._active) >= self.config.monitor_capacity:
+                    break
+            try:
+                leased = self.service.lease_job({
+                    "type": "auto_label", "worker_id": self._monitor_owner,
+                    "lease_seconds": self.config.lease_seconds,
+                })
+            except WorkflowError as exc:
+                if exc.status in {HTTPStatus.NOT_FOUND, HTTPStatus.CONFLICT}:
+                    break
+                raise
+            job_id = str(leased["job"]["job_id"])
+            with self._active_lock:
+                self._active[job_id] = dict(leased)
+
+        with self._active_lock:
+            waiting = sorted(
+                [(job_id, entry) for job_id, entry in self._active.items()
+                 if "future" not in entry and not entry.get("lost_lease")],
+                key=lambda item: item[1].get("last_result_attempt", 0.0),
+            )
+            result_busy = sum(entry.get("operation") == "result" and "future" in entry
+                              for entry in self._active.values())
+        resolved = []
+        for job_id, entry in waiting:
+            payload, episode = entry.get("payload") or {}, entry.get("episode") or {}
+            uri = str(payload.get("episode_uri") or episode.get("episode_uri") or episode.get("data_uri") or "")
+            try:
+                episode_id, _ = self._resolve_episode(uri)
+            except ValueError:
+                # Use the same validation/failure handling as the synchronous API.
+                self._process_status(job_id, self._monitor_owner, payload, episode, {})
+                with self._active_lock:
+                    self._active.pop(job_id, None)
+                continue
+            resolved.append((job_id, entry, episode_id))
+        if not resolved or self.stop_event.is_set():
+            return
+        statuses = self.publisher.statuses([episode_id for _, _, episode_id in resolved])
+        for job_id, entry, episode_id in resolved:
+            if self.stop_event.is_set():
+                return
+            status = statuses[episode_id]
+            shape = is_shape_calibration_episode(entry.get("episode") or {})
+            if not shape and not status["found"]:
+                pool, operation = self._publish_pool, "publish"
+            elif (shape and status.get("state") == "shape_calibrated") or (
+                not shape and status.get("state") in PUBLISHER_RESULT_STATES
+            ):
+                if result_busy >= self.config.max_inflight:
+                    continue
+                pool, operation = self._result_pool, "result"
+                result_busy += 1
+            else:
+                continue
+            if pool is None:
+                raise RuntimeError("Publisher monitor has not been started")
+            with self._active_lock:
+                if entry.get("lost_lease"):
+                    continue
+                entry["operation"] = operation
+                if operation == "result":
+                    entry["last_result_attempt"] = time.monotonic()
+                entry["future"] = pool.submit(
+                    self._process_status, job_id, self._monitor_owner,
+                    entry.get("payload") or {}, entry.get("episode") or {}, status)
 
     def worker_id(self, slot_index: int) -> str:
         return f"publisher_bridge:{self.hostname}:slot-{slot_index:02d}"
@@ -487,20 +663,8 @@ class PublisherBridge:
         finally:
             heartbeat.stop()
 
-    def _run_slot(self, slot_index: int) -> None:
-        worker_id = self.worker_id(slot_index)
-        while not self.stop_event.is_set():
-            try:
-                did_work = self.process_once(slot_index)
-            except BridgeShutdown:
-                break
-            except Exception as exc:  # Preserve the slot after an unexpected per-job error.
-                _log(f"slot-{slot_index:02d} error: {_format_error(exc)}")
-                did_work = False
-            if not did_work:
-                self.stop_event.wait(self.config.poll_seconds)
-
     def process_once(self, slot_index: int) -> bool:
+        """Synchronous single-job helper; start() uses the batch monitor instead."""
         if self.stop_event.is_set():
             return False
         worker_id = self.worker_id(slot_index)
@@ -546,13 +710,43 @@ class PublisherBridge:
                 except Exception as exc:
                     _log(f"release failed job={job_id}: {_format_error(exc)}")
 
+    def _check_owned_job(self, job_id: str, worker_id: str) -> None:
+        job = self.service.store.get_job(job_id) or {}
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        if (job.get("lease_owner") != worker_id or job.get("status") not in {"leased", "running"}
+                or str(job.get("lease_until") or "") <= now):
+            raise WorkflowError(HTTPStatus.CONFLICT, "Publisher job lease is no longer owned")
+
     def _process_leased_job(
+        self, job_id: str, worker_id: str, payload: Dict[str, Any], episode: Dict[str, Any],
+    ) -> bool:
+        """Synchronous single-job entry point; the running service uses poll_once."""
+        uri = str(payload.get("episode_uri") or episode.get("episode_uri") or episode.get("data_uri") or "")
+        try:
+            episode_id, _ = self._resolve_episode(uri)
+        except ValueError:
+            return self._process_status(job_id, worker_id, payload, episode, {})
+        while not self.stop_event.is_set():
+            try:
+                status = self.publisher.status(episode_id)
+                if self._process_status(job_id, worker_id, payload, episode, status):
+                    return True
+            except (PublisherCommandError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+                _log(f"job={job_id} transient Publisher/NAS error: {_format_error(exc)}")
+            self.stop_event.wait(self.config.poll_seconds)
+        raise BridgeShutdown("backend is stopping")
+
+    def _process_status(
         self,
         job_id: str,
         worker_id: str,
         payload: Dict[str, Any],
         episode: Dict[str, Any],
+        status: Dict[str, Any],
     ) -> bool:
+        if self.stop_event.is_set():
+            raise BridgeShutdown("backend is stopping")
+        self._check_owned_job(job_id, worker_id)
         episode_uri = str(payload.get("episode_uri") or episode.get("episode_uri") or episode.get("data_uri") or "").strip()
         try:
             publisher_episode_id, episode_dir = self._resolve_episode(episode_uri)
@@ -570,104 +764,98 @@ class PublisherBridge:
         cameras = payload.get("cameras") if isinstance(payload.get("cameras"), list) else episode.get("cameras")
         camera_ids = [str(value) for value in (cameras or [])]
 
-        while not self.stop_event.is_set():
-            try:
-                status = self.publisher.status(publisher_episode_id)
-                if is_shape_calibration_episode(episode):
-                    # Capture already published with --shape-calibration. Only
-                    # observe the result; never republish as a normal episode.
-                    if status.get("state") != "shape_calibrated":
-                        self.stop_event.wait(self.config.poll_seconds)
-                        continue
-                    result_dir = episode_dir.parent.parent / "shape_calibration_result"
-                    if not all((result_dir / name).is_file() and (result_dir / name).stat().st_size > 0
-                               for name in ("shape.npy", "scale.npy", "pose_mesh.png", "pose_2d.png")):
-                        self.stop_event.wait(self.config.poll_seconds)
-                        continue
-                    result_uri = uri_join(episode_uri.rsplit("/", 2)[0], "shape_calibration_result")
-                    self.service.complete_job(job_id, {"result": {
-                        "ok": True, "worker_id": worker_id, "publisher_state": "shape_calibrated",
-                        "shape_calibration": True, "generation": status.get("generation"),
-                    }, "artifacts": [{"kind": "shape_calibration_result", "uri": result_uri}]})
-                    return True
-                if not bool(status.get("found")):
-                    self.publisher.publish(publisher_episode_id)
-                    _log(f"published job={job_id} episode={publisher_episode_id}")
-                    self.stop_event.wait(self.config.poll_seconds)
-                    continue
-
-                state = str(status.get("state") or "").strip().lower()
-                if state in PUBLISHER_WAITING_STATES:
-                    self.stop_event.wait(self.config.poll_seconds)
-                    continue
-                if state not in PUBLISHER_RESULT_STATES:
-                    _log(f"job={job_id} waiting on unknown Publisher state={state or '<empty>'}")
-                    self.stop_event.wait(self.config.poll_seconds)
-                    continue
-
-                generation = int(status.get("generation") or 0)
-                result_sha256 = str(status.get("result_manifest_sha256") or "").strip()
-                materialized = self.materializer.run(
-                    episode_dir=episode_dir,
-                    generation=generation,
-                    result_manifest_sha256=result_sha256,
-                    cameras=camera_ids,
-                )
-                frames = [int(value) for value in materialized.get("frames", [])]
-                result = {
-                    "ok": True,
-                    "worker_id": worker_id,
-                    "generation": generation,
-                    "frames": frames,
-                    "optimized_pose_shape": [2, 99],
-                    "joints_3d_shape": list(materialized.get("joints_3d_shape") or []),
-                    "result_manifest_sha256": result_sha256,
-                    "materializer_reused": bool(materialized.get("reused")),
-                }
-                artifacts = [
-                    {
-                        "kind": "optimized_pose",
-                        "uri": uri_join(episode_uri, "optimized_pose"),
-                        "metadata": {"generation": generation, "frame_shape": [2, 99]},
-                    },
-                    {
-                        "kind": "mano_episode",
-                        "uri": uri_join(episode_uri, "mano", "episode"),
-                        "metadata": {"generation": generation, "coordinate_system": "episode_world"},
-                    },
-                ]
-                self.service.complete_job(job_id, {"result": result, "artifacts": artifacts})
-                _log(f"completed job={job_id} episode={publisher_episode_id} frames={len(frames)}")
+        try:
+            if is_shape_calibration_episode(episode):
+                # Capture already published with --shape-calibration. Only
+                # observe the result; never republish as a normal episode.
+                if status.get("state") != "shape_calibrated":
+                    return False
+                result_dir = episode_dir.parent.parent / "shape_calibration_result"
+                if not all((result_dir / name).is_file() and (result_dir / name).stat().st_size > 0
+                           for name in ("shape.npy", "scale.npy", "pose_mesh.png", "pose_2d.png")):
+                    return False
+                result_uri = uri_join(episode_uri.rsplit("/", 2)[0], "shape_calibration_result")
+                self._check_owned_job(job_id, worker_id)
+                self.service.complete_job(job_id, {"result": {
+                    "ok": True, "worker_id": worker_id, "publisher_state": "shape_calibrated",
+                    "shape_calibration": True, "generation": status.get("generation"),
+                }, "artifacts": [{"kind": "shape_calibration_result", "uri": result_uri}]})
                 return True
-            except BridgeShutdown:
-                break
-            except MaterializerError as exc:
-                if exc.retryable:
-                    _log(f"job={job_id} MANO result not ready: {exc}")
-                    self.stop_event.wait(self.config.poll_seconds)
-                    continue
-                error = f"optimized_pose materialization failed: {exc}"
-                self.service.fail_job(
-                    job_id,
-                    {
-                        "error": error,
-                        "result": {
-                            "ok": False,
-                            "worker_id": worker_id,
-                            "phase": "mano_materialization",
-                            "generation": generation,
-                            "result_manifest_sha256": result_sha256,
-                        },
+            if not bool(status.get("found")):
+                self.publisher.publish(publisher_episode_id)
+                _log(f"published job={job_id} episode={publisher_episode_id}")
+                return False
+
+            state = str(status.get("state") or "").strip().lower()
+            if state in PUBLISHER_WAITING_STATES:
+                return False
+            if state not in PUBLISHER_RESULT_STATES:
+                _log(f"job={job_id} waiting on unknown Publisher state={state or '<empty>'}")
+                return False
+
+            generation = int(status.get("generation") or 0)
+            result_sha256 = str(status.get("result_manifest_sha256") or "").strip()
+            materialized = self.materializer.run(
+                episode_dir=episode_dir,
+                generation=generation,
+                result_manifest_sha256=result_sha256,
+                cameras=camera_ids,
+            )
+            frames = [int(value) for value in materialized.get("frames", [])]
+            result = {
+                "ok": True,
+                "worker_id": worker_id,
+                "generation": generation,
+                "frames": frames,
+                "optimized_pose_shape": [2, 99],
+                "joints_3d_shape": list(materialized.get("joints_3d_shape") or []),
+                "result_manifest_sha256": result_sha256,
+                "materializer_reused": bool(materialized.get("reused")),
+            }
+            artifacts = [
+                {
+                    "kind": "optimized_pose",
+                    "uri": uri_join(episode_uri, "optimized_pose"),
+                    "metadata": {"generation": generation, "frame_shape": [2, 99]},
+                },
+                {
+                    "kind": "mano_episode",
+                    "uri": uri_join(episode_uri, "mano", "episode"),
+                    "metadata": {"generation": generation, "coordinate_system": "episode_world"},
+                },
+            ]
+            self._check_owned_job(job_id, worker_id)
+            self.service.complete_job(job_id, {"result": result, "artifacts": artifacts})
+            _log(f"completed job={job_id} episode={publisher_episode_id} frames={len(frames)}")
+            return True
+        except BridgeShutdown:
+            raise
+        except MaterializerError as exc:
+            if exc.retryable:
+                _log(f"job={job_id} MANO result not ready: {exc}")
+                return False
+            error = f"optimized_pose materialization failed: {exc}"
+            self._check_owned_job(job_id, worker_id)
+            self.service.fail_job(
+                job_id,
+                {
+                    "error": error,
+                    "result": {
+                        "ok": False,
+                        "worker_id": worker_id,
+                        "phase": "mano_materialization",
+                        "generation": generation,
+                        "result_manifest_sha256": result_sha256,
                     },
-                )
-                _log(f"failed job={job_id}: {error}")
-                return True
-            except (PublisherCommandError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
-                # Publisher/NAS/SSH failures are explicitly non-terminal.  The
-                # independent heartbeat keeps this job leased while we retry.
-                _log(f"job={job_id} transient Publisher/NAS error: {_format_error(exc)}")
-                self.stop_event.wait(self.config.poll_seconds)
-        raise BridgeShutdown("backend is stopping")
+                },
+            )
+            _log(f"failed job={job_id}: {error}")
+            return True
+        except (PublisherCommandError, OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+            # Publisher/NAS/SSH failures are explicitly non-terminal.  The
+            # independent heartbeat keeps this job leased while we retry.
+            _log(f"job={job_id} transient Publisher/NAS error: {_format_error(exc)}")
+            return False
 
     def _resolve_episode(self, episode_uri: str) -> Tuple[str, Path]:
         parsed = urlparse(episode_uri)

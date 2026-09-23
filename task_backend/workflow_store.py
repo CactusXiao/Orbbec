@@ -7,7 +7,7 @@ import uuid
 from contextlib import contextmanager
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 try:
     from .workflow_models import (
@@ -881,6 +881,34 @@ class WorkflowStore:
             )
             return self._get_job_unlocked(conn, str(selected["job_id"]))
 
+    def heartbeat_jobs(self, *, job_ids: Sequence[str], lease_owner: str,
+                       lease_seconds: int) -> List[str]:
+        """Renew a bounded monitor set in one transaction, without taking over jobs.
+
+        Returned IDs are still owned and nonterminal. Released, completed or
+        reassigned jobs must be removed from the caller's monitoring set.
+        """
+        if not job_ids:
+            return []
+        if not lease_owner or len(job_ids) > 100:
+            raise ValueError("heartbeat batch requires an owner and at most 100 jobs")
+        placeholders = ",".join("?" for _ in job_ids)
+        now = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                f"SELECT job_id FROM jobs WHERE job_id IN ({placeholders}) "
+                "AND lease_owner = ? AND status IN ('leased', 'running') "
+                "AND lease_until > ?",
+                (*job_ids, lease_owner, now),
+            ).fetchall()
+            owned = [str(row[0]) for row in rows]
+            conn.executemany(
+                "UPDATE jobs SET status = 'running', lease_until = ?, updated_at = ? WHERE job_id = ?",
+                [(_future_iso(lease_seconds), now, job_id) for job_id in owned],
+            )
+        return owned
+
     def heartbeat_job(
         self,
         *,
@@ -1064,12 +1092,14 @@ class WorkflowStore:
                 raise WorkflowError(HTTPStatus.INTERNAL_SERVER_ERROR, f"canceled job not found: {job_id}")
             return updated
 
-    def release_job(self, *, job_id: str, reason: str = "") -> Tuple[Dict[str, Any], bool]:
+    def release_job(self, *, job_id: str, reason: str = "", lease_owner: str = "") -> Tuple[Dict[str, Any], bool]:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             job = self._get_job_unlocked(conn, job_id)
             if job is None:
                 raise WorkflowError(HTTPStatus.NOT_FOUND, f"job not found: {job_id}")
+            if lease_owner and job.get("lease_owner") != lease_owner:
+                return job, False
             if job["status"] in TERMINAL_JOB_STATUSES:
                 return job, False
             if job["status"] == "queued" and not job.get("lease_owner"):

@@ -5,6 +5,7 @@ import importlib.util
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -22,6 +23,40 @@ def load_status_module():
 
 
 class PublisherStatusTest(unittest.TestCase):
+    def test_batch_reads_100_episodes_with_one_connection_and_one_select(self) -> None:
+        module = load_status_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "episodes.sqlite3"
+            ids = [f"subject/task/episode{i}" for i in range(100)]
+            with sqlite3.connect(db_path) as connection:
+                connection.execute("CREATE TABLE episodes (episode_id TEXT PRIMARY KEY, state TEXT, "
+                                   "updated_at TEXT, generation INTEGER, manifest_sha256 TEXT, "
+                                   "result_manifest_sha256 TEXT)")
+                connection.executemany("INSERT INTO episodes VALUES (?, 'cleaned', 'now', 0, '', '')",
+                                       [(i,) for i in ids[:-1]])
+            before = db_path.read_bytes()
+            calls, statements = [], []
+            real_connect = sqlite3.connect
+
+            def connect(database, **kwargs):
+                calls.append(database)
+                conn = real_connect(database, **kwargs)
+                conn.set_trace_callback(statements.append)
+                return conn
+
+            with patch.object(module.sqlite3, "connect", side_effect=connect):
+                result = module.query_episodes(db_path, ids)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("mode=ro", calls[0])
+            self.assertEqual(sum(sql.lstrip().startswith("SELECT") for sql in statements), 1)
+            self.assertEqual([row["episode_id"] for row in result], ids)
+            self.assertTrue(all(row["state"] == "cleaned" for row in result[:-1]))
+            self.assertEqual(result[-1], {"episode_id": ids[-1], "found": False})
+            self.assertEqual(before, db_path.read_bytes())
+            for invalid in ([], ids + ["subject/task/extra"], [ids[0], ids[0]], ["../task/episode"]):
+                with self.assertRaises(ValueError):
+                    module.query_episodes(db_path, invalid)
+
     def test_read_only_episode_query_includes_quality_queue_state(self) -> None:
         module = load_status_module()
         with tempfile.TemporaryDirectory() as tmp:

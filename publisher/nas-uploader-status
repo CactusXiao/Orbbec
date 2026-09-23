@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed read-only SSH API for one NAS Publisher episode."""
+"""Read-only SSH API for one episode or a batch of at most 100 episodes."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import sqlite3
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict
+from typing import Any, Dict, List, Sequence
 
 
 STATE_DB = Path("/volume1/ego/.nas-uploader/state/episodes.sqlite3")
@@ -25,6 +25,15 @@ def validate_episode_id(value: str) -> str:
 
 
 def query_episode(db_path: Path, episode_id: str) -> Dict[str, Any]:
+    return query_episodes(db_path, [episode_id])[0]
+
+
+def query_episodes(db_path: Path, episode_ids: Sequence[str]) -> List[Dict[str, Any]]:
+    if not 1 <= len(episode_ids) <= 100:
+        raise ValueError("status batch must contain 1 to 100 episodes")
+    ids = [validate_episode_id(value) for value in episode_ids]
+    if len(set(ids)) != len(ids):
+        raise ValueError("duplicate episode IDs in status batch")
     uri = f"file:{db_path}?mode=ro"
     with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
         connection.execute("PRAGMA query_only = ON")
@@ -44,17 +53,22 @@ def query_episode(db_path: Path, episode_id: str) -> Dict[str, Any]:
                 "CASE WHEN q.episode_id IS NULL THEN NULL ELSE 'pending' END"
             )
             quality_join = "LEFT JOIN quality_queue AS q ON q.episode_id = e.episode_id"
-        row = connection.execute(
+        rows = connection.execute(
             f"""
             SELECT e.episode_id, e.state, e.updated_at, e.generation,
                    e.manifest_sha256, e.result_manifest_sha256,
                    {quality_state_expression}
             FROM episodes AS e
             {quality_join}
-            WHERE e.episode_id = ?
+            WHERE e.episode_id IN ({','.join('?' for _ in ids)})
             """,
-            (episode_id,),
-        ).fetchone()
+            ids,
+        ).fetchall()
+    by_id = {row[0]: row for row in rows}
+    return [_episode_payload(episode_id, by_id.get(episode_id)) for episode_id in ids]
+
+
+def _episode_payload(episode_id: str, row: Any) -> Dict[str, Any]:
     if row is None:
         return {"episode_id": episode_id, "found": False}
     return {
@@ -70,12 +84,15 @@ def query_episode(db_path: Path, episode_id: str) -> Dict[str, Any]:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: nas-uploader-status subject/task/episode", file=sys.stderr)
+    batch = len(sys.argv) > 1 and sys.argv[1] == "--batch"
+    if (batch and not 3 <= len(sys.argv) <= 102) or (not batch and len(sys.argv) != 2):
+        print("usage: nas-uploader-status [--batch] subject/task/episode [episode ...] (max 100)", file=sys.stderr)
         return 2
     try:
-        episode_id = validate_episode_id(sys.argv[1])
-        payload = query_episode(STATE_DB, episode_id)
+        if batch:
+            payload = {"episodes": query_episodes(STATE_DB, sys.argv[2:])}
+        else:
+            payload = query_episode(STATE_DB, validate_episode_id(sys.argv[1]))
     except (ValueError, OSError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
         return 1

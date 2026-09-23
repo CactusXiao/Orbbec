@@ -27,19 +27,22 @@ RESULT_SHA256 = "a" * 64
 
 class FakePublisher:
     def __init__(self, statuses: list[dict]):
-        self.statuses = list(statuses)
+        self.responses = list(statuses)
         self.status_calls: list[str] = []
         self.published: list[str] = []
         self.manual_published: list[str] = []
 
     def status(self, episode_id: str) -> dict:
         self.status_calls.append(episode_id)
-        if len(self.statuses) > 1:
-            return dict(self.statuses.pop(0))
-        return dict(self.statuses[0])
+        if len(self.responses) > 1:
+            return dict(self.responses.pop(0))
+        return dict(self.responses[0])
 
     def publish(self, episode_id: str) -> None:
         self.published.append(episode_id)
+
+    def statuses(self, episode_ids: list[str]) -> dict:
+        return {episode_id: self.status(episode_id) for episode_id in episode_ids}
 
     def publish_manual(self, episode_id: str) -> None:
         self.manual_published.append(episode_id)
@@ -319,9 +322,13 @@ class PublisherBridgeTest(unittest.TestCase):
                 ]
             )
             config = PublisherBridgeConfig(
+                enabled=True,
                 poll_seconds=0.01,
                 lease_seconds=10,
                 heartbeat_seconds=1,
+                mano_python=Path(sys.executable),
+                mano_toolkit_root=root,
+                mano_model_dir=root,
             )
             bridge = PublisherBridge(
                 service,
@@ -331,12 +338,19 @@ class PublisherBridgeTest(unittest.TestCase):
                 hostname="capture-host",
             )
 
-            self.assertTrue(bridge.process_once(1))
-
+            bridge.start()
+            try:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if store.jobs_for_episode("episode_uuid", "auto_label")[0]["status"] == "succeeded":
+                        break
+                    time.sleep(0.01)
+            finally:
+                bridge.stop(timeout=2)
             auto_job = store.jobs_for_episode("episode_uuid", "auto_label")[0]
             self.assertEqual(auto_job["status"], "succeeded")
             self.assertEqual(auto_job["result"]["frames"], [2, 5])
-            self.assertEqual(auto_job["result"]["worker_id"], "publisher_bridge:capture-host:slot-01")
+            self.assertEqual(auto_job["result"]["worker_id"], bridge._monitor_owner)
             kinds = {artifact["kind"] for artifact in store.artifacts_for_episode("episode_uuid")}
             self.assertEqual(kinds, {"optimized_pose", "mano_episode"})
             qc_job = store.jobs_for_episode("episode_uuid", "qc")[0]
@@ -424,7 +438,7 @@ class PublisherBridgeTest(unittest.TestCase):
                         "auto_label_episode_uuid_episode",
                     ),
                 )
-            publisher.statuses = [
+            publisher.responses = [
                 {
                     "episode_id": "S001/pick_object/episode1",
                     "found": True,

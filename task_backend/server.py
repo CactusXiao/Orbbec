@@ -3555,6 +3555,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         PublisherBridgeConfig(
             enabled=publisher_bridge_enabled,
             max_inflight=env_int(env, 4, "ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT"),
+            monitor_capacity=env_int(env, 100, "ORBBEC_PUBLISHER_BRIDGE_MONITOR_CAPACITY"),
             poll_seconds=env_float(env, 20.0, "ORBBEC_PUBLISHER_BRIDGE_POLL_SECONDS"),
             lease_seconds=env_int(env, 300, "ORBBEC_PUBLISHER_BRIDGE_LEASE_SECONDS"),
             heartbeat_seconds=env_float(env, 60.0, "ORBBEC_PUBLISHER_BRIDGE_HEARTBEAT_SECONDS"),
@@ -3656,7 +3657,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[task-backend] nas_mounts={nas_mounts}", file=sys.stderr)
     print(
         f"[task-backend] publisher_bridge={'enabled' if publisher_bridge_enabled else 'disabled'} "
-        f"max_inflight={publisher_bridge.config.max_inflight}",
+        f"monitor_capacity={publisher_bridge.config.monitor_capacity} "
+        f"result_workers={publisher_bridge.config.max_inflight}",
         file=sys.stderr,
     )
     print(

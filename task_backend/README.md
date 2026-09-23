@@ -538,10 +538,13 @@ episode. A failed QC creates segment detail rows plus one episode-level
 job; the manual Publisher Bridge publishes the whole episode once and writes a
 replacement episode 3D result.
 
-When Publisher Bridge is enabled, each Bridge slot leases one episode-level
-`auto_label` job for its entire Publisher lifecycle. It idempotently publishes
-the three-part NAS episode ID, polls the fixed NAS status API, heartbeats the
-backend lease, and waits until `optimized_pose/` has returned. It then runs the
+When Publisher Bridge is enabled, one monitor tracks up to 100 episode-level
+`auto_label` jobs by default. Each polling round uses one SSH call to
+`nas-uploader-status --batch <episode ...>` (one read-only NAS database query).
+One heartbeat thread renews all held leases in one database transaction.
+Missing episodes are published through a single submission worker; waiting for
+remote results occupies no submission or conversion worker. Once
+`optimized_pose/` has returned, a bounded result worker runs the
 shared MANO conversion in `ORBBEC_MANO_PYTHON`, atomically writes
 `mano/episode/joints_3d.npy` and `mano_episode.json`, and completes the same
 `auto_label` job with `optimized_pose` and `mano_episode` artifacts. Completion
@@ -557,10 +560,23 @@ per-frame files. The backend validates this schema without NumPy; conversion
 and mesh previews share the same frame mapping. The v2 converter regenerates
 cached v1 artifacts once, then reuses matching generation/hash v2 artifacts.
 
-`ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT` limits backend jobs held by the Bridge,
-not Publisher GPU jobs. On backend shutdown, slots stop leasing, release jobs
-still in flight, and leave already-published Publisher episodes untouched so a
-restart can re-lease and resume from Publisher status.
+`ORBBEC_PUBLISHER_BRIDGE_MONITOR_CAPACITY` controls held episodes (default 100,
+range 1–100). `ORBBEC_PUBLISHER_BRIDGE_MAX_INFLIGHT` now limits concurrent local
+result conversions (default 4), not held episodes or Publisher GPU jobs. At
+defaults the automatic bridge uses at most seven threads: monitor, heartbeat,
+one submission worker and four result workers. An empty queue has one lease
+attempt per round, rather than one per unused slot. The 101st unfinished job
+waits for monitor capacity; this does not increase remote labeling throughput.
+
+Deployment requires upgrading the NAS `publisher/nas-uploader-status` script
+before starting the new backend. Single-episode queries remain compatible.
+The backend deliberately does not fall back to 100 separate SSH queries if
+the NAS lacks batch support: it logs the failure and retries without publishing.
+Capacity settings are read at startup, not hot-reloaded. Do not restart a live
+collection/backend to activate this change; deploy during a scheduled idle window.
+On shutdown the bridge stops submitting, cancels queued work, waits for active
+workers to stop, and releases only leases it still owns. Already-published NAS
+episodes are untouched; a restart resumes by querying Publisher status.
 
 Manual Publisher Bridge has its own configurable slot count and leases only
 episode-level `manual_3d` jobs. Each slot calls
