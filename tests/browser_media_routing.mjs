@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import {setMediaRoute,mediaURL} from '../remote_frontend/web/media-routing.js';
+setMediaRoute({id:'label',role:'label',media:{}});
+assert.equal(mediaURL('label','frames/00/0'),'/api/sessions/label/frames/00/0');
+setMediaRoute({id:'qc',role:'qc',media:{distributed:true}});
+assert.throws(()=>mediaURL('qc','frames/00/0'));
+setMediaRoute({id:'qc',role:'qc',media:{distributed:true,media_base:'https://capture/media/a'}});
+assert.equal(mediaURL('qc','chunks/0.mp4'),'https://capture/media/a/chunks/0.mp4');
+setMediaRoute({id:'qc',role:'qc',media:{distributed:true,media_base:'https://replacement/media/b'}});
+assert.equal(mediaURL('qc','raw_frames/00/1'),'https://replacement/media/b/raw_frames/00/1');
+console.log('QC routes directly to current worker, never falls back while queued; Label stays local');

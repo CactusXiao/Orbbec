@@ -1,6 +1,13 @@
 #include "shared_utils.hpp"
 
 #include <cstdlib>
+#include <cerrno>
+#include <cstring>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <thread>
+
+extern char **environ;
 
 namespace sync_app {
 
@@ -254,6 +261,40 @@ static bool writeJsonConfigFile(cJSON *root, const fs::path &path, std::string *
         }
         return false;
     }
+    return true;
+}
+
+bool launchWebWorkbench(const AppConfig &cfg, std::string *detail) {
+    const std::string url = trimString(cfg.frontends.webWorkbenchUrl);
+    const size_t schemeLength = url.rfind("https://", 0) == 0 ? 8 :
+                                url.rfind("http://", 0) == 0 ? 7 : 0;
+    if(schemeLength == 0 || url.size() <= schemeLength ||
+       url.find_first_of("\r\n") != std::string::npos) {
+        if(detail) *detail = "Configure frontends.webWorkbench.url with an HTTP(S) address";
+        return false;
+    }
+#ifdef __APPLE__
+    const char *opener = "open";
+#else
+    const char *opener = "xdg-open";
+#endif
+    // Pass the URL as one argument, without a shell. The menu must not wait
+    // for a newly launched browser to close before responding again.
+    char *args[] = {const_cast<char *>(opener), const_cast<char *>(url.c_str()), nullptr};
+    pid_t child;
+    const int error = posix_spawnp(&child, opener, nullptr, nullptr, args, environ);
+    if(error != 0) {
+        if(detail) *detail = std::string("Could not launch browser: ") + std::strerror(error);
+        return false;
+    }
+    std::thread([child]() {
+        int status = 0;
+        while(waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+        if(WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+            std::cerr << "Web workbench browser launcher exited with " << WEXITSTATUS(status) << std::endl;
+        }
+    }).detach();
+    if(detail) *detail = url;
     return true;
 }
 
@@ -952,6 +993,13 @@ AppConfig loadConfig(const fs::path &configPath) {
 
     if(auto *frontendsObj = cJSON_GetObjectItemCaseSensitive(root, "frontends")) {
         if(cJSON_IsObject(frontendsObj)) {
+            if(auto *webObj = cJSON_GetObjectItemCaseSensitive(frontendsObj, "webWorkbench")) {
+                if(cJSON_IsObject(webObj)) {
+                    if(auto url = getString(webObj, "url")) {
+                        cfg.frontends.webWorkbenchUrl = trimString(*url);
+                    }
+                }
+            }
             if(auto *labelObj = cJSON_GetObjectItemCaseSensitive(frontendsObj, "label")) {
                 if(cJSON_IsObject(labelObj)) {
                     if(auto v = getString(labelObj, "pythonExecutable")) {

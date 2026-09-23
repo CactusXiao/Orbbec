@@ -682,3 +682,7 @@ body:has(#workspace:not([hidden]) #content:not([hidden])) #connection {font-size
   grid-column: 1 / -1;
   grid-row: 1 / -1;
 }
+
+#frameList .labelSegment {display:block;width:100%;margin:0 0 8px;padding:10px 8px;text-align:left;white-space:pre-line;line-height:1.7;font-size:12px;border:1px solid #40516a;}
+#frameList .labelSegment.selected {background:#254d7b;border-color:#75b6ff;}
+#frameList .labelSegment.complete {border-left:4px solid #46d36b;}

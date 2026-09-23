@@ -688,7 +688,8 @@ int main(int argc, char **argv) {
                 cv::Rect b4(60, 286, 780, 48);
                 cv::Rect b5(60, 342, 780, 48);
                 cv::Rect b6(60, 398, 780, 48);
-                cv::Rect bShape(60, 454, 780, 48);
+                cv::Rect bShape(60, 454, 380, 48);
+                cv::Rect bWeb(460, 454, 380, 48);
                 cv::Rect b7(60, 510, 380, 48);
                 cv::Rect b8(460, 510, 380, 48);
                 if(uiButton(ui, b1, "Interaction", fm)) {
@@ -778,6 +779,17 @@ int main(int argc, char **argv) {
                     cv::resizeWindow(winName, 900, 640);
                     cv::setMouseCallback(winName, mouseThunk, &ms);
                     continue;
+                }
+                if(uiButton(ui, bWeb, "Web Workbench", fm)) {
+                    std::string detail;
+                    if(launchWebWorkbench(baseCfg, &detail)) {
+                        menuError.clear();
+                        menuNotice = "Opening web workbench: " + detail;
+                    }
+                    else {
+                        menuNotice.clear();
+                        menuError = "Web workbench failed: " + detail;
+                    }
                 }
                 if(uiButton(ui, b7, "Logout", fm)) {
                     logout();

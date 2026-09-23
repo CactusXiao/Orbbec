@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 import numpy as np
@@ -13,6 +14,7 @@ from label.storage import correction_task_from_backend_payload, find_frame_path
 from label.video_frames import ensure_decoded_rgb_frames
 from src.qc.media import MeshRendererSettings, _prepare_mesh_frames
 from .batch import reject
+from .browser_label import browser_task, decode_label
 
 
 class BrowserCompute:
@@ -32,7 +34,7 @@ class BrowserCompute:
         self.batch.check(item)
         if item["role"] != "label" or body.get("action") not in {"track", "skeleton", "mesh"}:
             reject("不支持的计算", 400)
-        task = correction_task_from_backend_payload(item["payload"], mounts=self.batch.mounts)
+        task = browser_task(item["payload"], mounts=self.batch.mounts)
         frame = body.get("frame")
         if type(frame) is not int or frame not in task.frames:
             reject("计算帧不属于该任务", 400)
@@ -58,6 +60,10 @@ class BrowserCompute:
             target = body.get("target")
             if type(target) is not int or target not in task.frames or target <= frame:
                 reject("跟踪目标必须是该任务后续帧", 400)
+            if task.segments and not any(
+                s["start_frame"] <= frame < target <= s["end_frame"] for s in task.segments
+            ):
+                reject("跟踪不能跨越标注区间", 400)
             selected = body.get("selected")
             if not isinstance(selected, dict) or not set(selected).issubset(task.cameras):
                 reject("跟踪机位无效", 400)
@@ -100,12 +106,14 @@ class BrowserCompute:
         return {"id": operation, "ready": False}
 
     def _run(self, sid, root, item, task, body):
+        started = time.perf_counter()
         try:
             cfg = self.config
             if body["action"] in {"track", "mesh"}:
                 frames = ([body["frame"], body["target"]] if body["action"] == "track" else [body["frame"]])
-                task = ensure_decoded_rgb_frames(replace(task, frames=frames), item["payload"],
+                task = decode_label(replace(task, frames=frames), item["payload"],
                                                 cache_root=self.media.directory(sid)/"decode")
+            prepared = time.perf_counter()
             if body["action"] == "mesh":
                 for camera in task.cameras:
                     source = find_frame_path(task.episode_dir(), camera, body["frame"], task.rgb_path_template)
@@ -133,6 +141,12 @@ class BrowserCompute:
                 if process.returncode:
                     raise RuntimeError(process.stderr[-1500:] or "计算进程失败")
                 result = json.loads((root/"result.json").read_text())
+            finished = time.perf_counter()
+            result["timings_ms"] = dict(
+                prepare=round((prepared - started) * 1000, 1),
+                compute=round((finished - prepared) * 1000, 1),
+                total=round((finished - started) * 1000, 1),
+            )
             (root/"ready.tmp").write_text(json.dumps(result, allow_nan=False))
             (root/"ready.tmp").replace(root/"ready.json")
         except Exception as exc:

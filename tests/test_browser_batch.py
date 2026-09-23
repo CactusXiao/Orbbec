@@ -211,7 +211,8 @@ class BrowserBatchTest(unittest.TestCase):
         actual=correction_task_from_backend_payload(item['payload'],mounts=self.mounts)
         legacy=SimpleNamespace(frames=actual.frames,cameras=actual.cameras,
             correction_dir=actual.correction_dir,episode_dir=actual.episode_dir)
-        with patch('remote_frontend.batch.correction_task_from_backend_payload',return_value=legacy):
+        with patch('remote_frontend.batch.correction_task_from_backend_payload',return_value=legacy), \
+             patch('remote_frontend.batch.browser_task',return_value=legacy):
             self.batch.submit(item['id'],body)
         point_file=episode/actual.correction_dir/'00/00000.npy'
         self.assertTrue(np.array_equal(np.load(point_file)[0,0],[-1,-1]))

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {labelLookahead} from '../remote_frontend/web/frame-cache.js';
-const frames=Array.from({length:30},(_,i)=>i+500), cameras=['00','02','03','05'];
+const frames=Array.from({length:30},(_,i)=>i+500), cameras=['00','02','03','05','ego'];
 const plan=labelLookahead(frames,cameras,5,'00',true);
 for(const camera of [...cameras,'ego'])
  for(let d=1;d<=4;d++) assert.ok(plan.some(p=>p.camera===camera&&p.frame===frames[5+d]));

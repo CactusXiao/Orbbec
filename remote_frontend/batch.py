@@ -12,6 +12,7 @@ import uuid
 import numpy as np
 
 from label.storage import correction_task_from_backend_payload
+from .browser_label import browser_task
 from mano.joint_order import SMPLX_MANO_SKELETON_EDGES, SMPLX_MANO_JOINT_NAMES
 from src.qc.state_store import normalize_ranges, normalize_segments
 from src.qc.report import build_qc_result, write_qc_report, write_ego_pose_qc_report
@@ -179,6 +180,8 @@ class BatchService:
                        else self.service.lease_job(body, forced_type="qc"))
             revision = self.revision(context)
             saved = {"role": role, "payload": context["payload"], "operator": self.operator}
+            if role == "label":
+                saved["label_cameras"] = browser_task(context["payload"], mounts=self.mounts).cameras
             conn.execute("INSERT INTO browser_sessions VALUES (?,?,?,?,?,?)", (
                 sid, owner, context["job"]["job_id"], revision, json.dumps(saved), now_iso()))
         return self.session(sid)
@@ -197,7 +200,7 @@ class BatchService:
 
     def manifest(self, sid):
         item = self.session(sid)
-        task = correction_task_from_backend_payload(item["payload"], mounts=self.mounts)
+        task = browser_task(item["payload"], mounts=self.mounts, role=item["role"])
         episode = self.store.get_episode(item["payload"]["episode_id"]) or {}
         job = self.store.get_job(item["job_id"]) or {}
         return dict(workflow_version=3, subject_id=episode.get("subject_id", ""),
@@ -271,7 +274,12 @@ class BatchService:
                 frames=body.get("frames"), decision=body.get("decision"))
 
     def validate(self, item, result):
-        task = correction_task_from_backend_payload(item["payload"], mounts=self.mounts)
+        task = browser_task(item["payload"], mounts=self.mounts, role=item["role"])
+        # A pre-upgrade session may already have a durable, in-flight submission.
+        # Its original camera contract remains valid for that exact retry.
+        if (item["role"] == "label" and "label_cameras" not in item and
+                not any(k.endswith(":ego") for k in result.get("samples", {}))):
+            task = correction_task_from_backend_payload(item["payload"], mounts=self.mounts)
         frames, cameras = set(task.frames), set(task.cameras)
         progress = result.get("confirmed" if item["role"] == "label" else "reviewed", [])
         if (not isinstance(progress, list) or any(type(f) is not int for f in progress)

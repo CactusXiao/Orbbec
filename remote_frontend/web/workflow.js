@@ -28,10 +28,41 @@ export function normalizeSegments(segments, gap = 5) {
     (a.primary_camera || "").localeCompare(b.primary_camera || ""));
 }
 
-export function enterLabelSegment(draft, frame) {
+// Preserve QC boundaries, including adjacent/overlapping error intervals.
+export function labelSegments(manifest) {
+  const segments = (manifest.qc_segments || []).map((s, i) => ({
+    ...s, key: String(s.segment_id || `${s.start_frame}:${s.end_frame}:${s.primary_camera || ""}:${i}`),
+    positions: manifest.frames.flatMap((f, p) => f >= s.start_frame && f <= s.end_frame ? [p] : []),
+  })).filter(s => s.positions.length);
+  const covered = new Set(segments.flatMap(s => s.positions));
+  let last = null;
+  manifest.frames.forEach((f, p) => {
+    if (covered.has(p)) { last = null; return; }
+    if (!last || f !== last.end_frame + 1) {
+      last = {key: `frames:${f}`, start_frame: f, end_frame: f, positions: []};
+      segments.push(last);
+    }
+    last.end_frame = f;
+    last.positions.push(p);
+  });
+  return segments.sort((a,b) => a.start_frame - b.start_frame || a.end_frame - b.end_frame);
+}
+export function activeLabelSegment(draft, position) {
+  const segments = labelSegments(draft.manifest);
+  return segments.find(s => s.key === draft.activeSegment && s.positions.includes(position)) ||
+    segments.find(s => s.positions.includes(position));
+}
+export function labelStep(draft, position, delta) {
+  const segment = activeLabelSegment(draft, position);
+  if (!segment) return position;
+  return segment.positions[Math.max(0, Math.min(segment.positions.length - 1,
+    segment.positions.indexOf(position) + delta))];
+}
+
+export function enterLabelSegment(draft, frame, segment = null) {
   const visited = new Set(draft.visitedSegments || []);
   let camera = null;
-  for (const s of draft.manifest.qc_segments || []) {
+  for (const s of segment ? [segment] : draft.manifest.qc_segments || []) {
     if (frame < s.start_frame || frame > s.end_frame) continue;
     const key = String(s.segment_id || `${s.start_frame}:${s.end_frame}:${s.primary_camera || ""}`);
     if (visited.has(key)) continue;

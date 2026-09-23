@@ -219,6 +219,7 @@ struct CollectionConfig {
 struct FrontendLaunchConfig {
     ManualLabelFrontendConfig label;
     QcFrontendConfig          qc;
+    std::string webWorkbenchUrl = "http://127.0.0.1:18882/";
 };
 
 struct AppConfig {
@@ -313,5 +314,7 @@ bool launchManualLabelFrontend(const AppConfig &cfg,
 bool launchQcFrontend(const AppConfig &cfg,
                       const std::string &operatorHint,
                       std::string *errorMessage = nullptr);
+
+bool launchWebWorkbench(const AppConfig &cfg, std::string *detail = nullptr);
 
 }  // namespace sync_app

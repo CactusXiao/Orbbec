@@ -20,6 +20,7 @@ from .browser_media import BrowserMedia
 from .browser_compute import BrowserCompute
 from .browser_login import Accounts
 from .preview_server import byte_range
+from .qc_dispatch import QCDispatch, RoutedMedia
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -93,7 +94,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' blob:; media-src 'self' blob:; style-src 'self'; script-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'")
+        origins = " ".join(getattr(self.server, "qc_origins", []))
+        self.send_header("Content-Security-Policy", f"default-src 'self'; img-src 'self' blob: {origins}; media-src 'self' blob: {origins}; connect-src 'self' {origins}; style-src 'self'; script-src 'self'; frame-ancestors 'none'; object-src 'none'; base-uri 'none'")
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(end-start+1))
         if self.headers.get("Range"):
@@ -113,10 +115,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.check_host()
             parts = urlsplit(self.path).path.strip("/").split("/")
-            if parts[0] in {"", "app.js", "auth.js", "workflow.js", "label-canvas.js", "desktop-layout.js", "queue.js", "player.js", "frame-cache.js", "style.css", "sw.js"} and len(parts) == 1:
+            if parts[:3] == ["internal", "qc", "input"] and len(parts) == 5:
+                dispatch = self.server.qc_dispatch
+                if dispatch is None:
+                    reject("QC dispatch is disabled", 404)
+                dispatch.authenticate(self.headers.get("Authorization"))
+                source = dispatch.input_source(self.headers.get("X-QC-Worker"), parts[3], parts[4])
+                from .qc_worker import export_inputs
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-tar")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return export_inputs(source, self.wfile)
+            if parts[0] in {"", "app.js", "auth.js", "workflow.js", "label-canvas.js", "desktop-layout.js", "queue.js", "player.js", "frame-cache.js", "media-routing.js", "style.css", "sw.js"} and len(parts) == 1:
                 name = parts[0] or "index.html"
                 return self.file(Path(__file__).with_name("web")/name,
-                    {"index.html":"text/html; charset=utf-8", "app.js":"text/javascript", "auth.js":"text/javascript", "workflow.js":"text/javascript", "label-canvas.js":"text/javascript", "desktop-layout.js":"text/javascript", "queue.js":"text/javascript", "player.js":"text/javascript", "frame-cache.js":"text/javascript", "sw.js":"text/javascript", "style.css":"text/css"}[name])
+                    {"index.html":"text/html; charset=utf-8", "app.js":"text/javascript", "auth.js":"text/javascript", "workflow.js":"text/javascript", "label-canvas.js":"text/javascript", "desktop-layout.js":"text/javascript", "queue.js":"text/javascript", "player.js":"text/javascript", "frame-cache.js":"text/javascript", "media-routing.js":"text/javascript", "sw.js":"text/javascript", "style.css":"text/css"}[name])
             user = self.account(unrestricted=parts == ["api", "identity"])
             if parts == ["api", "identity"]:
                 return self.json(self.identity(user))
@@ -193,6 +207,11 @@ class Handler(BaseHTTPRequestHandler):
                 token, user = self.server.auth.login(body.get("username"), body.get("password"), self.client_address[0])
                 self.server.auth.logout(self.token())
                 return self.json(self.identity(user), cookie=self.cookie(token))
+            if path == "/internal/qc/poll":
+                if self.server.qc_dispatch is None:
+                    reject("QC dispatch is disabled", 404)
+                self.server.qc_dispatch.authenticate(self.headers.get("Authorization"))
+                return self.json(self.server.qc_dispatch.poll(body))
             user = self.account(unrestricted=path in {"/api/logout", "/api/password", "/api/activity"})
             if path == "/api/logout":
                 self.server.auth.logout(self.token())
@@ -250,6 +269,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def configure(server, database, config, root, legacy_operator):
+    dispatch_config = config.get("qc_dispatch")
+    server.qc_dispatch = QCDispatch(root / "dispatch", dispatch_config) if dispatch_config else None
+    server.qc_origins = list(dispatch_config["workers"].values()) if dispatch_config else []
     server.workspace_label = str(config.get("workspace_label") or "")
     server.cookie_name = f"orbbec_account_{server.server_port}"
     public_origin = config.get("public_origin")
@@ -275,6 +297,8 @@ def configure(server, database, config, root, legacy_operator):
             if key not in units:
                 batch = BatchService(database, config["nas_mounts"], user["operator"], roles=user["roles"], tasks=user["tasks"])
                 media = BrowserMedia(batch, root / "media", config, slots=slots)
+                if server.qc_dispatch:
+                    media = RoutedMedia(media, server.qc_dispatch)
                 units[key] = SimpleNamespace(batch=batch, media=media,
                     compute=BrowserCompute(batch, media, config, pool=pool))
             return units[key]

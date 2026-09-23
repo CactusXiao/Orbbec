@@ -1,9 +1,5 @@
-import {
-  QcWorkflow,
-  sources,
-  sourceLabels,
-  enterLabelSegment,
-} from "/workflow.js";
+import { setMediaRoute } from "./media-routing.js";
+import { QcWorkflow, sources, sourceLabels, enterLabelSegment, labelSegments, activeLabelSegment, labelStep } from "/workflow.js";
 import { LabelCanvas } from "/label-canvas.js";
 import { installDesktopLayout } from "/desktop-layout.js";
 import { NativeQueue } from "/queue.js";
@@ -201,11 +197,14 @@ async function openDraft(d) {
   if (!d.receipt) {
     try {
       const manifest = await api(`/api/sessions/${d.id}/resume`, {});
-      if (
-        JSON.stringify(manifest.frames) !== JSON.stringify(d.manifest.frames) ||
-        JSON.stringify(manifest.cameras) !== JSON.stringify(d.manifest.cameras)
-      )
+      const added = manifest.cameras.filter(c => !d.manifest.cameras.includes(c));
+      const egoUpgrade = added.length === 1 && added[0] === "ego" &&
+        d.manifest.cameras.every(c => manifest.cameras.includes(c));
+      if (JSON.stringify(manifest.frames) !== JSON.stringify(d.manifest.frames) ||
+          (JSON.stringify(manifest.cameras) !== JSON.stringify(d.manifest.cameras) && !egoUpgrade))
         throw Error("任务范围变化，不能覆盖本机草稿");
+      if (egoUpgrade && !d.pending) d.needsCameraUpgrade = true;
+      if (d.pending) manifest.cameras = d.manifest.cameras;
       d.manifest = { ...d.manifest, ...manifest };
       d.released = false;
     } catch (e) {
@@ -275,7 +274,8 @@ async function openDraft(d) {
         )
       : d.position || 0;
   camera = d.camera || d.manifest.cameras[0];
-  if (camera === "ego") overview = true;
+  $("content").classList.add("showProgress");
+  $("toggleProgress").setAttribute("aria-expanded", "true");
   undo = [];
   generation++;
   $("picker").hidden = true;
@@ -318,14 +318,20 @@ async function refreshMedia() {
     if (draft?.id !== id) return;
     if (remote.revision !== draft.manifest.revision)
       throw new Error("数据版本已变化，保留草稿，请重新核对");
+    const addedCameras = remote.cameras.filter(c => !draft.manifest.cameras.includes(c));
+    if (draft.manifest.role === "label" && addedCameras.length && !draft.pending) {
+      draft.manifest.cameras = remote.cameras;
+      draft.needsCameraUpgrade = true;
+    }
     draft.manifest.media = remote.media;
+    setMediaRoute(draft.manifest);
     draft.manifest.task_name = remote.task_name;
     draft.manifest.episode_index = remote.episode_index;
     draft.manifest.lease_until = remote.lease_until;
     $("retryMedia").hidden = !remote.media.error;
     if (remote.media.error) {
       const message = "后端准备失败：" + remote.media.error;
-      if (draft.manifest.role === "qc") {
+      if (draft.manifest.role === "qc" && !remote.media.distributed) {
         await leaveWorkspace();
         notice(message);
         return;
@@ -334,7 +340,9 @@ async function refreshMedia() {
     }
     if (!remote.media.ready) {
       $("preparing").textContent =
-        "后端正在解码并准备首批画面，完成后即可开始工作。";
+        remote.media.distributed
+          ? (remote.media.phase === "queued" ? "正在等待空闲采集主机。" : "正在准备首批质检画面。")
+          : "后端正在解码并准备首批画面，完成后即可开始工作。";
       renderPreparation(remote.media);
       const progress = Object.entries(remote.media.progress || {});
       if (progress.length)
@@ -373,13 +381,26 @@ async function refreshMedia() {
         await save();
       }
     }
+    if (draft.needsCameraUpgrade) {
+      const samples = await api(`/api/sessions/${id}/samples.json`);
+      const refs = await api(`/api/sessions/${id}/sources.json`);
+      if (draft?.id !== id) return;
+      draft.result.samples = {...samples, ...draft.result.samples};
+      draft.initialSamples = {...samples, ...draft.initialSamples};
+      draft.sources = {...refs, ...draft.sources};
+      draft.result.confirmed = [];
+      draft.confirmedSamples = {};
+      delete draft.needsCameraUpgrade;
+      await save();
+      notice("已加入 Ego 标注；原有修改已保留，请核对各帧后重新确认。");
+    }
     await showContent();
   } catch (e) {
     if (draft?.id !== id || !owner || e.status === 401) return;
     if (
-      (draft.manifest.role === "label" &&
+      (draft.manifest.role === "label" && !draft.needsCameraUpgrade &&
         Object.keys(draft.result.samples).length) ||
-      draft.manifest.media?.ready
+      (draft.manifest.media?.ready && !draft.needsCameraUpgrade)
     ) {
       await showContent();
       notice(
@@ -462,6 +483,7 @@ function paintQC() {
   }
 }
 async function showContent() {
+  setMediaRoute(draft.manifest);
   if (!owner || !draft) return;
   $("preparing").hidden = true;
   $("decodeStatus").hidden = true;
@@ -579,7 +601,7 @@ function draw() {
     overlay?.action === "skeleton" ? "Hide Skeleton" : "Show Skeleton";
   $("mesh").textContent =
     overlay?.action === "mesh" ? "Hide MANO" : "Show MANO";
-  $("overview").title = "0：总览；1–7：单机位。滚轮缩放，右键平移。";
+  $("overview").title = `0：总览；1–${draft.manifest.cameras.length}：单机位。滚轮缩放，右键平移。`;
   $("viewNotice").textContent = overview ? "总览 · 只读" : "";
   const error =
     draft.sources?.[`${draft.manifest.frames[position]}:${camera}`]?.errors;
@@ -629,12 +651,12 @@ async function tile(host, cam, url, sample, label) {
   entry.box.hidden = false;
   entry.status.textContent = "";
   if (url) {
-    await entry.canvas.setImage(url, `${draft.id}:${position}:${cam}`);
+    await entry.canvas.setImage(url, `${draft.id}:${position}:${cam}`, `${draft.id}:${cam}`);
     entry.canvas.setState(sample, {
       edges: draft.manifest.skeleton_edges,
       tracked: draft.tracked?.[cam] || [],
       readOnly: true,
-      annotation: label && cam !== "ego" && !overlay,
+      annotation: label && !overlay,
     });
   } else {
     entry.status.textContent =
@@ -645,11 +667,13 @@ async function tile(host, cam, url, sample, label) {
 async function renderFrame() {
   if (!owner || !draft) return;
   if (draft.manifest.role === "label") {
+    const segment = activeLabelSegment(draft, position);
+    draft.activeSegment = segment?.key;
     const before = (draft.visitedSegments || []).length;
-    const primary = enterLabelSegment(draft, draft.manifest.frames[position]);
+    const primary = enterLabelSegment(draft, draft.manifest.frames[position], segment);
     if (primary) {
       camera = primary;
-      overview = primary === "ego";
+      overview = false;
       draft.camera = camera;
       draft.overview = overview;
       overlay = null;
@@ -657,10 +681,8 @@ async function renderFrame() {
       $("overviewGrid").hidden = !overview;
     }
     if (before !== draft.visitedSegments.length) save().catch(() => {});
-    $("overviewGrid").classList.toggle(
-      "primaryEgoView",
-      overview && camera === "ego",
-    );
+    $("timeline").min = segment?.positions[0] ?? 0;
+    $("timeline").max = segment?.positions.at(-1) ?? draft.manifest.frames.length - 1;
   }
   const renderStarted = performance.now();
   frameReady = false;
@@ -675,19 +697,14 @@ async function renderFrame() {
       if (!overview) {
         const url = await imageURL(camera, frame);
         if (gen !== generation) return;
-        await nativeCanvas.setImage(url, `${sid}:${frame}:${camera}:${source}`);
+        await nativeCanvas.setImage(url, `${sid}:${frame}:${camera}:${source}`, `${sid}:${camera}`);
         await nativeCanvas.setOverlay(
           overlay?.frame === frame
             ? `/api/sessions/${sid}/operations/${overlay.id}/${camera}.png`
             : null,
         );
       } else {
-        const cameras =
-          camera === "ego"
-            ? ["ego"]
-            : ["00", "02", "03", "05", "06"]
-                .filter((c) => draft.manifest.cameras.includes(c))
-                .concat("ego");
+        const cameras = draft.manifest.cameras.filter(c => !["01", "04"].includes(c));
         for (const [key, entry] of nativeTiles)
           if (key.startsWith("overviewGrid:"))
             entry.box.hidden = !cameras.includes(key.split(":")[1]);
@@ -703,11 +720,11 @@ async function renderFrame() {
             $("overviewGrid"),
             c,
             url,
-            c === "ego" ? null : selectedSample(c),
+            selectedSample(c),
             true,
           );
           await entry.canvas.setOverlay(
-            c !== "ego" && overlay?.frame === frame
+            overlay?.frame === frame
               ? `/api/sessions/${sid}/operations/${overlay.id}/${c}.png`
               : null,
           );
@@ -851,6 +868,8 @@ function updateProgress() {
         );
     $("nativePlaybackStatus").textContent = r.playback_complete
       ? "已完成一次播放，可随时提交"
+      : player?.mediaError
+        ? player.mediaError
       : !frameReady
         ? `目标帧 ${frame} 渲染中 · 可继续拖动进度条`
         : playing
@@ -867,10 +886,7 @@ function step(delta) {
     qcFlow.playing = !$("video").paused || !!player?.wantsPlay;
     position = qcFlow.step(delta);
   } else {
-    position = Math.max(
-      0,
-      Math.min(draft.manifest.frames.length - 1, position + delta),
-    );
+    position = labelStep(draft, position, delta);
     overlay = null;
   }
   draft.position = position;
@@ -940,6 +956,13 @@ async function confirmLabelFrame(noError = false) {
   }
   updateProgress();
   const hadTracks = Object.values(draft.tracked || {}).some((p) => p.length);
+  if (labelStep(draft, position, 1) === position) {
+    draft.tracked = {};
+    await save();
+    draw();
+    notice("当前区间已到末帧，请从左侧选择其他待标注区间。");
+    return;
+  }
   if (!noError && hadTracks && position < draft.manifest.frames.length - 1) {
     source = "correct";
     await trackNext();
@@ -989,7 +1012,7 @@ window.addEventListener("keydown", (e) => {
   if (e.key === "0") {
     e.preventDefault();
     $("overview").click();
-  } else if (/^[1-7]$/.test(e.key)) {
+  } else if (/^[1-9]$/.test(e.key)) {
     e.preventDefault();
     chooseCamera(draft.manifest.cameras[+e.key - 1]);
   }
@@ -1251,7 +1274,6 @@ function chooseCamera(cam) {
 }
 $("overview").onclick = () => {
   finishDrag();
-  if (camera === "ego") camera = draft.manifest.cameras[0];
   overview = true;
   draft.overview = overview;
   save().catch(() => {});
@@ -1475,7 +1497,7 @@ async function calculate(action, extras = {}) {
     const op = await api(`/api/sessions/${sid}/compute`, request);
     let result;
     while (draft?.id === sid) {
-      await new Promise((r) => setTimeout(r, 700));
+      await new Promise((r) => setTimeout(r, action === "track" ? 200 : 700));
       result = await api(`/api/sessions/${sid}/operations/${op.id}`);
       if (result.error) throw new Error(result.error);
       if (result.ready) break;
@@ -1492,8 +1514,8 @@ async function calculate(action, extras = {}) {
   }
 }
 async function trackNext() {
-  if (locked() || position >= draft.manifest.frames.length - 1) return;
-  const target = draft.manifest.frames[position + 1];
+  if (locked() || labelStep(draft, position, 1) === position) return;
+  const target = draft.manifest.frames[labelStep(draft, position, 1)];
   const selected = clone(draft.tracked || {});
   for (const cam of Object.keys(selected))
     selected[cam] = selected[cam].filter(
@@ -1575,27 +1597,33 @@ progressCanvas.onclick = (e) => {
     renderFrame().then(() => {
       if (playing) $("play").click();
     });
-  } else step(target - position);
+  } else {
+    const positions = activeLabelSegment(draft, position)?.positions || [position];
+    const index = Math.max(0, Math.min(positions.length - 1, Math.floor(((e.clientX - r.left) / r.width) * positions.length)));
+    step(positions[index] - position);
+  }
 };
 function renderProgress() {
   if (!draft || !draft.result) return;
   const label = draft.manifest.role === "label",
     done = new Set(label ? draft.result.confirmed : draft.result.reviewed);
   const frame = draft.manifest.frames[position];
+  const segmentPositions = label ? (activeLabelSegment(draft, position)?.positions || []) : draft.manifest.frames.map((_, i) => i);
   $("frameStatus").textContent =
     `当前帧 ${frame} · ${done.has(frame) ? "已确认" : "待确认"}`;
   $("frameStatus").className = done.has(frame) ? "done" : "todo";
-  const signature = `${draft.id}:${position}:${[...done].join(",")}:${JSON.stringify(draft.result.bad_ranges)}:${JSON.stringify(draft.result.ego_ranges)}:${qcFlow?.mode}:${qcFlow?.start}:${qcFlow?.end}`;
+  const signature = `${draft.id}:${draft.activeSegment}:${locked()}:${position}:${[...done].join(",")}:${JSON.stringify(draft.result.bad_ranges)}:${JSON.stringify(draft.result.ego_ranges)}:${qcFlow?.mode}:${qcFlow?.start}:${qcFlow?.end}`;
   if (signature === progressSignature) return;
   progressSignature = signature;
   const width = progressCanvas.parentElement.clientWidth || 900;
   if (progressCanvas.width !== width) progressCanvas.width = width;
   if (progressCanvas.height !== 36) progressCanvas.height = 36;
   const ctx = progressCanvas.getContext("2d"),
-    w = width / draft.manifest.frames.length;
+    w = width / segmentPositions.length;
   ctx.clearRect(0, 0, width, 36);
   if (label) {
-    draft.manifest.frames.forEach((f, i) => {
+    segmentPositions.forEach((p, i) => {
+      const f = draft.manifest.frames[p];
       ctx.fillStyle = done.has(f) ? "#46d36b" : "#ff5c5c";
       ctx.fillRect(i * w, 13, Math.max(1, w - 1), 10);
     });
@@ -1631,38 +1659,37 @@ function renderProgress() {
     }
   }
   ctx.fillStyle = "white";
-  ctx.fillRect(position * w, 8, 2, 26);
+  ctx.fillRect((label ? segmentPositions.indexOf(position) : position) * w, 8, 2, 26);
   $("progress").textContent = label
     ? `帧 ${frame} · ${position + 1}/${draft.manifest.frames.length} · ${done.has(frame) ? "已确认" : "未确认"} · 已确认 ${done.size}/${draft.manifest.frames.length}`
     : "";
   if (label) {
     $("frameList").replaceChildren();
-    const table = document.createElement("table");
-    table.className = "nativeTable";
-    const head = table.createTHead().insertRow();
-    for (const t of ["任务", "完成", "总数"]) {
-      const th = document.createElement("th");
-      th.textContent = t;
-      head.append(th);
+    for (const [index, segment] of labelSegments(draft.manifest).entries()) {
+      const completed = segment.positions.filter(p => done.has(draft.manifest.frames[p])).length;
+      const button = document.createElement("button");
+      button.className = "labelSegment";
+      button.classList.toggle("selected", segment.key === draft.activeSegment);
+      button.classList.toggle("complete", completed === segment.positions.length);
+      button.setAttribute("aria-pressed", String(segment.key === draft.activeSegment));
+      button.disabled = locked();
+      button.textContent = `区间 ${index + 1} · ${segment.start_frame}–${segment.end_frame}\n${segment.primary_camera ? `机位 ${segment.primary_camera} · ` : ""}${completed}/${segment.positions.length} 已确认`;
+      button.onclick = () => {
+        if (locked()) return;
+        finishDrag();
+        draft.activeSegment = segment.key;
+        position = segment.positions.find(p => !done.has(draft.manifest.frames[p])) ?? segment.positions[0];
+        draft.tracked = {};
+        if (draft.manifest.cameras.includes(segment.primary_camera)) camera = segment.primary_camera;
+        overview = false;
+        draft.camera = camera;
+        draft.position = position;
+        overlay = null;
+        save().catch(() => {});
+        showContent();
+      };
+      $("frameList").append(button);
     }
-    const row = table.createTBody().insertRow();
-    for (const t of [
-      `${draft.manifest.task_name} / ${draft.manifest.episode_index}`,
-      done.size,
-      draft.manifest.frames.length,
-    ])
-      row.insertCell().textContent = t;
-    row.className = "selected";
-    row.onclick = () => {
-      position = Math.max(
-        0,
-        draft.manifest.frames.findIndex((f) => !done.has(f)),
-      );
-      camera = draft.manifest.cameras[0];
-      draft.tracked = {};
-      step(0);
-    };
-    $("frameList").append(table);
   }
 }
 $("goFrame").onclick = () => {
@@ -1729,7 +1756,7 @@ $("setEnd").onclick = () => selectBoundary("end");
 let mediaPolling = false;
 async function pollMedia() {
   if (!owner || !draft || draft.manifest.role !== "qc" || draft.receipt) return;
-  if (draft.manifest.media?.complete) {
+  if (draft.manifest.media?.complete && !draft.manifest.media?.distributed) {
     clearInterval(mediaPoll);
     return;
   }
@@ -1739,7 +1766,17 @@ async function pollMedia() {
   try {
     const current = await api(`/api/sessions/${sid}`);
     if (draft?.id !== sid) return;
+    const reassigned = draft.manifest.media?.assignment !== current.media.assignment;
     draft.manifest.media = current.media;
+    setMediaRoute(draft.manifest);
+    if (reassigned) {
+      player?.close();
+      player = null;
+      frameCache.clearURLs();
+      frameReady = false;
+      await refreshMedia();
+      return;
+    }
     player?.update(current.media);
     if (current.media.error) notice("后端准备画面失败：" + current.media.error);
     if (
@@ -1767,7 +1804,7 @@ function updateHealth() {
       v.currentTime <= v.buffered.end(n)
     )
       buffered = v.buffered.end(n) - v.currentTime;
-  $("qcBufferStatus").textContent = player?.buffering ? "缓冲中…" : "";
+  $("qcBufferStatus").textContent = player?.mediaError || (player?.buffering ? "缓冲中…" : "");
   $("qcDisplayToolbar").title =
     `已缓冲 ${buffered.toFixed(1)} 秒${player?.incremental ? " · 前方预取 60 秒" : " · 浏览器自动缓冲"}`;
   const prep = draft.manifest.media;

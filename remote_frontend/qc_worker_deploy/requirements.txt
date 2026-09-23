@@ -1,0 +1,10 @@
+# Python 3.10; install CPU torch separately from https://download.pytorch.org/whl/cpu.
+# Isolated environment: do not alter the collection application's packages.
+numpy==1.23.5
+scipy==1.15.3
+opencv-python-headless==4.11.0.86
+Pillow>=10,<12
+smplx==0.1.28
+chumpy==0.70
+pyrender==0.1.45
+trimesh>=4,<5

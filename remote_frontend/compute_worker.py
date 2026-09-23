@@ -36,7 +36,8 @@ def run(body, folder):
             except Exception as exc:
                 errors.append(f"Camera {camera}: {exc}")
         return {"samples": result, "target": body["target"], "errors": errors}
-    runtime = ManoViewRuntime()
+    from .browser_label import BrowserLabelRuntime
+    runtime = BrowserLabelRuntime(body.get("frame", 0))
     joints = runtime.build_skeleton(episode_dir=episode, camera_ids=list(states), view_states=states)
     for camera, sample in body["samples"].items():
         points, visible = runtime.project_skeleton(episode_dir=episode, cam_id=camera, joints_3d=joints)

@@ -14,7 +14,7 @@ window.cameraTest = {
   async setup(role, segments = []) {
     owner = 'test'; busy = false; durable = true; highQuality = true;
     position = 0; camera = '00'; overview = false; overlay = null;
-    draft = {id: role, manifest: {role, cameras:['00','02','03'], frames:[0,1,2,10,11,20,21,30,31],
+    draft = {id: role, manifest: {role, cameras:['00','02','03','ego'], frames:[0,1,2,10,11,20,21,30,31],
       qc_segments:segments, task_name:'Test', episode_index:1, skeleton_edges:[]},
       result:{samples:{}, confirmed:[], reviewed:[], bad_ranges:[], ego_ranges:[]}};
     for (const f of draft.manifest.frames) for (const c of draft.manifest.cameras)
@@ -82,10 +82,11 @@ try {
   assert.equal((await page.evaluate(()=>cameraTest.state())).camera,'00');
   await page.evaluate(()=>cameraTest.jump(5));
   assert.equal((await page.evaluate(()=>cameraTest.state())).camera,'ego');
-  assert.equal(await page.locator('#overviewGrid .nativeCameraCell:visible').count(),1);
-  assert.equal(await page.locator('#editorLayout').isVisible(),false);
+  assert.equal(await page.locator('#overviewGrid .nativeCameraCell:visible').count(),0);
+  assert.equal(await page.locator('#editorLayout').isVisible(),true);
   await page.locator('#overview').click();
-  await page.waitForFunction(()=>cameraTest.state().camera==='00');
+  await page.waitForFunction(()=>cameraTest.state().overview);
+  await page.keyboard.press('1');
   await page.evaluate(()=>cameraTest.jump(6));
   assert.equal((await page.evaluate(()=>cameraTest.state())).camera,'00');
   await page.evaluate(()=>cameraTest.notify('计算完成，结果尚未提交。'));

@@ -13,7 +13,28 @@ from label.storage import (correction_task_from_backend_payload, find_frame_path
                            load_joint_visibility, load_prediction_bundle, source_frame_path, view_state_from_bundle)
 from label.video_frames import ensure_decoded_rgb_frames
 from src.qc.media import MeshRendererSettings, prepare_qc_media
-from .layered_preview import encode_layered, raw_frame, content_layout
+from .browser_label import browser_task, decode_label, BrowserLabelRuntime
+from .layered_preview import encode_layered, raw_frame, content_layout, layout
+
+
+def qc_encoding_settings(root, config):
+    """Pin a session's encoding so resumes never mix different video layouts."""
+    marker = root / 'encoding.json'
+    if marker.exists():
+        return json.loads(marker.read_text())
+    if (root / 'ready.json').exists():
+        settings = dict(profile='legacy', encoder='libx264', bitrate='6M')
+    else:
+        settings = dict(profile=config.get('qc_video_profile', 'detail960'),
+                        encoder=config.get('qc_video_encoder', 'libx264'),
+                        bitrate=config.get('qc_video_maxrate', '7M'))
+    layout(['00', 'ego'], settings['profile'])  # Validate before saving.
+    if settings['encoder'] not in ('libx264', 'h264_nvenc'):
+        raise ValueError('Unsupported QC video encoder')
+    temporary = root / 'encoding.tmp'
+    temporary.write_text(json.dumps(settings))
+    temporary.replace(marker)
+    return settings
 
 
 def label_states(runtime, task, corrected, frame, camera):
@@ -38,6 +59,10 @@ def label_states(runtime, task, corrected, frame, camera):
         references["errors"]["mano_visible"] = str(exc)
         if references["mano"] is hidden:
             references["errors"]["mano"] = str(exc)
+    if camera == "ego" and references["mano"] is not hidden and references["mano_visible"] is hidden:
+        # Preserve projected locations when an older episode has no Ego mask.
+        # Visibility stays unasserted until the operator checks each joint.
+        references["mano_visible"] = dict(points=references["mano"]["points"], visible=hidden["visible"])
     if source_frame_path(corrected, frame, camera) is not None:
         points, visible = view_state_from_bundle(corrected, frame, camera)
     else:
@@ -59,7 +84,7 @@ class BrowserMedia:
 
     def directory(self, sid):
         item = self.batch.session(sid)  # Only server-issued IDs can select a directory.
-        return self.root / sid / "layered-v1" if item["role"] == "qc" else self.root / sid
+        return self.root / sid / "layered-v1" if item["role"] == "qc" else self.root / sid / "label-v2"
 
     def status(self, sid):
         root = self.directory(sid)
@@ -78,8 +103,6 @@ class BrowserMedia:
             state["error"] = error.read_text()
             return state
         if state.get("complete", state.get("ready", False)):
-            if self.batch.session(sid)["role"] == "label":
-                self.ensure_ego(sid)
             return state
         with self.lock:
             state["progress"] = dict(self.progress.get(sid, {}))
@@ -163,10 +186,10 @@ class BrowserMedia:
             with self.slots:
                 item = self.batch.session(sid)
                 payload = item["payload"]
-                task = correction_task_from_backend_payload(payload, mounts=self.batch.mounts)
+                task = browser_task(payload, mounts=self.batch.mounts, role=item["role"])
                 if item["role"] == "label":
-                    decoded = ensure_decoded_rgb_frames(task, payload, cache_root=root / "decode", stop_event=stop)
-                    runtime, samples, sources = ManoViewRuntime(), {}, {}
+                    decoded = decode_label(task, payload, cache_root=root / "decode", stop_event=stop)
+                    runtime, samples, sources = BrowserLabelRuntime(), {}, {}
                     corrected = load_prediction_bundle(task, mode="correct")
                     for frame in task.frames:
                         if stop.is_set():
@@ -189,6 +212,7 @@ class BrowserMedia:
                     ready = dict(ready=True, cameras=task.cameras)
                 else:
                     cfg = self.config
+                    encoding = qc_encoding_settings(root, cfg)
                     settings = MeshRendererSettings(
                         python_executable=cfg["mesh_renderer_python"],
                         mano_toolkit_root=Path(cfg["mano_toolkit_root"]), mano_model_dir=Path(cfg["mano_model_dir"]),
@@ -224,7 +248,7 @@ class BrowserMedia:
                                         with Image.open(raw_source) as raw_image:
                                             raw_image.convert("RGB").save(raw_target, quality=95)
                             output = root / "chunks" / f"{len(chunks)}.mp4"
-                            info = encode_layered(media.cache_dir, output, frames, media.display_cameras)
+                            info = encode_layered(media.cache_dir, output, frames, media.display_cameras, **encoding)
                             chunks.append(dict(index=len(chunks), start=start, count=len(frames), bytes=info["bytes"]))
                             ready = dict(ready=True, complete=False, cameras=media.display_cameras,
                                          chunks=chunks, prepared=start+len(frames), total=len(task.frames), codec=info["codec"], layout=info["layout"])

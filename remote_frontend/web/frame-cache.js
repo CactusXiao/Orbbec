@@ -1,3 +1,4 @@
+import { mediaURL } from "./media-routing.js";
 // Cache expendable images separately from durable annotation drafts.
 export function labelLookahead(frames, cameras, position, selected, overview) {
   const plan = [],
@@ -10,8 +11,8 @@ export function labelLookahead(frames, cameras, position, selected, overview) {
       plan.push({ camera, frame: frames[p] });
     }
   };
-  // The overview also displays Ego, which is absent from annotation cameras.
-  const primary = overview ? [...new Set([...cameras, "ego"])] : [selected];
+  // Ego participates in the same camera contract as the fixed RGB views.
+  const primary = overview ? cameras : [selected];
   for (let d = 1; d <= (overview ? 4 : 20); d++)
     for (const c of primary) add(position + d, c);
   for (let d = 1; d <= 2; d++) for (const c of primary) add(position - d, c);
@@ -111,7 +112,7 @@ export class FrameCache {
     await this.slot(signal, background);
     try {
       const r = await fetch(
-        `/api/sessions/${session}/${layer}/${camera}/${frame}`,
+        mediaURL(session, `${layer}/${camera}/${frame}`),
         { signal },
       );
       if (!r.ok) throw new Error("画面尚未准备完成");

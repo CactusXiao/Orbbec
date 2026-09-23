@@ -1,3 +1,4 @@
+import { mediaURL, setMediaRoute } from "./media-routing.js";
 // Backend-rendered video, bounded lookahead and exact presented-frame tracking.
 export function chunkWindow(chunks, time, fps, total) {
   const low = Math.max(0, time - 15),
@@ -76,9 +77,11 @@ export class EpisodePlayer {
       seekSerial: 0,
       presented: -1,
     });
+    setMediaRoute(manifest);
+    if (manifest.media?.distributed) video.crossOrigin = "anonymous";
     this.abort = new AbortController();
     this.downloads = new ChunkDownloads(
-      (index) => `/api/sessions/${this.id}/chunks/${index}.mp4`,
+      (index) => mediaURL(this.id, `chunks/${index}.mp4`),
     );
     const mime = `video/mp4; codecs="${manifest.media.codec || "avc1.640028"}"`;
     this.incremental =
@@ -140,6 +143,7 @@ export class EpisodePlayer {
     this.update(manifest.media);
   }
   update(state) {
+    setMediaRoute({id: this.id, role: "qc", media: state});
     this.state = state;
     if (state.complete === false && Number.isFinite(state.prepared)) {
       const now = performance.now();
@@ -152,7 +156,7 @@ export class EpisodePlayer {
       while (samples.length > 2 && samples[1].time < now - 20000) samples.shift();
     }
     if (!this.incremental && !this.fullSource && state.complete !== false) {
-      this.video.src = `/api/sessions/${this.id}/preview.mp4`;
+      this.video.src = mediaURL(this.id, "preview.mp4");
       this.video.preload = "auto";
       this.fullSource = true;
     }
@@ -245,6 +249,7 @@ export class EpisodePlayer {
         await this.change(() => this.buffer.appendBuffer(bytes));
         this.loaded.add(c.index);
         this.downloads.entries.delete(c.index);
+        this.mediaError = "";
         this.onStatus({ mbps });
         this.resume();
       }
@@ -260,13 +265,14 @@ export class EpisodePlayer {
       )
         this.source.endOfStream();
     } catch (e) {
-      if (!this.closed)
-        this.onStatus({
-          error:
-            e.name === "QuotaExceededError"
-              ? "浏览器视频缓存不足，请关闭其他占用内存的页面后重试"
-              : e.message + "；自动重试中",
-        });
+      if (!this.closed) {
+        this.mediaError = e.name === "QuotaExceededError"
+          ? "浏览器视频缓存不足，请关闭其他占用内存的页面后重试"
+          : this.state.distributed && e instanceof TypeError
+            ? "无法连接采集主机的画面服务，请检查 Tailscale 连接及访问权限"
+            : e.message + "；自动重试中";
+        this.onStatus({error: this.mediaError});
+      }
     } finally {
       this.running = false;
     }

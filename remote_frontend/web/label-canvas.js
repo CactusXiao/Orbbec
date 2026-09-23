@@ -98,8 +98,13 @@ export class LabelCanvas {
     this.key = "";
     this.imageGeneration = 0;
     this.resizeObserver = new ResizeObserver(() => {
+      const width = this.width, height = this.height;
       this.resize();
-      this.fit();
+      if (!width || !height || width <= 1 || height <= 1) this.fit();
+      else {
+        this.view.x += (this.width - width) / 2;
+        this.view.y += (this.height - height) / 2;
+      }
       this.draw();
     });
     this.resizeObserver.observe(canvas);
@@ -163,12 +168,15 @@ export class LabelCanvas {
       y: (this.height - h * s) / 2,
     };
   }
-  async setImage(url, key) {
+  async setImage(url, key, viewKey = key) {
     const generation = ++this.imageGeneration;
     const image = new Image();
     image.src = url;
     await image.decode();
     if (generation !== this.imageGeneration) return;
+    const preserveView = this.image && this.viewKey === viewKey &&
+      this.imageWidth === image.naturalWidth && this.imageHeight === image.naturalHeight;
+    this.viewKey = viewKey;
     this.image = image;
     this.imageWidth = image.naturalWidth;
     this.imageHeight = image.naturalHeight;
@@ -178,7 +186,7 @@ export class LabelCanvas {
     this.history = [];
     this.locate = null;
     this.resize();
-    this.fit();
+    if (!preserveView) this.fit();
     this.draw();
   }
   videoLayers(video, crop, rendered, opacity) {

@@ -1,5 +1,5 @@
 // App shell only. No task API, result, access key or media is stored here.
-const cacheName = "orbbec-browser-shell-v7";
+const cacheName = "orbbec-browser-shell-v9";
 const shell = [
   "/",
   "/app.js",
@@ -10,6 +10,7 @@ const shell = [
   "/queue.js",
   "/player.js",
   "/frame-cache.js",
+  "/media-routing.js",
   "/style.css",
 ];
 self.addEventListener("install", (e) => {

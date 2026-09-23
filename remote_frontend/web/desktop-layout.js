@@ -35,7 +35,7 @@ export function installDesktopLayout() {
   info.append(progressToggle);
   $("workArea").prepend(info);
   const side = $("taskProgress");
-  side.querySelector("h3").textContent = "标注进度";
+  side.querySelector("h3").textContent = "待标注区间";
   $("frameList").replaceChildren();
   const editorHost = $("editorLayout");
   for (const e of [...editorHost.children]) hidden.append(e);
