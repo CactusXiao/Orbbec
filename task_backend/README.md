@@ -277,6 +277,20 @@ ownership remains in the selected instance's progress file under
 `task_assignments` and `operator_tasks`. Separate instances retain separate
 progress/assignment state.
 
+Non-loopback connections are restricted to `/operator`, the three operator
+session/task endpoints, and authenticated demo requests for the logged-in
+operator's current task. Other pages and APIs return 403, even after operator
+login. Downloading task JSON or another operator's video is forbidden. Access
+checks use the TCP peer address and ignore `Host`, `X-Forwarded-For`, and
+`X-Real-IP` headers.
+
+Management, capture, workflow and account-registration APIs are local-only.
+On the capture host, open `http://127.0.0.1:8765/` for management; local capture
+clients continue to use that address. Administrators working remotely can use
+an authenticated SSH tunnel, for example `ssh -L 18765:127.0.0.1:8765 <host>`,
+then open `http://127.0.0.1:18765/`. Do not place an unrestricted loopback reverse
+proxy in front of this listener: its connections would be treated as local.
+
 The desktop collection integration uses:
 
 ```text

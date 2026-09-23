@@ -12,6 +12,7 @@ import argparse
 import csv
 import hashlib
 import hmac
+import ipaddress
 import html
 import json
 import math
@@ -2731,6 +2732,24 @@ def render_error_page(status: HTTPStatus, message: str) -> str:
 class RequestHandler(BaseHTTPRequestHandler):
     server_version = "OrbbecTaskBackend/1.0"
 
+    def _operator_only_connection(self) -> bool:
+        # Use the actual TCP peer, never Host or client-supplied proxy headers.
+        return not ipaddress.ip_address(self.client_address[0]).is_loopback
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        if self._operator_only_connection():
+            path = urlparse(self.path).path
+            allowed = ((self.command == "GET" and path in {"/operator", "/operator/", "/api/v1/operator/task"})
+                       or (self.command == "POST" and path in {"/api/v1/operator/login", "/api/v1/operator/logout"})
+                       or (self.command == "GET" and path.startswith("/task-assets/")))
+            if not allowed:
+                self._json_response(HTTPStatus.FORBIDDEN, {"error": "局域网仅开放操作员页面 /operator，管理后端仅限主机本机访问"})
+                self.close_connection = True
+                return False
+        return True
+
     @property
     def runtime(self) -> BackendRuntime:
         return self.server.runtime  # type: ignore[attr-defined]
@@ -2928,6 +2947,12 @@ class RequestHandler(BaseHTTPRequestHandler):
                 if len(parts) != 2 or self.backend.nas_root is None:
                     raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
                 name, filename = map(unquote, parts)
+                if self._operator_only_connection():
+                    username = self.runtime.operator_username(self._operator_token())
+                    task = self.backend.assigned_task(username).get("task")
+                    if (not task or task["task_name"] != name
+                            or filename not in {"demo" + ext for ext in task_assets.VIDEO_TYPES}):
+                        raise BackendError(HTTPStatus.FORBIDDEN, "只能查看本人当前分配任务的演示视频")
                 if name not in self.backend.tasks_by_name or filename not in {"task.json", *("demo" + ext for ext in task_assets.VIDEO_TYPES)}:
                     raise BackendError(HTTPStatus.NOT_FOUND, "任务资源不存在")
                 directory = task_assets.task_directory(self.backend.nas_root, name)
