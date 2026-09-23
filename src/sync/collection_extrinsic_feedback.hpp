@@ -5,7 +5,7 @@
 namespace sync_app::extrinsic_feedback {
 
 inline constexpr const char *failureMessageKey = "extrinsic_check_failed";
-inline constexpr const char *failureMessage = "外参检查失败，请调整相机后按F2重新采样";
+inline constexpr const char *failureMessage = "外参检查失败，右侧脚踏板重新检查。";
 
 inline bool resampleOnFailure(int key, bool resampleAllowed, std::string_view status) {
     if(!resampleAllowed || status != "fail" || key < 0) return false;
